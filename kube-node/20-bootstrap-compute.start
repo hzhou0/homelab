@@ -1,0 +1,19 @@
+#!/bin/sh
+# Phase 2 (compute): k3s agent.
+[ -f /etc/local.d/20-bootstrap.done ] && exit 0
+set -e
+
+K3S_TOKEN_FILE="/etc/k3s-token"
+[ -f "$K3S_TOKEN_FILE" ] || { echo "ERROR: $K3S_TOKEN_FILE not found." >&2; exit 1; }
+
+curl -sfL https://get.k3s.io | \
+  K3S_URL="https://10.0.0.21:6443" \
+  K3S_TOKEN="$(cat "$K3S_TOKEN_FILE")" \
+  INSTALL_K3S_EXEC="--embedded-registry" \
+  sh -
+
+rc-service k3s-agent restart
+
+touch /etc/local.d/20-bootstrap.done
+echo "==> k3s compute bootstrap complete. Run from control plane:"
+echo "  kubectl label nodes $(hostname) gvisor=true"

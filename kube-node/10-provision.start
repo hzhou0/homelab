@@ -1,0 +1,51 @@
+#!/bin/sh
+# Phase 1: runs from ISO ramdisk — partitions disk, installs Alpine,
+# copies the role-specific phase-2 script into the installed root, then reboots.
+# NODE_ROLE is read from /etc/node-role (server | compute | db).
+
+grep -q 'tmpfs / tmpfs' /proc/mounts || exit 0
+
+set -e
+
+NODE_ROLE=$(cat /etc/node-role)
+DISK="/dev/nvme0n1"
+
+setup-alpine -f /root/answerfile
+
+case "$NODE_ROLE" in
+  server|compute)
+    parted -s -a optimal "$DISK" -- \
+      mklabel gpt \
+      mkpart boot fat32 1MiB 512MiB \
+      set 1 esp on \
+      mkpart root ext4 512MiB 100GiB \
+      mkpart ceph 100GiB 100%
+    ;;
+  db)
+    parted -s -a optimal "$DISK" -- \
+      mklabel gpt \
+      mkpart boot fat32 1MiB 512MiB \
+      set 1 esp on \
+      mkpart root ext4 512MiB 100%
+    ;;
+esac
+
+mkfs.vfat -F32 "${DISK}p1"
+mkfs.ext4 -q "${DISK}p2"
+
+mount -t ext4 "${DISK}p2" /mnt
+mkdir -p /mnt/boot
+mount -t vfat "${DISK}p1" /mnt/boot
+
+USE_EFI=1 BOOTLOADER=grub setup-disk -m sys /mnt
+
+mkdir -p /mnt/etc/local.d
+cp /etc/k3s-token /mnt/etc/k3s-token
+cp "/etc/local.d/20-bootstrap-${NODE_ROLE}.start" /mnt/etc/local.d/20-bootstrap.start
+chmod +x /mnt/etc/local.d/20-bootstrap.start
+chroot /mnt rc-update add local boot
+
+umount /mnt/boot
+umount /mnt
+
+reboot

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Phase 2 (db): ZFS, k3s agent.
+[ -f /etc/local.d/20-bootstrap.done ] && exit 0
+set -e
+
+apk add zfs-lts
+modprobe zfs
+
+zpool create -f -o ashift=12 tablespaces raidz /dev/sda /dev/sdb /dev/sdc /dev/sdd
+zfs set mountpoint=/mnt/tablespaces tablespaces
+
+rc-update add zfs-import boot
+rc-update add zfs-mount boot
+
+for f in /sys/bus/usb/devices/*/power/autosuspend; do
+  echo -1 > "$f"
+done
+
+K3S_TOKEN_FILE="/etc/k3s-token"
+[ -f "$K3S_TOKEN_FILE" ] || { echo "ERROR: $K3S_TOKEN_FILE not found." >&2; exit 1; }
+
+curl -sfL https://get.k3s.io | \
+  K3S_URL="https://10.0.0.21:6443" \
+  K3S_TOKEN="$(cat "$K3S_TOKEN_FILE")" \
+  INSTALL_K3S_EXEC="--embedded-registry" \
+  sh -
+
+rc-service k3s-agent restart
+
+touch /etc/local.d/20-bootstrap.done
+echo "==> k3s db bootstrap complete. Run from control plane:"
+echo "  kubectl label nodes db node-role=database"
+echo "  kubectl taint nodes db workload=database:NoSchedule"
