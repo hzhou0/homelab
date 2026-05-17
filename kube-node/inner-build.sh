@@ -12,30 +12,68 @@ cp /work/10-provision.start "$OVERLAY/etc/local.d/10-provision.start"
 cp /work/20-bootstrap-"$NODE_ROLE".start "$OVERLAY/etc/local.d/20-bootstrap-$NODE_ROLE.start"
 chmod +x "$OVERLAY/etc/local.d/"*.start
 
+mkdir -p "$OVERLAY/etc/network"
+cat > "$OVERLAY/etc/network/interfaces" <<'EOF'
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+EOF
+
+rc_add() {
+  mkdir -p "$OVERLAY/etc/runlevels/$2"
+  ln -sf /etc/init.d/"$1" "$OVERLAY/etc/runlevels/$2/$1"
+}
+
+rc_add devfs    sysinit
+rc_add dmesg    sysinit
+rc_add mdev     sysinit
+rc_add hwdrivers sysinit
+rc_add modloop  sysinit
+
+rc_add hwclock  boot
+rc_add modules  boot
+rc_add sysctl   boot
+rc_add hostname boot
+rc_add bootmisc boot
+rc_add syslog   boot
+rc_add networking boot
+
+rc_add mount-ro  shutdown
+rc_add killprocs shutdown
+rc_add savecache shutdown
+
+rc_add local    default
+
 SCRIPTS=/tmp/scripts
 cp -r /scripts "$SCRIPTS"
 cp /work/mkimg."$PROFILE".sh "$SCRIPTS"/
-sed -i "s|apkovl=.*|apkovl=\"$OVERLAY\"|" "$SCRIPTS/mkimg.$PROFILE.sh"
+
+# mkimage requires apkovl to be an executable genapkovl script, not a directory path
+GENAPKOVL_NAME="genapkovl-$PROFILE.sh"
+printf '#!/bin/sh -e\ntar -c -C "%s" . | gzip -9n > "$1.apkovl.tar.gz"\n' \
+  "$OVERLAY" > "$SCRIPTS/$GENAPKOVL_NAME"
+chmod +x "$SCRIPTS/$GENAPKOVL_NAME"
+sed -i "s|apkovl=.*|apkovl=\"$GENAPKOVL_NAME\"|" "$SCRIPTS/mkimg.$PROFILE.sh"
 
 REPO_VERSION=$(echo "$ALPINE_VERSION" | cut -d. -f1,2)
 REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/v${REPO_VERSION}"
 
-adduser -D builder
-addgroup builder abuild
-addgroup builder wheel
-echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
-chown -R builder:abuild "$SCRIPTS" "$OVERLAY" /output /tmp/mkimage-work 2>/dev/null || true
+abuild-keygen -n -a -q
+PACKAGER_PRIVKEY=$(find /root/.abuild -name "*.rsa" | head -1)
+[ -n "$PACKAGER_PRIVKEY" ] || { echo "ERROR: abuild key not generated"; exit 1; }
+export PACKAGER_PRIVKEY  # needed for abuild-sign to sign the APKINDEX
+cp "${PACKAGER_PRIVKEY}.pub" /etc/apk/keys/  # --hostkeys picks this up for the initramfs
 
 PROFILE_FUNC=$(echo "$PROFILE" | tr '-' '_')
-su builder -c "
-  abuild-keygen -n -a
-  cd $SCRIPTS
-  ./mkimage.sh \
-    --tag '$ALPINE_VERSION' \
-    --outdir /output \
-    --arch '$ARCH' \
-    --workdir /tmp/mkimage-work \
-    --repository '$REPO_BASE/main' \
-    --repository '$REPO_BASE/community' \
-    --profile '$PROFILE_FUNC'
-"
+cd "$SCRIPTS"
+./mkimage.sh \
+  --tag "$ALPINE_VERSION" \
+  --outdir /output \
+  --arch "$ARCH" \
+  --workdir /tmp/mkimage-work \
+  --repository "$REPO_BASE/main" \
+  --repository "$REPO_BASE/community" \
+  --hostkeys \
+  --profile "$PROFILE_FUNC"

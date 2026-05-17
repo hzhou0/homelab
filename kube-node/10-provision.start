@@ -5,12 +5,27 @@
 
 grep -q 'tmpfs / tmpfs' /proc/mounts || exit 0
 
+# Detach from local service so boot continues unblocked
+if [ "$1" != "--background" ]; then
+  "$0" --background </dev/null >>/var/log/provision.log 2>&1 &
+  exit 0
+fi
+
 set -e
+exec >>/var/log/provision.log 2>&1
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 NODE_ROLE=$(cat /etc/node-role)
 DISK="/dev/nvme0n1"
 
-setup-alpine -f /root/answerfile
+apk add -q --no-network parted e2fsprogs dosfstools
+
+setup-keymap us us
+setup-hostname -n "k3s-$NODE_ROLE"
+setup-dns -d local -n 1.1.1.1
+setup-interfaces -a
+setup-timezone -z UTC
+setup-apkrepos -1 -c
 
 case "$NODE_ROLE" in
   server|compute)
