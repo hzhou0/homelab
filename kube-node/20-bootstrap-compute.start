@@ -3,13 +3,29 @@
 [ -f /etc/local.d/20-bootstrap.done ] && exit 0
 set -e
 
+apk add -q curl procps
+
+cat > /etc/sysctl.d/99-k3s.conf <<EOF
+kernel.panic=10
+kernel.panic_on_oops=1
+vm.overcommit_memory=1
+EOF
+sysctl -p /etc/sysctl.d/99-k3s.conf
+
+mount --make-rshared /
+cat > /etc/local.d/00-rshared.start <<'EOF'
+#!/bin/sh
+mount --make-rshared /
+EOF
+chmod +x /etc/local.d/00-rshared.start
+
 K3S_TOKEN_FILE="/etc/k3s-token"
 [ -f "$K3S_TOKEN_FILE" ] || { echo "ERROR: $K3S_TOKEN_FILE not found." >&2; exit 1; }
 
 curl -sfL https://get.k3s.io | \
   K3S_URL="https://10.0.0.21:6443" \
   K3S_TOKEN="$(cat "$K3S_TOKEN_FILE")" \
-  INSTALL_K3S_EXEC="--embedded-registry" \
+  INSTALL_K3S_EXEC="--embedded-registry --protect-kernel-defaults" \
   sh -
 
 rc-service k3s-agent restart

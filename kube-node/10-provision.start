@@ -18,13 +18,14 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 NODE_ROLE=$(cat /etc/node-role)
 DISK="/dev/nvme0n1"
 
-apk add -q --no-network parted e2fsprogs dosfstools
+apk add -q --no-network parted e2fsprogs dosfstools grub grub-efi
 
 setup-keymap us us
 setup-hostname -n "k3s-$NODE_ROLE"
-setup-dns -d local -n 1.1.1.1
+setup-dns -d local -n 10.0.0.1
 setup-interfaces -a
 setup-timezone -z UTC
+setup-ntp chrony
 setup-apkrepos -1 -c
 
 case "$NODE_ROLE" in
@@ -45,6 +46,9 @@ case "$NODE_ROLE" in
     ;;
 esac
 
+partprobe "$DISK"
+mdev -s
+
 mkfs.vfat -F32 "${DISK}p1"
 mkfs.ext4 -q "${DISK}p2"
 
@@ -58,7 +62,7 @@ mkdir -p /mnt/etc/local.d
 cp /etc/k3s-token /mnt/etc/k3s-token
 cp "/etc/local.d/20-bootstrap-${NODE_ROLE}.start" /mnt/etc/local.d/20-bootstrap.start
 chmod +x /mnt/etc/local.d/20-bootstrap.start
-chroot /mnt rc-update add local boot
+chroot /mnt rc-update add local default
 
 umount /mnt/boot
 umount /mnt

@@ -1,14 +1,37 @@
 #!/bin/sh
-# Phase 2 (server): k3s control plane.
+# Phase 2 (server): k3s control plane with Cilium CNI.
 [ -f /etc/local.d/20-bootstrap.done ] && exit 0
 set -e
+
+apk add -q curl procps
+
+cat > /etc/sysctl.d/99-k3s.conf <<EOF
+kernel.panic=10
+kernel.panic_on_oops=1
+vm.overcommit_memory=1
+EOF
+sysctl -p /etc/sysctl.d/99-k3s.conf
+
+# Cilium requires shared mount propagation on the root fs.
+# Alpine defaults to private; make it rshared now and persist via local.d.
+mount --make-rshared /
+cat > /etc/local.d/00-rshared.start <<'EOF'
+#!/bin/sh
+mount --make-rshared /
+EOF
+chmod +x /etc/local.d/00-rshared.start
 
 K3S_TOKEN_FILE="/etc/k3s-token"
 [ -f "$K3S_TOKEN_FILE" ] || { echo "ERROR: $K3S_TOKEN_FILE not found." >&2; exit 1; }
 
+# Disable the built-in flannel CNI and network-policy controller; Cilium
+# (installed below) replaces them. Agents need no extra flags — the server
+# controls the CNI and Cilium runs as a cluster-wide DaemonSet.
 curl -sfL https://get.k3s.io | \
   K3S_TOKEN="$(cat "$K3S_TOKEN_FILE")" \
   INSTALL_K3S_EXEC="\
+  --flannel-backend=none \
+  --disable-network-policy \
   --disable=traefik \
   --disable=servicelb \
   --write-kubeconfig-mode=644 \
@@ -17,7 +40,29 @@ curl -sfL https://get.k3s.io | \
 " sh -
 
 systemctl restart k3s 2>/dev/null || rc-service k3s restart
-kubectl label nodes k3s-server ceph-osd=true gvisor=true
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+# Wait for the API server. Nodes stay NotReady until Cilium provides the CNI.
+until kubectl get --raw='/readyz' >/dev/null 2>&1; do sleep 3; done
+
+# Install the Cilium CLI (latest stable).
+CILIUM_CLI_VERSION="$(curl -sfL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)"
+CLI_ARCH=amd64
+[ "$(uname -m)" = aarch64 ] && CLI_ARCH=arm64
+CLI_BASE="https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}"
+curl -sfL --remote-name-all \
+  "${CLI_BASE}/cilium-linux-${CLI_ARCH}.tar.gz" \
+  "${CLI_BASE}/cilium-linux-${CLI_ARCH}.tar.gz.sha256sum"
+sha256sum -c "cilium-linux-${CLI_ARCH}.tar.gz.sha256sum"
+tar xzf "cilium-linux-${CLI_ARCH}.tar.gz" -C /usr/local/bin
+rm -f "cilium-linux-${CLI_ARCH}.tar.gz" "cilium-linux-${CLI_ARCH}.tar.gz.sha256sum"
+
+# Deploy Cilium. clusterPoolIPv4PodCIDRList matches k3s's default pod CIDR.
+cilium install --set=ipam.operator.clusterPoolIPv4PodCIDRList="10.42.0.0/16"
+cilium status --wait
+
+kubectl label nodes k3s-server ceph-osd=true
 
 touch /etc/local.d/20-bootstrap.done
 echo "==> k3s server bootstrap complete. Token:"
