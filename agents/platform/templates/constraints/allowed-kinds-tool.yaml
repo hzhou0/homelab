@@ -1,6 +1,6 @@
 {{- if .Values.policies.enabled }}
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
 metadata:
   name: allowed-kinds-tool
   labels:
@@ -9,24 +9,27 @@ metadata:
     policies.kyverno.io/title: Allowed resource kinds (tool-*)
     policies.kyverno.io/description: >-
       tool-* namespaces allow the app set plus StatefulSet, DaemonSet, Job,
-      CronJob and PersistentVolumeClaim. A few legacy/raw kinds stay disallowed.
-      Cluster-scoped and RBAC kinds are never granted to the operator.
+      CronJob and PVC. Raw ReplicaSets / ReplicationControllers stay disallowed.
 spec:
-  background: false
-  rules:
-    - name: deny-non-tool-kinds
-      match:
-        any:
-          - resources:
-              kinds:
-                - ReplicationController
-                - ReplicaSet
-              namespaces: ["{{ include "platform.toolGlob" . }}"]
-      validate:
-        failureAction: {{ .Values.policies.failureAction }}
-        message: >-
-          {{`{{ request.object.kind }}`}} is not allowed in tool-* namespaces.
-          Deploy controllers (Deployment/StatefulSet/DaemonSet) or Jobs instead
-          of raw ReplicaSets / ReplicationControllers.
-        deny: {}
+  validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["replicasets"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["replicationcontrollers"]
+  matchConditions:
+    - name: in-tool-namespace
+      expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.tool }}')"
+  validations:
+    - expression: "false"
+      messageExpression: >-
+        "'" + object.kind + "' is not allowed in tool-* namespaces; deploy a controller (Deployment/StatefulSet/DaemonSet) or Job instead."
 {{- end }}

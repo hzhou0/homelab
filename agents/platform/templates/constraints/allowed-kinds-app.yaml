@@ -1,6 +1,6 @@
 {{- if .Values.policies.enabled }}
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
 metadata:
   name: allowed-kinds-app
   labels:
@@ -8,30 +8,32 @@ metadata:
   annotations:
     policies.kyverno.io/title: Allowed resource kinds (app-*)
     policies.kyverno.io/description: >-
-      app-* namespaces follow the stateless standard deploy pattern: Deployment,
-      Service, ConfigMap, Secret, ServiceAccount, HPA, PDB, Ingress, HTTPRoute.
-      Stateful / batch / PVC kinds are rejected here (use a tool-* namespace).
+      app-* namespaces follow the stateless standard deploy pattern. Stateful /
+      batch / PVC kinds are rejected here (use a tool-* namespace).
 spec:
-  background: false
-  rules:
-    - name: deny-non-app-kinds
-      match:
-        any:
-          - resources:
-              kinds:
-                - StatefulSet
-                - DaemonSet
-                - ReplicaSet
-                - ReplicationController
-                - Job
-                - CronJob
-                - PersistentVolumeClaim
-              namespaces: ["{{ include "platform.appGlob" . }}"]
-      validate:
-        failureAction: {{ .Values.policies.failureAction }}
-        message: >-
-          {{`{{ request.object.kind }}`}} is not allowed in app-* namespaces.
-          app-* is for stateless Deployments only; use a tool-* namespace for
-          stateful, batch, or storage workloads.
-        deny: {}
+  validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["statefulsets", "daemonsets", "replicasets"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs", "cronjobs"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["persistentvolumeclaims", "replicationcontrollers"]
+  matchConditions:
+    - name: in-app-namespace
+      expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.app }}')"
+  validations:
+    - expression: "false"
+      messageExpression: >-
+        "'" + object.kind + "' is not allowed in app-* namespaces (stateless Deployments only); use a tool-* namespace."
 {{- end }}

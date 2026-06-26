@@ -1,6 +1,6 @@
 {{- if .Values.policies.enabled }}
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
 metadata:
   name: runtime-label
   labels:
@@ -8,36 +8,32 @@ metadata:
   annotations:
     policies.kyverno.io/title: Require runtime label (app-*)
     policies.kyverno.io/description: >-
-      Every app-* Deployment must declare its language runtime via the
-      {{ .Values.runtimeLabel }} pod-template label, drawn from the
-      runtime-profiles ConfigMap. The label drives the per-runtime resource
-      envelope enforced by the runtime-ranges policy.
+      Every app-* Deployment must declare {{ .Values.runtimeLabel }} on its pod
+      template, set to a runtime defined in the runtime-profiles ConfigMap.
 spec:
-  background: false
-  rules:
-    - name: require-valid-runtime-label
-      match:
-        any:
-          - resources:
-              kinds: [Deployment]
-              namespaces: ["{{ include "platform.appGlob" . }}"]
-      context:
-        - name: profiles
-          configMap:
-            name: runtime-profiles
-            namespace: {{ .Release.Namespace }}
-        - name: runtimes
-          variable:
-            jmesPath: {{ "profiles.data | keys(@)" | quote }}
-      validate:
-        failureAction: {{ .Values.policies.failureAction }}
-        message: >-
-          app-* Deployments must set the pod-template label {{ .Values.runtimeLabel }}
-          to a known runtime (one of the runtime-profiles keys).
-        deny:
-          conditions:
-            all:
-              - key: {{ printf "{{ request.object.spec.template.metadata.labels.\"%s\" || '' }}" .Values.runtimeLabel | quote }}
-                operator: AnyNotIn
-                value: {{ "{{ runtimes }}" | quote }}
+  validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  matchConditions:
+    - name: in-app-namespace
+      expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.app }}')"
+  variables:
+    - name: profiles
+      expression: >-
+        resource.Get("v1", "configmaps", "{{ .Release.Namespace }}", "runtime-profiles").data
+    - name: runtime
+      expression: >-
+        has(object.spec.template.metadata.labels) && "{{ .Values.runtimeLabel }}" in object.spec.template.metadata.labels
+          ? object.spec.template.metadata.labels["{{ .Values.runtimeLabel }}"] : ""
+  validations:
+    - expression: >-
+        variables.runtime != "" && (variables.runtime + ".cpuMin") in variables.profiles
+      message: "app-* Deployments must set pod-template label {{ .Values.runtimeLabel }} to a known runtime (a runtime-profiles key)."
 {{- end }}

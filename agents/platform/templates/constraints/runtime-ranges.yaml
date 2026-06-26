@@ -1,6 +1,6 @@
 {{- if .Values.policies.enabled }}
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
 metadata:
   name: runtime-ranges
   labels:
@@ -8,51 +8,53 @@ metadata:
   annotations:
     policies.kyverno.io/title: Per-runtime resource ranges (app-*)
     policies.kyverno.io/description: >-
-      Looks up the cpu/mem envelope for the Deployment's declared runtime (from
-      the runtime-profiles ConfigMap) and rejects any container whose requests or
-      limits fall outside that window. Presence of requests+limits is forced by
-      the namespace ResourceQuota.
+      Each app-* Deployment container's cpu/mem requests and limits must fall
+      within the envelope for its declared runtime (runtime-profiles ConfigMap).
 spec:
-  background: false
-  rules:
-    - name: container-resources-within-runtime-envelope
-      match:
-        any:
-          - resources:
-              kinds: [Deployment]
-              namespaces: ["{{ include "platform.appGlob" . }}"]
-      context:
-        - name: profiles
-          configMap:
-            name: runtime-profiles
-            namespace: {{ .Release.Namespace }}
-        - name: runtime
-          variable:
-            jmesPath: {{ printf "request.object.spec.template.metadata.labels.\"%s\"" .Values.runtimeLabel | quote }}
-        - name: profile
-          variable:
-            jmesPath: {{ printf "profiles.data.\"{{ runtime }}\" | parse_json(@)" | quote }}
-      validate:
-        failureAction: {{ .Values.policies.failureAction }}
-        message: >-
-          A container's cpu/mem requests or limits are outside the allowed range
-          for runtime '{{ "{{ runtime }}" }}'. Allowed: cpu [{{ "{{ profile.cpuMin }}" }},{{ "{{ profile.cpuMax }}" }}],
-          memory [{{ "{{ profile.memMin }}" }},{{ "{{ profile.memMax }}" }}].
-        foreach:
-          - list: "request.object.spec.template.spec.containers"
-            deny:
-              conditions:
-                any:
-                  - key: {{ "{{ element.resources.requests.cpu || '0' }}" | quote }}
-                    operator: LessThan
-                    value: {{ "{{ profile.cpuMin }}" | quote }}
-                  - key: {{ "{{ element.resources.limits.cpu || '0' }}" | quote }}
-                    operator: GreaterThan
-                    value: {{ "{{ profile.cpuMax }}" | quote }}
-                  - key: {{ "{{ element.resources.requests.memory || '0' }}" | quote }}
-                    operator: LessThan
-                    value: {{ "{{ profile.memMin }}" | quote }}
-                  - key: {{ "{{ element.resources.limits.memory || '0' }}" | quote }}
-                    operator: GreaterThan
-                    value: {{ "{{ profile.memMax }}" | quote }}
+  validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  matchConditions:
+    - name: in-app-namespace
+      expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.app }}')"
+  variables:
+    - name: profiles
+      expression: >-
+        resource.Get("v1", "configmaps", "{{ .Release.Namespace }}", "runtime-profiles").data
+    - name: runtime
+      expression: >-
+        has(object.spec.template.metadata.labels) && "{{ .Values.runtimeLabel }}" in object.spec.template.metadata.labels
+          ? object.spec.template.metadata.labels["{{ .Values.runtimeLabel }}"] : ""
+    - name: cpuMin
+      expression: "variables.profiles[?(variables.runtime + '.cpuMin')].orValue('0')"
+    - name: cpuMax
+      expression: "variables.profiles[?(variables.runtime + '.cpuMax')].orValue('0')"
+    - name: memMin
+      expression: "variables.profiles[?(variables.runtime + '.memMin')].orValue('0')"
+    - name: memMax
+      expression: "variables.profiles[?(variables.runtime + '.memMax')].orValue('0')"
+  validations:
+    # If the runtime is unknown, defer to runtime-label; otherwise every container
+    # must declare cpu/mem requests+limits within the runtime envelope.
+    - expression: >-
+        !((variables.runtime + '.cpuMin') in variables.profiles) ? true :
+        object.spec.template.spec.containers.all(c,
+          has(c.resources) && has(c.resources.requests) && has(c.resources.limits) &&
+          has(c.resources.requests.cpu) && has(c.resources.limits.cpu) &&
+          has(c.resources.requests.memory) && has(c.resources.limits.memory) &&
+          !quantity(c.resources.requests.cpu).isLessThan(quantity(variables.cpuMin)) &&
+          !quantity(c.resources.limits.cpu).isGreaterThan(quantity(variables.cpuMax)) &&
+          !quantity(c.resources.requests.memory).isLessThan(quantity(variables.memMin)) &&
+          !quantity(c.resources.limits.memory).isGreaterThan(quantity(variables.memMax)))
+      messageExpression: >-
+        "container cpu/mem requests+limits must be set and within the '" + variables.runtime +
+        "' envelope: cpu [" + variables.cpuMin + "," + variables.cpuMax + "], memory [" +
+        variables.memMin + "," + variables.memMax + "]."
 {{- end }}

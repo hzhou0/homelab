@@ -1,6 +1,6 @@
 {{- if .Values.policies.enabled }}
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
 metadata:
   name: image-allowlist
   labels:
@@ -8,45 +8,36 @@ metadata:
   annotations:
     policies.kyverno.io/title: Container image allowlist (app-* / tool-*)
     policies.kyverno.io/description: >-
-      Only specific, vetted container images (full references) listed in the
-      image-allowlist ConfigMap may run in app-* / tool-* namespaces.
+      Only images listed in the image-allowlist ConfigMap may run in app-*/tool-*.
 spec:
-  background: false
-  rules:
-    - name: images-must-be-allowlisted
-      match:
-        any:
-          - resources:
-              kinds: [Pod]
-              namespaces:
-                - "{{ include "platform.appGlob" . }}"
-                - "{{ include "platform.toolGlob" . }}"
-      context:
-        - name: rawlist
-          configMap:
-            name: image-allowlist
-            namespace: {{ .Release.Namespace }}
-        - name: allowed
-          variable:
-            jmesPath: {{ "rawlist.data.images | parse_json(@)" | quote }}
-      validate:
-        failureAction: {{ .Values.policies.failureAction }}
-        message: >-
-          Image is not in the allowlist. Add the exact image reference to the
-          image-allowlist ConfigMap (via a chart upgrade) before deploying it.
-        foreach:
-          - list: "request.object.spec.containers"
-            deny:
-              conditions:
-                all:
-                  - key: {{ "{{ element.image }}" | quote }}
-                    operator: AnyNotIn
-                    value: {{ "{{ allowed }}" | quote }}
-          - list: "request.object.spec.initContainers || `[]`"
-            deny:
-              conditions:
-                all:
-                  - key: {{ "{{ element.image }}" | quote }}
-                    operator: AnyNotIn
-                    value: {{ "{{ allowed }}" | quote }}
+  validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
+  evaluation:
+    background:
+      enabled: false
+  # Evaluate on Pods directly (covers every controller's pods); the autogen'd
+  # controller variant mis-rewrites the namespace match.
+  autogen:
+    podControllers:
+      controllers: []
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: in-tier-namespace
+      expression: >-
+        object.metadata.namespace.startsWith('{{ .Values.prefixes.app }}') ||
+        object.metadata.namespace.startsWith('{{ .Values.prefixes.tool }}')
+  variables:
+    - name: allowed
+      expression: >-
+        resource.Get("v1", "configmaps", "{{ .Release.Namespace }}", "image-allowlist").data["images"].split(",")
+    - name: containers
+      expression: "object.spec.containers + object.spec.?initContainers.orValue([])"
+  validations:
+    - expression: "variables.containers.all(c, c.image in variables.allowed)"
+      messageExpression: >-
+        "container image not in the allowlist; add it to the image-allowlist ConfigMap. Images: " + variables.containers.map(c, c.image).join(", ")
 {{- end }}

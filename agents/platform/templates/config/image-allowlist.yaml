@@ -1,7 +1,7 @@
 {{- if .Values.policies.enabled }}
-# Explicit allowlist of full container image references. The image-allowlist
-# constraint parses `images` (a JSON array) and rejects any container image not
-# present. To run a new image, add it here and upgrade the release.
+# Allowed container images as a comma-separated string so the CEL image-allowlist
+# policy can read it via resource.Get(...).data["images"].split(","). To run a new
+# image, add it to imageAllowlist in values and upgrade.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,6 +10,5 @@ metadata:
   labels:
 {{ include "platform.labels" . | indent 4 }}
 data:
-  images: |
-    {{ toJson .Values.imageAllowlist }}
+  images: {{ join "," .Values.imageAllowlist | quote }}
 {{- end }}

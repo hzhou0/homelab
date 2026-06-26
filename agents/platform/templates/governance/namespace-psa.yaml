@@ -1,0 +1,42 @@
+{{- if .Values.policies.enabled }}
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: namespace-psa-labels
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Pod Security labels (app-* / tool-*)
+    policies.kyverno.io/description: >-
+      Stamps Pod Security Admission labels on new tier namespaces: restricted for
+      app-*, baseline for tool-*. Uses JSONPatch because the label keys contain
+      '/' (not expressible as ApplyConfiguration identifiers).
+spec:
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces"]
+  matchConditions:
+    - name: tier-namespace
+      expression: >-
+        object.metadata.name.startsWith('{{ .Values.prefixes.app }}') ||
+        object.metadata.name.startsWith('{{ .Values.prefixes.tool }}')
+  variables:
+    - name: level
+      expression: >-
+        object.metadata.name.startsWith('{{ .Values.prefixes.app }}') ? "{{ .Values.tiers.app.psaLevel }}" : "{{ .Values.tiers.tool.psaLevel }}"
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >
+          [
+            JSONPatch{op: "add", path: "/metadata/labels/pod-security.kubernetes.io~1enforce", value: variables.level},
+            JSONPatch{op: "add", path: "/metadata/labels/pod-security.kubernetes.io~1warn", value: variables.level},
+            JSONPatch{op: "add", path: "/metadata/labels/pod-security.kubernetes.io~1audit", value: variables.level}
+          ]
+{{- end }}

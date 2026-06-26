@@ -1,48 +1,90 @@
 {{- if .Values.policies.enabled }}
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
 metadata:
   name: harden-defaults
   labels:
 {{ include "platform.labels" . | indent 4 }}
   annotations:
-    policies.kyverno.io/title: Default restricted securityContext (app-*)
+    policies.kyverno.io/title: Harden security defaults (app-* pods)
     policies.kyverno.io/description: >-
-      Mutates app-* Pods to fill the restricted Pod Security fields when unset, so
-      the operator can submit minimal specs while PSA still hard-rejects anything
-      that explicitly opts out of the baseline.
+      Auto-fills restricted-PSS securityContext fields on app-* pods that the operator
+      hasn't explicitly set: seccompProfile at pod level, and allowPrivilegeEscalation,
+      runAsNonRoot, and capabilities.drop=[ALL] per container. PSA restricted still
+      hard-enforces the outcome; this mutation makes it ergonomic for the operator.
+      Autogen disabled — namespace match only works at Pod level.
 spec:
-  background: false
-  rules:
-    - name: add-restricted-securitycontext
-      match:
-        any:
-          - resources:
-              kinds: [Pod]
-              namespaces: ["{{ include "platform.appGlob" . }}"]
-      mutate:
-        patchStrategicMerge:
-          spec:
-            securityContext:
-              +(runAsNonRoot): true
-              +(seccompProfile):
-                type: RuntimeDefault
-            containers:
-              - (name): "*"
-                securityContext:
-                  +(runAsNonRoot): true
-                  +(allowPrivilegeEscalation): false
-                  +(capabilities):
-                    drop: ["ALL"]
-                  +(seccompProfile):
-                    type: RuntimeDefault
-            initContainers:
-              - (name): "*"
-                securityContext:
-                  +(runAsNonRoot): true
-                  +(allowPrivilegeEscalation): false
-                  +(capabilities):
-                    drop: ["ALL"]
-                  +(seccompProfile):
-                    type: RuntimeDefault
+  autogen:
+    podControllers:
+      controllers: []
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: in-app-namespace
+      expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.app }}')"
+  mutations:
+    # 1. Set pod-level seccompProfile (RuntimeDefault) if not already present.
+    #    Creates /spec/securityContext when the field is entirely absent.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: |
+          !has(object.spec.securityContext) ?
+            [JSONPatch{op: "add", path: "/spec/securityContext",
+                       value: dyn({"seccompProfile": dyn({"type": "RuntimeDefault"})})}] :
+          !has(object.spec.securityContext.seccompProfile) ?
+            [JSONPatch{op: "add", path: "/spec/securityContext/seccompProfile",
+                       value: dyn({"type": "RuntimeDefault"})}] :
+          []
+
+    # 2. Create an empty /securityContext for every container that lacks one.
+    #    Must run before mutations 3-5 so the parent path exists.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: |
+          object.spec.containers.map(c,
+            !has(c.securityContext) ?
+              JSONPatch{op: "add",
+                        path: "/spec/containers/" + string(object.spec.containers.indexOf(c)) + "/securityContext",
+                        value: dyn({})} :
+              null
+          ).filter(p, p != null)
+
+    # 3. Set allowPrivilegeEscalation=false on every container.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: |
+          object.spec.containers.map(c,
+            JSONPatch{op: "add",
+                      path: "/spec/containers/" + string(object.spec.containers.indexOf(c)) + "/securityContext/allowPrivilegeEscalation",
+                      value: dyn(false)}
+          )
+
+    # 4. Set runAsNonRoot=true on every container.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: |
+          object.spec.containers.map(c,
+            JSONPatch{op: "add",
+                      path: "/spec/containers/" + string(object.spec.containers.indexOf(c)) + "/securityContext/runAsNonRoot",
+                      value: dyn(true)}
+          )
+
+    # 5. Set capabilities.drop=["ALL"] on every container.
+    #    Replaces the entire capabilities object — no capability additions are valid in
+    #    app-* (PSA restricted rejects them anyway).
+    #    Requires dyn() on both the map and the list: ApplyConfiguration fails with
+    #    "may not mutate atomic arrays" for capabilities.drop; JSONPatch bypasses the
+    #    typed schema and the dyn() unwraps the heterogeneous CEL value correctly.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: |
+          object.spec.containers.map(c,
+            JSONPatch{op: "add",
+                      path: "/spec/containers/" + string(object.spec.containers.indexOf(c)) + "/securityContext/capabilities",
+                      value: dyn({"drop": dyn(["ALL"])})}
+          )
 {{- end }}

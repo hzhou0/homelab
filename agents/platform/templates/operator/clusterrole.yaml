@@ -25,8 +25,11 @@ rules:
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
   # Read-only introspection of the constraint surface (cannot modify it).
-  - apiGroups: ["kyverno.io"]
-    resources: ["clusterpolicies", "policies", "policyexceptions"]
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["validatingpolicies", "mutatingpolicies", "generatingpolicies", "imagevalidatingpolicies", "deletingpolicies", "policyexceptions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["wgpolicyk8s.io"]
     resources: ["policyreports", "clusterpolicyreports"]

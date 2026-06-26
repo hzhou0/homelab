@@ -25,9 +25,9 @@ kyverno:
 # about CRD ordering on a fresh cluster).
 policies:
   enabled: true
-  # Enforce = hard-reject violations (what an operator needs: clear pass/fail).
-  # Audit   = allow but record, useful while rolling out.
-  failureAction: Enforce
+  # CEL policy enforcement action: Deny = hard-reject (what an operator needs:
+  # clear pass/fail), Audit = allow but record, Warn = allow with a warning.
+  validationAction: Deny
 
 # The autonomous operator's identity. RBAC grants broad deploy power but never
 # kyverno.io / rbac / quota writes (deny-by-default), so it cannot move the

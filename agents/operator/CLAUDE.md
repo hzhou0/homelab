@@ -36,8 +36,8 @@ done inside the constraints, **stop and escalate** (see below) rather than forci
 Don't assume limits — read them live. They are the source of truth and may change:
 
 ```sh
-kubectl get cpol                                          # list all constraints
-kubectl get cpol <name> -o yaml                           # read a specific rule
+kubectl get vpol,mpol,gpol                                # list all constraints (CEL policies)
+kubectl get vpol <name> -o yaml                           # read a specific rule
 kubectl get cm runtime-profiles -n kyverno -o yaml        # per-runtime cpu/mem envelopes
 kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container images
 ```

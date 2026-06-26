@@ -1,7 +1,8 @@
 {{- if .Values.policies.enabled }}
-# Maps each language runtime to its cpu/mem envelope. Each value is a JSON object
-# so policies can parse_json it and compare quantities. Consumed by the
-# runtime-label and runtime-ranges constraints.
+# Per-runtime cpu/mem envelopes, flattened to "<runtime>.<bound>" keys so the
+# CEL runtime-label / runtime-ranges policies can read them directly via
+# resource.Get(...).data["go.cpuMin"] without JSON parsing. A runtime is "known"
+# iff its "<runtime>.cpuMin" key exists.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,6 +12,9 @@ metadata:
 {{ include "platform.labels" . | indent 4 }}
 data:
 {{- range $runtime, $p := .Values.runtimeProfiles }}
-  {{ $runtime }}: '{{ printf "{\"cpuMin\":\"%s\",\"cpuMax\":\"%s\",\"memMin\":\"%s\",\"memMax\":\"%s\"}" $p.cpuMin $p.cpuMax $p.memMin $p.memMax }}'
+  {{ $runtime }}.cpuMin: {{ $p.cpuMin | quote }}
+  {{ $runtime }}.cpuMax: {{ $p.cpuMax | quote }}
+  {{ $runtime }}.memMin: {{ $p.memMin | quote }}
+  {{ $runtime }}.memMax: {{ $p.memMax | quote }}
 {{- end }}
 {{- end }}

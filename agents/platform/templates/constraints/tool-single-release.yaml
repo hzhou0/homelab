@@ -1,6 +1,6 @@
 {{- if and .Values.policies.enabled .Values.oneChartPerToolNamespace.enabled }}
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
 metadata:
   name: tool-single-release
   labels:
@@ -8,42 +8,35 @@ metadata:
   annotations:
     policies.kyverno.io/title: One Helm release per tool-* namespace
     policies.kyverno.io/description: >-
-      A tool-* namespace may host at most one Helm release (chart). When Helm
-      records a new release (an owner=helm Secret), the namespace is rejected if
-      it already contains a different release. Deploy the second chart into its
-      own tool-* namespace.
+      When Helm records a new release (an owner=helm Secret) in a tool-* namespace,
+      reject it if the namespace already holds a different release.
 spec:
-  background: false
-  rules:
-    - name: at-most-one-release
-      match:
-        any:
-          - resources:
-              kinds: [Secret]
-              namespaces: ["{{ include "platform.toolGlob" . }}"]
-              operations: [CREATE]
-              # Helm release records carry owner=helm; this keeps the apiCall off
-              # of every other Secret create.
-              selector:
-                matchLabels:
-                  owner: helm
-      context:
-        # Names of helm release Secrets in this namespace that belong to a
-        # DIFFERENT release than the one being created (name label differs).
-        - name: otherReleaseSecrets
-          apiCall:
-            urlPath: "/api/v1/namespaces/{{ "{{ request.namespace }}" }}/secrets"
-            jmesPath: {{ "items[?metadata.labels.owner=='helm' && metadata.labels.name != '{{ request.object.metadata.labels.name }}'].metadata.labels.name" | quote }}
-      validate:
-        failureAction: {{ .Values.policies.failureAction }}
-        message: >-
-          {{ "{{ request.namespace }}" }} already hosts a different Helm release
-          ({{ "{{ otherReleaseSecrets | to_string(@) }}" }}). A tool-* namespace
-          allows at most one chart; install this one in its own tool-* namespace.
-        deny:
-          conditions:
-            any:
-              - key: {{ "{{ otherReleaseSecrets | length(@) }}" | quote }}
-                operator: GreaterThan
-                value: 0
+  validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["secrets"]
+  matchConditions:
+    - name: in-tool-namespace
+      expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.tool }}')"
+    - name: is-helm-release
+      expression: "has(object.type) && object.type == 'helm.sh/release.v1'"
+  variables:
+    - name: thisRelease
+      expression: "object.metadata.?labels['name'].orValue('')"
+    - name: otherReleases
+      expression: >-
+        dyn(resource.List("v1", "secrets", object.metadata.namespace, {"owner": "helm"}).items)
+          .filter(s, has(s.metadata.labels) && s.metadata.labels['name'] != variables.thisRelease)
+          .map(s, s.metadata.labels['name'])
+  validations:
+    - expression: "variables.otherReleases.size() == 0"
+      messageExpression: >-
+        "tool-* namespaces allow at most one Helm release; this namespace already hosts: " +
+        variables.otherReleases.join(", ") + ". Use a separate tool-* namespace."
 {{- end }}

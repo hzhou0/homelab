@@ -76,11 +76,10 @@ permissions, and the constraint surface**.
 
 | Concern | Mechanism |
 |---|---|
-| Allowed kinds per tier | Kyverno `allowed-kinds-{app,tool}` (deny complementary kinds) |
-| Stateless / no bare Pods | Kyverno `deployment-only` |
-| Pod Security | native PSA labels (stamped by `namespace-governance`) |
-| securityContext defaults | Kyverno `harden-defaults` (mutate) |
-| Image allowlist | Kyverno `image-allowlist` + ConfigMap |
+| Allowed kinds per tier | `ValidatingPolicy` `allowed-kinds-{app,tool}` (deny complementary kinds) |
+| Stateless / no bare Pods | `ValidatingPolicy` `no-bare-pods` + `no-pvc-volumes-app` |
+| Pod Security | native PSA labels (stamped by `MutatingPolicy` `namespace-psa-labels`) + defaults auto-filled by `harden-defaults` |
+| Image allowlist | `ValidatingPolicy` `image-allowlist` + ConfigMap |
 | App resource ranges | Kyverno `runtime-label` + `runtime-ranges` + ConfigMap |
 | **Tool resource ranges** | the generated **`LimitRange` + `ResourceQuota`** (no extra policy needed) |
 | One chart per `tool-*` ns | Kyverno `tool-single-release` (inspects Helm release Secrets) |
@@ -125,6 +124,18 @@ permissions, and the constraint surface**.
   namespace. **MetalLB** is the first example: it lives in its own cluster-admin chart at
   `agents/metallb` (installed into `metallb-system`). Rook/CloudNativePG would follow the
   same pattern.
+- **CEL policies, not `ClusterPolicy`.** Kyverno deprecated `ClusterPolicy` in 1.17 (removal
+  in v1.20). All constraints are the GA CEL types (`ValidatingPolicy`, `MutatingPolicy`,
+  `GeneratingPolicy`) under `policies.kyverno.io/v1`. Key consequence of the CEL engine:
+  the pod-level `image-allowlist`/`no-bare-pods`/`harden-defaults` checks run at **Pod**
+  admission (podController autogen is disabled because its namespace rewrite is broken), so
+  a bad image or missing securityContext surfaces as a ReplicaSet `FailedCreate` rather than
+  a Deployment rejection. `harden-defaults` auto-fills restricted securityContext fields on
+  `app-*` pods using multi-step JSONPatch (not ApplyConfiguration — CEL's ApplyConfiguration
+  engine rejects mutations to atomic fields like `capabilities.drop`; JSONPatch bypasses the
+  typed schema and `dyn({"drop": dyn(["ALL"])})` correctly unwraps the value). PSA
+  `restricted` still hard-enforces the outcome; the mutation makes the operator's job
+  ergonomic.
 - Optional: re-enable gVisor for `app-*` (infra exists at `utils/gvisor-runtime.yaml`),
   the Kyverno reports controller for a policy-report dashboard, and GitOps for an audit
   trail of operator actions.
