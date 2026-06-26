@@ -1,0 +1,21 @@
+{{- if and .Values.policies.enabled .Values.operator.enabled }}
+# Lets Kyverno's background controller generate the per-namespace operator
+# RoleBindings, and bind the homelab-operator-deploy ClusterRole without holding
+# all of its permissions (the `bind` verb satisfies RBAC's escalation check).
+# Aggregated into the background controller's ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}:kyverno-operator-rolebinding-manager
+  labels:
+    rbac.kyverno.io/aggregate-to-background-controller: "true"
+{{ include "platform.labels" . | indent 4 }}
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: ["{{ .Values.operator.serviceAccountName }}-deploy"]
+{{- end }}

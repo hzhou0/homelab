@@ -1,0 +1,48 @@
+{{- if .Values.operator.enabled }}
+# The operator's namespaced deploy permissions. This ClusterRole is NEVER bound
+# cluster-wide -- namespace-governance binds it via a RoleBinding inside each
+# app-*/tool-* namespace, so the operator can only deploy there. Kyverno still
+# restricts which of these kinds may land in which tier (allowed-kinds-*).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.operator.serviceAccountName }}-deploy
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+rules:
+  # Workload controllers.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Core app objects (scoped to the bound namespace, so no cluster-wide
+  # Secret/ConfigMap exposure).
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["events", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  # Scaling & availability.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Ingress / Gateway routing.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+{{- end }}

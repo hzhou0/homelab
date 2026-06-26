@@ -1,0 +1,100 @@
+{{- if and .Values.policies.enabled .Values.operator.enabled }}
+{{- $op := include "platform.operatorUsername" . -}}
+{{- $protectedNs := concat .Values.protectedNamespaces (list .Release.Namespace .Values.operator.namespace) | uniq -}}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: protect-constraints
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Protect the constraint surface from the operator
+    policies.kyverno.io/description: >-
+      Defense-in-depth beyond RBAC: the operator ServiceAccount may not create,
+      update or delete Kyverno policies, RBAC, the generated namespace guardrails,
+      the platform ConfigMaps, or anything inside protected system namespaces.
+      Cluster-admins and Kyverno's own controllers are unaffected.
+spec:
+  background: false
+  rules:
+    - name: deny-operator-policy-and-rbac-writes
+      match:
+        any:
+          - resources:
+              kinds:
+                - ClusterPolicy
+                - Policy
+                - PolicyException
+                - ClusterRole
+                - Role
+                - ClusterRoleBinding
+                - RoleBinding
+                - ResourceQuota
+                - LimitRange
+                - NetworkPolicy
+              operations: [CREATE, UPDATE, DELETE]
+      preconditions:
+        all:
+          - key: {{ "{{ request.userInfo.username }}" | quote }}
+            operator: Equals
+            value: {{ $op | quote }}
+      validate:
+        failureAction: Enforce
+        message: >-
+          The operator may not modify the constraint surface (Kyverno policies,
+          RBAC, namespace quotas/limits/netpol).
+        deny: {}
+
+    - name: deny-operator-platform-configmap-writes
+      match:
+        any:
+          - resources:
+              kinds: [ConfigMap]
+              namespaces: ["{{ .Release.Namespace }}"]
+              names: ["runtime-profiles", "image-allowlist"]
+              operations: [CREATE, UPDATE, DELETE]
+      preconditions:
+        all:
+          - key: {{ "{{ request.userInfo.username }}" | quote }}
+            operator: Equals
+            value: {{ $op | quote }}
+      validate:
+        failureAction: Enforce
+        message: >-
+          The operator may not modify the runtime-profiles / image-allowlist
+          ConfigMaps; change them via a chart upgrade instead.
+        deny: {}
+
+    - name: deny-operator-writes-in-protected-namespaces
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - DaemonSet
+                - Job
+                - CronJob
+                - Pod
+                - Service
+                - ConfigMap
+                - Secret
+                - ServiceAccount
+                - PersistentVolumeClaim
+              namespaces:
+{{- range $protectedNs }}
+                - {{ . | quote }}
+{{- end }}
+              operations: [CREATE, UPDATE, DELETE]
+      preconditions:
+        all:
+          - key: {{ "{{ request.userInfo.username }}" | quote }}
+            operator: Equals
+            value: {{ $op | quote }}
+      validate:
+        failureAction: Enforce
+        message: >-
+          The operator may only deploy into app-* / tool-* namespaces, not into
+          protected system namespaces.
+        deny: {}
+{{- end }}

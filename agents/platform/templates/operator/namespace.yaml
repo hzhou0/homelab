@@ -1,0 +1,10 @@
+{{- if .Values.operator.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.operator.namespace }}
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+    # tool tier: governed by namespace-governance (baseline PSA + quota/limits).
+    pod-security.kubernetes.io/enforce: baseline
+{{- end }}

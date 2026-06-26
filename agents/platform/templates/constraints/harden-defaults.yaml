@@ -1,0 +1,48 @@
+{{- if .Values.policies.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: harden-defaults
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Default restricted securityContext (app-*)
+    policies.kyverno.io/description: >-
+      Mutates app-* Pods to fill the restricted Pod Security fields when unset, so
+      the operator can submit minimal specs while PSA still hard-rejects anything
+      that explicitly opts out of the baseline.
+spec:
+  background: false
+  rules:
+    - name: add-restricted-securitycontext
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: ["{{ include "platform.appGlob" . }}"]
+      mutate:
+        patchStrategicMerge:
+          spec:
+            securityContext:
+              +(runAsNonRoot): true
+              +(seccompProfile):
+                type: RuntimeDefault
+            containers:
+              - (name): "*"
+                securityContext:
+                  +(runAsNonRoot): true
+                  +(allowPrivilegeEscalation): false
+                  +(capabilities):
+                    drop: ["ALL"]
+                  +(seccompProfile):
+                    type: RuntimeDefault
+            initContainers:
+              - (name): "*"
+                securityContext:
+                  +(runAsNonRoot): true
+                  +(allowPrivilegeEscalation): false
+                  +(capabilities):
+                    drop: ["ALL"]
+                  +(seccompProfile):
+                    type: RuntimeDefault
+{{- end }}

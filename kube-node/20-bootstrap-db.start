@@ -16,7 +16,7 @@ for f in /sys/bus/usb/devices/*/power/autosuspend; do
   echo -1 > "$f"
 done
 
-apk add -q curl
+apk add -q curl procps
 
 cat > /etc/sysctl.d/99-k3s.conf <<EOF
 kernel.panic=10
@@ -36,7 +36,7 @@ K3S_TOKEN_FILE="/etc/k3s-token"
 [ -f "$K3S_TOKEN_FILE" ] || { echo "ERROR: $K3S_TOKEN_FILE not found." >&2; exit 1; }
 
 curl -sfL https://get.k3s.io | \
-  K3S_URL="https://10.0.0.21:6443" \
+  K3S_URL="https://10.0.0.22:6443" \
   K3S_TOKEN="$(cat "$K3S_TOKEN_FILE")" \
   INSTALL_K3S_EXEC="--embedded-registry --protect-kernel-defaults" \
   sh -

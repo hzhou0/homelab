@@ -1,0 +1,52 @@
+{{- if .Values.policies.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: image-allowlist
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Container image allowlist (app-* / tool-*)
+    policies.kyverno.io/description: >-
+      Only specific, vetted container images (full references) listed in the
+      image-allowlist ConfigMap may run in app-* / tool-* namespaces.
+spec:
+  background: false
+  rules:
+    - name: images-must-be-allowlisted
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces:
+                - "{{ include "platform.appGlob" . }}"
+                - "{{ include "platform.toolGlob" . }}"
+      context:
+        - name: rawlist
+          configMap:
+            name: image-allowlist
+            namespace: {{ .Release.Namespace }}
+        - name: allowed
+          variable:
+            jmesPath: {{ "rawlist.data.images | parse_json(@)" | quote }}
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          Image is not in the allowlist. Add the exact image reference to the
+          image-allowlist ConfigMap (via a chart upgrade) before deploying it.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                all:
+                  - key: {{ "{{ element.image }}" | quote }}
+                    operator: AnyNotIn
+                    value: {{ "{{ allowed }}" | quote }}
+          - list: "request.object.spec.initContainers || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: {{ "{{ element.image }}" | quote }}
+                    operator: AnyNotIn
+                    value: {{ "{{ allowed }}" | quote }}
+{{- end }}

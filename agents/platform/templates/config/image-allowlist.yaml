@@ -1,0 +1,15 @@
+{{- if .Values.policies.enabled }}
+# Explicit allowlist of full container image references. The image-allowlist
+# constraint parses `images` (a JSON array) and rejects any container image not
+# present. To run a new image, add it here and upgrade the release.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: image-allowlist
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+data:
+  images: |
+    {{ toJson .Values.imageAllowlist }}
+{{- end }}

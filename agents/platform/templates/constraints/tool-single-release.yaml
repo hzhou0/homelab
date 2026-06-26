@@ -1,0 +1,49 @@
+{{- if and .Values.policies.enabled .Values.oneChartPerToolNamespace.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: tool-single-release
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: One Helm release per tool-* namespace
+    policies.kyverno.io/description: >-
+      A tool-* namespace may host at most one Helm release (chart). When Helm
+      records a new release (an owner=helm Secret), the namespace is rejected if
+      it already contains a different release. Deploy the second chart into its
+      own tool-* namespace.
+spec:
+  background: false
+  rules:
+    - name: at-most-one-release
+      match:
+        any:
+          - resources:
+              kinds: [Secret]
+              namespaces: ["{{ include "platform.toolGlob" . }}"]
+              operations: [CREATE]
+              # Helm release records carry owner=helm; this keeps the apiCall off
+              # of every other Secret create.
+              selector:
+                matchLabels:
+                  owner: helm
+      context:
+        # Names of helm release Secrets in this namespace that belong to a
+        # DIFFERENT release than the one being created (name label differs).
+        - name: otherReleaseSecrets
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ "{{ request.namespace }}" }}/secrets"
+            jmesPath: {{ "items[?metadata.labels.owner=='helm' && metadata.labels.name != '{{ request.object.metadata.labels.name }}'].metadata.labels.name" | quote }}
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          {{ "{{ request.namespace }}" }} already hosts a different Helm release
+          ({{ "{{ otherReleaseSecrets | to_string(@) }}" }}). A tool-* namespace
+          allows at most one chart; install this one in its own tool-* namespace.
+        deny:
+          conditions:
+            any:
+              - key: {{ "{{ otherReleaseSecrets | length(@) }}" | quote }}
+                operator: GreaterThan
+                value: 0
+{{- end }}

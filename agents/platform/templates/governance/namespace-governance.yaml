@@ -1,0 +1,158 @@
+{{- if .Values.policies.enabled }}
+{{- $root := . -}}
+{{/* Build a tier -> {glob, cfg} map so app/tool rules render from one loop. */}}
+{{- $tiers := dict
+    "app"  (dict "glob" (include "platform.appGlob" .)  "cfg" .Values.tiers.app)
+    "tool" (dict "glob" (include "platform.toolGlob" .) "cfg" .Values.tiers.tool) -}}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: namespace-governance
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Namespace governance (app-* / tool-*)
+    policies.kyverno.io/description: >-
+      Stamps Pod Security labels and generates a ResourceQuota, LimitRange and
+      default-deny NetworkPolicy into every app-* / tool-* namespace on creation.
+      synchronize:true reverts any drift, so the operator cannot widen its sandbox.
+spec:
+  # Govern namespaces that already exist at install time too.
+  generateExisting: true
+  rules:
+{{- range $tier, $t := $tiers }}
+{{- $cfg := $t.cfg }}
+    # --- {{ $tier }} tier --------------------------------------------------
+    - name: psa-labels-{{ $tier }}
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              names: ["{{ $t.glob }}"]
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              pod-security.kubernetes.io/enforce: {{ $cfg.psaLevel }}
+              pod-security.kubernetes.io/warn: {{ $cfg.psaLevel }}
+              pod-security.kubernetes.io/audit: {{ $cfg.psaLevel }}
+
+    - name: quota-{{ $tier }}
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              names: ["{{ $t.glob }}"]
+      generate:
+        apiVersion: v1
+        kind: ResourceQuota
+        name: tier-quota
+        namespace: "{{`{{request.object.metadata.name}}`}}"
+        synchronize: true
+        data:
+          metadata:
+            labels:
+{{ include "platform.labels" $root | indent 14 }}
+          spec:
+            hard:
+              requests.cpu: {{ $cfg.quota.requestsCpu | quote }}
+              requests.memory: {{ $cfg.quota.requestsMemory | quote }}
+              limits.cpu: {{ $cfg.quota.limitsCpu | quote }}
+              limits.memory: {{ $cfg.quota.limitsMemory | quote }}
+              pods: {{ $cfg.quota.pods | quote }}
+
+    - name: limitrange-{{ $tier }}
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              names: ["{{ $t.glob }}"]
+      generate:
+        apiVersion: v1
+        kind: LimitRange
+        name: tier-limits
+        namespace: "{{`{{request.object.metadata.name}}`}}"
+        synchronize: true
+        data:
+          metadata:
+            labels:
+{{ include "platform.labels" $root | indent 14 }}
+          spec:
+            limits:
+              - type: Container
+                min:
+                  cpu: {{ $cfg.limitRange.min.cpu | quote }}
+                  memory: {{ $cfg.limitRange.min.memory | quote }}
+                max:
+                  cpu: {{ $cfg.limitRange.max.cpu | quote }}
+                  memory: {{ $cfg.limitRange.max.memory | quote }}
+{{- if $cfg.limitRange.defaults }}
+                default:
+                  cpu: {{ $cfg.limitRange.default.cpu | quote }}
+                  memory: {{ $cfg.limitRange.default.memory | quote }}
+                defaultRequest:
+                  cpu: {{ $cfg.limitRange.defaultRequest.cpu | quote }}
+                  memory: {{ $cfg.limitRange.defaultRequest.memory | quote }}
+{{- end }}
+{{- if $root.Values.networkPolicy.enabled }}
+
+    - name: netpol-{{ $tier }}
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              names: ["{{ $t.glob }}"]
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: default-ingress
+        namespace: "{{`{{request.object.metadata.name}}`}}"
+        synchronize: true
+        data:
+          metadata:
+            labels:
+{{ include "platform.labels" $root | indent 14 }}
+          spec:
+            # Restrict ingress to same-namespace + labelled ingress namespaces.
+            # Egress is intentionally left open (DNS / services / internet).
+            podSelector: {}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - podSelector: {}
+                  - namespaceSelector:
+                      matchLabels:
+                        {{ $root.Values.networkPolicy.ingressFromNamespaceLabel }}: "true"
+{{- end }}
+{{- if $root.Values.operator.enabled }}
+
+    - name: operator-rolebinding-{{ $tier }}
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              names: ["{{ $t.glob }}"]
+      generate:
+        # Grants the operator its deploy permissions, scoped to THIS namespace.
+        # This is the operator's only namespaced write access -- it is confined
+        # to app-*/tool-* because these are the only namespaces that get one.
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        name: {{ $root.Values.operator.serviceAccountName }}-deploy
+        namespace: "{{`{{request.object.metadata.name}}`}}"
+        synchronize: true
+        data:
+          metadata:
+            labels:
+{{ include "platform.labels" $root | indent 14 }}
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: {{ $root.Values.operator.serviceAccountName }}-deploy
+          subjects:
+            - kind: ServiceAccount
+              name: {{ $root.Values.operator.serviceAccountName }}
+              namespace: {{ $root.Values.operator.namespace }}
+{{- end }}
+{{- end }}
+{{- end }}

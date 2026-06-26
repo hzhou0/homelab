@@ -237,7 +237,62 @@ spec:
 
 ### 5.6 Service Exposure
 
-MetalLB assigns each service its own dedicated LAN IP from the pool (10.0.0.100–150). A custom Kubernetes operator watches for Ingress annotations and configures corresponding port forwarding rules on OPNsense via its API. This eliminates the need for a shared ingress controller. In a homelab, IP addresses are free and unlimited, so there is no reason to multiplex services behind a single IP.
+Traffic flows through two layers:
+
+1. **North-south ingress** — Cilium's Gateway API implementation routes incoming traffic to pods. A shared `Gateway` holds a single MetalLB IP and routes by hostname via `HTTPRoute` objects. UDP services that cannot go through the Gateway get their own dedicated MetalLB IP via `type: LoadBalancer`.
+
+2. **WAN exposure** — A custom OPNsense operator watches `Gateway` and `Service` objects for an annotation and creates/removes the corresponding WAN port forward rule via the OPNsense API. Status is written back to the standard Kubernetes status fields (`status.addresses` on `Gateway`, `status.loadBalancer.ingress` on `Service`), so `kubectl get gateway,svc -A` shows the full external exposure map.
+
+This follows the same annotation-driven pattern as the AWS Load Balancer Controller in EKS.
+
+**HTTP/HTTPS (shared gateway):**
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: homelab-gateway
+  annotations:
+    opnsense.lab/expose: "true"       # operator creates WAN:443 → MetalLB IP
+spec:
+  gatewayClassName: cilium
+  listeners:
+  - name: https
+    port: 443
+    protocol: HTTPS
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: grafana
+spec:
+  parentRefs:
+  - name: homelab-gateway
+  hostnames: ["grafana.lab"]
+  rules:
+  - backendRefs:
+    - name: grafana
+      port: 3000
+```
+
+**UDP (dedicated IP):**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: game-server-udp
+  annotations:
+    opnsense.lab/expose: "true"
+    opnsense.lab/external-port: "27015"
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 27015
+    protocol: UDP
+```
+
+**Internal DNS** — Unbound host overrides map `.lab` hostnames to MetalLB IPs. HTTP services share one override pointing at the Gateway IP; UDP services each get their own override. See section 13.4.
 
 ### 5.7 Power Loss Recovery
 
@@ -275,16 +330,27 @@ k3s upgrades are performed one minor version at a time (e.g., v1.32 → v1.33 �
 
 ### 6.2 Recommended Configuration
 
-Cilium in native routing mode provides zero encapsulation overhead with the option to enable eBPF features (Hubble observability, kube-proxy replacement, network policies) later without changing CNI. Flannel is an equally valid choice for maximum simplicity.
+Cilium in native routing mode with Gateway API and Hubble observability. The service mesh is not enabled — Hubble provides traffic visibility via the eBPF datapath without sidecars or per-pod proxies, and Gateway API handles all ingress routing.
 
-Cilium native routing Helm values:
+Gateway API CRDs must be installed before Cilium:
 
-```yaml
-routingMode: native
-ipam:
-  mode: kubernetes
-autoDirectNodeRoutes: true
+```sh
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
 ```
+
+Cilium install flags (run during bootstrap):
+
+```sh
+cilium install \
+  --set=ipam.operator.clusterPoolIPv4PodCIDRList="10.42.0.0/16" \
+  --set=gatewayAPI.enabled=true \
+  --set=hubble.relay.enabled=true \
+  --set=hubble.ui.enabled=true
+```
+
+**Hubble** taps the eBPF datapath and provides per-flow metrics, DNS query visibility, HTTP request/response metadata, service dependency maps, and drop reasons — all with zero application instrumentation. The Hubble UI is exposed as a service on the cluster.
+
+The service mesh (mTLS, east-west L7 traffic management) is omitted. For a homelab on a trusted LAN, the operational overhead is not justified. It can be enabled per-namespace later if needed.
 
 ### 6.3 Cross-Node Pod Communication
 

@@ -1,0 +1,34 @@
+{{- if .Values.operator.enabled }}
+# Cluster-scoped + read-only rights for the operator, bound cluster-wide. It has
+# NO namespaced workload write here -- those come only from per-namespace
+# RoleBindings that namespace-governance generates into app-*/tool-* namespaces
+# (binding the homelab-operator-deploy ClusterRole). THAT is what actually
+# confines the operator to the two tiers: it has zero write permission in
+# kube-system, default, or any other namespace, independent of Kyverno's
+# namespace exclusions. Writes here are limited to creating tier namespaces,
+# whose names are constrained to app-*/tool-* by restrict-operator-namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.operator.serviceAccountName }}
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+rules:
+  # Self-provision AND tear down tier namespaces. Create/delete are cluster-wide
+  # at the RBAC layer (RBAC can't scope by name prefix), but restrict-operator-
+  # namespaces gates both CREATE and DELETE to app-*/tool-* names.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Read-only cluster view for placement decisions.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Read-only introspection of the constraint surface (cannot modify it).
+  - apiGroups: ["kyverno.io"]
+    resources: ["clusterpolicies", "policies", "policyexceptions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources: ["policyreports", "clusterpolicyreports"]
+    verbs: ["get", "list", "watch"]
+{{- end }}

@@ -1,0 +1,32 @@
+{{- if .Values.policies.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: allowed-kinds-tool
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Allowed resource kinds (tool-*)
+    policies.kyverno.io/description: >-
+      tool-* namespaces allow the app set plus StatefulSet, DaemonSet, Job,
+      CronJob and PersistentVolumeClaim. A few legacy/raw kinds stay disallowed.
+      Cluster-scoped and RBAC kinds are never granted to the operator.
+spec:
+  background: false
+  rules:
+    - name: deny-non-tool-kinds
+      match:
+        any:
+          - resources:
+              kinds:
+                - ReplicationController
+                - ReplicaSet
+              namespaces: ["{{ include "platform.toolGlob" . }}"]
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          {{`{{ request.object.kind }}`}} is not allowed in tool-* namespaces.
+          Deploy controllers (Deployment/StatefulSet/DaemonSet) or Jobs instead
+          of raw ReplicaSets / ReplicationControllers.
+        deny: {}
+{{- end }}

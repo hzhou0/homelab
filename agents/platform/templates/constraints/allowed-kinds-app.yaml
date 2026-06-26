@@ -1,0 +1,37 @@
+{{- if .Values.policies.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: allowed-kinds-app
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Allowed resource kinds (app-*)
+    policies.kyverno.io/description: >-
+      app-* namespaces follow the stateless standard deploy pattern: Deployment,
+      Service, ConfigMap, Secret, ServiceAccount, HPA, PDB, Ingress, HTTPRoute.
+      Stateful / batch / PVC kinds are rejected here (use a tool-* namespace).
+spec:
+  background: false
+  rules:
+    - name: deny-non-app-kinds
+      match:
+        any:
+          - resources:
+              kinds:
+                - StatefulSet
+                - DaemonSet
+                - ReplicaSet
+                - ReplicationController
+                - Job
+                - CronJob
+                - PersistentVolumeClaim
+              namespaces: ["{{ include "platform.appGlob" . }}"]
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          {{`{{ request.object.kind }}`}} is not allowed in app-* namespaces.
+          app-* is for stateless Deployments only; use a tool-* namespace for
+          stateful, batch, or storage workloads.
+        deny: {}
+{{- end }}

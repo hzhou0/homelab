@@ -1,0 +1,43 @@
+{{- if .Values.policies.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: runtime-label
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Require runtime label (app-*)
+    policies.kyverno.io/description: >-
+      Every app-* Deployment must declare its language runtime via the
+      {{ .Values.runtimeLabel }} pod-template label, drawn from the
+      runtime-profiles ConfigMap. The label drives the per-runtime resource
+      envelope enforced by the runtime-ranges policy.
+spec:
+  background: false
+  rules:
+    - name: require-valid-runtime-label
+      match:
+        any:
+          - resources:
+              kinds: [Deployment]
+              namespaces: ["{{ include "platform.appGlob" . }}"]
+      context:
+        - name: profiles
+          configMap:
+            name: runtime-profiles
+            namespace: {{ .Release.Namespace }}
+        - name: runtimes
+          variable:
+            jmesPath: {{ "profiles.data | keys(@)" | quote }}
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          app-* Deployments must set the pod-template label {{ .Values.runtimeLabel }}
+          to a known runtime (one of the runtime-profiles keys).
+        deny:
+          conditions:
+            all:
+              - key: {{ printf "{{ request.object.spec.template.metadata.labels.\"%s\" || '' }}" .Values.runtimeLabel | quote }}
+                operator: AnyNotIn
+                value: {{ "{{ runtimes }}" | quote }}
+{{- end }}

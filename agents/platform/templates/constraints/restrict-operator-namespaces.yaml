@@ -1,0 +1,44 @@
+{{- if .Values.operator.enabled }}
+# Confine the operator's namespace create/delete to app-*/tool-* names.
+#
+# This is a NATIVE ValidatingAdmissionPolicy, not a Kyverno policy, on purpose:
+# Kyverno excludes its own namespace (and kube-node-lease) from webhook
+# processing, so a Kyverno rule could not stop the operator from deleting the
+# `kyverno` namespace -- which would tear down enforcement. A VAP runs inside the
+# kube-apiserver for every namespace, with no such exclusions. (Kubernetes itself
+# already protects kube-system/kube-public/default from deletion.)
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ .Values.operator.serviceAccountName }}-namespaces
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "DELETE"]
+        resources: ["namespaces"]
+  matchConditions:
+    # Only constrain the operator ServiceAccount; admins are unaffected.
+    - name: only-operator
+      expression: "request.userInfo.username == '{{ include "platform.operatorUsername" . }}'"
+  validations:
+    # request.name works for CREATE and DELETE (object is null on delete). The
+    # operator may only touch app-*/tool-* namespaces, and never its own.
+    - expression: "(request.name.startsWith('{{ .Values.prefixes.app }}') || request.name.startsWith('{{ .Values.prefixes.tool }}')) && request.name != '{{ .Values.operator.namespace }}'"
+      message: "The operator may only create or delete app-* / tool-* namespaces (and not its own)."
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ .Values.operator.serviceAccountName }}-namespaces
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+spec:
+  policyName: {{ .Values.operator.serviceAccountName }}-namespaces
+  validationActions: [Deny]
+{{- end }}

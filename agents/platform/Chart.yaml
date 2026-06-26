@@ -1,0 +1,25 @@
+apiVersion: v2
+name: homelab-platform
+description: >-
+  Constraint-based deployment platform for the homelab k3s cluster. Ships Kyverno
+  (as a dependency) plus the admission constraints that define the feasible region an
+  autonomous operator deploys into: per-tier allowed resource kinds, restricted/baseline
+  Pod Security, auto-governed namespaces (quota/limitrange/netpol/PSA), a container-image
+  allowlist, runtime-keyed resource ranges for apps, and the operator's own identity/RBAC.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - kyverno
+  - policy
+  - governance
+  - homelab
+dependencies:
+  - name: kyverno
+    # 3.8.1 (Kyverno 1.18). Earlier 3.x pinned helper-hook Jobs to
+    # bitnami/kubectl:1.30.2, which Bitnami removed from Docker Hub -> the
+    # post-upgrade hook ImagePullBackOffs and stalls `helm upgrade`. 3.8.x drops
+    # that reports-cleanup hook and uses kyverno's own readiness-checker image.
+    version: "3.8.1"
+    repository: https://kyverno.github.io/kyverno/
+    condition: kyverno.enabled

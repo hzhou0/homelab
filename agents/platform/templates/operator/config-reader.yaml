@@ -1,0 +1,32 @@
+{{- if .Values.operator.enabled }}
+# Lets the operator READ the platform config (runtime-profiles, image-allowlist)
+# in the release namespace for introspection -- without granting it cluster-wide
+# ConfigMap access. Scoped to the release namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.operator.serviceAccountName }}-config-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.operator.serviceAccountName }}-config-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.operator.serviceAccountName }}-config-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.operator.serviceAccountName }}
+    namespace: {{ .Values.operator.namespace }}
+{{- end }}

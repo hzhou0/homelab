@@ -1,0 +1,69 @@
+{{- if and .Values.policies.enabled .Values.namespaceMetadata.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: namespace-metadata
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Required namespace metadata (app-* / tool-*)
+    policies.kyverno.io/description: >-
+      Every operator-managed app-*/tool-* namespace must carry provenance
+      annotations (homelab.lab/src, homelab.lab/notes) and the recommended
+      app.kubernetes.io/* labels, with managed-by pinned to the operator agent.
+      The platform's own operator namespace is exempt.
+spec:
+  background: false
+  rules:
+    - name: require-source-and-notes-annotations
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              names:
+                - "{{ include "platform.appGlob" . }}"
+                - "{{ include "platform.toolGlob" . }}"
+      exclude:
+        any:
+          - resources:
+              names: ["{{ .Values.operator.namespace }}"]
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          app-*/tool-* namespaces must set annotations 'homelab.lab/src' (URL of the
+          deployment's source code, or the vendor if there is none) and
+          'homelab.lab/notes' (a short description of the deployment).
+        pattern:
+          metadata:
+            annotations:
+              homelab.lab/src: "?*"
+              homelab.lab/notes: "?*"
+
+    - name: require-recommended-labels
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              names:
+                - "{{ include "platform.appGlob" . }}"
+                - "{{ include "platform.toolGlob" . }}"
+      exclude:
+        any:
+          - resources:
+              names: ["{{ .Values.operator.namespace }}"]
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          app-*/tool-* namespaces must set the recommended Kubernetes labels
+          (app.kubernetes.io/name, instance, version, component, part-of) and
+          app.kubernetes.io/managed-by must be '{{ .Values.namespaceMetadata.managedBy }}'.
+        pattern:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "?*"
+              app.kubernetes.io/instance: "?*"
+              app.kubernetes.io/version: "?*"
+              app.kubernetes.io/component: "?*"
+              app.kubernetes.io/part-of: "?*"
+              app.kubernetes.io/managed-by: "{{ .Values.namespaceMetadata.managedBy }}"
+{{- end }}

@@ -1,0 +1,19 @@
+apiVersion: v2
+name: homelab-metallb
+description: >-
+  MetalLB for the homelab, installed by cluster-admin into metallb-system. MetalLB
+  is foundational networking that needs cluster-admin (CRDs, cluster RBAC, a
+  webhook, and a privileged namespace for the L2 speaker's hostNetwork/NET_RAW),
+  so the autonomous operator cannot install it. This wraps the upstream MetalLB
+  chart (L2 mode) and ships the lab IP pool from homelab-design-document.md.
+  It is a separate Helm release from homelab-platform because a Helm subchart
+  shares its parent's release namespace, and MetalLB must live in metallb-system
+  while Kyverno lives in kyverno.
+type: application
+version: 0.1.0
+appVersion: "0.16.1"
+dependencies:
+  - name: metallb
+    version: "0.16.1"
+    repository: https://metallb.github.io/metallb
+    condition: metallb.enabled

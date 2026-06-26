@@ -1,0 +1,16 @@
+{{- if .Values.policies.enabled }}
+# Maps each language runtime to its cpu/mem envelope. Each value is a JSON object
+# so policies can parse_json it and compare quantities. Consumed by the
+# runtime-label and runtime-ranges constraints.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runtime-profiles
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+data:
+{{- range $runtime, $p := .Values.runtimeProfiles }}
+  {{ $runtime }}: '{{ printf "{\"cpuMin\":\"%s\",\"cpuMax\":\"%s\",\"memMin\":\"%s\",\"memMax\":\"%s\"}" $p.cpuMin $p.cpuMax $p.memMin $p.memMax }}'
+{{- end }}
+{{- end }}

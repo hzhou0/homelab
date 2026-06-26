@@ -1,0 +1,54 @@
+{{- if .Values.policies.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deployment-only
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Stateless Deployment-only (app-*)
+    policies.kyverno.io/description: >-
+      Enforces the stateless contract in app-*: no standalone Pods (must be owned
+      by a controller) and no PersistentVolumeClaim-backed volumes. Bare Pods are
+      also rejected in tool-* (use a controller).
+spec:
+  background: false
+  rules:
+    - name: no-bare-pods
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces:
+                - "{{ include "platform.appGlob" . }}"
+                - "{{ include "platform.toolGlob" . }}"
+      preconditions:
+        all:
+          - key: {{ "{{ request.object.metadata.ownerReferences[] || `[]` | length(@) }}" | quote }}
+            operator: Equals
+            value: 0
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          Standalone Pods are not allowed. Deploy via a Deployment (app-*) or a
+          controller/Job (tool-*) so the workload is managed and reschedulable.
+        deny: {}
+
+    - name: no-pvc-volumes-app
+      match:
+        any:
+          - resources:
+              kinds: [Deployment]
+              namespaces: ["{{ include "platform.appGlob" . }}"]
+      validate:
+        failureAction: {{ .Values.policies.failureAction }}
+        message: >-
+          app-* Deployments must be stateless: persistentVolumeClaim volumes are
+          not allowed. Use emptyDir for scratch, or a tool-* namespace for state.
+        deny:
+          conditions:
+            any:
+              - key: {{ "{{ request.object.spec.template.spec.volumes[?persistentVolumeClaim] || `[]` | length(@) }}" | quote }}
+                operator: GreaterThan
+                value: 0
+{{- end }}
