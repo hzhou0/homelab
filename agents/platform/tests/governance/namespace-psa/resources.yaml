@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-test
+  labels: {}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tool-test
+  labels: {}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: default
+  labels: {}

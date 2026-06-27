@@ -1,0 +1,36 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: allowed-kinds-app
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/allowed-kinds-app.yaml
+resources:
+  - resources.yaml
+results:
+  # Denied kinds in app-* namespaces
+  - kind: StatefulSet
+    policy: allowed-kinds-app
+    resources:
+      - statefulset-in-app
+    result: fail
+  - kind: DaemonSet
+    policy: allowed-kinds-app
+    resources:
+      - daemonset-in-app
+    result: fail
+  - kind: Job
+    policy: allowed-kinds-app
+    resources:
+      - job-in-app
+    result: fail
+  - kind: PersistentVolumeClaim
+    policy: allowed-kinds-app
+    resources:
+      - pvc-in-app
+    result: fail
+  # Same kinds in tool-* are not in scope for this policy (matchCondition is app-* only)
+  - kind: StatefulSet
+    policy: allowed-kinds-app
+    resources:
+      - statefulset-in-tool
+    result: skip

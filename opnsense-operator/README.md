@@ -1,0 +1,67 @@
+# opnsense-operator
+
+An [external-dns](https://github.com/kubernetes-sigs/external-dns)-style Kubernetes controller
+for an OPNsense-fronted homelab. It watches `type: LoadBalancer` **Services** and Gateway-API
+**Gateways** and, from `homelab.lab/*` annotations, reconciles two things in OPNsense via the
+[`opnsense-sdk`](https://github.com/hzhou0/opnsense-sdk) Go SDK:
+
+- **Internal DNS** — Unbound host overrides (wildcards supported, e.g. `*.lab`) pointing at the
+  object's MetalLB IP.
+- **WAN port-forward** — firewall DNAT rules exposing the service to the internet.
+
+It is the operator described in §5.6 of the homelab design document. See [DESIGN.md](DESIGN.md)
+for the full architecture.
+
+## Annotations
+
+Put these on a `LoadBalancer` Service or a `Gateway`:
+
+| Annotation | Meaning | Default |
+|---|---|---|
+| `homelab.lab/hostname` | Comma-separated DNS names (wildcard ok, e.g. `*.lab,grafana.home.example.com`) | — |
+| `homelab.lab/expose` | `"true"` to create a WAN port-forward | off |
+| `homelab.lab/external-port` | External WAN port | service/listener port |
+| `homelab.lab/protocol` | `tcp` or `udp` | service port protocol (Gateways: tcp) |
+| `homelab.lab/internal-port` | Forwarded-to port | service/listener port |
+
+Hostnames outside the configured `MANAGED_DOMAINS` are rejected.
+
+The controller owns only the OPNsense objects it creates — each carries a description tag
+`k8s:opnsense-operator owner=<Kind>/<ns>/<name> …` — and removes them via a finalizer when the
+Service/Gateway is deleted.
+
+## Build & test
+
+```sh
+make test          # unit tests (annotation parsing, diff, fake OPNsense server)
+make build         # build the manager binary
+make docker-build  # build the image
+```
+
+The OPNsense SDK is consumed as the published module
+`github.com/hzhou0/opnsense-sdk/go-sdk` (tag `go-sdk/v0.1.0`).
+
+## Install
+
+Bootstrap infrastructure, installed by hand into its own namespace (like MetalLB):
+
+```sh
+helm install opnsense-operator ./chart \
+  --namespace opnsense-operator --create-namespace \
+  --set opnsense.url=https://10.0.0.1 \
+  --set opnsense.managedDomains="lab,home.example.com" \
+  --set opnsense.apiKey=<KEY> --set opnsense.apiSecret=<SECRET>
+```
+
+Or reference an existing Secret holding `OPNSENSE_API_KEY` / `OPNSENSE_API_SECRET` via
+`--set opnsense.existingSecret=<name>`.
+
+## Example
+
+```sh
+kubectl annotate svc grafana \
+  homelab.lab/hostname='grafana.lab,grafana.home.example.com' \
+  homelab.lab/expose=true
+# → Unbound overrides grafana.lab / grafana.home.example.com -> the LB IP,
+#   and a WAN:443 -> LB IP:443 port-forward.
+```

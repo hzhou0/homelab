@@ -1,0 +1,47 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: runtime-ranges
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/runtime-ranges.yaml
+resources:
+  - resources.yaml
+clusterResources:
+  - cluster-resources.yaml
+results:
+  # go runtime, cpu and mem within [50m,500m] / [32Mi,1000Mi] → pass
+  - kind: Deployment
+    policy: runtime-ranges
+    resources:
+      - deploy-go-in-range
+    result: pass
+  # cpu limit exceeds go max (500m)
+  - kind: Deployment
+    policy: runtime-ranges
+    resources:
+      - deploy-go-cpu-over
+    result: fail
+  # memory request below go min (32Mi)
+  - kind: Deployment
+    policy: runtime-ranges
+    resources:
+      - deploy-go-mem-low
+    result: fail
+  # requests/limits entirely absent → fail
+  - kind: Deployment
+    policy: runtime-ranges
+    resources:
+      - deploy-go-no-resources
+    result: fail
+  # Unknown runtime → runtime-ranges short-circuits to true (runtime-label catches it)
+  - kind: Deployment
+    policy: runtime-ranges
+    resources:
+      - deploy-unknown-runtime
+    result: pass
+  # Deployment in tool-* → matchCondition is app-* only → skip
+  - kind: Deployment
+    policy: runtime-ranges
+    resources:
+      - deploy-go-in-tool
+    result: skip

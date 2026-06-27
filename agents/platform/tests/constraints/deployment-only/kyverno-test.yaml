@@ -1,0 +1,51 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: deployment-only
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/deployment-only.yaml
+resources:
+  - resources.yaml
+results:
+  # no-bare-pods: pods without ownerReferences are rejected in any tier namespace
+  - kind: Pod
+    policy: no-bare-pods
+    resources:
+      - pod-bare-in-app
+    result: fail
+  - kind: Pod
+    policy: no-bare-pods
+    resources:
+      - pod-bare-in-tool
+    result: fail
+  # Pod with ownerReferences (created by a ReplicaSet) is allowed
+  - kind: Pod
+    policy: no-bare-pods
+    resources:
+      - pod-owned-in-app
+    result: pass
+  # Pod outside any tier namespace → matchCondition false → skip
+  - kind: Pod
+    policy: no-bare-pods
+    resources:
+      - pod-bare-outside
+    result: skip
+
+  # no-pvc-volumes-app: Deployments with PVC volumes are rejected in app-*
+  - kind: Deployment
+    policy: no-pvc-volumes-app
+    resources:
+      - deploy-with-pvc-in-app
+    result: fail
+  # Stateless Deployment in app-* is fine
+  - kind: Deployment
+    policy: no-pvc-volumes-app
+    resources:
+      - deploy-stateless-in-app
+    result: pass
+  # Deployment with PVC in tool-* → matchCondition is app-* only → skip
+  - kind: Deployment
+    policy: no-pvc-volumes-app
+    resources:
+      - deploy-with-pvc-in-tool
+    result: skip

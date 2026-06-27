@@ -1,0 +1,31 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: namespace-psa-labels
+policies:
+  - ../../.rendered/homelab-platform/templates/governance/namespace-psa.yaml
+resources:
+  - resources.yaml
+results:
+  # app-* namespace gets enforce/warn/audit: restricted
+  - kind: Namespace
+    policy: namespace-psa-labels
+    resources:
+      - app-test
+    result: pass
+    isMutatingPolicy: true
+    patchedResources: expected/app-ns.yaml
+  # tool-* namespace gets enforce/warn/audit: baseline
+  - kind: Namespace
+    policy: namespace-psa-labels
+    resources:
+      - tool-test
+    result: pass
+    isMutatingPolicy: true
+    patchedResources: expected/tool-ns.yaml
+  # Non-tier namespace → matchCondition false → skip
+  - kind: Namespace
+    policy: namespace-psa-labels
+    resources:
+      - default
+    result: skip

@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# opnsense-operator values
+#
+# Bootstrap infrastructure, installed by a human via Helm (like metallb), into
+# its own namespace (default release namespace: opnsense-operator). It is NOT an
+# app-*/tool-* namespace, so the platform's Kyverno governance does not apply.
+# ---------------------------------------------------------------------------
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/hzhou0/opnsense-operator
+  # tag defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Connection to OPNsense and the operator's managed scope.
+opnsense:
+  # Base URL of the OPNsense host.
+  url: "https://10.0.0.1"
+  # OPNsense interface name WAN port-forwards are bound to.
+  wanInterface: "wan"
+  # Trust a self-signed OPNsense certificate.
+  insecureTLS: true
+  # Comma-separated DNS zones the operator may create overrides in (the
+  # external-dns "domain filter"). Empty allows any zone.
+  managedDomains: "lab,home.example.com"
+
+  # API credentials. Either reference an existing Secret that holds the keys
+  # OPNSENSE_API_KEY and OPNSENSE_API_SECRET, or set apiKey/apiSecret here to
+  # have the chart create the Secret.
+  existingSecret: ""
+  apiKey: ""
+  apiSecret: ""
+
+# Leader election lets a restarted/replaced pod take over safely.
+leaderElect: true
+
+serviceAccount:
+  name: opnsense-operator
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# Restricted-friendly pod hardening (works under PSA baseline/restricted).
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

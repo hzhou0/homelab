@@ -1,0 +1,45 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: protect-constraints
+# All requests in this test file are made as the operator ServiceAccount.
+# The matchCondition "is-operator" evaluates request.userInfo.username, which
+# only matches the operator SA — so without this, every result would be skip.
+userInfo: userinfo-operator.yaml
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/protect-constraints.yaml
+resources:
+  - resources.yaml
+results:
+  # Kyverno-native kinds (ValidatingPolicy etc.) can't be resolved offline by kyverno test
+  # (CRD GVR mapping is unavailable); they're covered by integration testing against the cluster.
+
+  # protect-constraints: deny RBAC, NetworkPolicy, ResourceQuota, LimitRange writes
+  - kind: ClusterRole
+    policy: protect-constraints
+    resources:
+      - test-clusterrole
+    result: fail
+  - kind: NetworkPolicy
+    policy: protect-constraints
+    resources:
+      - test-netpol
+    result: fail
+  - kind: ResourceQuota
+    policy: protect-constraints
+    resources:
+      - test-quota
+    result: fail
+  # ConfigMaps not in protect-constraints' resourceRules → skip
+  - kind: ConfigMap
+    policy: protect-constraints
+    resources:
+      - runtime-profiles
+    result: skip
+
+  # protect-platform-configmaps: deny writes to runtime-profiles/image-allowlist in default ns
+  - kind: ConfigMap
+    policy: protect-platform-configmaps
+    resources:
+      - runtime-profiles
+    result: fail

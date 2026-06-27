@@ -1,0 +1,7 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: UserInfo
+metadata:
+  name: homelab-operator
+userInfo:
+  username: "system:serviceaccount:tool-operator:homelab-operator"
+  groups: []

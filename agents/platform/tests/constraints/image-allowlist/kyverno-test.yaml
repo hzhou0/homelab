@@ -1,0 +1,35 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: image-allowlist
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/image-allowlist.yaml
+resources:
+  - resources.yaml
+clusterResources:
+  - cluster-resources.yaml
+results:
+  # Pod using an allowlisted image → pass
+  - kind: Pod
+    policy: image-allowlist
+    resources:
+      - pod-good-image-in-app
+    result: pass
+  # Pod using an image not on the list → fail
+  - kind: Pod
+    policy: image-allowlist
+    resources:
+      - pod-bad-image-in-app
+    result: fail
+  # Pod with bad image in tool-* → also checked (both tiers)
+  - kind: Pod
+    policy: image-allowlist
+    resources:
+      - pod-bad-image-in-tool
+    result: fail
+  # Pod outside any tier namespace → matchCondition false → skip
+  - kind: Pod
+    policy: image-allowlist
+    resources:
+      - pod-bad-image-outside
+    result: skip

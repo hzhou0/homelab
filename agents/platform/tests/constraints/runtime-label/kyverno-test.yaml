@@ -1,0 +1,35 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: runtime-label
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/runtime-label.yaml
+resources:
+  - resources.yaml
+clusterResources:
+  - cluster-resources.yaml
+results:
+  # Valid runtime label pointing to a known profile → pass
+  - kind: Deployment
+    policy: runtime-label
+    resources:
+      - deploy-runtime-go
+    result: pass
+  # Missing runtime label entirely → fail
+  - kind: Deployment
+    policy: runtime-label
+    resources:
+      - deploy-no-runtime
+    result: fail
+  # Runtime label set to an unknown value (not a profiles key) → fail
+  - kind: Deployment
+    policy: runtime-label
+    resources:
+      - deploy-bad-runtime
+    result: fail
+  # Deployment in tool-* → matchCondition is app-* only → skip
+  - kind: Deployment
+    policy: runtime-label
+    resources:
+      - deploy-runtime-go-in-tool
+    result: skip

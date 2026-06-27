@@ -1,0 +1,44 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: ClusterResource
+metadata:
+  name: runtime-profiles-configmap
+spec:
+  resources:
+    - apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: runtime-profiles
+        namespace: default
+      data:
+        static.cpuMin: "10m"
+        static.cpuMax: "250m"
+        static.memMin: "16Mi"
+        static.memMax: "128Mi"
+        go.cpuMin: "50m"
+        go.cpuMax: "500m"
+        go.memMin: "32Mi"
+        go.memMax: "1000Mi"
+        rust.cpuMin: "50m"
+        rust.cpuMax: "500m"
+        rust.memMin: "32Mi"
+        rust.memMax: "200Mi"
+        node.cpuMin: "100m"
+        node.cpuMax: "1000m"
+        node.memMin: "128Mi"
+        node.memMax: "4000Mi"
+        python.cpuMin: "100m"
+        python.cpuMax: "1000m"
+        python.memMin: "128Mi"
+        python.memMax: "4000Mi"
+        jvm.cpuMin: "250m"
+        jvm.cpuMax: "2000m"
+        jvm.memMin: "256Mi"
+        jvm.memMax: "1536Mi"
+    - apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: app-test
+    - apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: tool-test

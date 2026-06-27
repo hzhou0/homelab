@@ -1,0 +1,26 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: allowed-kinds-tool
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/allowed-kinds-tool.yaml
+resources:
+  - resources.yaml
+results:
+  # Raw ReplicaSet and ReplicationController are denied in tool-*
+  - kind: ReplicaSet
+    policy: allowed-kinds-tool
+    resources:
+      - replicaset-in-tool
+    result: fail
+  - kind: ReplicationController
+    policy: allowed-kinds-tool
+    resources:
+      - rc-in-tool
+    result: fail
+  # ReplicaSet in app-* is handled by allowed-kinds-app, not this policy → skip
+  - kind: ReplicaSet
+    policy: allowed-kinds-tool
+    resources:
+      - replicaset-in-app
+    result: skip

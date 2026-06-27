@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-no-secctx-in-app
+  namespace: app-test
+spec:
+  containers:
+    - name: app
+      image: docker.io/rancher/kubectl:v1.30.2
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 100Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        capabilities:
+          drop:
+            - ALL
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault

@@ -1,0 +1,89 @@
+# Fully-valid app-* namespace — passes both validations
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-full-metadata
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/instance: myapp
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: myapp
+    app.kubernetes.io/managed-by: operator-agent
+  annotations:
+    homelab.lab/src: "https://github.com/acme/myapp"
+    homelab.lab/notes: "Full metadata, should pass both validations."
+---
+# Missing homelab.lab/src annotation
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-missing-src
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/instance: myapp
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: myapp
+    app.kubernetes.io/managed-by: operator-agent
+  annotations:
+    homelab.lab/notes: "Missing src annotation"
+---
+# homelab.lab/src is empty string
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-empty-src
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/instance: myapp
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: myapp
+    app.kubernetes.io/managed-by: operator-agent
+  annotations:
+    homelab.lab/src: ""
+    homelab.lab/notes: "Empty src annotation"
+---
+# managed-by has wrong value (not operator-agent)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-wrong-managed-by
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/instance: myapp
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: myapp
+    app.kubernetes.io/managed-by: helm
+  annotations:
+    homelab.lab/src: "https://github.com/acme/myapp"
+    homelab.lab/notes: "Wrong managed-by value"
+---
+# Missing app.kubernetes.io/version label
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-missing-version
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/instance: myapp
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: myapp
+    app.kubernetes.io/managed-by: operator-agent
+  annotations:
+    homelab.lab/src: "https://github.com/acme/myapp"
+    homelab.lab/notes: "Missing version label"
+---
+# tool-operator namespace is exempt (matchCondition name != tool-operator) → skip
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tool-operator
+---
+# kube-system is not app-*/tool-* → matchCondition false → skip
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-system

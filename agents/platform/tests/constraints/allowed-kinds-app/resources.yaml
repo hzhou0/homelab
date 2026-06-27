@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: statefulset-in-app
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: db}
+  serviceName: db
+  template:
+    metadata:
+      labels: {app: db}
+    spec:
+      containers:
+        - name: db
+          image: postgres:16
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: daemonset-in-app
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: agent}
+  template:
+    metadata:
+      labels: {app: agent}
+    spec:
+      containers:
+        - name: agent
+          image: busybox:1.36
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-in-app
+  namespace: app-test
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: job
+          image: busybox:1.36
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-in-app
+  namespace: app-test
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# StatefulSet in a tool-* namespace — policy matchCondition is app-* only → skip
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: statefulset-in-tool
+  namespace: tool-test
+spec:
+  selector:
+    matchLabels: {app: db}
+  serviceName: db
+  template:
+    metadata:
+      labels: {app: db}
+    spec:
+      containers:
+        - name: db
+          image: postgres:16

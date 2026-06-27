@@ -80,8 +80,11 @@ imageAllowlist:
   # --- k3s upgrades (optional) ---
   - docker.io/rancher/system-upgrade-controller:v0.14.2
   - docker.io/rancher/kubectl:v1.30.2                       # upgrade-job runner
-  # --- Custom OPNsense WAN-exposure operator (design doc §5.6) ---
-  # - ghcr.io/<you>/opnsense-operator:<tag>                 # set once the image is published
+  # --- Custom OPNsense WAN-exposure + DNS operator (design doc §5.6) ---
+  # Bootstrap infra: installed via the opnsense-operator chart into its own
+  # (ungoverned) namespace, so allowlisting is not strictly required — listed
+  # here for a complete image catalogue. Bump the tag on upgrade.
+  - ghcr.io/hzhou0/opnsense-operator:0.1.0
 
   # --- applications (app-* tier) ---
   # - ghcr.io/<org>/<app>:<tag>

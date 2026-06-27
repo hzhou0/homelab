@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-bare-in-app
+  namespace: app-test
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-bare-in-tool
+  namespace: tool-test
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+---
+# Pod owned by a ReplicaSet — no-bare-pods passes
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-owned-in-app
+  namespace: app-test
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: ReplicaSet
+      name: my-rs-abc12
+      uid: "00000000-0000-0000-0000-000000000001"
+      controller: true
+      blockOwnerDeletion: true
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+---
+# Pod outside any tier namespace → no-bare-pods doesn't apply
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-bare-outside
+  namespace: default
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+---
+# Deployment with a PVC volume in app-* — rejected by no-pvc-volumes-app
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-with-pvc-in-app
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels: {app: myapp}
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: my-pvc
+      containers:
+        - name: app
+          image: nginx:1.27
+          volumeMounts:
+            - name: data
+              mountPath: /data
+---
+# Stateless Deployment in app-* — no-pvc-volumes-app passes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-stateless-in-app
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels: {app: myapp}
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.27
+---
+# Deployment with PVC in tool-* — no-pvc-volumes-app matchCondition is app-* only → skip
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-with-pvc-in-tool
+  namespace: tool-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels: {app: myapp}
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: my-pvc
+      containers:
+        - name: app
+          image: nginx:1.27

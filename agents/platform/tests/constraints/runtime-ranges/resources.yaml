@@ -1,0 +1,129 @@
+# go runtime, all values within [50m,500m] / [32Mi,1000Mi] → pass
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-go-in-range
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: go
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits:   {cpu: 400m, memory: 512Mi}
+---
+# cpu limit 600m > go cpuMax 500m → fail
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-go-cpu-over
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: go
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits:   {cpu: 600m, memory: 512Mi}
+---
+# memory request 16Mi < go memMin 32Mi → fail
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-go-mem-low
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: go
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 100m, memory: 16Mi}
+            limits:   {cpu: 400m, memory: 512Mi}
+---
+# No resources declared at all → fail (requests required)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-go-no-resources
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: go
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+---
+# Unknown runtime "cobol" — runtime-ranges short-circuits to true because
+# "cobol.cpuMin" is not in profiles; runtime-label catches the invalid label.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-unknown-runtime
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: cobol
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits:   {cpu: 400m, memory: 512Mi}
+---
+# Deployment in tool-* → matchCondition is app-* only → skip
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-go-in-tool
+  namespace: tool-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: go
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits:   {cpu: 400m, memory: 512Mi}

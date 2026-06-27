@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: replicaset-in-tool
+  namespace: tool-test
+spec:
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+---
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: rc-in-tool
+  namespace: tool-test
+spec:
+  selector:
+    app: web
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+---
+# ReplicaSet in app-* — matchCondition for this policy is tool-* only → skip
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: replicaset-in-app
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27

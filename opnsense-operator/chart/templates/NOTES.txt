@@ -1,0 +1,22 @@
+opnsense-operator is installed in namespace "{{ .Release.Namespace }}".
+
+It reconciles OPNsense from homelab.lab/* annotations on LoadBalancer Services
+and Gateway-API Gateways:
+
+  homelab.lab/hostname       comma-separated DNS names (wildcard ok, e.g. "*.lab")
+  homelab.lab/expose         "true" to create a WAN port-forward
+  homelab.lab/external-port  external WAN port (default: the service port)
+  homelab.lab/protocol       tcp|udp (default: the service port protocol)
+  homelab.lab/internal-port  forwarded-to port (default: the service port)
+
+Managed zones: {{ .Values.opnsense.managedDomains | quote }}
+OPNsense URL:  {{ .Values.opnsense.url | quote }}
+
+Verify the controller is running:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "opnsense-operator.fullname" . }}
+
+Example:
+
+  kubectl annotate svc my-svc \
+    homelab.lab/hostname=my-svc.lab homelab.lab/expose=true

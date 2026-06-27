@@ -1,0 +1,51 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: namespace-metadata
+policies:
+  - ../../.rendered/homelab-platform/templates/governance/namespace-metadata.yaml
+resources:
+  - resources.yaml
+results:
+  # Fully correct namespace → pass
+  - kind: Namespace
+    policy: namespace-metadata
+    resources:
+      - app-full-metadata
+    result: pass
+  # Missing homelab.lab/src annotation → fail
+  - kind: Namespace
+    policy: namespace-metadata
+    resources:
+      - app-missing-src
+    result: fail
+  # homelab.lab/src present but empty → fail
+  - kind: Namespace
+    policy: namespace-metadata
+    resources:
+      - app-empty-src
+    result: fail
+  # managed-by label is wrong value → fail
+  - kind: Namespace
+    policy: namespace-metadata
+    resources:
+      - app-wrong-managed-by
+    result: fail
+  # Missing app.kubernetes.io/version label → fail
+  - kind: Namespace
+    policy: namespace-metadata
+    resources:
+      - app-missing-version
+    result: fail
+  # tool-operator namespace is exempt (excluded by matchCondition) → skip
+  - kind: Namespace
+    policy: namespace-metadata
+    resources:
+      - tool-operator
+    result: skip
+  # Non-tier namespace → matchCondition false → skip
+  - kind: Namespace
+    policy: namespace-metadata
+    resources:
+      - kube-system
+    result: skip

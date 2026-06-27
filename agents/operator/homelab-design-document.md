@@ -206,8 +206,8 @@ curl -sfL https://get.k3s.io | K3S_URL=https://10.0.0.21:6443 K3S_TOKEN=<token> 
 
 ### 5.4 Disabled Default Components
 
-- **Traefik:** Disabled. Each service gets its own MetalLB IP. No shared ingress controller needed.
-- **Default CNI (Flannel):** Replaced with Cilium in native routing mode (or retained for simplicity).
+- **Traefik:** Disabled. Cilium Gateway API handles all TCP ingress through a single shared Gateway (one MetalLB IP). UDP services that cannot traverse the Gateway get their own dedicated MetalLB IP.
+- **Default CNI (Flannel):** Replaced with Cilium in native routing mode.
 - **Default network policy controller:** Disabled when using Cilium.
 
 ### 5.5 Database Node Isolation
@@ -237,11 +237,13 @@ spec:
 
 ### 5.6 Service Exposure
 
-Traffic flows through two layers:
+Traffic flows through three layers:
 
-1. **North-south ingress** — Cilium's Gateway API implementation routes incoming traffic to pods. A shared `Gateway` holds a single MetalLB IP and routes by hostname via `HTTPRoute` objects. UDP services that cannot go through the Gateway get their own dedicated MetalLB IP via `type: LoadBalancer`.
+1. **Service mesh (east-west TCP)** — Cilium's sidecarless service mesh intercepts all TCP traffic between pods using per-node Envoy proxies and eBPF socket redirection. No sidecars are injected into pods. This provides L7 observability (via Hubble), traffic management, and a consistent mTLS-capable data plane for all in-cluster TCP communication.
 
-2. **WAN exposure** — A custom OPNsense operator watches `Gateway` and `Service` objects for an annotation and creates/removes the corresponding WAN port forward rule via the OPNsense API. Status is written back to the standard Kubernetes status fields (`status.addresses` on `Gateway`, `status.loadBalancer.ingress` on `Service`), so `kubectl get gateway,svc -A` shows the full external exposure map.
+2. **North-south ingress** — The only externally accessible entry point for TCP is a shared `Gateway` object backed by a single MetalLB IP. Traffic is routed by hostname via `HTTPRoute` objects. No TCP service is exposed via `type: LoadBalancer` directly — all inbound TCP must enter through the Gateway. UDP services that cannot traverse the Gateway each get their own dedicated MetalLB IP via `type: LoadBalancer`, unchanged from before.
+
+3. **WAN exposure** — A custom OPNsense operator watches `Gateway` and `Service` objects for an annotation and creates/removes the corresponding WAN port forward rule via the OPNsense API. Status is written back to the standard Kubernetes status fields (`status.addresses` on `Gateway`, `status.loadBalancer.ingress` on `Service`), so `kubectl get gateway,svc -A` shows the full external exposure map.
 
 This follows the same annotation-driven pattern as the AWS Load Balancer Controller in EKS.
 
@@ -268,14 +270,14 @@ metadata:
 spec:
   parentRefs:
   - name: homelab-gateway
-  hostnames: ["grafana.lab"]
+  hostnames: ["grafana.lab", "grafana.home.example.com"]
   rules:
   - backendRefs:
     - name: grafana
       port: 3000
 ```
 
-**UDP (dedicated IP):**
+**UDP (dedicated IP, unchanged):**
 
 ```yaml
 apiVersion: v1
@@ -292,7 +294,12 @@ spec:
     protocol: UDP
 ```
 
-**Internal DNS** — Unbound host overrides map `.lab` hostnames to MetalLB IPs. HTTP services share one override pointing at the Gateway IP; UDP services each get their own override. See section 13.4.
+**DNS** — Two wildcard zones both resolve to the Gateway's MetalLB IP, allowing any `HTTPRoute` hostname to work automatically without per-service DNS entries:
+
+- **Private (`*.lab`)** — Unbound wildcard host override: `*.lab → 10.0.0.100`. Any `.lab` query from the LAN resolves to the Gateway. See section 13.4.
+- **Public (`*.home.example.com`)** — Wildcard A record at the registrar pointing to the WAN IP. The OPNsense operator's port forward on the annotated Gateway routes inbound HTTPS to the Gateway MetalLB IP.
+
+UDP services are excluded from these wildcards; each retains an individual Unbound host override pointing to its own dedicated MetalLB IP.
 
 ### 5.7 Power Loss Recovery
 
@@ -330,7 +337,7 @@ k3s upgrades are performed one minor version at a time (e.g., v1.32 → v1.33 �
 
 ### 6.2 Recommended Configuration
 
-Cilium in native routing mode with Gateway API and Hubble observability. The service mesh is not enabled — Hubble provides traffic visibility via the eBPF datapath without sidecars or per-pod proxies, and Gateway API handles all ingress routing.
+Cilium in native routing mode with Gateway API, Hubble observability, and the Cilium service mesh enabled in sidecarless mode.
 
 Gateway API CRDs must be installed before Cilium:
 
@@ -345,12 +352,13 @@ cilium install \
   --set=ipam.operator.clusterPoolIPv4PodCIDRList="10.42.0.0/16" \
   --set=gatewayAPI.enabled=true \
   --set=hubble.relay.enabled=true \
-  --set=hubble.ui.enabled=true
+  --set=hubble.ui.enabled=true \
+  --set=envoy.enabled=true
 ```
 
 **Hubble** taps the eBPF datapath and provides per-flow metrics, DNS query visibility, HTTP request/response metadata, service dependency maps, and drop reasons — all with zero application instrumentation. The Hubble UI is exposed as a service on the cluster.
 
-The service mesh (mTLS, east-west L7 traffic management) is omitted. For a homelab on a trusted LAN, the operational overhead is not justified. It can be enabled per-namespace later if needed.
+**Cilium service mesh (sidecarless)** — Unlike Istio and Linkerd, Cilium does not inject sidecar proxies into pods. Instead, a shared Envoy proxy runs on each node, and eBPF socket redirection transparently routes TCP traffic through it. This provides L7 traffic management and enhanced Hubble visibility for all TCP services with no changes to application pods. All external TCP access is restricted to the shared Gateway; pods and ClusterIP services are not directly reachable from outside the cluster.
 
 ### 6.3 Cross-Node Pod Communication
 
@@ -785,9 +793,21 @@ skip_incompatible = true
 
 ### 10.4 Internal DNS
 
-OPNsense's DHCP static mappings automatically register hostnames in Unbound. Devices set their own hostname during provisioning, and OPNsense picks it up during DHCP lease registration. Service IPs (MetalLB) are added as Unbound Host Overrides.
+OPNsense's DHCP static mappings automatically register hostnames in Unbound. Devices set their own hostname during provisioning, and OPNsense picks it up during DHCP lease registration.
 
 Enable in OPNsense: **Services → Unbound DNS → General → Register DHCP leases ✅**
+
+**Wildcard zone for TCP services** — Instead of per-service host overrides, a single Unbound wildcard entry covers all TCP services routed through the Gateway:
+
+```
+Host Override: *.lab → 10.0.0.100  (Gateway MetalLB IP)
+```
+
+Any `<service>.lab` query from a LAN or WiFi device resolves to the Gateway. The Gateway then routes by `Host:` header to the correct backend via `HTTPRoute`. Adding a new TCP service requires only a new `HTTPRoute` — no DNS change needed.
+
+**UDP services** — Each UDP service retains an individual Unbound host override pointing to its own dedicated MetalLB IP (unchanged from before).
+
+**Public wildcard zone** — A wildcard A record `*.home.example.com → <WAN IP>` is configured at the DNS registrar. The OPNsense operator's WAN port forward on the annotated Gateway routes inbound HTTPS to the same Gateway MetalLB IP. An `HTTPRoute` can match on both the `.lab` and `.home.example.com` hostnames simultaneously to serve private and public clients from the same backend. See section 5.6.
 
 ### 10.5 Comparison of DNS Privacy Approaches
 
@@ -918,12 +938,22 @@ A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database 
 | 10.42.0.0/16 | k3s pod network (CNI managed) |
 | 10.43.0.0/16 | k3s service network |
 
-### 13.4 Service DNS (Unbound Host Overrides)
+### 13.4 Service DNS
+
+**Private wildcard (Unbound host override):**
 
 | Hostname | IP | Purpose |
 |----------|----|---------|
-| ceph-s3.lab | 10.0.0.100 | Ceph RGW S3 endpoint |
-| grafana.lab | 10.0.0.101 | Monitoring dashboard |
+| `*.lab` (wildcard) | 10.0.0.100 | All TCP services — resolves to the Gateway MetalLB IP |
+| `<udp-svc>.lab` (per-service) | 10.0.0.101+ | Each UDP service — resolves to its own dedicated MetalLB IP |
+
+**Public wildcard (registrar DNS):**
+
+| Hostname | IP | Purpose |
+|----------|----|---------|
+| `*.home.example.com` (wildcard) | WAN IP | All public TCP services — routes via OPNsense port forward to Gateway |
+
+TCP services need only an `HTTPRoute` with the desired hostname — no additional DNS entry is required for either the private or public zone. UDP services each require a dedicated Unbound host override and their own MetalLB IP.
 
 ### 13.5 Reserved Ranges for Future Subnets
 

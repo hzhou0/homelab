@@ -1,0 +1,23 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: harden-defaults
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/harden-defaults.yaml
+resources:
+  - resources.yaml
+results:
+  # Pod in app-* with no securityContext gets all restricted-PSS fields filled
+  - kind: Pod
+    policy: harden-defaults
+    resources:
+      - pod-no-secctx-in-app
+    result: pass
+    isMutatingPolicy: true
+    patchedResources: expected/hardened-pod.yaml
+  # Pod in tool-* → matchCondition is app-* only → skip
+  - kind: Pod
+    policy: harden-defaults
+    resources:
+      - pod-no-secctx-in-tool
+    result: skip

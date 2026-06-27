@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-good-image-in-app
+  namespace: app-test
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: ReplicaSet
+      name: my-rs
+      uid: "00000000-0000-0000-0000-000000000001"
+      controller: true
+spec:
+  containers:
+    - name: app
+      image: docker.io/rancher/kubectl:v1.30.2
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-bad-image-in-app
+  namespace: app-test
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: ReplicaSet
+      name: my-rs
+      uid: "00000000-0000-0000-0000-000000000001"
+      controller: true
+spec:
+  containers:
+    - name: app
+      image: docker.io/evil/malware:latest
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-bad-image-in-tool
+  namespace: tool-test
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: ReplicaSet
+      name: my-rs
+      uid: "00000000-0000-0000-0000-000000000001"
+      controller: true
+spec:
+  containers:
+    - name: app
+      image: docker.io/evil/malware:latest
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-bad-image-outside
+  namespace: default
+spec:
+  containers:
+    - name: app
+      image: docker.io/evil/malware:latest

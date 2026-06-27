@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-runtime-go
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: go
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits:   {cpu: 500m, memory: 1000Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-no-runtime
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits:   {cpu: 500m, memory: 1000Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-bad-runtime
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: cobol
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits:   {cpu: 500m, memory: 1000Mi}
+---
+# Same deployment in tool-* — matchCondition is app-* only → skip
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-runtime-go-in-tool
+  namespace: tool-test
+spec:
+  selector:
+    matchLabels: {app: myapp}
+  template:
+    metadata:
+      labels:
+        app: myapp
+        homelab.lab/runtime: go
+    spec:
+      containers:
+        - name: app
+          image: myapp:1.0.0
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits:   {cpu: 500m, memory: 1000Mi}

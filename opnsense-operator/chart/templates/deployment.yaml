@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "opnsense-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "opnsense-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "opnsense-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "opnsense-operator.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "opnsense-operator.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: manager
+          image: {{ include "opnsense-operator.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --leader-elect={{ .Values.leaderElect }}
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+          env:
+            - name: OPNSENSE_URL
+              value: {{ .Values.opnsense.url | quote }}
+            - name: OPNSENSE_WAN_INTERFACE
+              value: {{ .Values.opnsense.wanInterface | quote }}
+            - name: OPNSENSE_INSECURE_TLS
+              value: {{ .Values.opnsense.insecureTLS | quote }}
+            - name: MANAGED_DOMAINS
+              value: {{ .Values.opnsense.managedDomains | quote }}
+            - name: OPNSENSE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "opnsense-operator.secretName" . }}
+                  key: OPNSENSE_API_KEY
+            - name: OPNSENSE_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "opnsense-operator.secretName" . }}
+                  key: OPNSENSE_API_SECRET
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
