@@ -13,6 +13,17 @@ within: the node topology (server / compute / database, taints and labels), netw
 storage model (Ceph/RGW S3, CloudNativePG), and the planned cluster tooling. It is the intent
 behind the constraints — consult it when deciding where and how something should run.
 
+The **`references/`** directory (in this directory) holds the READMEs of the cluster's
+foundational components, symlinked from their charts at the repo root — read these when your
+task touches that component:
+
+- `references/platform.md` — the `homelab-platform` governance chart (the Kyverno guardrails
+  you operate inside).
+- `references/metallb.md` — the MetalLB LoadBalancer IP pool.
+- `references/opnsense-operator.md` — the OPNsense DNS + WAN port-forward operator. Read this
+  to learn the `homelab.lab/*` Service/Gateway annotations that bind a LoadBalancer to an
+  internal DNS name and expose it through the firewall.
+
 ## Golden rule
 
 **The constraints are the spec.** If the cluster accepts your manifest, it is compliant. If

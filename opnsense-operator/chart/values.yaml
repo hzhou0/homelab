@@ -11,7 +11,7 @@ replicaCount: 1
 image:
   repository: ghcr.io/hzhou0/opnsense-operator
   # tag defaults to the chart appVersion when empty.
-  tag: ""
+  tag: "sha-57db539"
   pullPolicy: IfNotPresent
 
 # Connection to OPNsense and the operator's managed scope.
@@ -24,14 +24,12 @@ opnsense:
   insecureTLS: true
   # Comma-separated DNS zones the operator may create overrides in (the
   # external-dns "domain filter"). Empty allows any zone.
-  managedDomains: "lab,home.example.com"
+  managedDomains: "internal.haustorium.net"
 
   # API credentials. Either reference an existing Secret that holds the keys
   # OPNSENSE_API_KEY and OPNSENSE_API_SECRET, or set apiKey/apiSecret here to
   # have the chart create the Secret.
-  existingSecret: ""
-  apiKey: ""
-  apiSecret: ""
+  existingSecret: "opnsense-operator-creds"
 
 # Leader election lets a restarted/replaced pod take over safely.
 leaderElect: true

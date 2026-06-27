@@ -77,7 +77,7 @@ func addHostBody(h HostOverride, desc string) generated.UnboundSettingsControlle
 	body.Host.Addptr = "0"
 	body.Host.Hostname = strptr(h.Host)
 	body.Host.Domain = h.Domain
-	body.Host.Rr = generated.UnboundSettingsControllerAddHostOverrideActionJSONBodyHostRr("A")
+	body.Host.Rr = "A"
 	body.Host.Server = strptr(h.Address)
 	body.Host.Description = strptr(desc)
 	return body
@@ -89,7 +89,7 @@ func setHostBody(h HostOverride, desc string) generated.UnboundSettingsControlle
 	body.Host.Addptr = "0"
 	body.Host.Hostname = strptr(h.Host)
 	body.Host.Domain = h.Domain
-	body.Host.Rr = generated.UnboundSettingsControllerSetHostOverrideActionJSONBodyHostRr("A")
+	body.Host.Rr = "A"
 	body.Host.Server = strptr(h.Address)
 	body.Host.Description = strptr(desc)
 	return body

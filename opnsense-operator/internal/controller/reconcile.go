@@ -109,6 +109,7 @@ func handle(
 	}
 
 	// Record what we wired up (without fighting MetalLB for status.loadBalancer).
+	// Only log/emit on an actual change, so steady-state re-reconciles stay quiet.
 	summary := desired.Summary()
 	if obj.GetAnnotations()[AnnExposed] != summary {
 		base := obj.DeepCopyObject().(client.Object)
@@ -116,8 +117,9 @@ func handle(
 		if err := c.Patch(ctx, obj, client.MergeFrom(base)); err != nil {
 			return ctrl.Result{}, err
 		}
+		l.Info("reconciled OPNsense state", "ip", in.IP, "exposed", summary)
+		rec.Eventf(obj, corev1.EventTypeNormal, "Synced", "OPNsense updated: %s", summary)
 	}
-	rec.Eventf(obj, corev1.EventTypeNormal, "Synced", "OPNsense updated: %s", summary)
 	return ctrl.Result{}, nil
 }
 

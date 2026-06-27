@@ -2,3 +2,4 @@
 kube-node/output
 kube-node/.aports
 agents/operator/*.kubeconfig
+**.tgz

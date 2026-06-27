@@ -4,11 +4,13 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	crconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -29,9 +31,14 @@ func init() {
 func main() {
 	var metricsAddr, probeAddr string
 	var enableLeaderElection bool
+	var startupTimeout time.Duration
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true, "Enable leader election for controller manager.")
+	flag.DurationVar(&startupTimeout, "startup-timeout", 60*time.Second,
+		"Per-controller cache-sync deadline. If a watch can't sync within this window "+
+			"(e.g. a required CRD like Gateway is missing), the manager exits non-zero "+
+			"instead of hanging NotReady, so Kubernetes restarts the pod.")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -57,6 +64,9 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "opnsense-operator.homelab.lab",
+		// Bound cache sync so a missing CRD / unreachable API server fails startup
+		// loudly (mgr.Start returns an error -> os.Exit below) rather than hanging.
+		Controller: crconfig.Controller{CacheSyncTimeout: startupTimeout},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
