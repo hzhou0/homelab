@@ -1,7 +1,7 @@
 #!/bin/sh
 # Phase 1: runs from ISO ramdisk — partitions disk, installs Alpine,
 # copies the role-specific phase-2 script into the installed root, then reboots.
-# NODE_ROLE is read from /etc/node-role (server | compute | db).
+# NODE_ROLE is read from /etc/node-role (server | compute | compute-spot | db).
 
 grep -q 'tmpfs / tmpfs' /proc/mounts || exit 0
 
@@ -18,12 +18,47 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 NODE_ROLE=$(cat /etc/node-role)
 DISK="/dev/nvme0n1"
 
-apk add -q --no-network parted e2fsprogs dosfstools grub grub-efi
+# dhcpcd is installed here (from the on-ISO cache) so setup-disk carries it onto
+# the target; without it the loopback-only interfaces leave the node with no net.
+apk add -q --no-network parted e2fsprogs dosfstools grub grub-efi dhcpcd
+
+# The boot runlevel ran before dhcpcd existed, so start it now to get the ramdisk
+# online — setup-apkrepos (apk update) and setup-ntp (fetches chrony) below need
+# internet. dhcpcd DHCPs whichever interface has a carrier.
+rc-service dhcpcd start
+
+# dhcpcd backgrounds as soon as it configures any address (e.g. an IPv6 SLAAC
+# address), which can happen before the IPv4 DHCP lease lands. Wait for an IPv4
+# default route (Destination 00000000 in /proc/net/route) before continuing.
+i=0
+while [ "$i" -lt 30 ]; do
+  awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route && break
+  i=$((i + 1))
+  sleep 1
+done
 
 setup-keymap us us
-setup-hostname -n "k3s-$NODE_ROLE"
-setup-dns -d local -n 10.0.0.1
-setup-interfaces -a
+# compute and compute-spot can have many instances, so append a short hash of the
+# machine's DMI UUID (random fallback) to keep node names unique. Singleton roles
+# (server, db) keep their plain, predictable names.
+case "$NODE_ROLE" in
+  compute|compute-spot)
+    HOST_ID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null || true)
+    [ -n "$HOST_ID" ] || HOST_ID=$(head -c16 /dev/urandom | od -An -tx1)
+    HOST_HASH=$(printf '%s' "$HOST_ID" | sha256sum | cut -c1-6)
+    setup-hostname -n "k3s-${NODE_ROLE}-${HOST_HASH}"
+    ;;
+  *)
+    setup-hostname -n "k3s-$NODE_ROLE"
+    ;;
+esac
+# DNS comes from DHCP (the homelab DHCP server hands out 10.0.0.1), and dhcpcd
+# brings up whichever interface has a carrier, so /etc/network/interfaces only
+# manages loopback. No static resolver or fixed eth0 stanza.
+cat > /etc/network/interfaces <<'EOF'
+auto lo
+iface lo inet loopback
+EOF
 setup-timezone -z UTC
 setup-ntp chrony
 setup-apkrepos -1 -c
@@ -37,7 +72,8 @@ case "$NODE_ROLE" in
       mkpart root ext4 512MiB 100GiB \
       mkpart ceph 100GiB 100%
     ;;
-  db)
+  db|compute-spot)
+    # compute-spot does not participate in ceph, so root claims the whole disk.
     parted -s -a optimal "$DISK" -- \
       mklabel gpt \
       mkpart boot fat32 1MiB 512MiB \
@@ -63,6 +99,9 @@ cp /etc/k3s-token /mnt/etc/k3s-token
 cp "/etc/local.d/20-bootstrap-${NODE_ROLE}.start" /mnt/etc/local.d/20-bootstrap.start
 chmod +x /mnt/etc/local.d/20-bootstrap.start
 chroot /mnt rc-update add local default
+# Enable dhcpcd on the target explicitly — the overlay's runlevel symlink isn't
+# relied on to survive setup-disk (same reason 'local' is added here).
+chroot /mnt rc-update add dhcpcd boot
 
 umount /mnt/boot
 umount /mnt

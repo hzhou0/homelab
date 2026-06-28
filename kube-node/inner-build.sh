@@ -13,12 +13,11 @@ cp /work/20-bootstrap-"$NODE_ROLE".start "$OVERLAY/etc/local.d/20-bootstrap-$NOD
 chmod +x "$OVERLAY/etc/local.d/"*.start
 
 mkdir -p "$OVERLAY/etc/network"
+# All nodes use dhcpcd to DHCP whichever interface has a carrier, so
+# /etc/network/interfaces only manages loopback.
 cat > "$OVERLAY/etc/network/interfaces" <<'EOF'
 auto lo
 iface lo inet loopback
-
-auto eth0
-iface eth0 inet dhcp
 EOF
 
 rc_add() {

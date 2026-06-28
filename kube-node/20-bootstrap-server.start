@@ -2,6 +2,10 @@
 # Phase 2 (server): k3s control plane with Cilium CNI.
 [ -f /etc/local.d/20-bootstrap.done ] && exit 0
 set -e
+# Run under the local service, so log to a file and set a full PATH (the service
+# environment is minimal — same reason 10-provision.start exports PATH).
+exec >>/var/log/bootstrap.log 2>&1
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 apk add -q curl procps
 
@@ -59,7 +63,13 @@ tar xzf "cilium-linux-${CLI_ARCH}.tar.gz" -C /usr/local/bin
 rm -f "cilium-linux-${CLI_ARCH}.tar.gz" "cilium-linux-${CLI_ARCH}.tar.gz.sha256sum"
 
 # Deploy Cilium. clusterPoolIPv4PodCIDRList matches k3s's default pod CIDR.
-cilium install --set=ipam.operator.clusterPoolIPv4PodCIDRList="10.42.0.0/16"
+# k8sServiceHost/Port must be the server's routable address, not the 127.0.0.1
+# the cilium CLI would infer from k3s's kubeconfig — otherwise agent nodes can't
+# reach the apiserver and their cilium pods crashloop.
+cilium install \
+  --set=ipam.operator.clusterPoolIPv4PodCIDRList="10.42.0.0/16" \
+  --set=k8sServiceHost=10.0.0.22 \
+  --set=k8sServicePort=6443
 cilium status --wait
 
 kubectl label nodes k3s-server ceph-osd=true

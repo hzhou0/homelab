@@ -2,7 +2,7 @@
 # Build Alpine ISO images for k3s cluster nodes using mkimage.sh via Docker.
 #
 # Usage:
-#   ./build.sh [k3s-server|k3s-compute|k3s-db|all]
+#   ./build.sh [k3s-server|k3s-compute|k3s-compute-spot|k3s-db|all]
 #
 # Output ISOs land in ./output/.
 # Requires: docker (with privileged capability)
@@ -79,13 +79,14 @@ case "$PROFILES" in
   all)
     build_profile k3s-server
     build_profile k3s-compute
+    build_profile k3s-compute-spot
     build_profile k3s-db
     ;;
-  k3s-server|k3s-compute|k3s-db)
+  k3s-server|k3s-compute|k3s-compute-spot|k3s-db)
     build_profile "$PROFILES"
     ;;
   *)
-    die "Unknown profile '$PROFILES'. Valid: k3s-server, k3s-compute, k3s-db, all"
+    die "Unknown profile '$PROFILES'. Valid: k3s-server, k3s-compute, k3s-compute-spot, k3s-db, all"
     ;;
 esac
 

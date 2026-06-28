@@ -85,6 +85,7 @@ imageAllowlist:
   # (ungoverned) namespace, so allowlisting is not strictly required — listed
   # here for a complete image catalogue. Bump the tag on upgrade.
   - ghcr.io/hzhou0/opnsense-operator:0.1.0
+  - ghcr.io/headlamp-k8s/headlamp:0.43.0
 
   # --- applications (app-* tier) ---
   # - ghcr.io/<org>/<app>:<tag>
