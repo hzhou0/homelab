@@ -1,0 +1,25 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: operator-no-network-topology
+# All requests are made as the operator ServiceAccount (the is-operator matchCondition only
+# matches that username; otherwise every result would be skip).
+userInfo: userinfo-operator.yaml
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/operator-no-network-topology.yaml
+resources:
+  - resources.yaml
+results:
+  # Native Ingress / IngressClass are built-in kinds → resolvable offline → denied.
+  - kind: Ingress
+    policy: operator-no-network-topology
+    resources: [test-ingress]
+    result: fail
+  - kind: IngressClass
+    policy: operator-no-network-topology
+    resources: [test-ingressclass]
+    result: fail
+  # The Gateway-API (Gateway/GatewayClass/TCPRoute) and Cilium (cilium.io) CRD kinds are also
+  # denied by this policy, but kyverno test cannot map their GVRs offline — they are verified
+  # against the live cluster (helm install + `kubectl auth can-i` / apply round-trip). HTTPRoute
+  # is intentionally absent from the policy's match, so it remains allowed.

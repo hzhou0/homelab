@@ -1,0 +1,66 @@
+# ClusterIP — allowed (no exposure).
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-clusterip
+  namespace: app-test
+spec:
+  type: ClusterIP
+  selector: { app: x }
+  ports:
+    - port: 80
+      protocol: TCP
+---
+# UDP-only LoadBalancer — allowed (each UDP service gets its own LB IP via Cilium LB IPAM).
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-udp-lb
+  namespace: app-test
+spec:
+  type: LoadBalancer
+  selector: { app: x }
+  ports:
+    - port: 53
+      protocol: UDP
+---
+# TCP LoadBalancer — denied (TCP must go through the shared Gateway).
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-tcp-lb
+  namespace: app-test
+spec:
+  type: LoadBalancer
+  selector: { app: x }
+  ports:
+    - port: 443
+      protocol: TCP
+---
+# Mixed-protocol LoadBalancer — denied (has a non-UDP port).
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-mixed-lb
+  namespace: app-test
+spec:
+  type: LoadBalancer
+  selector: { app: x }
+  ports:
+    - port: 53
+      protocol: UDP
+    - port: 443
+      protocol: TCP
+---
+# NodePort — denied (not part of the architecture).
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-nodeport
+  namespace: app-test
+spec:
+  type: NodePort
+  selector: { app: x }
+  ports:
+    - port: 8080
+      protocol: TCP

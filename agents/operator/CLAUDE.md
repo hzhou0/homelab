@@ -9,9 +9,10 @@ chart). You cannot change them — you operate inside them.
 
 Read **`homelab-design-document.md`** (in this directory) for the architecture you operate
 within: the node topology (server / compute / database, taints and labels), networking
-(Cilium + Gateway API, MetalLB pools, `.lab` DNS, the OPNsense WAN-exposure operator), the
-storage model (Ceph/RGW S3, CloudNativePG), and the planned cluster tooling. It is the intent
-behind the constraints — consult it when deciding where and how something should run.
+(Cilium + Gateway API service mesh, Cilium LB IPAM + L2 for LoadBalancer IPs, `.lab` DNS, the
+OPNsense WAN-exposure operator), the storage model (Ceph/RGW S3, CloudNativePG), and the planned
+cluster tooling. It is the intent behind the constraints — consult it when deciding where and how
+something should run.
 
 The **`references/`** directory (in this directory) holds the READMEs of the cluster's
 foundational components, symlinked from their charts at the repo root — read these when your
@@ -19,7 +20,14 @@ task touches that component:
 
 - `references/platform.md` — the `homelab-platform` governance chart (the Kyverno guardrails
   you operate inside).
-- `references/metallb.md` — the MetalLB LoadBalancer IP pool.
+- `references/cilium.md` — the `cilium` chart: CNI + service mesh (Gateway API), the single
+  shared ingress Gateway for `*.internal.haustorium.net`, and the LoadBalancer stack (Cilium LB
+  IPAM + L2 announcements — what assigns and announces LoadBalancer IPs; MetalLB was replaced).
+  Read this to attach an app to the shared Gateway via `HTTPRoute`, or when a UDP service needs
+  its own LoadBalancer IP.
+- `references/cert-manager.md` — TLS certificate issuance (Let's Encrypt via Cloudflare DNS-01).
+  Read this when a deployment needs an HTTPS cert (the shared Gateway already terminates the
+  wildcard `*.internal.haustorium.net`).
 - `references/opnsense-operator.md` — the OPNsense DNS + WAN port-forward operator. Read this
   to learn the `homelab.lab/*` Service/Gateway annotations that bind a LoadBalancer to an
   internal DNS name and expose it through the firewall.

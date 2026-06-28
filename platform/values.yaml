@@ -20,6 +20,14 @@ kyverno:
     enabled: false
   crds:
     install: true
+    kyverno:
+      cleanuppolicies: false
+      clustercleanuppolicies: false
+      clusterpolicies: false
+      globalcontextentries: false
+      policies: false
+      policyexceptions: false
+      updaterequests: false
 
 # Our ClusterPolicies. Toggle off to install Kyverno alone (see README caveat
 # about CRD ordering on a fresh cluster).
@@ -60,11 +68,11 @@ runtimeProfiles:
 # image catalog; adding a new image is a deliberate, auditable change.
 #
 # Cluster tooling below is sourced from homelab-design-document.md (Ceph/RGW,
-# CloudNativePG, MetalLB, Cilium Gateway API, rclone backup, OPNsense operator,
-# System Upgrade Controller). Tags must match the chart/version you actually
-# deploy — bump them here when you upgrade a tool. Cilium is installed at
-# bootstrap into kube-system, which the allowlist does not gate, so it is not
-# listed. App images go under the "applications" group as you onboard them.
+# CloudNativePG, Cilium Gateway API + L2 LoadBalancer, rclone backup, OPNsense
+# operator, System Upgrade Controller). Tags must match the chart/version you
+# actually deploy — bump them here when you upgrade a tool. Cilium and cert-manager
+# run in ungoverned namespaces (kube-system / cert-manager), which the allowlist
+# does not gate, so they are not listed. App images go under "applications".
 imageAllowlist:
   # --- Rook Ceph (S3/RGW object storage) ---
   - quay.io/ceph/ceph:v18                                   # design doc §7.4
@@ -72,9 +80,8 @@ imageAllowlist:
   # --- CloudNativePG (managed PostgreSQL) ---
   - ghcr.io/cloudnative-pg/postgresql:17.5-minimal-bullseye # design doc §8.1
   - ghcr.io/cloudnative-pg/cloudnative-pg:1.24.1            # CNPG operator (match release)
-  # --- MetalLB (LoadBalancer IPs) ---
-  - quay.io/metallb/controller:v0.16.1
-  - quay.io/metallb/speaker:v0.16.1
+  # LoadBalancer IPs are handled by Cilium LB IPAM + L2 (in kube-system, ungoverned) —
+  # MetalLB has been removed, so no MetalLB images are listed.
   # --- Offsite backup (rclone crypt -> Backblaze B2) ---
   - docker.io/rclone/rclone:1.68.2                          # design doc §9.4 (pin a tag)
   # --- k3s upgrades (optional) ---

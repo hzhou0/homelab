@@ -28,14 +28,17 @@ chmod +x /etc/local.d/00-rshared.start
 K3S_TOKEN_FILE="/etc/k3s-token"
 [ -f "$K3S_TOKEN_FILE" ] || { echo "ERROR: $K3S_TOKEN_FILE not found." >&2; exit 1; }
 
-# Disable the built-in flannel CNI and network-policy controller; Cilium
-# (installed below) replaces them. Agents need no extra flags — the server
-# controls the CNI and Cilium runs as a cluster-wide DaemonSet.
+# Disable the built-in flannel CNI, network-policy controller and kube-proxy; Cilium
+# (installed below, with kubeProxyReplacement) replaces all three. --disable-kube-proxy
+# is required because Cilium runs full kube-proxy replacement — running both would
+# conflict. Agents need no extra flags — the server controls the CNI and Cilium runs
+# as a cluster-wide DaemonSet.
 curl -sfL https://get.k3s.io | \
   K3S_TOKEN="$(cat "$K3S_TOKEN_FILE")" \
   INSTALL_K3S_EXEC="\
   --flannel-backend=none \
   --disable-network-policy \
+  --disable-kube-proxy \
   --disable=traefik \
   --disable=servicelb \
   --write-kubeconfig-mode=644 \
@@ -65,11 +68,15 @@ rm -f "cilium-linux-${CLI_ARCH}.tar.gz" "cilium-linux-${CLI_ARCH}.tar.gz.sha256s
 # Deploy Cilium. clusterPoolIPv4PodCIDRList matches k3s's default pod CIDR.
 # k8sServiceHost/Port must be the server's routable address, not the 127.0.0.1
 # the cilium CLI would infer from k3s's kubeconfig — otherwise agent nodes can't
-# reach the apiserver and their cilium pods crashloop.
+# reach the apiserver and their cilium pods crashloop. kubeProxyReplacement pairs
+# with --disable-kube-proxy above (k8sServiceHost/Port satisfy its prerequisite).
+# The service mesh (gatewayAPI) + ingress Gateway are layered on later by the
+# homelab-cilium Helm chart (helm upgrade cilium ...), not here.
 cilium install \
   --set=ipam.operator.clusterPoolIPv4PodCIDRList="10.42.0.0/16" \
   --set=k8sServiceHost=10.0.0.22 \
-  --set=k8sServicePort=6443
+  --set=k8sServicePort=6443 \
+  --set=kubeProxyReplacement=true
 cilium status --wait
 
 kubectl label nodes k3s-server ceph-osd=true

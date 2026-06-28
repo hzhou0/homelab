@@ -1,0 +1,22 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: operator-no-service-exposure
+# All requests are made as the operator ServiceAccount (the is-operator matchCondition only
+# matches that username; otherwise every result would be skip).
+userInfo: userinfo-operator.yaml
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/operator-no-service-exposure.yaml
+resources:
+  - resources.yaml
+results:
+  # Allowed: ClusterIP and UDP-only LoadBalancer.
+  - kind: Service
+    policy: operator-no-service-exposure
+    resources: [svc-clusterip, svc-udp-lb]
+    result: pass
+  # Denied: TCP LoadBalancer, mixed LoadBalancer, NodePort.
+  - kind: Service
+    policy: operator-no-service-exposure
+    resources: [svc-tcp-lb, svc-mixed-lb, svc-nodeport]
+    result: fail

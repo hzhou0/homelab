@@ -108,7 +108,7 @@ func handle(
 		return ctrl.Result{}, err
 	}
 
-	// Record what we wired up (without fighting MetalLB for status.loadBalancer).
+	// Record what we wired up (without fighting the LB controller for status.loadBalancer).
 	// Only log/emit on an actual change, so steady-state re-reconciles stay quiet.
 	summary := desired.Summary()
 	if obj.GetAnnotations()[AnnExposed] != summary {

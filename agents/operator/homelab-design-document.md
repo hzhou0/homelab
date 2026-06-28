@@ -88,7 +88,7 @@ Each physical interface on OPNsense has its own subnet. Network segregation is a
 | WIFI | 10.0.1.0/24 | Wireless clients (segregated) | 10.0.1.1 |
 | k3s Pods | 10.42.0.0/16 | Internal to cluster (CNI managed) | N/A |
 | k3s Services | 10.43.0.0/16 | Internal to cluster | N/A |
-| MetalLB Pool | 10.0.0.100–150 | LoadBalancer service IPs | N/A |
+| LB IP pool | 10.0.0.100–150 | LoadBalancer service IPs (Cilium LB IPAM + L2) | N/A |
 
 ### 3.3 OPNsense Interface Configuration
 
@@ -206,7 +206,7 @@ curl -sfL https://get.k3s.io | K3S_URL=https://10.0.0.21:6443 K3S_TOKEN=<token> 
 
 ### 5.4 Disabled Default Components
 
-- **Traefik:** Disabled. Cilium Gateway API handles all TCP ingress through a single shared Gateway (one MetalLB IP). UDP services that cannot traverse the Gateway get their own dedicated MetalLB IP.
+- **Traefik:** Disabled. Cilium Gateway API handles all TCP ingress through a single shared Gateway (one LoadBalancer IP). UDP services that cannot traverse the Gateway get their own dedicated LoadBalancer IP. LoadBalancer IPs are assigned by Cilium's built-in **LB IPAM** and ARP-announced by Cilium **L2 announcements** — MetalLB is not used (see `references/cilium.md`).
 - **Default CNI (Flannel):** Replaced with Cilium in native routing mode.
 - **Default network policy controller:** Disabled when using Cilium.
 
@@ -241,7 +241,7 @@ Traffic flows through three layers:
 
 1. **Service mesh (east-west TCP)** — Cilium's sidecarless service mesh intercepts all TCP traffic between pods using per-node Envoy proxies and eBPF socket redirection. No sidecars are injected into pods. This provides L7 observability (via Hubble), traffic management, and a consistent mTLS-capable data plane for all in-cluster TCP communication.
 
-2. **North-south ingress** — The only externally accessible entry point for TCP is a shared `Gateway` object backed by a single MetalLB IP. Traffic is routed by hostname via `HTTPRoute` objects. No TCP service is exposed via `type: LoadBalancer` directly — all inbound TCP must enter through the Gateway. UDP services that cannot traverse the Gateway each get their own dedicated MetalLB IP via `type: LoadBalancer`, unchanged from before.
+2. **North-south ingress** — The only externally accessible entry point for TCP is a shared `Gateway` object backed by a single LoadBalancer IP (assigned by Cilium LB IPAM, ARP-announced by Cilium L2). Traffic is routed by hostname via `HTTPRoute` objects. No TCP service is exposed via `type: LoadBalancer` directly — all inbound TCP must enter through the Gateway. UDP services that cannot traverse the Gateway each get their own dedicated LoadBalancer IP via `type: LoadBalancer`.
 
 3. **WAN exposure** — A custom OPNsense operator watches `Gateway` and `Service` objects for an annotation and creates/removes the corresponding WAN port forward rule via the OPNsense API. Status is written back to the standard Kubernetes status fields (`status.addresses` on `Gateway`, `status.loadBalancer.ingress` on `Service`), so `kubectl get gateway,svc -A` shows the full external exposure map.
 
@@ -255,7 +255,7 @@ kind: Gateway
 metadata:
   name: homelab-gateway
   annotations:
-    opnsense.lab/expose: "true"       # operator creates WAN:443 → MetalLB IP
+    opnsense.lab/expose: "true"       # operator creates WAN:443 → LoadBalancer IP
 spec:
   gatewayClassName: cilium
   listeners:
@@ -294,12 +294,12 @@ spec:
     protocol: UDP
 ```
 
-**DNS** — Two wildcard zones both resolve to the Gateway's MetalLB IP, allowing any `HTTPRoute` hostname to work automatically without per-service DNS entries:
+**DNS** — Two wildcard zones both resolve to the Gateway's LoadBalancer IP, allowing any `HTTPRoute` hostname to work automatically without per-service DNS entries:
 
 - **Private (`*.lab`)** — Unbound wildcard host override: `*.lab → 10.0.0.100`. Any `.lab` query from the LAN resolves to the Gateway. See section 13.4.
-- **Public (`*.home.example.com`)** — Wildcard A record at the registrar pointing to the WAN IP. The OPNsense operator's port forward on the annotated Gateway routes inbound HTTPS to the Gateway MetalLB IP.
+- **Public (`*.home.example.com`)** — Wildcard A record at the registrar pointing to the WAN IP. The OPNsense operator's port forward on the annotated Gateway routes inbound HTTPS to the Gateway LoadBalancer IP.
 
-UDP services are excluded from these wildcards; each retains an individual Unbound host override pointing to its own dedicated MetalLB IP.
+UDP services are excluded from these wildcards; each retains an individual Unbound host override pointing to its own dedicated LoadBalancer IP.
 
 ### 5.7 Power Loss Recovery
 
@@ -471,7 +471,7 @@ Two RGW instances provide zero-downtime S3 availability during single node failu
 
 S3 endpoint within the cluster: `rook-ceph-rgw-s3-store.rook-ceph.svc`
 
-Exposed externally via MetalLB LoadBalancer for services outside the cluster.
+Exposed externally via a Cilium-assigned LoadBalancer IP for services outside the cluster.
 
 ### 7.7 Ceph Resource Overhead
 
@@ -711,7 +711,7 @@ In the event of complete cluster loss, the rebuild order is:
 1. Install Alpine on all nodes (automated via custom ISO)
 2. Install k3s (server first, then agents)
 3. Deploy Ceph via Rook, wait for OSDs to peer
-4. Deploy MetalLB, custom OPNsense operator
+4. Deploy the cilium chart (service mesh + LB IPAM/L2 + ingress Gateway), cert-manager, and the custom OPNsense operator
 5. Restore Ceph S3 data from Backblaze via rclone
 6. Deploy CloudNativePG, restore database from Backblaze B2 backup
 7. Reconfigure OPNsense port forwards (operator handles automatically)
@@ -800,14 +800,14 @@ Enable in OPNsense: **Services → Unbound DNS → General → Register DHCP lea
 **Wildcard zone for TCP services** — Instead of per-service host overrides, a single Unbound wildcard entry covers all TCP services routed through the Gateway:
 
 ```
-Host Override: *.lab → 10.0.0.100  (Gateway MetalLB IP)
+Host Override: *.lab → 10.0.0.100  (Gateway LoadBalancer IP)
 ```
 
 Any `<service>.lab` query from a LAN or WiFi device resolves to the Gateway. The Gateway then routes by `Host:` header to the correct backend via `HTTPRoute`. Adding a new TCP service requires only a new `HTTPRoute` — no DNS change needed.
 
-**UDP services** — Each UDP service retains an individual Unbound host override pointing to its own dedicated MetalLB IP (unchanged from before).
+**UDP services** — Each UDP service retains an individual Unbound host override pointing to its own dedicated LoadBalancer IP (unchanged from before).
 
-**Public wildcard zone** — A wildcard A record `*.home.example.com → <WAN IP>` is configured at the DNS registrar. The OPNsense operator's WAN port forward on the annotated Gateway routes inbound HTTPS to the same Gateway MetalLB IP. An `HTTPRoute` can match on both the `.lab` and `.home.example.com` hostnames simultaneously to serve private and public clients from the same backend. See section 5.6.
+**Public wildcard zone** — A wildcard A record `*.home.example.com → <WAN IP>` is configured at the DNS registrar. The OPNsense operator's WAN port forward on the annotated Gateway routes inbound HTTPS to the same Gateway LoadBalancer IP. An `HTTPRoute` can match on both the `.lab` and `.home.example.com` hostnames simultaneously to serve private and public clients from the same backend. See section 5.6.
 
 ### 10.5 Comparison of DNS Privacy Approaches
 
@@ -921,7 +921,7 @@ A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database 
 | 10.0.0.21 | k3s server node |
 | 10.0.0.22–40 | k3s compute nodes |
 | 10.0.0.41–50 | Database / storage nodes |
-| 10.0.0.100–150 | MetalLB LoadBalancer pool |
+| 10.0.0.100–150 | Cilium LoadBalancer IP pool (LB IPAM + L2; .100 = shared Gateway) |
 | 10.0.0.200–250 | DHCP for other wired devices |
 
 ### 13.2 WIFI (10.0.1.0/24)
@@ -944,8 +944,8 @@ A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database 
 
 | Hostname | IP | Purpose |
 |----------|----|---------|
-| `*.lab` (wildcard) | 10.0.0.100 | All TCP services — resolves to the Gateway MetalLB IP |
-| `<udp-svc>.lab` (per-service) | 10.0.0.101+ | Each UDP service — resolves to its own dedicated MetalLB IP |
+| `*.lab` (wildcard) | 10.0.0.100 | All TCP services — resolves to the Gateway LoadBalancer IP |
+| `<udp-svc>.lab` (per-service) | 10.0.0.101+ | Each UDP service — resolves to its own dedicated LoadBalancer IP |
 
 **Public wildcard (registrar DNS):**
 
@@ -953,7 +953,7 @@ A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database 
 |----------|----|---------|
 | `*.home.example.com` (wildcard) | WAN IP | All public TCP services — routes via OPNsense port forward to Gateway |
 
-TCP services need only an `HTTPRoute` with the desired hostname — no additional DNS entry is required for either the private or public zone. UDP services each require a dedicated Unbound host override and their own MetalLB IP.
+TCP services need only an `HTTPRoute` with the desired hostname — no additional DNS entry is required for either the private or public zone. UDP services each require a dedicated Unbound host override and their own LoadBalancer IP.
 
 ### 13.5 Reserved Ranges for Future Subnets
 

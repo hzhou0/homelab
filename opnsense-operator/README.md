@@ -6,7 +6,7 @@ for an OPNsense-fronted homelab. It watches `type: LoadBalancer` **Services** an
 [`opnsense-sdk`](https://github.com/hzhou0/opnsense-sdk) Go SDK:
 
 - **Internal DNS** — Unbound host overrides (wildcards supported, e.g. `*.lab`) pointing at the
-  object's MetalLB IP.
+  object's LoadBalancer IP.
 - **WAN port-forward** — firewall DNAT rules exposing the service to the internet.
 
 It is the operator described in §5.6 of the homelab design document. See [DESIGN.md](DESIGN.md)
@@ -43,7 +43,7 @@ The OPNsense SDK is consumed as the published module
 
 ## Install
 
-Bootstrap infrastructure, installed by hand into its own namespace (like MetalLB):
+Bootstrap infrastructure, installed by hand into its own namespace (like the cilium/cert-manager charts):
 
 ```sh
 helm install opnsense-operator ./chart \

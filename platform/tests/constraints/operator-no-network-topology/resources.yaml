@@ -1,0 +1,27 @@
+# Native Ingress — a built-in kind, so kyverno test can resolve it offline. Denied: it's an
+# alternate ingress path around the shared Gateway.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-ingress
+  namespace: app-test
+spec:
+  rules:
+    - host: app.internal.haustorium.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80
+---
+# IngressClass (cluster-scoped) — denied.
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: test-ingressclass
+spec:
+  controller: example.com/ingress

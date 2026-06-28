@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# homelab-cert-manager values
+# ---------------------------------------------------------------------------
+
+# Upstream cert-manager subchart. Trimmed to single replicas for the N100 nodes; CRDs
+# installed with the chart.
+cert-manager:
+  enabled: true
+  crds:
+    enabled: true
+  replicaCount: 1
+  webhook:
+    replicaCount: 1
+  cainjector:
+    replicaCount: 1
+
+# ACME (Let's Encrypt) ClusterIssuer that solves DNS-01 via Cloudflare. DNS-01 issues a
+# publicly-trusted wildcard cert for the internal-only *.internal.haustorium.net without any
+# inbound reachability — exactly what the Cilium ingress Gateway's HTTPS listener needs.
+acme:
+  enabled: true
+  # ACME account email (expiry notices).
+  email: "henryzhou000@gmail.com"
+  # Production endpoint. Swap to the staging URL while testing to avoid rate limits:
+  #   https://acme-staging-v02.api.letsencrypt.org/directory
+  server: "https://acme-v02.api.letsencrypt.org/directory"
+  # Must match gateway.issuerName in the homelab-cilium chart.
+  issuerName: letsencrypt-cloudflare
+  privateKeySecretName: letsencrypt-cloudflare-account-key
+
+# Cloudflare API token with Zone:DNS:Edit on the haustorium.net zone. Either point at an
+# existing Secret (recommended — keep the token out of git) or set apiToken to have the chart
+# create the Secret. The Secret must live in this release's namespace (cert-manager) because a
+# ClusterIssuer resolves apiTokenSecretRef from the cluster-resource namespace.
+cloudflare:
+  existingSecret: "cloudflare-api-token"          # name of a pre-created Secret holding the token, or empty
+  secretKey: api-token

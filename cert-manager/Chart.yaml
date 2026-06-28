@@ -1,0 +1,23 @@
+apiVersion: v2
+name: homelab-cert-manager
+description: >-
+  cert-manager for the homelab, installed by cluster-admin into the cert-manager namespace.
+  Foundational like cilium: it needs cluster-admin (CRDs, cluster RBAC, a webhook), so the
+  autonomous operator cannot install it, and it lives in its own namespace rather than an
+  app-*/tool-* one. Wraps the upstream jetstack cert-manager chart and ships a Let's Encrypt
+  ClusterIssuer that solves DNS-01 via Cloudflare (the homelab owns haustorium.net on Cloudflare),
+  used to issue the wildcard *.internal.haustorium.net cert for the Cilium ingress Gateway.
+type: application
+version: 0.1.0
+appVersion: "v1.20.3"
+keywords:
+  - cert-manager
+  - acme
+  - letsencrypt
+  - cloudflare
+  - homelab
+dependencies:
+  - name: cert-manager
+    version: "v1.20.3"
+    repository: https://charts.jetstack.io
+    condition: cert-manager.enabled

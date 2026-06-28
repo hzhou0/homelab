@@ -38,10 +38,9 @@ rules:
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Ingress / Gateway routing.
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Gateway routing. The operator attaches apps to the single shared ingress Gateway via
+  # HTTPRoute only -- it gets NO `ingresses` grant and no Gateway/GatewayClass write (those
+  # would create alternate ingress paths / alter topology; see operator-no-network-topology).
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

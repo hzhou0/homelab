@@ -41,20 +41,41 @@ autonomous operator on vetted images.
 
 ```sh
 helm dependency build platform
+
+# 1. Kyverno CRDs FIRST, out-of-band (see below) — server-side apply, they're too big
+#    for client-side. Render with crds.install temporarily on, keep only the CRD docs:
+helm template homelab-platform platform -n kyverno --set kyverno.crds.install=true 2>/dev/null \
+  | awk 'BEGIN{RS="\n---\n"} /kind: CustomResourceDefinition/{print "---"; print}' \
+  | kubectl apply --server-side -f -
+
+# 2. Then the release itself (chart default keeps kyverno.crds.install=false).
 helm install homelab-platform platform -n kyverno --create-namespace
 ```
 
-> **CRD ordering caveat (fresh cluster).** The Kyverno subchart installs its CRDs before our
-> policy templates render, so the one-shot install normally works. If you ever hit a
-> CRD-not-found race, install in two passes:
+> **Kyverno CRDs (managed out-of-band).** Kyverno's 22 CRDs render to ~5.7MB; gzipped they push
+> the Helm **release Secret** past Kubernetes' 1MB object limit (`data: Too long: may not be more
+> than 1048576 bytes`). So the chart sets `kyverno.crds.install: false` and the CRDs are applied
+> separately (step 1 above), keeping the release object ~100KB. They must also be applied with
+> `kubectl apply --server-side` — the full CRD schemas exceed the 256KB client-side
+> `last-applied-configuration` annotation limit.
+>
+> **Upgrading Kyverno:** re-run step 1 with the new chart version before `helm upgrade`.
+>
+> **Migrating an existing release that already manages the CRDs** (avoids Helm pruning — and thus
+> deleting — them, which would drop every policy):
 > ```sh
-> helm install homelab-platform platform -n kyverno --create-namespace \
->   --set policies.enabled=false --set operator.enabled=false   # Kyverno + CRDs only
-> # Re-enable EXPLICITLY -- a plain upgrade may carry the disables forward
-> # (e.g. via --reuse-values), leaving you with Kyverno but zero policies:
-> helm upgrade homelab-platform platform -n kyverno \
->   --set policies.enabled=true --set operator.enabled=true     # policies + operator
+> # a) Tell Helm to keep the live CRDs, so removing them from the manifest won't delete them:
+> kubectl get crd -o name | grep -E 'kyverno\.io|wgpolicyk8s\.io' \
+>   | xargs -I{} kubectl annotate {} helm.sh/resource-policy=keep --overwrite
+> # b) Upgrade with CRDs now excluded from the release (shrinks the Secret):
+> helm upgrade homelab-platform platform -n kyverno
+> # c) Confirm the CRDs and policies survived:
+> kubectl get crd | grep -c kyverno.io ;  kubectl get vpol,mpol,gpol
 > ```
+>
+> If you hit a CRD-not-found race on a fresh install, gate the policies off for the first pass
+> (`--set policies.enabled=false --set operator.enabled=false`) then re-enable them explicitly on
+> a follow-up `helm upgrade` (a plain upgrade may carry the disables forward via `--reuse-values`).
 
 Tune everything (quota sizes, runtime profiles, image allowlist, PSA levels, operator
 names) in `values.yaml`.
@@ -89,6 +110,8 @@ permissions, and the constraint surface**.
 | Per-namespace caps | generated `ResourceQuota` |
 | Constraint immutability | operator `ClusterRole` omits kyverno/RBAC/quota writes + `protect-constraints` |
 | Operator confined to tiers | `homelab-operator-deploy` bound per-namespace by `namespace-governance` + `restrict-operator-namespaces` |
+| Operator can't alter network topology | `ValidatingPolicy` `operator-no-network-topology` (deny Gateway/GatewayClass, L4 routes, Cilium network CRDs, Ingress) + deploy `ClusterRole` omits `ingresses`/gateways |
+| Operator can't expose TCP services | `ValidatingPolicy` `operator-no-service-exposure` (only ClusterIP/ExternalName + UDP-only LoadBalancers; TCP enters via the shared Gateway/HTTPRoute) |
 
 ## Notes & follow-ups
 
@@ -123,9 +146,10 @@ permissions, and the constraint surface**.
     brief retry until it lands.
 - **Foundational tooling** that needs cluster-admin (CRDs, cluster RBAC, webhooks, or a
   privileged namespace) can't be operator-installed and doesn't belong in this release's
-  namespace. **MetalLB** is the first example: it lives in its own cluster-admin chart at
-  `metallb` (installed into `metallb-system`). Rook/CloudNativePG would follow the
-  same pattern.
+  namespace. **`cilium`** (CNI + service mesh + LB IPAM/L2, in `kube-system`) and
+  **`cert-manager`** (in `cert-manager`) are the examples in-repo, each its own cluster-admin
+  chart. Rook/CloudNativePG would follow the same pattern. (LoadBalancer IPs are handled by
+  Cilium's built-in LB IPAM + L2 announcements — MetalLB was removed.)
 - **CEL policies, not `ClusterPolicy`.** Kyverno deprecated `ClusterPolicy` in 1.17 (removal
   in v1.20). All constraints are the GA CEL types (`ValidatingPolicy`, `MutatingPolicy`,
   `GeneratingPolicy`) under `policies.kyverno.io/v1`. Key consequence of the CEL engine:

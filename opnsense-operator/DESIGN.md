@@ -3,11 +3,12 @@
 ## Context
 
 The homelab (OPNsense + k3s + Cilium) exposes services two ways (design doc §5.6): all
-TCP enters through one Cilium Gateway behind a single MetalLB IP, and UDP services each get
-their own MetalLB IP. Two things must be wired into the OPNsense firewall for each exposed
-service: an **internal DNS** record in Unbound (wildcard `*.lab` for the Gateway, or a
-specific name) pointing at the MetalLB IP, and a **WAN port-forward (DNAT)** so the service
-is reachable from the internet. Today both are manual.
+TCP enters through one Cilium Gateway behind a single LoadBalancer IP, and UDP services each get
+their own LoadBalancer IP. LoadBalancer IPs are assigned and L2-announced by Cilium (LB IPAM +
+L2 announcements; MetalLB was removed). Two things must be wired into the OPNsense firewall for
+each exposed service: an **internal DNS** record in Unbound (wildcard for the Gateway, or a
+specific name) pointing at the LB IP, and a **WAN port-forward (DNAT)** so the service is
+reachable from the internet. Today both are manual.
 
 This controller automates both, external-dns style: it watches LoadBalancer `Service`s and
 Gateway-API `Gateway`s, reads `homelab.lab/*` annotations, and reconciles Unbound host
@@ -90,7 +91,7 @@ A controller-wide **managed-domains** filter rejects hostnames outside the manag
    `UnboundServiceControllerReconfigureAction`, under a process-global mutex.
 6. **Finalizer** `homelab.lab/opnsense-operator`: on delete, remove all owned OPNsense objects,
    apply, then drop the finalizer.
-7. **Status.** Do not touch `Service.status.loadBalancer` (MetalLB owns it). Record results via
+7. **Status.** Do not touch `Service.status.loadBalancer` (the LB controller — Cilium LB IPAM — owns it). Record results via
    annotation `homelab.lab/exposed` + Events.
 
 ## Concurrency / config
@@ -105,7 +106,7 @@ A controller-wide **managed-domains** filter rejects hostnames outside the manag
 
 Deployment (1 replica, distroless non-root), ServiceAccount, ClusterRole/Binding (watch
 Services + Gateways, patch their metadata/finalizers, emit Events), Secret (OPNsense creds),
-values.yaml. Installed by a human via Helm (like `metallb`) into its own namespace
+values.yaml. Installed by a human via Helm (like the `cilium`/`cert-manager` charts) into its own namespace
 `opnsense-operator` — deliberately **not** an `app-*`/`tool-*` namespace, so the platform's
 Kyverno governance (which only targets those prefixes) does not apply. The image is also
 listed in the platform image allowlist for a complete catalogue.

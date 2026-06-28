@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # opnsense-operator values
 #
-# Bootstrap infrastructure, installed by a human via Helm (like metallb), into
+# Bootstrap infrastructure, installed by a human via Helm (like the cilium/cert-manager charts), into
 # its own namespace (default release namespace: opnsense-operator). It is NOT an
 # app-*/tool-* namespace, so the platform's Kyverno governance does not apply.
 # ---------------------------------------------------------------------------

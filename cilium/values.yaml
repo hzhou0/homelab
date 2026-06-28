@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# homelab-cilium values
+# ---------------------------------------------------------------------------
+
+# Upstream Cilium subchart. Everything under `cilium:` is passed straight through.
+#
+# The block below is the EXACT live config of the running install, captured with
+#   helm -n kube-system get values cilium
+# so adopting the CLI-installed release (`helm upgrade cilium ./cilium -n kube-system`)
+# changes nothing about existing behaviour. Do NOT "tidy" these — they must match the
+# cluster. The ONLY addition is gatewayAPI.enabled (service mesh), at the bottom.
+cilium:
+  enabled: true
+
+  # --- adopted verbatim from the live `cilium` release (no changes) ---
+  cluster:
+    name: default
+  ipam:
+    operator:
+      clusterPoolIPv4PodCIDRList: 10.42.0.0/16
+  # The server's routable address (matching the bootstrap script). The live release recorded
+  # 127.0.0.1 — what the CLI inferred from k3s's loopback kubeconfig — but that only works on
+  # the server node; agent nodes need this address to reach the API server with kube-proxy
+  # replacement, so we pin the routable IP here.
+  k8sServiceHost: 10.0.0.22
+  k8sServicePort: 6443
+  kubeProxyReplacement: true
+  operator:
+    replicas: 1
+  routingMode: tunnel
+  tunnelProtocol: vxlan
+
+  # --- service mesh (the one addition on top of the adopted config) ---
+  # Enables the Gateway API integration; Cilium creates the `cilium` GatewayClass and
+  # serves Gateways/HTTPRoutes through its L7 Envoy proxy (l7Proxy is on by default).
+  # The Gateway API CRDs must already be present (they are, on this cluster).
+  gatewayAPI:
+    enabled: true
+
+  # --- LoadBalancer L2 (replaces MetalLB) ---
+  # Cilium answers ARP for LoadBalancer IPs assigned by LB IPAM (see loadBalancer: below),
+  # so MetalLB is no longer needed. Requires kubeProxyReplacement (on above). Critically, this
+  # also announces the Gateway's own LoadBalancer Service — which has no endpoints, so MetalLB
+  # would not advertise it; Cilium does, because it owns the Envoy datapath behind it.
+  l2announcements:
+    enabled: true
+  # L2 leader-election uses per-service Leases, which adds API-server traffic. Raise the client
+  # rate limits per Cilium's L2 guidance so the agents don't get throttled.
+  k8sClientRateLimit:
+    qps: 50
+    burst: 100
+
+# ---------------------------------------------------------------------------
+# LoadBalancer IP management (Cilium LB IPAM + L2) — replaces MetalLB
+# ---------------------------------------------------------------------------
+# The shared gateway gets a dedicated, stable IP; every other LoadBalancer Service (e.g. UDP
+# services, which DO have endpoints and announce fine) draws from the general pool. ARP
+# announcements are pinned to the node(s) on the 10.0.0.x LAN segment — only k3s-server is on
+# it (k3s-compute-spot is 10.0.1.x and cannot ARP for 10.0.0.x). Tune for your topology.
+loadBalancer:
+  enabled: true
+  # General pool: all LoadBalancer Services EXCEPT the gateway (which has its own pool below).
+  pool:
+    name: lab-pool
+    start: "10.0.0.101"
+    stop: "10.0.0.150"
+  # Dedicated single IP for the shared ingress Gateway, kept stable (the opnsense-operator also
+  # tracks it dynamically). Selected by the gateway Service's owning-gateway label.
+  gatewayPool:
+    name: gateway-pool
+    ip: "10.0.0.100"
+  # L2 (ARP) announcement policy. Pin to the LAN node; restrict interfaces if you have several.
+  l2:
+    name: lab-l2
+    nodeSelector:
+      matchLabels:
+        kubernetes.io/hostname: k3s-server
+    interfaces: []          # empty = all NICs; e.g. ["^eth0$"] to restrict the ARP interface
+
+# ---------------------------------------------------------------------------
+# Single shared ingress Gateway: *.internal.haustorium.net
+# ---------------------------------------------------------------------------
+# All TCP/HTTP app exposure flows through this one Gateway (apps attach with an
+# HTTPRoute). Cilium provisions a backing LoadBalancer Service `cilium-gateway-<name>`,
+# gives it the dedicated gatewayPool IP, and L2-announces it; the opnsense-operator (which
+# watches Gateways) reads the homelab.lab/hostname annotation and creates the matching
+# wildcard Unbound DNS record.
+gateway:
+  enabled: true
+  name: internal
+  # Dedicated namespace, labelled so the platform's generated default-ingress
+  # NetworkPolicy admits gateway->backend traffic into app-*/tool-* namespaces.
+  namespace: cilium-gateway
+  ingressLabel: homelab.lab/ingress
+  gatewayClassName: cilium
+  hostname: "*.internal.haustorium.net"
+
+  # HTTPS termination. The TLS Secret is produced by the cert-manager Certificate
+  # below, issued via the ClusterIssuer shipped by the cert-manager chart.
+  tlsSecretName: internal-haustorium-wildcard-tls
+  issuerName: letsencrypt-cloudflare
+
+  # Internal-only: no homelab.lab/expose annotation -> the operator wires Unbound DNS
+  # but NOT a WAN port-forward. Flip to expose this gateway to the internet (rarely
+  # wanted for an *.internal zone).
+  expose: false

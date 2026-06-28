@@ -1,0 +1,42 @@
+{{- if and .Values.policies.enabled .Values.operator.enabled }}
+{{- $op := include "platform.operatorUsername" . -}}
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: operator-no-service-exposure
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Operator Service exposure (UDP LoadBalancers only)
+    policies.kyverno.io/description: >-
+      Enforces the homelab exposure architecture: all TCP/HTTP traffic enters through the one
+      shared Cilium ingress Gateway (apps attach an HTTPRoute), while UDP services may each take
+      their own LoadBalancer IP (via Cilium LB IPAM). So the operator may create ClusterIP/ExternalName
+      Services and UDP-only LoadBalancers, but NOT TCP/mixed LoadBalancers or any NodePort.
+      Cluster-admins are unaffected.
+spec:
+  validationActions: [Deny]
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["services"]
+  matchConditions:
+    - name: is-operator
+      expression: "request.userInfo.username == '{{ $op }}'"
+  validations:
+    # Allowed iff: no explicit type / ClusterIP / ExternalName, OR a LoadBalancer whose every
+    # port is UDP. Port protocol defaults to TCP when unset, so a LoadBalancer must declare all
+    # ports UDP to pass; NodePort and TCP/mixed LoadBalancers fall through to deny.
+    - expression: >-
+        !has(object.spec.type) ||
+        object.spec.type == 'ClusterIP' ||
+        object.spec.type == 'ExternalName' ||
+        (object.spec.type == 'LoadBalancer' &&
+         object.spec.ports.all(p, p.?protocol.orValue('TCP') == 'UDP'))
+      message: "The operator may only create ClusterIP/ExternalName Services or UDP-only LoadBalancers; TCP/HTTP exposure must go through the shared internal Gateway via an HTTPRoute (NodePort and TCP LoadBalancers are not allowed)."
+{{- end }}

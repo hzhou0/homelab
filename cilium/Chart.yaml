@@ -1,0 +1,29 @@
+apiVersion: v2
+name: homelab-cilium
+description: >-
+  Cilium for the homelab k3s cluster. Cilium was first installed imperatively with the
+  cilium CLI at node bootstrap (kube-node/20-bootstrap-server.start); this chart ADOPTS
+  that running install (the existing `cilium` Helm release in kube-system) with its values
+  unchanged, then layers on the Cilium service mesh: Gateway API + the L7/Envoy proxy.
+  On top it ships a single ingress Gateway bound to *.internal.haustorium.net, whose backing
+  cilium-gateway-<name> LoadBalancer (a MetalLB IP) the opnsense-operator turns into a wildcard
+  Unbound DNS record. A wildcard TLS cert is issued by cert-manager (see the cert-manager chart).
+  Like metallb, this is foundational networking installed by a human (cluster-admin), not the
+  autonomous operator, and lives in kube-system rather than an app-*/tool-* namespace.
+type: application
+version: 0.1.0
+appVersion: "1.19.3"
+keywords:
+  - cilium
+  - cni
+  - service-mesh
+  - gateway-api
+  - homelab
+dependencies:
+  # Pinned to the version of Cilium ALREADY RUNNING on the cluster (verify with
+  # `kubectl -n kube-system get ds cilium -o jsonpath='{...image}'` /
+  # `helm -n kube-system list`). Keeping it in lockstep makes adoption a no-op.
+  - name: cilium
+    version: "1.19.3"
+    repository: https://helm.cilium.io
+    condition: cilium.enabled
