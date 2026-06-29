@@ -1,12 +1,5 @@
 {{- if .Values.loadBalancer.enabled }}
 {{- $lb := .Values.loadBalancer }}
-# Cilium LB IPAM + L2 announcement — the homelab's LoadBalancer stack (replaces MetalLB).
-#
-# Two pools so the shared gateway keeps a stable, predictable IP while everything else (UDP
-# services etc.) draws from the general range:
-#   - lab-pool      : every LoadBalancer Service EXCEPT the gateway (owning-gateway label absent)
-#   - gateway-pool  : exactly the gateway Service (matched by its owning-gateway label) -> 1 IP
-# A single CiliumL2AnnouncementPolicy then ARP-announces all assigned LB IPs from the LAN node.
 apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
@@ -18,7 +11,6 @@ spec:
   blocks:
     - start: {{ $lb.pool.start | quote }}
       stop: {{ $lb.pool.stop | quote }}
-  # Exclude the gateway Service so it can only draw from gateway-pool below.
   serviceSelector:
     matchExpressions:
       - key: io.cilium.gateway/owning-gateway
@@ -32,7 +24,7 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/part-of: homelab-cilium
 spec:
-  # Single-IP range (start==stop) rather than a /32 cidr, so allowFirstLastIPs can't drop it.
+  # start==stop single-IP range instead of a /32 cidr (allowFirstLastIPs can't drop it).
   blocks:
     - start: {{ $lb.gatewayPool.ip | quote }}
       stop: {{ $lb.gatewayPool.ip | quote }}
@@ -48,13 +40,11 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/part-of: homelab-cilium
 spec:
-  # Announce LoadBalancer IPs (not arbitrary externalIPs) for all matching Services.
   loadBalancerIPs: true
   {{- with $lb.l2.interfaces }}
   interfaces:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  # Pin announcements to the node(s) on the LB segment's L2 domain.
   nodeSelector:
     {{- toYaml $lb.l2.nodeSelector | nindent 4 }}
 {{- end }}

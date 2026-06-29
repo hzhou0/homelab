@@ -1,12 +1,7 @@
 {{- if .Values.operator.enabled }}
-# Confine the operator's namespace create/delete to app-*/tool-* names.
-#
-# This is a NATIVE ValidatingAdmissionPolicy, not a Kyverno policy, on purpose:
-# Kyverno excludes its own namespace (and kube-node-lease) from webhook
-# processing, so a Kyverno rule could not stop the operator from deleting the
-# `kyverno` namespace -- which would tear down enforcement. A VAP runs inside the
-# kube-apiserver for every namespace, with no such exclusions. (Kubernetes itself
-# already protects kube-system/kube-public/default from deletion.)
+# Native ValidatingAdmissionPolicy, not Kyverno: Kyverno excludes its own namespace and
+# kube-node-lease from webhook processing, so a Kyverno rule couldn't stop the operator from
+# deleting the `kyverno` namespace. A VAP runs inside kube-apiserver with no such exclusions.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -22,15 +17,10 @@ spec:
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["namespaces"]
   matchConditions:
-    # Only constrain the operator ServiceAccount; admins are unaffected.
     - name: only-operator
       expression: "request.userInfo.username == '{{ include "platform.operatorUsername" . }}'"
   validations:
-    # request.name works for CREATE, UPDATE and DELETE (object is null on delete). The
-    # operator may only touch app-*/tool-* namespaces, and never its own -- so it can
-    # create/delete and patch (e.g. update homelab.lab/notes) only its own tiers, never
-    # kube-system, kyverno, database, etc. (PSA labels are re-stamped on UPDATE by
-    # namespace-psa-labels, so a patch cannot widen Pod Security.)
+    # request.name works for CREATE, UPDATE and DELETE (object is null on delete).
     - expression: "(request.name.startsWith('{{ .Values.prefixes.app }}') || request.name.startsWith('{{ .Values.prefixes.tool }}')) && request.name != '{{ .Values.operator.namespace }}'"
       message: "The operator may only create, update or delete app-* / tool-* namespaces (and not its own)."
       reason: Forbidden

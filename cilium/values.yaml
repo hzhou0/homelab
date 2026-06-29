@@ -1,27 +1,17 @@
-# ---------------------------------------------------------------------------
 # homelab-cilium values
-# ---------------------------------------------------------------------------
 
-# Upstream Cilium subchart. Everything under `cilium:` is passed straight through.
-#
-# The block below is the EXACT live config of the running install, captured with
-#   helm -n kube-system get values cilium
-# so adopting the CLI-installed release (`helm upgrade cilium ./cilium -n kube-system`)
-# changes nothing about existing behaviour. Do NOT "tidy" these — they must match the
-# cluster. The ONLY addition is gatewayAPI.enabled (service mesh), at the bottom.
+# Upstream Cilium subchart values. `cilium:` is a near-verbatim copy of the live release
+# (`helm -n kube-system get values cilium`). Do NOT "tidy" these — they must match the cluster.
 cilium:
   enabled: true
 
-  # --- adopted verbatim from the live `cilium` release (no changes) ---
   cluster:
     name: default
   ipam:
     operator:
       clusterPoolIPv4PodCIDRList: 10.42.0.0/16
-  # The server's routable address (matching the bootstrap script). The live release recorded
-  # 127.0.0.1 — what the CLI inferred from k3s's loopback kubeconfig — but that only works on
-  # the server node; agent nodes need this address to reach the API server with kube-proxy
-  # replacement, so we pin the routable IP here.
+  # The live release recorded 127.0.0.1 (loopback kubeconfig); pinned to the routable IP so
+  # agent nodes can reach the API server under kube-proxy replacement.
   k8sServiceHost: 10.0.0.22
   k8sServicePort: 6443
   kubeProxyReplacement: true
@@ -30,18 +20,9 @@ cilium:
   routingMode: tunnel
   tunnelProtocol: vxlan
 
-  # --- service mesh (the one addition on top of the adopted config) ---
-  # Enables the Gateway API integration; Cilium creates the `cilium` GatewayClass and
-  # serves Gateways/HTTPRoutes through its L7 Envoy proxy (l7Proxy is on by default).
-  # The Gateway API CRDs must already be present (they are, on this cluster).
   gatewayAPI:
     enabled: true
 
-  # --- Hubble (observability) ---
-  # Network flow visibility. `relay` aggregates the per-node Hubble servers into one
-  # cluster-wide API; `ui` is the web dashboard (service-map + flow table). The same
-  # flow stream backs `hubble observe`, handy for rolling out the host firewall below
-  # in audit mode. TLS between agent/relay is auto-provisioned (hubble.tls.auto default).
   hubble:
     enabled: true
     relay:
@@ -49,142 +30,87 @@ cilium:
     ui:
       enabled: true
 
-  # Scope Cilium's datapath -- and therefore the host firewall -- to ethernet only.
-  # `devices` is otherwise auto-detected from the default route, so a node that rolls onto wifi
-  # (wlan0) would have Cilium attach there and the host firewall would lock down the wifi link too.
-  # Both nodes name their wired NIC ethN (server eth0, spot laptop eth1) and neither needs Cilium
-  # on wlan0, so `eth+` (Cilium's wildcard) covers the wired interfaces and excludes wlan0. Effect:
-  # unplug the spot laptop and use wifi, and the host firewall is simply not on that interface.
-  # NOTE: any future node must use an ethN-named wired NIC, or be added to this pattern.
+  # Scope Cilium's datapath (and host firewall) to ethernet only. Without this, a node that
+  # rolls onto wifi (wlan0) would have Cilium manage that interface and the host firewall would
+  # lock down wifi ingress too. eth+ covers both nodes' wired NICs (server eth0, spot eth1).
   devices: "eth+"
 
-  # --- host firewall (enables the node-level lockdown below) ---
-  # Turns on enable-host-firewall so a CiliumClusterwideNetworkPolicy with a `nodeSelector`
-  # governs the node's HOST network namespace (API server, kubelet, etc.). A host-scoped policy
-  # does NOT affect pod-to-pod traffic (incl. cross-node, decapsulated overlay traffic is "ingress
-  # to the pod", not to the host), so this is compatible with tunnel/vxlan routing.
-  # LESSON LEARNED: the host policy's nodeSelector MUST be non-empty (see host-firewall.yaml) --
-  # an empty `{}` selector matches all endpoints (pods included) and takes the cluster down.
+  # Enables the host firewall so a CiliumClusterwideNetworkPolicy with a `nodeSelector` governs
+  # the node's HOST network namespace. Compatible with tunnel/vxlan: the host policy does NOT
+  # affect pod-to-pod traffic. IMPORTANT: the host policy's nodeSelector must be non-empty —
+  # empty `{}` matches pods too and takes the cluster down (see host-firewall.yaml).
   hostFirewall:
     enabled: true
 
-  # --- LoadBalancer L2 (replaces MetalLB) ---
-  # Cilium answers ARP for LoadBalancer IPs assigned by LB IPAM (see loadBalancer: below),
-  # so MetalLB is no longer needed. Requires kubeProxyReplacement (on above). Critically, this
-  # also announces the Gateway's own LoadBalancer Service — which has no endpoints, so MetalLB
-  # would not advertise it; Cilium does, because it owns the Envoy datapath behind it.
   l2announcements:
     enabled: true
-  # L2 leader-election uses per-service Leases, which adds API-server traffic. Raise the client
-  # rate limits per Cilium's L2 guidance so the agents don't get throttled.
+  # Raise client rate limits per Cilium's L2 guidance to avoid throttling with per-service Leases.
   k8sClientRateLimit:
     qps: 50
     burst: 100
 
 # ---------------------------------------------------------------------------
-# Host firewall: lock TCP/SCTP ingress to the NODES down to in-cluster sources
+# Host firewall
 # ---------------------------------------------------------------------------
-# Restricts who may open TCP/SCTP connections to the node host network namespace
-# (the control plane on 6443, kubelet on 10250, etc.). Only in-cluster sources
-# (other nodes + pods, tracked by Cilium identity so DHCP agents need no static IPs)
-# and the admin hosts below may; everyone else on the LAN/world is dropped. UDP is
-# deliberately left untouched (DHCP lease renewal, DNS, NTP, vxlan keep working).
-# Requires cilium.hostFirewall.enabled (above). Roll out in audit mode first — see
-# cilium/README.md "Host firewall".
-# Host-scoped (templates/host-firewall.yaml selects host endpoints via nodeSelector), so it does
-# NOT touch pod-to-pod / cross-node traffic and is compatible with tunnel/vxlan routing.
-# Requires cilium.hostFirewall.enabled. Roll out in audit mode first.
 hostFirewall:
   enabled: true
-  # Non-cluster source IPs granted full host access (e.g. admin kubectl to 6443). Empty =
-  # strictly cluster-only. Use /32 for single hosts; mirrors the gateway's allowedCIDRs.
   adminCIDRs:
     - 10.0.0.232/32
     - 10.0.1.140/32
 
 # ---------------------------------------------------------------------------
-# LoadBalancer IP management (Cilium LB IPAM + L2) — replaces MetalLB
+# LoadBalancer IP management (Cilium LB IPAM + L2)
 # ---------------------------------------------------------------------------
-# The shared gateway gets a dedicated, stable IP; every other LoadBalancer Service (e.g. UDP
-# services, which DO have endpoints and announce fine) draws from the general pool. ARP
-# announcements are pinned to the node(s) on the 10.0.0.x LAN segment — only k3s-server is on
-# it (k3s-compute-spot is 10.0.1.x and cannot ARP for 10.0.0.x). Tune for your topology.
 loadBalancer:
   enabled: true
-  # General pool: all LoadBalancer Services EXCEPT the gateway (which has its own pool below).
   pool:
     name: lab-pool
     start: "10.0.0.101"
     stop: "10.0.0.150"
-  # Dedicated single IP for the shared ingress Gateway, kept stable (the opnsense-operator also
-  # tracks it dynamically). Selected by the gateway Service's owning-gateway label.
+  # Dedicated single IP for the shared ingress Gateway. The gateway Service has no endpoints
+  # (Envoy is fronted by Cilium's BPF), so MetalLB-L2 wouldn't announce it — Cilium does.
   gatewayPool:
     name: gateway-pool
     ip: "10.0.0.100"
-  # L2 (ARP) announcement policy. Pin to the LAN node; restrict interfaces if you have several.
   l2:
     name: lab-l2
+    # Pin to the LAN node — only k3s-server is on 10.0.0.x; the spot node (10.0.1.x) can't ARP.
     nodeSelector:
       matchLabels:
         kubernetes.io/hostname: k3s-server
-    interfaces: []          # empty = all NICs; e.g. ["^eth0$"] to restrict the ARP interface
+    interfaces: []
 
 # ---------------------------------------------------------------------------
 # Single shared ingress Gateway: *.internal.haustorium.net
 # ---------------------------------------------------------------------------
-# All TCP/HTTP app exposure flows through this one Gateway (apps attach with an
-# HTTPRoute). Cilium provisions a backing LoadBalancer Service `cilium-gateway-<name>`,
-# gives it the dedicated gatewayPool IP, and L2-announces it; the opnsense-operator (which
-# watches Gateways) reads the homelab.lab/hostname annotation and creates the matching
-# wildcard Unbound DNS record.
 gateway:
   enabled: true
   name: internal
-  # Dedicated namespace for the Gateway object. (Labelling it homelab.lab/ingress=true does
-  # NOT, by itself, let gateway traffic through the platform's default-deny NetworkPolicies:
-  # Cilium's gateway Envoy reaches backends with the reserved "ingress" identity, which a k8s
-  # NetworkPolicy namespaceSelector cannot match. allowBackendsFromIngress below handles that.)
   namespace: cilium-gateway
   ingressLabel: homelab.lab/ingress
   gatewayClassName: cilium
   hostname: "*.internal.haustorium.net"
 
-  # HTTPS termination. The TLS Secret is produced by the cert-manager Certificate
-  # below, issued via the ClusterIssuer shipped by the cert-manager chart.
   tlsSecretName: internal-haustorium-wildcard-tls
   issuerName: letsencrypt-cloudflare
 
-  # Internal-only: no homelab.lab/expose annotation -> the operator wires Unbound DNS
-  # but NOT a WAN port-forward. Flip to expose this gateway to the internet (rarely
-  # wanted for an *.internal zone).
   expose: false
 
-  # L3 ingress allow-list: ONLY these source IPs may reach the gateway's Envoy front door.
-  # Everything else (the rest of the LAN, the wider world, AND in-cluster pods) is dropped
-  # at L3 before any TLS/route processing -- access control is no longer delegated entirely
-  # to the app/route. Listed as CIDRs; use /32 for single hosts. Cilium mints a per-prefix
-  # CIDR identity so a packet from one of these addresses matches even though it arrives on
-  # the same 10.0.0.x LAN as the gateway IP. An empty list falls back to the old behaviour
-  # (world + cluster), so keep at least one entry to actually enforce the whitelist.
+  # L3 ingress allow-list: only these source IPs may reach the gateway's Envoy front door.
+  # An empty list falls back to world + cluster (open). Use /32 for single hosts.
   allowedCIDRs:
     - 10.0.0.232/32
     - 10.0.1.140/32
 
-  # Expose the Hubble UI through this Gateway (instead of `cilium hubble ui` port-forward).
-  # Renders an HTTPRoute for the hostname below -> the hubble-ui Service in kube-system.
-  # Access is still gated by the gateway's allowedCIDRs (your admin hosts only). Requires
-  # cilium.hubble.ui.enabled. The hostname must fall under the gateway's wildcard zone.
   hubbleUI:
     enabled: true
     hostname: hubble.internal.haustorium.net
 
-  # Namespaces excluded from the gateway->backends allow policy (boundary 2). That policy uses a
-  # cluster-wide selector, and selecting a pod with an ingress rule flips it to default-deny
-  # ingress. That's only safe for app-*/tool-* backends (already default-denied by the platform).
-  # System namespaces have NO default-deny, so sweeping them in BREAKS them -- notably kube-system,
-  # where it cut off all pod->coredns DNS. Cilium selectors can't prefix-match app-*/tool-*, so we
-  # blocklist every NON-app-/tool- namespace here; app-*/tool-* backends stay selected automatically.
-  # Add any new non-governed namespace you create.
+  # Namespaces excluded from the gateway→backends allow policy. That policy selects pods with an
+  # ingress rule, flipping them to default-deny. Safe only for app-*/tool-* (already default-denied
+  # by the platform). System namespaces have no default-deny of their own — sweeping them in
+  # breaks them (notably kube-system, where it cut off all pod→coredns DNS). Cilium selectors
+  # can't prefix-match app-*/tool-*, so we blocklist the non-governed namespaces instead.
   backendsExcludeNamespaces:
     - kube-system
     - kube-public
@@ -196,10 +122,4 @@ gateway:
     - rook-ceph
     - database
 
-  # Let the gateway's Envoy reach backend pods through the platform's default-deny ingress
-  # NetworkPolicies. The proxy connects with Cilium's reserved "ingress" identity, which a
-  # vanilla k8s NetworkPolicy cannot allow -> backends 503 unless we ship a Cilium-native allow.
-  # This CiliumClusterwideNetworkPolicy unions with (does not replace) the per-namespace deny,
-  # and the "ingress" identity only originates from this gateway proxy, so it does not loosen
-  # pod-to-pod isolation. Disable only if you remove the platform's default-deny NetworkPolicies.
   allowBackendsFromIngress: true

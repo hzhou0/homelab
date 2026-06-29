@@ -1,8 +1,6 @@
 {{- if .Values.gateway.enabled }}
 {{- $g := .Values.gateway }}
-# Dedicated namespace for the shared ingress Gateway. The homelab.lab/ingress label
-# lets the platform's per-namespace default-ingress NetworkPolicy admit traffic from
-# here into app-*/tool-* backends (see homelab-platform values.networkPolicy).
+# homelab.lab/ingress=true lets the platform's default-ingress NetworkPolicy admit gateway traffic.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -12,9 +10,7 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/part-of: homelab-cilium
 ---
-# Wildcard TLS cert for the gateway, issued by cert-manager (DNS-01 via Cloudflare).
-# Produces the Secret the HTTPS listener references. Until the ACME order completes the
-# Gateway stays un-programmed for HTTPS — expected on first install.
+# Until the ACME order completes the Gateway stays un-programmed for HTTPS — expected on first install.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -32,12 +28,6 @@ spec:
     kind: ClusterIssuer
     group: cert-manager.io
 ---
-# The one ingress Gateway. gatewayClassName=cilium -> Cilium provisions a backing
-# LoadBalancer Service `cilium-gateway-<name>`, assigns it the dedicated gatewayPool IP
-# (Cilium LB IPAM) and L2-announces it. The homelab.lab/hostname annotation drives the
-# opnsense-operator to create the wildcard Unbound DNS override pointing at that IP.
-# allowedRoutes.from=All lets HTTPRoutes in any app-*/tool-* namespace attach without a
-# ReferenceGrant.
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:

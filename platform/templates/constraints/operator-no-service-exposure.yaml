@@ -29,9 +29,7 @@ spec:
     - name: is-operator
       expression: "request.userInfo.username == '{{ $op }}'"
   validations:
-    # Allowed iff: no explicit type / ClusterIP / ExternalName, OR a LoadBalancer whose every
-    # port is UDP. Port protocol defaults to TCP when unset, so a LoadBalancer must declare all
-    # ports UDP to pass; NodePort and TCP/mixed LoadBalancers fall through to deny.
+    # Port protocol defaults to TCP when unset, so a LoadBalancer must declare all ports UDP to pass.
     - expression: >-
         !has(object.spec.type) ||
         object.spec.type == 'ClusterIP' ||

@@ -27,8 +27,6 @@ spec:
     - name: in-app-namespace
       expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.app }}')"
   mutations:
-    # 1. Set pod-level seccompProfile (RuntimeDefault) if not already present.
-    #    Creates /spec/securityContext when the field is entirely absent.
     - patchType: JSONPatch
       jsonPatch:
         expression: |
@@ -40,8 +38,7 @@ spec:
                        value: dyn({"type": "RuntimeDefault"})}] :
           []
 
-    # 2. Create an empty /securityContext for every container that lacks one.
-    #    Must run before mutations 3-5 so the parent path exists.
+    # Must run before the per-container mutations so the parent path exists.
     - patchType: JSONPatch
       jsonPatch:
         expression: |
@@ -53,7 +50,6 @@ spec:
               null
           ).filter(p, p != null)
 
-    # 3. Set allowPrivilegeEscalation=false on every container.
     - patchType: JSONPatch
       jsonPatch:
         expression: |
@@ -63,7 +59,6 @@ spec:
                       value: dyn(false)}
           )
 
-    # 4. Set runAsNonRoot=true on every container.
     - patchType: JSONPatch
       jsonPatch:
         expression: |
@@ -73,12 +68,8 @@ spec:
                       value: dyn(true)}
           )
 
-    # 5. Set capabilities.drop=["ALL"] on every container.
-    #    Replaces the entire capabilities object — no capability additions are valid in
-    #    app-* (PSA restricted rejects them anyway).
-    #    Requires dyn() on both the map and the list: ApplyConfiguration fails with
-    #    "may not mutate atomic arrays" for capabilities.drop; JSONPatch bypasses the
-    #    typed schema and the dyn() unwraps the heterogeneous CEL value correctly.
+    # dyn() on both the map and list is required: ApplyConfiguration rejects mutations to atomic
+    # arrays (capabilities.drop); JSONPatch bypasses the typed schema and dyn() unwraps correctly.
     - patchType: JSONPatch
       jsonPatch:
         expression: |

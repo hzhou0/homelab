@@ -21,15 +21,11 @@ spec:
       enabled: false
   matchConstraints:
     resourceRules:
-      # Gateway API: ingress gateways + L4 routes. HTTPRoute/GRPCRoute (L7, attach to the
-      # shared Gateway) are deliberately NOT listed -- those are the sanctioned path.
+      # HTTPRoute/GRPCRoute are deliberately NOT listed — those are the sanctioned attach path.
       - apiGroups: ["gateway.networking.k8s.io"]
         apiVersions: ["v1", "v1alpha2", "v1beta1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["gateways", "gatewayclasses", "tcproutes"]
-      # Cilium network CRDs present on this cluster that shape topology / dataplane.
-      # (CiliumEgressGatewayPolicy / EnvoyConfig / BGP have no CRD here yet; add them to
-      # this list if those features get enabled.)
       - apiGroups: ["cilium.io"]
         apiVersions: ["v2", "v2alpha1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
@@ -41,7 +37,6 @@ spec:
           - ciliumpodippools
           - ciliumcidrgroups
           - ciliumnodeconfigs
-      # Native Ingress: another ingress path around the shared Gateway.
       - apiGroups: ["networking.k8s.io"]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]

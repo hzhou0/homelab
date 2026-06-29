@@ -1,12 +1,7 @@
 {{- if .Values.operator.enabled }}
-# Cluster-scoped + read-only rights for the operator, bound cluster-wide. It has
-# NO namespaced workload write here -- those come only from per-namespace
-# RoleBindings that namespace-governance generates into app-*/tool-* namespaces
-# (binding the homelab-operator-deploy ClusterRole). THAT is what actually
-# confines the operator to the two tiers: it has zero write permission in
-# kube-system, default, or any other namespace, independent of Kyverno's
-# namespace exclusions. Writes here are limited to creating tier namespaces,
-# whose names are constrained to app-*/tool-* by restrict-operator-namespaces.
+# Cluster-scoped + read-only rights, bound cluster-wide. Namespaced write power lives
+# exclusively in clusterrole-deploy.yaml, bound per-namespace by namespace-governance —
+# that is what actually confines the operator to app-*/tool-* independent of Kyverno exclusions.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -14,20 +9,14 @@ metadata:
   labels:
 {{ include "platform.labels" . | indent 4 }}
 rules:
-  # Self-provision, annotate, and tear down tier namespaces. update/patch let the
-  # operator maintain provenance metadata (e.g. the homelab.lab/notes annotation)
-  # on namespaces it owns. All of create/update/patch/delete are cluster-wide at the
-  # RBAC layer (RBAC can't scope by name prefix), but restrict-operator-namespaces
-  # gates them to app-*/tool-* names; and namespace-psa-labels re-stamps PSA on every
-  # UPDATE, so a patch cannot widen Pod Security or escape the two tiers.
+  # Namespace create/update/patch/delete is cluster-wide at the RBAC layer (RBAC can't scope by
+  # name prefix); restrict-operator-namespaces gates it to app-*/tool-* names at admission.
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Read-only cluster view for placement decisions.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
-  # Read-only introspection of the constraint surface (cannot modify it).
   - apiGroups: ["policies.kyverno.io"]
     resources: ["validatingpolicies", "mutatingpolicies", "generatingpolicies", "imagevalidatingpolicies", "deletingpolicies", "policyexceptions"]
     verbs: ["get", "list", "watch"]

@@ -1,13 +1,6 @@
-# ---------------------------------------------------------------------------
 # homelab-platform values
-#
-# Everything tunable lives here: the Kyverno engine footprint, the operator
-# identity, per-tier namespace governance (quota / limitrange / PSA / netpol),
-# the container-image allowlist, and the per-runtime resource envelopes.
-# ---------------------------------------------------------------------------
 
-# Kyverno engine (subchart). Trimmed for the N100 nodes: single replicas, only
-# the controllers we use. Enable reports/cleanup later if wanted.
+# Kyverno engine (subchart). Single replicas for the N100 nodes.
 kyverno:
   enabled: true
   admissionController:
@@ -15,48 +8,30 @@ kyverno:
   backgroundController:        # required for `generate` + `synchronize`
     replicas: 1
   reportsController:
-    enabled: false             # turn on later for a policy-report dashboard
+    enabled: false
   cleanupController:
     enabled: false
-  # Do NOT install Kyverno's CRDs through this Helm release. Kyverno bundles ~5.6MB of CRD source
-  # (the `crds` + `kyverno-api` subcharts), and Helm stores the ENTIRE chart in the release Secret
-  # — so the full CRD set blows past Kubernetes' 1MB Secret limit ("data: Too long") no matter what
-  # renders. (Per-CRD `groups.*` toggles only affect rendering, not the stored chart source, so
-  # they can't fix this.) Setting install:false makes Helm PRUNE those conditional subcharts from
-  # the release entirely — the kyverno chart drops from ~6.5MB to ~885KB and the release fits.
-  #
-  # The CRDs are instead applied out-of-band (they live on the cluster, not in any Helm release):
-  #   ./platform/install-crds.sh        # kubectl apply --server-side, run before install/upgrade
-  # See README "Kyverno CRDs (installed out-of-band)".
+  # CRDs are applied out-of-band via ./platform/install-crds.sh — Kyverno's CRD source exceeds
+  # Kubernetes' 1MB release Secret limit when bundled. install:false prunes those subcharts.
   crds:
     install: false
 
-# Our ClusterPolicies. Toggle off to install Kyverno alone (see README caveat
-# about CRD ordering on a fresh cluster).
+# Toggle off to install Kyverno alone (see README for CRD ordering caveat on fresh clusters).
 policies:
   enabled: true
-  # CEL policy enforcement action: Deny = hard-reject (what an operator needs:
-  # clear pass/fail), Audit = allow but record, Warn = allow with a warning.
   validationAction: Deny
 
-# The autonomous operator's identity. RBAC grants broad deploy power but never
-# kyverno.io / rbac / quota writes (deny-by-default), so it cannot move the
-# constraints it deploys within.
 operator:
   enabled: true
   namespace: tool-operator
   serviceAccountName: homelab-operator
 
-# Namespace prefixes that define the two tiers.
 prefixes:
   app: "app-"
   tool: "tool-"
 
-# Label an app's Deployment pod template must carry, e.g. homelab.lab/runtime: go
 runtimeLabel: "homelab.lab/runtime"
 
-# Per-runtime resource envelopes for app-* containers. The operator declares the
-# language; these fix the legal cpu/mem window. Add/adjust runtimes freely.
 runtimeProfiles:
   static: { cpuMin: "10m",  cpuMax: "250m",  memMin: "16Mi",  memMax: "128Mi" }
   go:     { cpuMin: "50m",  cpuMax: "500m",  memMin: "32Mi",  memMax: "1000Mi" }
@@ -65,42 +40,22 @@ runtimeProfiles:
   python: { cpuMin: "100m", cpuMax: "1000m", memMin: "128Mi", memMax: "4000Mi" }
   jvm:    { cpuMin: "250m", cpuMax: "2000m", memMin: "256Mi", memMax: "1536Mi" }
 
-# Explicit, vetted container images (full references — NOT registry prefixes).
-# Anything not listed is rejected in app-* and tool-*. This is the operator's
-# image catalog; adding a new image is a deliberate, auditable change.
-#
-# Cluster tooling below is sourced from homelab-design-document.md (Ceph/RGW,
-# CloudNativePG, Cilium Gateway API + L2 LoadBalancer, rclone backup, OPNsense
-# operator, System Upgrade Controller). Tags must match the chart/version you
-# actually deploy — bump them here when you upgrade a tool. Cilium and cert-manager
-# run in ungoverned namespaces (kube-system / cert-manager), which the allowlist
-# does not gate, so they are not listed. App images go under "applications".
+# Vetted container images. Anything not listed is rejected in app-* and tool-*.
+# Cilium and cert-manager run in ungoverned namespaces and are not listed.
 imageAllowlist:
-  # --- Rook Ceph (S3/RGW object storage) ---
-  - quay.io/ceph/ceph:v18                                   # design doc §7.4
-  - docker.io/rook/ceph:v1.15.6                             # Rook operator (match release)
-  # --- CloudNativePG (managed PostgreSQL) ---
-  - ghcr.io/cloudnative-pg/postgresql:17.5-minimal-bullseye # design doc §8.1
-  - ghcr.io/cloudnative-pg/cloudnative-pg:1.24.1            # CNPG operator (match release)
-  # LoadBalancer IPs are handled by Cilium LB IPAM + L2 (in kube-system, ungoverned) —
-  # MetalLB has been removed, so no MetalLB images are listed.
-  # --- Offsite backup (rclone crypt -> Backblaze B2) ---
-  - docker.io/rclone/rclone:1.68.2                          # design doc §9.4 (pin a tag)
-  # --- k3s upgrades (optional) ---
+  - quay.io/ceph/ceph:v18
+  - docker.io/rook/ceph:v1.15.6
+  - ghcr.io/cloudnative-pg/postgresql:17.5-minimal-bullseye
+  - ghcr.io/cloudnative-pg/cloudnative-pg:1.24.1
+  - docker.io/rclone/rclone:1.68.2
   - docker.io/rancher/system-upgrade-controller:v0.14.2
-  - docker.io/rancher/kubectl:v1.30.2                       # upgrade-job runner
-  # --- Custom OPNsense WAN-exposure + DNS operator (design doc §5.6) ---
-  # Bootstrap infra: installed via the opnsense-operator chart into its own
-  # (ungoverned) namespace, so allowlisting is not strictly required — listed
-  # here for a complete image catalogue. Bump the tag on upgrade.
+  - docker.io/rancher/kubectl:v1.30.2
   - ghcr.io/hzhou0/opnsense-operator:0.1.0
   - ghcr.io/headlamp-k8s/headlamp:v0.43.0
 
   # --- applications (app-* tier) ---
   # - ghcr.io/<org>/<app>:<tag>
 
-# Per-tier namespace governance, generated on namespace creation and kept in
-# sync (operator tampering is reverted). Sizes are homelab defaults; tune away.
 tiers:
   app:
     psaLevel: restricted
@@ -110,10 +65,10 @@ tiers:
       limitsCpu: "4"
       limitsMemory: "8Gi"
       pods: "20"
-    # app-* gets only a hard ceiling (and floor) per container; actual values
-    # are forced explicit by the quota and shaped per-runtime by Kyverno.
+    # Hard ceiling + floor only; actual values must be declared by the operator and shaped
+    # per-runtime by Kyverno (no default request/limit — operator must be explicit).
     limitRange:
-      defaults: false          # no default request/limit -> operator must declare
+      defaults: false
       min: { cpu: "10m",  memory: "16Mi" }
       max: { cpu: "2",    memory: "1536Mi" }
   tool:
@@ -124,8 +79,6 @@ tiers:
       limitsCpu: "8"
       limitsMemory: "16Gi"
       pods: "40"
-    # tool-* gets full defaults + ceiling from the LimitRange (no per-runtime
-    # Kyverno rule needed for this tier).
     limitRange:
       defaults: true
       defaultRequest: { cpu: "100m", memory: "128Mi" }
@@ -133,24 +86,15 @@ tiers:
       min: { cpu: "10m",  memory: "16Mi" }
       max: { cpu: "4",    memory: "4Gi" }
 
-# tool-* tier: allow at most ONE Helm release (chart) per namespace. Enforced by
-# inspecting Helm's release Secrets, so it requires granting Kyverno's admission
-# controller read access to Secrets (an aggregation ClusterRole is created). Set
-# enabled:false to drop both the policy and that grant.
+# Require at most one Helm release per tool-* namespace. Needs Kyverno admission controller to
+# read Secrets (an aggregation ClusterRole is created). Set false to drop both.
 oneChartPerToolNamespace:
   enabled: true
 
-# Require provenance metadata on operator-managed app-*/tool-* namespaces:
-# annotations homelab.lab/src (source repo or vendor) + homelab.lab/notes, plus
-# the recommended app.kubernetes.io/* labels with managed-by pinned to `managedBy`.
-# The platform's own operator namespace is exempt.
 namespaceMetadata:
   enabled: true
   managedBy: operator-agent
 
-# System namespaces the operator must never write into (defense-in-depth on top
-# of RBAC). The release namespace and the operator namespace are added
-# automatically.
 protectedNamespaces:
   - kube-system
   - kube-public
@@ -158,9 +102,6 @@ protectedNamespaces:
   - database
   - rook-ceph
 
-# Default-deny-style NetworkPolicy generated per namespace. Ingress is restricted
-# to same-namespace + namespaces carrying `ingressFromNamespaceLabel`; egress is
-# left open (DNS, other services, internet) to avoid foot-gunning apps.
 networkPolicy:
   enabled: true
-  ingressFromNamespaceLabel: "homelab.lab/ingress"   # label a gateway ns with =true
+  ingressFromNamespaceLabel: "homelab.lab/ingress"

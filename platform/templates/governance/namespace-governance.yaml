@@ -21,12 +21,9 @@ spec:
       enabled: true
   matchConstraints:
     resourceRules:
-      # CREATE *and* UPDATE: the gpol engine watches the trigger namespace and re-evaluates this
-      # rule on every namespace event. With CREATE-only, any later namespace UPDATE (PSA label
-      # stamping, the hourly resync, or the operator patching homelab.lab/notes) fails to match, so
-      # the engine treats the namespace as no-longer-qualifying and DELETES all downstream resources
-      # (quota, limitrange, default-ingress NetworkPolicy, and the operator's deploy RoleBinding).
-      # Matching UPDATE too keeps the generated set synchronized instead of being torn down.
+      # CREATE and UPDATE: UPDATE is required so namespace patches (PSA label stamping, operator
+      # notes) don't cause the engine to treat the namespace as no-longer-qualifying and tear down
+      # all generated resources (quota, limitrange, NetworkPolicy, deploy RoleBinding).
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]

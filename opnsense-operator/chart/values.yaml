@@ -1,11 +1,3 @@
-# ---------------------------------------------------------------------------
-# opnsense-operator values
-#
-# Bootstrap infrastructure, installed by a human via Helm (like the cilium/cert-manager charts), into
-# its own namespace (default release namespace: opnsense-operator). It is NOT an
-# app-*/tool-* namespace, so the platform's Kyverno governance does not apply.
-# ---------------------------------------------------------------------------
-
 replicaCount: 1
 
 image:
@@ -14,24 +6,17 @@ image:
   tag: "sha-57db539"
   pullPolicy: IfNotPresent
 
-# Connection to OPNsense and the operator's managed scope.
 opnsense:
-  # Base URL of the OPNsense host.
   url: "https://10.0.0.1"
-  # OPNsense interface name WAN port-forwards are bound to.
   wanInterface: "wan"
-  # Trust a self-signed OPNsense certificate.
   insecureTLS: true
-  # Comma-separated DNS zones the operator may create overrides in (the
-  # external-dns "domain filter"). Empty allows any zone.
+  # Comma-separated DNS zones the operator may manage. Empty allows any zone.
   managedDomains: "internal.haustorium.net"
 
-  # API credentials. Either reference an existing Secret that holds the keys
-  # OPNSENSE_API_KEY and OPNSENSE_API_SECRET, or set apiKey/apiSecret here to
-  # have the chart create the Secret.
+  # Either reference an existing Secret holding OPNSENSE_API_KEY / OPNSENSE_API_SECRET,
+  # or set apiKey/apiSecret to have the chart create the Secret.
   existingSecret: "opnsense-operator-creds"
 
-# Leader election lets a restarted/replaced pod take over safely.
 leaderElect: true
 
 serviceAccount:
@@ -45,7 +30,6 @@ resources:
     cpu: 200m
     memory: 128Mi
 
-# Restricted-friendly pod hardening (works under PSA baseline/restricted).
 podSecurityContext:
   runAsNonRoot: true
   seccompProfile:
