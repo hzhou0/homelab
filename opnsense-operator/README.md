@@ -29,6 +29,11 @@ them via a finalizer on deletion.
 
 ## Install
 
-Bootstrap infrastructure, installed by hand into its own namespace. Set `opnsense.url`,
-`opnsense.managedDomains`, and credentials via `opnsense.apiKey`/`opnsense.apiSecret` or
-`opnsense.existingSecret` (a Secret holding `OPNSENSE_API_KEY` / `OPNSENSE_API_SECRET`).
+```sh
+helm install opnsense-operator ./chart \
+  --namespace opnsense-operator --create-namespace \
+  --set opnsense.existingSecret=opnsense-operator-creds
+```
+
+Credentials go in a pre-created Secret (`OPNSENSE_API_KEY` / `OPNSENSE_API_SECRET`), or set
+`opnsense.apiKey`/`opnsense.apiSecret` to have the chart create it.

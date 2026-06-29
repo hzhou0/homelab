@@ -8,7 +8,7 @@ kyverno:
   backgroundController:        # required for `generate` + `synchronize`
     replicas: 1
   reportsController:
-    enabled: false
+    enabled: true
   cleanupController:
     enabled: false
   # CRDs are applied out-of-band via ./platform/install-crds.sh — Kyverno's CRD source exceeds
@@ -52,6 +52,9 @@ imageAllowlist:
   - docker.io/rancher/kubectl:v1.30.2
   - ghcr.io/hzhou0/opnsense-operator:0.1.0
   - ghcr.io/headlamp-k8s/headlamp:v0.43.0
+  - ghcr.io/gethomepage/homepage:v1.13.2
+  - ghcr.io/kyverno/policy-reporter:3.7.4
+  - ghcr.io/kyverno/policy-reporter-ui:2.5.1
 
   # --- applications (app-* tier) ---
   # - ghcr.io/<org>/<app>:<tag>
@@ -105,3 +108,20 @@ protectedNamespaces:
 networkPolicy:
   enabled: true
   ingressFromNamespaceLabel: "homelab.lab/ingress"
+
+# Policy Reporter: Kyverno policy-report dashboard (subchart).
+# Deployed into the kyverno namespace alongside Kyverno itself.
+policy-reporter:
+  enabled: true
+  namespaceOverride: kyverno
+
+  ui:
+    enabled: true
+    replicaCount: 1
+    httproute:
+      enabled: true
+      parentRefs:
+        - name: internal
+          namespace: cilium-gateway
+      hostnames:
+        - kyverno.internal.haustorium.net

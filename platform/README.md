@@ -38,9 +38,22 @@ applied out-of-band by `./platform/install-crds.sh` and `values.yaml` sets `kyve
 false`. Run the script before the first install and before any upgrade that bumps the Kyverno
 version.
 
-> **First install:** gate policies off for pass 1 (`--set policies.enabled=false
-> --set operator.enabled=false`), wait for Kyverno to be ready, then re-enable on a follow-up
-> upgrade — the `ClusterIssuer` / policy CRDs aren't available until the webhook is live.
+```sh
+helm dependency build platform
+./platform/install-crds.sh
+
+# Pass 1: Kyverno only (webhook not ready yet to validate CEL policy CRDs)
+helm install homelab-platform platform -n kyverno --create-namespace \
+  --set policies.enabled=false --set operator.enabled=false
+kubectl -n kyverno wait --for=condition=available deploy --all --timeout=120s
+
+# Pass 2: enable policies + operator
+helm upgrade homelab-platform platform -n kyverno
+
+# Subsequent upgrades (CRDs already present)
+./platform/install-crds.sh   # only needed when bumping the Kyverno chart version
+helm upgrade homelab-platform platform -n kyverno
+```
 
 > **Migrating from a release that bundled CRDs:** annotate existing CRDs with
 > `helm.sh/resource-policy=keep` before upgrading to `crds.install: false`, otherwise Helm prunes

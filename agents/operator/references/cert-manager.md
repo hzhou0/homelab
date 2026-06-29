@@ -22,6 +22,12 @@ Alternatively, `cloudflare.apiToken` has the chart create the Secret inline.
 ## Install (two passes)
 
 The `ClusterIssuer` is validated by cert-manager's own webhook, so it can't be created in the same
-pass that installs cert-manager. Install with `acme.enabled=false` first, wait for the controller
-to be ready, then upgrade with `acme.enabled=true`. Install this **before** `homelab-cilium` so
-the Gateway's `Certificate` can resolve its issuer.
+pass that installs cert-manager. Install this **before** `homelab-cilium`.
+
+```sh
+helm dependency build cert-manager
+helm install homelab-cert-manager cert-manager -n cert-manager --create-namespace \
+  --set acme.enabled=false
+kubectl -n cert-manager wait --for=condition=available deploy --all --timeout=120s
+helm upgrade homelab-cert-manager cert-manager -n cert-manager --set acme.enabled=true
+```

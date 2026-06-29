@@ -66,6 +66,17 @@ so a node on wifi is not subject to the lockdown.
 `hubble.internal.haustorium.net` (see `hubble-ui-route.yaml` + `gateway.hubbleUI` in
 `values.yaml`), gated by the gateway's `allowedCIDRs`.
 
+## Install / upgrade
+
+```sh
+helm dependency build cilium
+helm upgrade cilium cilium -n kube-system
+```
+
+> On first adoption of the CLI-created release, Helm will refuse existing objects ("exists and
+> cannot be imported"). Use `--take-ownership` (Helm ≥3.17) or pre-annotate the Cilium objects
+> with `meta.helm.sh/release-name=cilium` and `app.kubernetes.io/managed-by=Helm`.
+
 ## The ingress Gateway
 
 One `Gateway` (`gatewayClassName: cilium`) named `internal` in `cilium-gateway`, HTTPS:443 +
