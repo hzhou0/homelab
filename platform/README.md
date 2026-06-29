@@ -39,36 +39,29 @@ autonomous operator on vetted images.
 
 ```sh
 helm dependency build platform
-
-# 1. Kyverno CRDs FIRST, out-of-band (see below) — server-side apply, they're too big
-#    for client-side. Render with crds.install temporarily on, keep only the CRD docs:
-helm template homelab-platform platform -n kyverno --set kyverno.crds.install=true 2>/dev/null \
-  | awk 'BEGIN{RS="\n---\n"} /kind: CustomResourceDefinition/{print "---"; print}' \
-  | kubectl apply --server-side -f -
-
-# 2. Then the release itself (chart default keeps kyverno.crds.install=false).
+./platform/install-crds.sh                              # Kyverno CRDs, out-of-band (see below)
 helm install homelab-platform platform -n kyverno --create-namespace
 ```
 
-> **Kyverno CRDs (managed out-of-band).** Kyverno's 22 CRDs render to ~5.7MB; gzipped they push
-> the Helm **release Secret** past Kubernetes' 1MB object limit (`data: Too long: may not be more
-> than 1048576 bytes`). So the chart sets `kyverno.crds.install: false` and the CRDs are applied
-> separately (step 1 above), keeping the release object ~100KB. They must also be applied with
-> `kubectl apply --server-side` — the full CRD schemas exceed the 256KB client-side
-> `last-applied-configuration` annotation limit.
+> **Kyverno CRDs (installed out-of-band).** Helm stores the **entire chart** inside its release
+> Secret, and Kyverno bundles ~5.6MB of CRD source (the `crds` + `kyverno-api` subcharts). That
+> exceeds Kubernetes' 1MB Secret limit (`data: Too long: may not be more than 1048576 bytes`) no
+> matter what *renders* — per-CRD `crds.groups.*` toggles only affect rendering, not the stored
+> chart, so they can't fix it. So `values.yaml` sets **`kyverno.crds.install: false`**, which makes
+> Helm **prune** those conditional subcharts from the release entirely (the kyverno chart drops from
+> ~6.5MB to ~885KB; the release Secret lands ~220KB). The CRDs are applied separately by
+> **`./platform/install-crds.sh`** (`kubectl apply --server-side`, rendered from the pinned chart so
+> they track the engine version). Run it before the first `helm install`, and again before any
+> `helm upgrade` that bumps the Kyverno chart version.
 >
-> **Upgrading Kyverno:** re-run step 1 with the new chart version before `helm upgrade`.
->
-> **Migrating an existing release that already manages the CRDs** (avoids Helm pruning — and thus
-> deleting — them, which would drop every policy):
+> **Migrating an existing release that previously bundled the CRDs** — a plain upgrade to
+> `crds.install: false` would make Helm *prune (delete)* the CRDs as they leave the manifest, which
+> cascades to **every policy and custom resource**. Tell Helm to keep them first:
 > ```sh
-> # a) Tell Helm to keep the live CRDs, so removing them from the manifest won't delete them:
+> ./platform/install-crds.sh                            # ensure CRDs exist + adopt the kubectl field manager
 > kubectl get crd -o name | grep -E 'kyverno\.io|wgpolicyk8s\.io' \
 >   | xargs -I{} kubectl annotate {} helm.sh/resource-policy=keep --overwrite
-> # b) Upgrade with CRDs now excluded from the release (shrinks the Secret):
-> helm upgrade homelab-platform platform -n kyverno
-> # c) Confirm the CRDs and policies survived:
-> kubectl get crd | grep -c kyverno.io ;  kubectl get vpol,mpol,gpol
+> helm upgrade homelab-platform platform -n kyverno     # now small; CRDs survive the prune
 > ```
 >
 > If you hit a CRD-not-found race on a fresh install, gate the policies off for the first pass

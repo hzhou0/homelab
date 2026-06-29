@@ -85,6 +85,60 @@ cilium status --wait
 > If you ever install under a *different* release name, Helm will refuse the CLI-created objects
 > ("exists and cannot be imported"); use `--take-ownership` (Helm ≥3.17) or re-annotate them.
 
+## Host firewall (node lockdown)
+
+TCP/SCTP into the **nodes** (the host network namespace — API server `6443`, kubelet `10250`, …)
+is restricted to **in-cluster sources only**, plus the admin hosts in `hostFirewall.adminCIDRs`.
+This is a Cilium *host policy* (`host-firewall.yaml` — a `CiliumClusterwideNetworkPolicy` with a
+`nodeSelector`, enabled by `cilium.hostFirewall.enabled`). Cilium identities express "cluster"
+directly, so the **DHCP agent nodes need no static IPs** — `remote-node`/`cluster` track them.
+
+UDP is deliberately left open. Selecting the host flips host-ingress to default-deny for *all*
+protocols (Cilium's default-deny is per-direction, not per-protocol), so the policy re-allows all
+UDP from any source to keep **DHCP lease renewal, DNS, NTP and vxlan** alive. Net effect: only
+**TCP/SCTP from `world`** (the rest of the LAN + internet) is dropped.
+
+> **Roll out in audit mode first — a wrong allow-set can lock out the kubelet and brick the node.**
+> There is no CRD field for audit; set it on each node's host endpoint (identity `1`), watch, then
+> enforce. Hubble is **not** required — `cilium monitor` reads policy verdicts straight off the agent.
+> Run this **per node** (once for each `cilium` pod):
+> ```sh
+> CILIUM=$(kubectl -n kube-system get pod -l k8s-app=cilium -o name | head -1)   # repeat per node
+> HOST_EP=$(kubectl -n kube-system exec $CILIUM -- cilium endpoint list -o json \
+>   | jq '.[] | select(.status.identity.id==1) | .id')
+> kubectl -n kube-system exec $CILIUM -- cilium endpoint config $HOST_EP PolicyAuditMode=Enabled
+>
+> helm upgrade cilium cilium -n kube-system          # apply the policy (now audited, nothing dropped)
+>
+> # watch verdicts: in audit mode, traffic that WOULD drop is logged as `action audit` but allowed.
+> # Confirm only unwanted world TCP/SCTP shows up (nothing from nodes/pods/admin hosts):
+> hubble observe --type policy-verdict --verdict AUDIT           # cluster-wide, via Hubble relay
+> #   or, with no Hubble at all, per-node off the agent:
+> kubectl -n kube-system exec $CILIUM -- cilium monitor -t policy-verdict
+>
+> # once clean, enforce by turning audit back off:
+> kubectl -n kube-system exec $CILIUM -- cilium endpoint config $HOST_EP PolicyAuditMode=Disabled
+> ```
+> Set `hostFirewall.adminCIDRs: []` for strictly cluster-only (no external kubectl path), or
+> `hostFirewall.enabled: false` to drop the lockdown entirely.
+
+## Hubble (observability)
+
+`hubble.enabled` + `relay` + `ui` are on (`values.yaml` → `cilium.hubble`). The per-node Hubble
+servers stream flows; `hubble-relay` aggregates them cluster-wide; `hubble-ui` is the dashboard.
+TLS between agent and relay is auto-provisioned. Access the UI:
+
+```sh
+cilium hubble ui                         # port-forwards hubble-ui and opens a browser
+# CLI flows (port-forward relay once: `cilium hubble port-forward &`):
+hubble observe --follow
+hubble status
+```
+
+To reach the UI through the shared Gateway instead of a port-forward, add an `HTTPRoute` for
+`hubble.internal.haustorium.net` targeting the `hubble-ui` Service in `kube-system` — the gateway's
+IP allow-list already restricts who can connect. (Not shipped by default; it's an ops dashboard.)
+
 ## The ingress Gateway
 
 One `Gateway` (`gatewayClassName: cilium`) named `internal` in the `cilium-gateway` namespace, with
@@ -96,6 +150,19 @@ platform's generated default-ingress NetworkPolicy admits gateway→backend traf
   opnsense-operator create a wildcard Unbound override pointing at the gateway's LB IP — the
   Cilium-assigned `10.0.0.100` on its backing `cilium-gateway-internal` Service. No
   `homelab.lab/expose`, so it's **internal-only** (no WAN port-forward).
+- **NetworkPolicy (important):** Cilium enforces Gateway traffic at **two** policy boundaries —
+  *clients → `ingress` proxy* and *`ingress` proxy → backend* — both using Cilium's reserved
+  `ingress` identity. The platform generates a **default-deny** ingress NetworkPolicy per
+  `app-*`/`tool-*` namespace, and a vanilla k8s NetworkPolicy can match neither boundary, so the
+  route fails: **503** if the proxy→backend hop is dropped, **403 "Access denied"** (from the
+  `cilium.l7policy` filter) if the client→proxy hop is denied. This chart ships two
+  `CiliumClusterwideNetworkPolicy`s (gated by `gateway.allowBackendsFromIngress`):
+  `allow-clients-to-gateway-ingress` (world/cluster → `ingress`) and
+  `allow-gateway-ingress-to-backends` (`ingress` → all backends). They **union** with the
+  per-namespace deny — they don't replace it — and since the `ingress` identity only originates
+  from this gateway's Envoy, pod-to-pod isolation between namespaces is unchanged. (Labelling the
+  gateway namespace `homelab.lab/ingress=true` does **not** help — there's no pod there to match;
+  the traffic is the reserved `ingress` entity.)
 - **TLS:** a cert-manager `Certificate` requests a wildcard cert for `*.internal.haustorium.net`
   into the `internal-haustorium-wildcard-tls` Secret, via the `letsencrypt-cloudflare` ClusterIssuer
   shipped by the **`cert-manager` chart — install that first.**

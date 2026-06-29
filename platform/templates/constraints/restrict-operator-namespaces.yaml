@@ -19,17 +19,20 @@ spec:
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
-        operations: ["CREATE", "DELETE"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["namespaces"]
   matchConditions:
     # Only constrain the operator ServiceAccount; admins are unaffected.
     - name: only-operator
       expression: "request.userInfo.username == '{{ include "platform.operatorUsername" . }}'"
   validations:
-    # request.name works for CREATE and DELETE (object is null on delete). The
-    # operator may only touch app-*/tool-* namespaces, and never its own.
+    # request.name works for CREATE, UPDATE and DELETE (object is null on delete). The
+    # operator may only touch app-*/tool-* namespaces, and never its own -- so it can
+    # create/delete and patch (e.g. update homelab.lab/notes) only its own tiers, never
+    # kube-system, kyverno, database, etc. (PSA labels are re-stamped on UPDATE by
+    # namespace-psa-labels, so a patch cannot widen Pod Security.)
     - expression: "(request.name.startsWith('{{ .Values.prefixes.app }}') || request.name.startsWith('{{ .Values.prefixes.tool }}')) && request.name != '{{ .Values.operator.namespace }}'"
-      message: "The operator may only create or delete app-* / tool-* namespaces (and not its own)."
+      message: "The operator may only create, update or delete app-* / tool-* namespaces (and not its own)."
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

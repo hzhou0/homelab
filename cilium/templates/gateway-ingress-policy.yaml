@@ -1,0 +1,95 @@
+{{- if and .Values.gateway.enabled .Values.gateway.allowBackendsFromIngress }}
+# Make the shared Gateway work alongside the platform's default-deny ingress NetworkPolicies.
+#
+# Cilium enforces Gateway API traffic at TWO policy boundaries (see Cilium docs, "Gateway API
+# and Network Policy"): clients must be allowed to reach the reserved `ingress` identity (the
+# gateway's Envoy proxy), AND the `ingress` identity must be allowed to reach the backends.
+# The platform applies a default-deny ingress NetworkPolicy in every app-*/tool-* namespace, and
+# a vanilla k8s NetworkPolicy can match neither the `ingress` entity (no pod to select) nor the
+# enforcement on the proxy itself -- so without these two Cilium-native allows the route returns
+# 503 (boundary 2 dropped) or 403 "Access denied" from cilium.l7policy (boundary 1 denied).
+# Cilium unions allow-lists, so these ADD to (never replace) the per-namespace deny, and the
+# `ingress` identity only ever originates from this gateway's Envoy -- so pod-to-pod isolation
+# between namespaces is unchanged.
+
+# Boundary 1: clients -> ingress proxy. This is the cluster's outer ingress gate.
+{{- if .Values.gateway.allowedCIDRs }}
+# Locked down to an explicit L3 allow-list (gateway.allowedCIDRs): ONLY these source IPs may
+# reach the gateway Envoy at all. Every other source -- the rest of the LAN, the wider world,
+# and in-cluster pods -- is dropped here, before TLS or any route/app sees the connection.
+# Cilium creates a per-prefix CIDR identity, so an allowed host matches even though it sits on
+# the same LAN as the gateway IP. (Per-route/app authz still applies on top for these hosts.)
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: allow-clients-to-gateway-ingress
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  endpointSelector:
+    matchLabels:
+      reserved:ingress: ""
+  ingress:
+    - fromCIDR:
+        {{- range .Values.gateway.allowedCIDRs }}
+        - {{ . | quote }}
+        {{- end }}
+{{- else }}
+# No allow-list configured -> fall back to the open front door (world + in-cluster). Access
+# control is then entirely the route/app's responsibility. Set gateway.allowedCIDRs to lock down.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: allow-clients-to-gateway-ingress
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  endpointSelector:
+    matchLabels:
+      reserved:ingress: ""
+  ingress:
+    - fromEntities:
+        - world
+        - cluster
+{{- end }}
+---
+# Boundary 2: ingress proxy -> backends. Let the gateway Envoy reach the pods it routes to.
+#
+# CRITICAL: this selects backend pods and adds an `ingress` allow -- but the act of selecting a
+# pod with an ingress rule flips it to DEFAULT-DENY ingress. That's intended ONLY for app-*/tool-*
+# backends, which the platform ALREADY default-denies (its per-namespace default-ingress netpol).
+# A bare `endpointSelector: {}` would also select system pods that have NO default-deny of their
+# own -- most importantly coredns -- breaking pod->coredns DNS cluster-wide (the proxy is the only
+# allowed source). Cilium selectors can't prefix-match "app-*/tool-*", so we EXCLUDE the known
+# non-governed namespaces instead; app-*/tool-* backends (incl. new ones) stay selected and
+# reachable, while kube-system et al. keep their default-allow.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: allow-gateway-ingress-to-backends
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  endpointSelector:
+    matchExpressions:
+      # Only ever select real namespaced pods. Reserved/label-less endpoints (notably
+      # `reserved:health`, used for cross-node connectivity checks) carry NO namespace label, and a
+      # bare `NotIn` MATCHES label-less endpoints -- which swept in the health endpoint and broke
+      # cilium-health ("Endpoints 0/1"). Requiring the namespace label to Exist excludes them.
+      - key: k8s:io.kubernetes.pod.namespace
+        operator: Exists
+      # ...and of the real pods, skip the non-governed (system) namespaces, which have no
+      # default-deny of their own and would break if swept in (see backendsExcludeNamespaces).
+      - key: k8s:io.kubernetes.pod.namespace
+        operator: NotIn
+        values:
+          {{- range .Values.gateway.backendsExcludeNamespaces }}
+          - {{ . | quote }}
+          {{- end }}
+  ingress:
+    - fromEntities:
+        - ingress
+{{- end }}

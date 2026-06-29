@@ -1,0 +1,77 @@
+{{- if .Values.hostFirewall.enabled }}
+# Host firewall: TCP/SCTP into the NODES is cluster-only.
+#
+# This is a "host policy" -- it has a `nodeSelector` (not an `endpointSelector`), which is what
+# makes Cilium apply it to the node's HOST network namespace (the API server on 6443, kubelet on
+# 10250, etc.) rather than to a pod. It requires cilium.hostFirewall.enabled (enable-host-firewall).
+# It enforces only on Cilium's managed devices, which `cilium.devices: "eth+"` pins to the wired
+# ethernet NICs -- so a node on wifi (wlan0) is not subject to this lockdown.
+#
+# Selecting the host with an ingress rule flips host-ingress to DEFAULT-DENY -- and Cilium's
+# default-deny is per *direction*, not per *protocol*. So to honour "lock down TCP/SCTP but leave
+# UDP alone" we:
+#   1. re-allow ALL traffic (every protocol/port) from in-cluster identities + the admin hosts, and
+#   2. re-allow ALL UDP from any source (so DHCP lease renewal, DNS, NTP and vxlan keep working).
+# The net effect is exactly the requested lockdown: TCP and SCTP from `world` (the rest of the LAN
+# and the internet) match nothing and are dropped; UDP and all in-cluster traffic are unaffected.
+#
+# Egress is left wide open (enableDefaultDeny.egress: false) -- nodes must reach DHCP/DNS/NTP, the
+# internet, etc. Connection replies are allowed by conntrack regardless of these ingress rules.
+#
+# !! Roll this out in AUDIT mode first to avoid locking yourself (or the kubelet) out -- there is no
+#    CRD field for that; see cilium/README.md "Host firewall" for the `cilium endpoint config
+#    PolicyAuditMode=Enabled` procedure. Then watch `hubble observe --verdict DROPPED` before
+#    enforcing.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: host-firewall-cluster-only
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  description: >-
+    Host firewall: default-deny host ingress, re-allowing all traffic from in-cluster
+    identities and the admin hosts plus all UDP from anywhere. Net effect: TCP/SCTP into
+    the nodes is cluster-only; UDP (DHCP/DNS/NTP/vxlan) is unaffected.
+  # Select every node's HOST endpoint. This MUST be non-empty: an empty nodeSelector ({})
+  # matches all endpoints -- pods included -- which flips the whole cluster to default-deny
+  # ingress and breaks pod-to-pod (DNS, cross-node cilium-health). `kubernetes.io/os: linux`
+  # is carried by every node and by no pod, so it scopes the policy to host endpoints only.
+  nodeSelector:
+    matchLabels:
+      kubernetes.io/os: linux
+  enableDefaultDeny:
+    ingress: true
+    egress: false
+  ingress:
+    # 1) In-cluster sources keep full access on every protocol/port. These reserved identities
+    #    track membership by Cilium identity, so the DHCP agents need no static IPs:
+    #      cluster       - all endpoints (pods + nodes) of this cluster
+    #      remote-node   - the other k3s nodes specifically
+    #      health        - cilium-health probes (node connectivity checks)
+    #      kube-apiserver- the API server identity (kubelet <-> apiserver)
+    #      ingress       - the gateway's Envoy ingress proxy
+    - fromEntities:
+        - cluster
+        - remote-node
+        - health
+        - kube-apiserver
+        - ingress
+    {{- with .Values.hostFirewall.adminCIDRs }}
+    # 2) Admin hosts: full host access (e.g. kubectl to the API server on 6443).
+    - fromCIDR:
+        {{- range . }}
+        - {{ . | quote }}
+        {{- end }}
+    {{- end }}
+    # 3) Preserve UDP from any source so the per-direction default-deny doesn't strand node
+    #    networking (DHCP/DNS/NTP/vxlan). Only TCP/SCTP from `world` is left denied.
+    - fromEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "1"
+              endPort: 65535
+              protocol: UDP
+{{- end }}

@@ -14,12 +14,15 @@ metadata:
   labels:
 {{ include "platform.labels" . | indent 4 }}
 rules:
-  # Self-provision AND tear down tier namespaces. Create/delete are cluster-wide
-  # at the RBAC layer (RBAC can't scope by name prefix), but restrict-operator-
-  # namespaces gates both CREATE and DELETE to app-*/tool-* names.
+  # Self-provision, annotate, and tear down tier namespaces. update/patch let the
+  # operator maintain provenance metadata (e.g. the homelab.lab/notes annotation)
+  # on namespaces it owns. All of create/update/patch/delete are cluster-wide at the
+  # RBAC layer (RBAC can't scope by name prefix), but restrict-operator-namespaces
+  # gates them to app-*/tool-* names; and namespace-psa-labels re-stamps PSA on every
+  # UPDATE, so a patch cannot widen Pod Security or escape the two tiers.
   - apiGroups: [""]
     resources: ["namespaces"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Read-only cluster view for placement decisions.
   - apiGroups: [""]
     resources: ["nodes"]

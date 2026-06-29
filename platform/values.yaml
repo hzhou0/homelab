@@ -18,16 +18,18 @@ kyverno:
     enabled: false             # turn on later for a policy-report dashboard
   cleanupController:
     enabled: false
+  # Do NOT install Kyverno's CRDs through this Helm release. Kyverno bundles ~5.6MB of CRD source
+  # (the `crds` + `kyverno-api` subcharts), and Helm stores the ENTIRE chart in the release Secret
+  # — so the full CRD set blows past Kubernetes' 1MB Secret limit ("data: Too long") no matter what
+  # renders. (Per-CRD `groups.*` toggles only affect rendering, not the stored chart source, so
+  # they can't fix this.) Setting install:false makes Helm PRUNE those conditional subcharts from
+  # the release entirely — the kyverno chart drops from ~6.5MB to ~885KB and the release fits.
+  #
+  # The CRDs are instead applied out-of-band (they live on the cluster, not in any Helm release):
+  #   ./platform/install-crds.sh        # kubectl apply --server-side, run before install/upgrade
+  # See README "Kyverno CRDs (installed out-of-band)".
   crds:
-    install: true
-    kyverno:
-      cleanuppolicies: false
-      clustercleanuppolicies: false
-      clusterpolicies: false
-      globalcontextentries: false
-      policies: false
-      policyexceptions: false
-      updaterequests: false
+    install: false
 
 # Our ClusterPolicies. Toggle off to install Kyverno alone (see README caveat
 # about CRD ordering on a fresh cluster).
@@ -92,7 +94,7 @@ imageAllowlist:
   # (ungoverned) namespace, so allowlisting is not strictly required — listed
   # here for a complete image catalogue. Bump the tag on upgrade.
   - ghcr.io/hzhou0/opnsense-operator:0.1.0
-  - ghcr.io/headlamp-k8s/headlamp:0.43.0
+  - ghcr.io/headlamp-k8s/headlamp:v0.43.0
 
   # --- applications (app-* tier) ---
   # - ghcr.io/<org>/<app>:<tag>
