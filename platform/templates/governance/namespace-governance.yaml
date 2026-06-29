@@ -83,6 +83,9 @@ spec:
             "ingress": dyn([dyn({"from": dyn([
               dyn({"podSelector": dyn({})}),
               dyn({"namespaceSelector": dyn({"matchLabels": dyn({"{{ .Values.networkPolicy.ingressFromNamespaceLabel }}": "true"})})})
+              {{- if .Values.networkPolicy.monitoringNamespace }},
+              dyn({"namespaceSelector": dyn({"matchLabels": dyn({"kubernetes.io/metadata.name": "{{ .Values.networkPolicy.monitoringNamespace }}"})})})
+              {{- end }}
             ])})])
           })
         }

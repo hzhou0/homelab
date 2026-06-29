@@ -121,5 +121,6 @@ gateway:
     - kyverno
     - rook-ceph
     - database
+    - monitoring
 
   allowBackendsFromIngress: true

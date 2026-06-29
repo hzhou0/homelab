@@ -108,6 +108,11 @@ protectedNamespaces:
 networkPolicy:
   enabled: true
   ingressFromNamespaceLabel: "homelab.lab/ingress"
+  # Namespace whose pods (Prometheus) are allowed to scrape /metrics on every governed app-*/tool-*
+  # pod, on top of the default-deny ingress. Matched by the immutable kubernetes.io/metadata.name
+  # label Kubernetes stamps on every namespace, so the monitoring namespace needs no extra labeling.
+  # Set empty to drop the allowance.
+  monitoringNamespace: "monitoring"
 
 # Policy Reporter: Kyverno policy-report dashboard (subchart).
 # Deployed into the kyverno namespace alongside Kyverno itself.

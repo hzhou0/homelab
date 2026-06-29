@@ -1,0 +1,78 @@
+# homelab-monitoring values
+
+# Upstream kube-prometheus-stack subchart values.
+kube-prometheus-stack:
+  enabled: true
+
+  # CRDs (Prometheus, ServiceMonitor, PrometheusRule, ...) are owned by this release. They are
+  # cluster-scoped, which is why this chart is cluster-admin territory, not the operator's.
+  crds:
+    enabled: true
+
+  prometheus:
+    prometheusSpec:
+      replicas: 1
+      retention: 15d
+      # Discover ServiceMonitors/PodMonitors/PrometheusRules in ALL namespaces, not just those
+      # carrying this release's labels. Without this, app-*/tool-* workloads that ship their own
+      # ServiceMonitor would be invisible to Prometheus.
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+      probeSelectorNilUsesHelmValues: false
+      # Default is emptyDir (metrics are lost on pod restart). Point storageClassName at the
+      # cluster's Ceph block class to make Prometheus durable; left unset to avoid assuming a
+      # storage class exists at install time.
+      # storageSpec:
+      #   volumeClaimTemplate:
+      #     spec:
+      #       storageClassName: ceph-block
+      #       accessModes: ["ReadWriteOnce"]
+      #       resources:
+      #         requests:
+      #           storage: 20Gi
+
+  alertmanager:
+    alertmanagerSpec:
+      replicas: 1
+
+  grafana:
+    enabled: true
+    # Exposed via the shared Cilium Gateway (HTTPRoute in templates/grafana-route.yaml), so the
+    # subchart's own Ingress is off.
+    ingress:
+      enabled: false
+    # adminPassword defaults to the upstream "prom-operator". Override out-of-git, e.g. with
+    # admin.existingSecret pointing at a Secret pre-created in the monitoring namespace.
+    grafana.ini:
+      server:
+        root_url: "https://grafana.internal.haustorium.net"
+      # No Grafana login: every visitor is an anonymous Admin and the login form is hidden. Safe
+      # only because the gateway's L3 allow-list (gateway.allowedCIDRs in the cilium chart) already
+      # restricts who can reach Grafana to the admin hosts — anonymous here means "those hosts",
+      # not the world. Drop this block to restore the normal login.
+      auth.anonymous:
+        enabled: true
+        org_role: Admin
+      auth:
+        disable_login_form: true
+
+# ---------------------------------------------------------------------------
+# Grafana ingress via the shared Cilium Gateway: grafana.internal.haustorium.net
+# ---------------------------------------------------------------------------
+# Mirrors how the Hubble UI is exposed (see homelab-cilium hubble-ui-route.yaml). The HTTPRoute
+# lives in the monitoring namespace (same as the Grafana Service, so no ReferenceGrant) and
+# attaches to the `internal` Gateway in cilium-gateway. TLS is terminated by the gateway's
+# wildcard cert; reachability is bounded by the gateway's L3 allow-list (gateway.allowedCIDRs in
+# the cilium chart). NOTE: add `monitoring` to gateway.backendsExcludeNamespaces in the cilium
+# chart so the gateway→backends policy does not flip this (non-governed) namespace to default-deny.
+gateway:
+  enabled: true
+  # Must match gateway.name / gateway.namespace in the homelab-cilium chart.
+  name: internal
+  namespace: cilium-gateway
+  hostname: grafana.internal.haustorium.net
+  # Grafana Service created by the subchart: <release>-grafana on port 80. Default assumes the
+  # release is named `homelab-monitoring`.
+  serviceName: homelab-monitoring-grafana
+  servicePort: 80
