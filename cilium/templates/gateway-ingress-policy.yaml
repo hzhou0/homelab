@@ -1,10 +1,11 @@
-{{- if and .Values.gateway.enabled .Values.gateway.allowBackendsFromIngress }}
-# Cilium enforces Gateway API traffic at two policy boundaries: clients→`ingress` proxy, and
-# `ingress` proxy→backends. A vanilla k8s NetworkPolicy cannot match the reserved `ingress`
-# identity, so both hops need Cilium-native allows. These union with (never replace) the
-# platform's per-namespace default-deny.
-
-# Boundary 1: clients → ingress proxy.
+{{- if .Values.gateway.enabled }}
+# Clients → `ingress` proxy L3 allow-list. A vanilla k8s NetworkPolicy cannot match the reserved
+# `ingress` identity, so this front-door allow is Cilium-native.
+#
+# The reverse hop (ingress proxy → backend pods) needs no policy here: the east-west-baseline-allow
+# CCNP already grants `fromEntities: [ingress]` to every pod, so any Gateway backend is reachable by
+# the proxy regardless of namespace. (It used to be a second CCNP scoped by backendsExcludeNamespaces;
+# that became redundant once the baseline allow + the platform's namespace-default-ingress landed.)
 {{- if .Values.gateway.allowedCIDRs }}
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
@@ -39,35 +40,4 @@ spec:
         - world
         - cluster
 {{- end }}
----
-# Boundary 2: ingress proxy → backends.
-#
-# Selecting a pod with an ingress rule flips it to default-deny ingress — safe only for
-# app-*/tool-* which the platform already default-denies. endpointSelector must exclude system
-# namespaces (no default-deny of their own), otherwise coredns and other system pods get swept
-# in and break. Cilium can't prefix-match app-*/tool-*, so we blocklist non-governed namespaces.
-#
-# Exists requirement is critical: a bare NotIn MATCHES label-less endpoints (reserved:health),
-# which broke cross-node cilium-health. Requiring namespace label Exists excludes them.
-apiVersion: cilium.io/v2
-kind: CiliumClusterwideNetworkPolicy
-metadata:
-  name: allow-gateway-ingress-to-backends
-  labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/part-of: homelab-cilium
-spec:
-  endpointSelector:
-    matchExpressions:
-      - key: k8s:io.kubernetes.pod.namespace
-        operator: Exists
-      - key: k8s:io.kubernetes.pod.namespace
-        operator: NotIn
-        values:
-          {{- range .Values.gateway.backendsExcludeNamespaces }}
-          - {{ . | quote }}
-          {{- end }}
-  ingress:
-    - fromEntities:
-        - ingress
 {{- end }}

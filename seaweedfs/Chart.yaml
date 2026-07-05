@@ -1,0 +1,24 @@
+apiVersion: v2
+name: homelab-seaweedfs
+description: >-
+  SeaweedFS for the homelab: the caching S3 endpoint that the hypha gateway proxies. Redundancy
+  is off (replication 000) and it is tuned for latency; master/volume/filer data sit on node-local
+  NVMe via the topolvm-provisioner StorageClass (homelab-topolvm chart) on vg=nvme nodes.
+  Exposes the SeaweedFS S3 API in-cluster only. hypha is a SEPARATE deployment that treats this as an
+  interchangeable cache S3 endpoint — SeaweedFS is not embedded in the proxy. Foundational like
+  cilium/cert-manager (owns a StatefulSet + PVCs and node-scoped storage), installed by cluster-admin
+  into its own seaweedfs namespace, not an app-*/tool-* one.
+type: application
+version: 0.1.0
+appVersion: "4.37"
+keywords:
+  - seaweedfs
+  - s3
+  - object-storage
+  - cache
+  - homelab
+dependencies:
+  - name: seaweedfs
+    version: "4.37.0"
+    repository: https://seaweedfs.github.io/seaweedfs/helm
+    condition: seaweedfs.enabled

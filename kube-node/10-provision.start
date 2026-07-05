@@ -18,8 +18,9 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 NODE_ROLE=$(cat /etc/node-role)
 DISK="/dev/nvme0n1"
 
-# dhcpcd is installed here (from the on-ISO cache) so setup-disk carries it onto
-# the target; without it the loopback-only interfaces leave the node with no net.
+# Installed from the on-ISO cache: parted/grub/etc. are the disk-setup tools;
+# dhcpcd brings the ramdisk online below. setup-disk lays down a minimal base and
+# does NOT clone dhcpcd, so it is installed into the target separately (see below).
 apk add -q --no-network parted e2fsprogs dosfstools grub grub-efi dhcpcd
 
 # The boot runlevel ran before dhcpcd existed, so start it now to get the ramdisk
@@ -99,8 +100,10 @@ cp /etc/k3s-token /mnt/etc/k3s-token
 cp "/etc/local.d/20-bootstrap-${NODE_ROLE}.start" /mnt/etc/local.d/20-bootstrap.start
 chmod +x /mnt/etc/local.d/20-bootstrap.start
 chroot /mnt rc-update add local default
-# Enable dhcpcd on the target explicitly — the overlay's runlevel symlink isn't
-# relied on to survive setup-disk (same reason 'local' is added here).
+# setup-disk drops dhcpcd, so the installed root would boot loopback-only with no
+# way to recover (phase 2 has no network to apk add it). Install it into the
+# target while the ramdisk is still online, then enable it for the next boot.
+apk add -q --root /mnt dhcpcd
 chroot /mnt rc-update add dhcpcd boot
 
 umount /mnt/boot

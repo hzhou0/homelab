@@ -114,6 +114,22 @@ networkPolicy:
   # Set empty to drop the allowance.
   monitoringNamespace: "monitoring"
 
+  # The default-ingress fence (namespace-default-ingress.yaml) is stamped into EVERY namespace
+  # except these — app-*, tool-* and foundational (cluster-admin) namespaces all get it, so a new
+  # deployment is default-deny east-west unless explicitly granted. Requires cilium's
+  # east-west-baseline-allow CCNP live first (it re-allows kubelet probes / admission webhooks /
+  # gateway). Excluded here: CoreDNS (kube-system) receives DNS from every pod; the rest are vendor
+  # infra with cross-cutting apiserver/webhook flows or the gateway data path.
+  excludeNamespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+    - default
+    - cilium-gateway
+    - cilium-secrets
+    - cert-manager
+    - kyverno
+
 # Policy Reporter: Kyverno policy-report dashboard (subchart).
 # Deployed into the kyverno namespace alongside Kyverno itself.
 policy-reporter:

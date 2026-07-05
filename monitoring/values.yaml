@@ -10,6 +10,7 @@ kube-prometheus-stack:
     enabled: true
 
   prometheus:
+    enabled: true
     prometheusSpec:
       replicas: 1
       retention: 15d
@@ -20,6 +21,15 @@ kube-prometheus-stack:
       podMonitorSelectorNilUsesHelmValues: false
       ruleSelectorNilUsesHelmValues: false
       probeSelectorNilUsesHelmValues: false
+      # Lower the Go GC threshold from the default 100 (collect when the heap has grown 100%) to 40,
+      # so Prometheus collects earlier and settles at a smaller resident heap. This is a soft knob,
+      # not a memory limit: it trades a little CPU (which is near-idle here) for lower steady-state
+      # memory and cannot OOMKill the process. Env merged onto the operator-generated container.
+      containers:
+        - name: prometheus
+          env:
+            - name: GOGC
+              value: "40"
       # Default is emptyDir (metrics are lost on pod restart). Point storageClassName at the
       # cluster's Ceph block class to make Prometheus durable; left unset to avoid assuming a
       # storage class exists at install time.
@@ -38,6 +48,10 @@ kube-prometheus-stack:
 
   grafana:
     enabled: true
+    # See GOGC note on prometheusSpec above: collect earlier for a smaller heap, no hard limit. Only
+    # the grafana container is Go; the two k8s-sidecar (Python) containers ignore this.
+    env:
+      GOGC: "40"
     # Exposed via the shared Cilium Gateway (HTTPRoute in templates/grafana-route.yaml), so the
     # subchart's own Ingress is off.
     ingress:
@@ -64,8 +78,9 @@ kube-prometheus-stack:
 # lives in the monitoring namespace (same as the Grafana Service, so no ReferenceGrant) and
 # attaches to the `internal` Gateway in cilium-gateway. TLS is terminated by the gateway's
 # wildcard cert; reachability is bounded by the gateway's L3 allow-list (gateway.allowedCIDRs in
-# the cilium chart). NOTE: add `monitoring` to gateway.backendsExcludeNamespaces in the cilium
-# chart so the gateway→backends policy does not flip this (non-governed) namespace to default-deny.
+# the cilium chart). This namespace is default-deny ingress (platform namespace-default-ingress);
+# the gateway still reaches Grafana because cilium's east-west-baseline-allow CCNP admits the
+# `ingress` identity to every pod — no per-namespace carve-out needed.
 gateway:
   enabled: true
   # Must match gateway.name / gateway.namespace in the homelab-cilium chart.
@@ -76,3 +91,19 @@ gateway:
   # release is named `homelab-monitoring`.
   serviceName: homelab-monitoring-grafana
   servicePort: 80
+
+# ---------------------------------------------------------------------------
+# Prometheus ingress via the shared Cilium Gateway: prometheus.internal.haustorium.net
+# ---------------------------------------------------------------------------
+# Same shape as the Grafana gateway block above. Prometheus has no built-in auth (unlike Grafana's
+# anonymous-admin trick) — this
+# is safe only because reachability is already bounded by the gateway's L3 allow-list.
+prometheusGateway:
+  enabled: true
+  name: internal
+  namespace: cilium-gateway
+  hostname: prometheus.internal.haustorium.net
+  # Service created by the kube-prometheus-stack subchart: <release>-kube-pr-prometheus on the
+  # "http-web" port. Default assumes the release is named `homelab-monitoring`.
+  serviceName: homelab-monitoring-kube-pr-prometheus
+  servicePort: 9090

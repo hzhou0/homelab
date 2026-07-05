@@ -21,12 +21,14 @@ The HTTPRoute attaches to the `internal` Gateway in `cilium-gateway` (matching `
 wildcard cert and access is bounded by the gateway's L3 allow-list (`gateway.allowedCIDRs` over
 there). Grafana's own Ingress is disabled in favour of the Gateway API.
 
-Add `monitoring` to `gateway.backendsExcludeNamespaces` in the `homelab-cilium` chart so the
-gateway→backends allow policy doesn't flip this non-governed namespace to default-deny.
+This `monitoring` namespace is itself default-deny ingress (the platform `namespace-default-ingress`
+policy fences every namespace, not just `app-*`/`tool-*`). Gateway traffic to Grafana/Prometheus
+still flows because the `homelab-cilium` `east-west-baseline-allow` CCNP admits the `ingress`
+identity to every pod — no per-namespace carve-out needed.
 
 ## Scraping governed namespaces
 
-`app-*`/`tool-*` namespaces carry a platform default-deny ingress NetworkPolicy. The platform
+Every namespace carries a platform default-deny ingress NetworkPolicy. The platform
 chart's generated `default-ingress` policy admits traffic from this `monitoring` namespace
 (`networkPolicy.monitoringNamespace`, matched by the immutable `kubernetes.io/metadata.name`
 label), so Prometheus can scrape app pods' `/metrics` there with no per-namespace setup. Keep this

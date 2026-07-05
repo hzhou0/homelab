@@ -1,0 +1,23 @@
+{{- if and .Values.prometheusGateway.enabled (index .Values "kube-prometheus-stack" "prometheus" "enabled") }}
+# Expose Prometheus through the shared ingress Gateway. Same shape as grafana-route.yaml: the
+# HTTPRoute sits next to the Prometheus Service (monitoring namespace, no ReferenceGrant needed)
+# and attaches cross-namespace to the `internal` Gateway.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: prometheus
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-monitoring
+spec:
+  parentRefs:
+    - name: {{ .Values.prometheusGateway.name }}
+      namespace: {{ .Values.prometheusGateway.namespace }}
+  hostnames:
+    - {{ .Values.prometheusGateway.hostname | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ .Values.prometheusGateway.serviceName }}
+          port: {{ .Values.prometheusGateway.servicePort }}
+{{- end }}

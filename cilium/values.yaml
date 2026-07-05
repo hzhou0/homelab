@@ -50,6 +50,15 @@ cilium:
     burst: 100
 
 # ---------------------------------------------------------------------------
+# East-west baseline allow (pairs with the platform chart's per-namespace default-deny)
+# ---------------------------------------------------------------------------
+# Additive CCNP that re-allows node/control-plane/gateway ingress (kubelet probes, admission
+# webhooks, cilium health, Cilium Gateway) to every pod, so the platform's default-deny does not
+# break them. See templates/east-west-baseline-allow.yaml. Land this BEFORE the platform deny.
+eastWestBaseline:
+  enabled: true
+
+# ---------------------------------------------------------------------------
 # Host firewall
 # ---------------------------------------------------------------------------
 hostFirewall:
@@ -105,22 +114,3 @@ gateway:
   hubbleUI:
     enabled: true
     hostname: hubble.internal.haustorium.net
-
-  # Namespaces excluded from the gateway→backends allow policy. That policy selects pods with an
-  # ingress rule, flipping them to default-deny. Safe only for app-*/tool-* (already default-denied
-  # by the platform). System namespaces have no default-deny of their own — sweeping them in
-  # breaks them (notably kube-system, where it cut off all pod→coredns DNS). Cilium selectors
-  # can't prefix-match app-*/tool-*, so we blocklist the non-governed namespaces instead.
-  backendsExcludeNamespaces:
-    - kube-system
-    - kube-public
-    - kube-node-lease
-    - default
-    - cilium-gateway
-    - cert-manager
-    - kyverno
-    - rook-ceph
-    - database
-    - monitoring
-
-  allowBackendsFromIngress: true

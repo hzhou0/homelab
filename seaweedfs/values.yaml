@@ -1,0 +1,103 @@
+# homelab-seaweedfs values
+#
+# Upstream seaweedfs subchart, configured as hypha's hot cache tier: no redundancy, latency-first,
+# all data on node-local NVMe via topolvm-provisioner. hypha reaches this over the S3 API only, so
+# nothing here is coupled to the proxy — swap SeaweedFS for any S3 cache and hypha is unaffected.
+seaweedfs:
+  enabled: true
+
+  global:
+    # No redundancy anywhere. Durability is hypha's encrypted copy on the remote S3 endpoint, not
+    # local replication — matches the homelab's "backups, not replication" storage philosophy.
+    enableReplication: false
+    replicationPlacement: "000"
+
+  master:
+    enabled: true
+    replicas: 1
+    defaultReplication: "000"
+    # Don't pre-allocate volume files: keeps LV usage proportional to real data so TopoLVM's
+    # capacity tracking stays honest.
+    volumePreallocate: false
+    nodeSelector: |
+      vg: nvme
+    data:
+      type: persistentVolumeClaim
+      storageClass: topolvm-provisioner
+      size: 1Gi
+
+  # Shared defaults for every entry in `volumes:` below (port, grpcPort, index mode, etc.).
+  # `enabled: false` here turns off the chart's own generic, unnamed volume-server group — we
+  # only want the explicitly pinned per-node groups.
+  volume:
+    enabled: false
+
+  # One named StatefulSet per storage node (seaweedfs.volumes, not the singular seaweedfs.volume
+  # a StatefulSet + a replica count can't guarantee one pod per specific node — nothing stops the
+  # scheduler from double-stacking two replicas on the same node while a third sits elsewhere, and
+  # the replica count silently drifts from the real node count as nodes are added/removed. Each
+  # entry here pins one volume server to one named node and sizes its PVC to that node's actual
+  # vg-nvme capacity (read from topolvm_volumegroup_size_bytes), leaving headroom for TopoLVM's
+  # own spare-gb reservation and the master/filer PVCs that may also land on that node.
+  volumes:
+    k3s-server:
+      replicas: 1
+      nodeSelector: |
+        vg: nvme
+        kubernetes.io/hostname: k3s-server
+      dataDirs:
+        - name: data1
+          type: persistentVolumeClaim
+          storageClass: topolvm-provisioner
+          # vg-nvme on this node is 853.87Gi (topolvm_volumegroup_size_bytes); leave 200Gi free.
+          size: 650Gi
+          maxVolumes: 0
+    k3s-compute-cb3c65:
+      replicas: 1
+      nodeSelector: |
+        vg: nvme
+        kubernetes.io/hostname: k3s-compute-cb3c65
+      dataDirs:
+        - name: data1
+          type: persistentVolumeClaim
+          storageClass: topolvm-provisioner
+          # vg-nvme on this node is 376.94Gi (topolvm_volumegroup_size_bytes); leave 200Gi free.
+          size: 175Gi
+          maxVolumes: 0
+
+  filer:
+    enabled: true
+    replicas: 1
+    nodeSelector: |
+      vg: nvme
+    data:
+      type: persistentVolumeClaim
+      storageClass: topolvm-provisioner
+      size: 10Gi
+
+  # Dedicated S3 gateway → a stable <release>-seaweedfs-s3 Service on :8333 for hypha to point at.
+  # Auth is off: reachability is fenced by the namespace NetworkPolicy, and hypha is the only client.
+  s3:
+    enabled: true
+    port: 8333
+    enableAuth: false
+
+# ---------------------------------------------------------------------------
+# Master status UI via the shared Cilium Gateway: seaweedfs.internal.haustorium.net
+# ---------------------------------------------------------------------------
+# Only the MASTER UI (:9333 — cluster topology/health) is exposed, and only to the admin CIDRs the
+# gateway already allow-lists. The S3 (:8333), filer (:8888) and volume (:8080) surfaces are NOT
+# routed: those serve plaintext object bytes and have no auth, so the namespace NetworkPolicy must
+# stay their only door (hypha is the sole intended client). Mirrors the monitoring chart's Grafana/
+# Prometheus routes. NOTE: `seaweedfs` must be in gateway.backendsExcludeNamespaces in the cilium
+# chart (already added) so the gateway→backends policy doesn't flip this namespace to default-deny.
+gateway:
+  enabled: true
+  # Must match gateway.name / gateway.namespace in the homelab-cilium chart.
+  name: internal
+  namespace: cilium-gateway
+  hostname: seaweedfs.internal.haustorium.net
+  # Master Service created by the subchart: <release>-master. Default assumes the release is
+  # named `homelab-seaweedfs`.
+  serviceName: homelab-seaweedfs-master
+  servicePort: 9333

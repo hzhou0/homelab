@@ -1,0 +1,35 @@
+topolvm:
+  enabled: true
+
+  lvmd:
+    nodeSelector:
+      vg: nvme
+    deviceClasses:
+      - name: nvme
+        volume-group: vg-nvme
+        default: true
+        spare-gb: 5
+
+  node:
+    nodeSelector:
+      vg: nvme
+    prometheus:
+      podMonitor:
+        enabled: true
+
+  controller:
+    replicaCount: 1
+
+
+  storageClasses:
+    - name: topolvm-provisioner
+      storageClass:
+        fsType: xfs
+        # volumeBindingMode and allowVolumeExpansion must stay explicit even though they match
+        # the chart's sample values: this whole list replaces the chart's default wholesale, and
+        # Kubernetes' own API defaults for these fields (Immediate, false) differ from what's
+        # wanted here — there's no "inherit from chart default" fallback for an omitted field.
+        volumeBindingMode: WaitForFirstConsumer
+        allowVolumeExpansion: true
+        additionalParameters:
+          "topolvm.io/device-class": "nvme"

@@ -1,7 +1,6 @@
 # Homelab Infrastructure Design Document
 
-**OPNsense + k3s + Ceph + PostgreSQL**
-**Vancouver, BC — May 2026**
+**OPNsense + k3s + Hypha**
 
 ---
 
@@ -25,7 +24,7 @@
 
 ## 1. Overview
 
-This document describes the design of a personal homelab infrastructure located in Vancouver, BC. The system provides network segregation, Kubernetes-based container orchestration, distributed object storage, managed PostgreSQL databases, encrypted offsite backups, and privacy-preserving DNS resolution.
+This document describes the design of a personal homelab infrastructure located. The system provides network segregation, Kubernetes-based container orchestration, a caching and encrypting S3 gateway (Hypha), encrypted offsite backups, and privacy-preserving DNS resolution.
 
 The design prioritizes simplicity, minimal resource overhead, and strong backup/recovery over high availability and replication. The assumption is that downtime during recovery is acceptable for a homelab, but data loss is not.
 
@@ -41,7 +40,7 @@ The design prioritizes simplicity, minimal resource overhead, and strong backup/
 | Managed Switch | Not required (4 NIC ports available) | N/A |
 | Unmanaged Switch | Horaco (8-port, unmanaged) | LAN port multiplier on Port 2 |
 | Wireless AP | TP-Link Archer AX55 (AP mode) | WiFi subnet, dedicated Port 3 |
-| Compute Nodes | Multiple N100 mini PCs (Alpine Linux) | k3s workers, Ceph OSD contributors |
+| Compute Nodes | Multiple N100 mini PCs (Alpine Linux) | k3s workers, SeaweedFS storage nodes |
 | Database Node | Dedicated mini PC | PostgreSQL, local path provisioner |
 | DAS Enclosure | TerraMaster D4-320 (USB 3.2 Gen2, 4-bay) | Database tablespaces via direct mount |
 
@@ -131,7 +130,7 @@ The TP-Link Archer AX55 runs in AP mode. It does not perform NAT, DHCP, or routi
 
 ### 4.1 Telus PureFibre
 
-The connection is Telus PureFibre in Vancouver, BC. The Telus-provided NAH (Network Access Hub) is a combo unit containing an XGS-PON SFP module and integrated router.
+The connection is Telus PureFibre. The Telus-provided NAH (Network Access Hub) is a combo unit containing an XGS-PON SFP module and integrated router.
 
 ### 4.2 Bridge Mode
 
@@ -185,9 +184,9 @@ k3s is chosen for its single-binary design, minimal resource footprint, and clea
 
 | Node | Role | IP | Storage |
 |------|------|----|---------|
-| k3s-server | Server + worker | 10.0.0.21 | NVMe (OS 100GB, Ceph remainder) |
-| compute-2 | Worker | 10.0.0.22 | NVMe (OS 100GB, Ceph remainder) |
-| compute-3 | Worker | 10.0.0.23 | NVMe (OS 100GB, Ceph remainder) |
+| k3s-server | Server + worker | 10.0.0.21 | NVMe (OS 100GB, vg-nvme remainder) |
+| compute-2 | Worker | 10.0.0.22 | NVMe (OS 100GB, vg-nvme remainder) |
+| compute-3 | Worker | 10.0.0.23 | NVMe (OS 100GB, vg-nvme remainder) |
 | db | Worker (tainted) | 10.0.0.24 | NVMe (OS) + D4-320 (4× HDD) |
 
 ### 5.3 Installation
@@ -313,15 +312,14 @@ Realistic power outage timeline:
 1:00  — k3s server starts, etcd recovers
 1:15  — k3s agents connect, nodes go Ready
 1:30  — Scheduler starts placing pods
-2:00  — Ceph OSDs come online, peer with each other
-2:30  — Ceph healthy, RGW pod starts, S3 available
-3:00  — PostgreSQL crash recovery completes
-3:30  — Everything running normally
+2:00  — TopoLVM node plugins start, SeaweedFS volume servers come online
+2:30  — SeaweedFS S3 ready, hypha starts, S3 available
+3:00  — Everything running normally
 ```
 
 ### 5.8 Upgrades
 
-k3s upgrades are performed one minor version at a time (e.g., v1.32 → v1.33 → v1.34, never skipping). Server node is upgraded first, then agent nodes. Verify Cilium/Ceph/CloudNativePG compatibility before upgrading. The Rancher System Upgrade Controller can automate this process.
+k3s upgrades are performed one minor version at a time (e.g., v1.32 → v1.33 → v1.34, never skipping). Server node is upgraded first, then agent nodes. Verify Cilium/SeaweedFS compatibility before upgrading. The Rancher System Upgrade Controller can automate this process.
 
 ---
 
@@ -374,7 +372,9 @@ In both cases, k3s handles cross-node pod networking automatically — no static
 
 ### 7.1 Design Philosophy
 
-Storage is split by workload type. The database node uses local storage for performance. Compute nodes contribute spare NVMe capacity to a Ceph cluster for S3 object storage. No persistent block devices (CephBlockPool) or shared filesystems (CephFS) are provisioned through Ceph — only RGW (S3 gateway).
+Storage is split by workload type. The database node uses local storage for performance. Server and compute nodes contribute spare NVMe capacity to the cluster's object storage, provided by **Hypha** — a caching + encrypting S3 gateway fronting SeaweedFS. This replaces the previously-planned Ceph/Rook RGW stack, which was built but never deployed (so there is no data to migrate).
+
+Hypha's design — data path, conditional writes, encryption, tiering, and recovery — lives in [`hypha/ARCHITECTURE.md`](../../hypha/ARCHITECTURE.md). This section covers only how it sits in the cluster.
 
 ### 7.2 Storage Layout
 
@@ -382,208 +382,35 @@ Storage is split by workload type. The database node uses local storage for perf
 |-----------|---------|-------------|----------|
 | Database node | Internal NVMe | Local Path Provisioner | WAL, default tablespace |
 | Database node | D4-320 (4× HDD, RAID5) | Direct mount | Large tablespaces |
-| Compute nodes | Spare NVMe partition | Ceph OSD | S3 object store pool |
+| Server + compute nodes | Spare NVMe partition | TopoLVM (`vg-nvme`) | SeaweedFS volumes (hypha's S3 cache) |
 
-### 7.3 Compute Node Disk Partitioning
+### 7.3 Storage Node Disk Partitioning
 
-Each compute node's NVMe is partitioned during Alpine installation:
+Each server/compute node's NVMe is partitioned during Alpine installation (`kube-node/10-provision.start`):
 
 | Partition | Size | Format | Purpose |
 |-----------|------|--------|---------|
 | nvme0n1p1 | 512MB | FAT32 (ESP) | EFI boot |
 | nvme0n1p2 | 100GB | ext4 | Alpine OS + k3s |
-| nvme0n1p3 | 4GB | swap | Swap |
-| nvme0n1p4 | Remainder | Raw (unformatted) | Ceph OSD |
+| nvme0n1p3 | Remainder | LVM PV (raw) | `vg-nvme` — SeaweedFS via TopoLVM |
 
-The Ceph partition must remain unformatted — Rook requires raw block devices.
+`p3` is the partition formerly earmarked for Ceph (still GPT-labelled `ceph`); it is now an LVM physical volume in the `vg-nvme` volume group. The `db` and `compute-spot` roles have no `p3` — root claims the whole disk — and provide no object storage.
 
-### 7.4 Ceph Cluster Configuration
+### 7.4 Object Storage — Hypha
 
-Ceph is deployed via the Rook operator. Only RGW (S3 gateway) is enabled.
+Object storage is three foundational charts, all cluster-admin installed (not operator-deployed):
 
-```yaml
-apiVersion: ceph.rook.io/v1
-kind: CephCluster
-metadata:
-  name: rook-ceph
-  namespace: rook-ceph
-spec:
-  cephVersion:
-    image: quay.io/ceph/ceph:v18
-  mon:
-    count: 3
-    allowMultiplePerNode: false
-  mgr:
-    count: 2
-  storage:
-    useAllNodes: false
-    useAllDevices: false
-    deviceFilter: "^nvme0n1p4"
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: ceph-osd
-                operator: In
-                values: ["true"]
-```
+- **`homelab-topolvm`** — CSI driver provisioning node-local logical volumes from the `vg-nvme` volume group (each storage node's `nvme0n1p3`, the ex-Ceph partition). Provides the `topolvm-provisioner` StorageClass; scoped to nodes labelled `vg=nvme` (replacing Ceph's `ceph-osd=true`).
+- **`homelab-seaweedfs`** — SeaweedFS as the hot cache tier: one volume server per storage node on `topolvm-provisioner` PVCs, replication off (no local redundancy).
+- **`hypha`** — the gateway, an encrypting S3 proxy whose cache is optional. It is deployed twice: a cached deployment (`s3.internal.haustorium.net`, via the shared Cilium Gateway, replacing `rook-ceph-rgw-s3-store`) fronting SeaweedFS as the default tier, and a cacheless deployment (`s3-direct.internal.haustorium.net`) that writes synchronously to the remote for clients that cannot tolerate loss (e.g. ZeroFS). Each deployment is scoped to its own remote namespace — a separate account/bucket, or a shared remote under a forced key prefix.
 
-Adding a new compute node to the Ceph cluster:
-
-```bash
-kubectl label nodes compute-N ceph-osd=true
-```
-
-Rook discovers the raw partition, creates an OSD, and Ceph rebalances automatically.
-
-### 7.5 Replication Strategy
-
-| Pool | Replication | Rationale |
-|------|-------------|-----------|
-| S3 metadata pool | size: 2 | Enables incremental recovery; metadata is tiny |
-| S3 data pool | size: 1 | No replication; backups handle data protection |
-| CephBlockPool | Not created | Not needed |
-| CephFS | Not created | Not needed |
-
-With data at size: 1, usable capacity equals raw capacity. With size: 3, usable capacity would be one-third of raw.
-
-### 7.6 S3 Object Store (RGW)
-
-```yaml
-apiVersion: ceph.rook.io/v1
-kind: CephObjectStore
-metadata:
-  name: s3-store
-  namespace: rook-ceph
-spec:
-  metadataPool:
-    replicated:
-      size: 2
-  dataPool:
-    replicated:
-      size: 1
-  gateway:
-    port: 80
-    instances: 2
-```
-
-Two RGW instances provide zero-downtime S3 availability during single node failures. The gateway is stateless — if a node dies, Kubernetes reschedules the pod to a surviving node automatically.
-
-S3 endpoint within the cluster: `rook-ceph-rgw-s3-store.rook-ceph.svc`
-
-Exposed externally via a Cilium-assigned LoadBalancer IP for services outside the cluster.
-
-### 7.7 Ceph Resource Overhead
-
-| Daemon | Count | RAM Estimate |
-|--------|-------|--------------|
-| MON | 3 | 300–500MB each |
-| MGR | 2 | 300–500MB each |
-| OSD | 1 per compute node | 500MB–1GB each |
-| RGW | 2 instances | 200–300MB each |
-
-Total estimated overhead: 3–4GB across the cluster.
-
-### 7.8 S3 Failure Modes
-
-With metadata replicated (size: 2) and data unreplicated (size: 1), a node failure results in:
-
-- Metadata survives — bucket listings remain complete
-- Some data objects are lost (those stored on the dead OSD)
-- S3 GET requests for lost objects return clean HTTP 500/503 errors
-- rclone can perform incremental recovery by comparing against the Backblaze B2 offsite copy and re-uploading only missing objects
-- Uploads targeting the dead OSD fail with HTTP 503; clients retry
-
-Without metadata replication, a node failure could make the entire bucket unopenable, requiring full restore from Backblaze.
+Object bodies are encrypted client-side and continuously replicated to the remote for durability (local redundancy is off; names and metadata stay plaintext, as with standard S3 client-side encryption). The cache holds no unique state — on loss it is discarded and repopulates from the remote. The encryption scheme, conditional writes, tiering, and the mirror-vs-versioned-backup trade-off are all covered in [`hypha/ARCHITECTURE.md`](../../hypha/ARCHITECTURE.md).
 
 ---
 
 ## 8. Database Layer
 
-### 8.1 CloudNativePG
-
-PostgreSQL is managed by the CloudNativePG operator, which provides declarative cluster management, automated minor/major version upgrades (via pg_upgrade), and integrated backup via Barman Cloud. A single instance is deployed with no replicas.
-
-### 8.2 Cluster Definition
-
-```yaml
-apiVersion: postgresql.cnpg.io/v1
-kind: Cluster
-metadata:
-  name: mydb
-  namespace: database
-spec:
-  instances: 1
-  imageName: ghcr.io/cloudnative-pg/postgresql:17.5-minimal-bullseye
-
-  postgresql:
-    parameters:
-      wal_level: "replica"
-      max_wal_senders: "1"
-
-  storage:
-    storageClass: local-path
-    size: 50Gi
-
-  tablespaces:
-    - name: historical
-      storage:
-        storageClass: local-path
-        size: 500Gi
-    - name: archive
-      storage:
-        storageClass: local-path
-        size: 500Gi
-
-  backup:
-    barmanObjectStore:
-      destinationPath: s3://pg-backups/
-      endpointURL: https://s3.us-west-000.backblazeb2.com
-      s3Credentials:
-        accessKeyId:
-          name: b2-creds
-          key: ACCESS_KEY
-        secretAccessKey:
-          name: b2-creds
-          key: SECRET_KEY
-      wal:
-        compression: gzip
-        encryption: AES256
-      data:
-        compression: gzip
-        encryption: AES256
-    retentionPolicy: "14d"
-
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: node-role
-                operator: In
-                values: ["database"]
-    tolerations:
-      - key: workload
-        value: database
-        effect: NoSchedule
-```
-
-### 8.3 Tablespace Strategy
-
-Hot data (current, frequently accessed) resides on the internal NVMe for maximum IOPS. Cold/large data (historical records, archives, logs) resides on the D4-320 HDDs via PostgreSQL tablespaces. The WAL is kept on NVMe for write performance and durability.
-
-```sql
-CREATE TABLESPACE historical_data LOCATION '/mnt/disk1/pg_tablespace';
-ALTER TABLE events SET TABLESPACE historical_data;
-```
-
-### 8.4 Major Version Upgrades
-
-CloudNativePG handles major PostgreSQL upgrades (e.g., 16 → 17) via pg_upgrade with `--link` mode. This creates hard links instead of copying data, making even multi-hundred-GB tablespace upgrades complete in seconds. A Barman Cloud backup is taken automatically before each upgrade. Post-upgrade, `ANALYZE` is run on all databases to refresh query planner statistics.
-
-### 8.5 WAL Configuration
-
-`wal_level` is set to `replica` (not `minimal`) to support continuous WAL archiving via Barman Cloud. `max_wal_senders` is set to 1 — just enough for WAL archiving with no replicas.
+> **Deferred.** The database design (PostgreSQL via CloudNativePG, Barman Cloud offsite, tablespace/WAL layout) is out of date and being reworked; it will be documented in a later revision. The database node hardware and its scheduling isolation (§5.5) still stand.
 
 ---
 
@@ -592,144 +419,34 @@ CloudNativePG handles major PostgreSQL upgrades (e.g., 16 → 17) via pg_upgrade
 ### 9.1 Design Principles
 
 - All backups are encrypted client-side before leaving the network. The backup provider sees only encrypted blobs.
-- Offsite backups go to Backblaze B2 (S3-compatible, ~$6/TB/month).
-- Replication is not used for data protection. Backups are the disaster recovery mechanism.
+- Offsite copies go to an S3-compatible remote (e.g. Backblaze B2, ~$6/TB/month).
+- Replication is not used for local data protection. For object storage, hypha continuously replicates an encrypted copy to the remote; whether that copy is a plain mirror or a versioned backup is a remote-bucket configuration choice (see §7.4), not a property of hypha.
 - Encryption keys must be stored outside the cluster (password manager, printed in a safe). Losing them renders all backups unrecoverable.
 
-### 9.2 PostgreSQL Backup (Barman Cloud)
+### 9.2 Object Storage Offsite (Hypha)
 
-CloudNativePG's integrated Barman Cloud ships continuous WAL archives and scheduled base backups directly to Backblaze B2. WAL archiving provides near-zero RPO (Recovery Point Objective). Point-in-time recovery (PITR) to any second in time is supported.
+Object storage has no separate backup job: Hypha continuously replicates an encrypted copy of every object to a remote S3 endpoint as it is written (see §7.4). Whether that remote copy is a plain mirror or a point-in-time backup (recoverable deletes/overwrites) is a remote-bucket versioning choice. Full detail in [`hypha/ARCHITECTURE.md`](../../hypha/ARCHITECTURE.md).
 
-Scheduled backup:
-
-```yaml
-apiVersion: postgresql.cnpg.io/v1
-kind: ScheduledBackup
-metadata:
-  name: mydb-weekly
-spec:
-  schedule: "0 2 * * 0"
-  cluster:
-    name: mydb
-  backupOwnerReference: self
-```
-
-| Backup Type | Frequency | Retention |
-|-------------|-----------|-----------|
-| Full base backup | Weekly (Sunday 2am) | 2 full backups |
-| WAL archiving | Continuous | Tied to base backup retention |
-
-### 9.3 PostgreSQL Restore
-
-Recovery is declarative. Create a new Cluster resource specifying the backup source and optional target time:
-
-```yaml
-apiVersion: postgresql.cnpg.io/v1
-kind: Cluster
-metadata:
-  name: mydb-restored
-spec:
-  instances: 1
-  bootstrap:
-    recovery:
-      source: mydb-backup
-      recoveryTarget:
-        targetTime: "2026-04-25 14:30:00"
-  externalClusters:
-    - name: mydb-backup
-      barmanObjectStore:
-        destinationPath: s3://pg-backups/
-        endpointURL: https://s3.us-west-000.backblazeb2.com
-        s3Credentials:
-          accessKeyId:
-            name: b2-creds
-            key: ACCESS_KEY
-          secretAccessKey:
-            name: b2-creds
-            key: SECRET_KEY
-```
-
-### 9.4 Ceph S3 Backup (rclone)
-
-A nightly CronJob runs rclone sync from the Ceph RGW S3 endpoint to Backblaze B2 through an rclone crypt overlay. File contents, filenames, and directory names are all encrypted (XSalsa20/Poly1305) before upload.
-
-```ini
-# ~/.config/rclone/rclone.conf
-
-[b2-raw]
-type = s3
-provider = Other
-endpoint = s3.us-west-000.backblazeb2.com
-access_key_id = your-key
-secret_access_key = your-secret
-
-[b2-encrypted]
-type = crypt
-remote = b2-raw:my-backup-bucket
-password = your-encryption-password
-password2 = your-salt-password
-filename_encryption = standard
-directory_name_encryption = true
-```
-
-CronJob:
-
-```yaml
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: ceph-offsite-sync
-spec:
-  schedule: "0 3 * * *"
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          containers:
-          - name: rclone
-            image: rclone/rclone
-            command:
-              - rclone
-              - sync
-              - ceph-s3:my-data
-              - b2-encrypted:
-              - --transfers=4
-              - --fast-list
-            volumeMounts:
-              - name: rclone-config
-                mountPath: /config/rclone
-          volumes:
-            - name: rclone-config
-              secret:
-                secretName: rclone-config
-```
-
-### 9.5 Full Cluster Disaster Recovery
+### 9.3 Full Cluster Disaster Recovery
 
 In the event of complete cluster loss, the rebuild order is:
 
 1. Install Alpine on all nodes (automated via custom ISO)
 2. Install k3s (server first, then agents)
-3. Deploy Ceph via Rook, wait for OSDs to peer
-4. Deploy the cilium chart (service mesh + LB IPAM/L2 + ingress Gateway), cert-manager, and the custom OPNsense operator
-5. Restore Ceph S3 data from Backblaze via rclone
-6. Deploy CloudNativePG, restore database from Backblaze B2 backup
-7. Reconfigure OPNsense port forwards (operator handles automatically)
+3. Deploy the cilium chart (service mesh + LB IPAM/L2 + ingress Gateway), cert-manager, and the custom OPNsense operator
+4. Deploy homelab-topolvm and homelab-seaweedfs, then hypha; the cache starts empty and repopulates from the remote on demand
+5. Reconfigure OPNsense port forwards (operator handles automatically)
 
 Steps 1–4 should be scripted and stored in an external git repository for rapid rebuilds. Target recovery time: under 1 hour excluding data restore.
 
-### 9.6 Backup Architecture Diagram
+### 9.4 Offsite Architecture Diagram
 
 ```
-Database node (local NVMe + D4-320)
-  → Barman Cloud (encrypted, continuous WAL + weekly full)
-    → Backblaze B2
+Object storage (SeaweedFS on server/compute NVMe)
+  → Hypha (write-through, encrypted, continuous)
+    → remote S3 endpoint
 
-Ceph cluster (compute node spare NVMe)
-  → rclone crypt (nightly sync, encrypted)
-    → Backblaze B2
-
-Both encrypted client-side. Backblaze sees nothing.
+Encrypted client-side. The remote provider sees nothing.
 ```
 
 ---
@@ -840,16 +557,15 @@ Practical mitigation: encrypt all traffic at L3+ (HTTPS, WireGuard, TLS, encrypt
 
 ### 11.3 Backup Security
 
-- Barman Cloud: AES-256 encryption of WAL and base backups
-- rclone: XSalsa20/Poly1305 encryption with encrypted filenames and directory names
-- Backblaze B2 has zero visibility into backup contents
+- Hypha: object bodies encrypted client-side before they reach the remote (standard S3 client-side encryption; key names and metadata are not encrypted)
+- The offsite remote has no visibility into object contents (bodies are encrypted); it does see object names and sizes
 - Encryption keys stored outside the cluster infrastructure
 
 ### 11.4 Kubernetes Security
 
 - Database node is tainted — only authorized workloads schedule there
-- Ceph OSD nodes are labelled — storage auto-discovery is scoped by label
-- Device filter (`^nvme0n1p4`) prevents Rook from claiming unintended devices
+- Storage nodes are labelled `vg=nvme` — TopoLVM's lvmd/node plugins are scoped by label
+- TopoLVM manages only the `vg-nvme` volume group, so it never claims unintended devices
 
 ---
 
@@ -857,7 +573,7 @@ Practical mitigation: encrypt all traffic at L3+ (HTTPS, WireGuard, TLS, encrypt
 
 ### 12.1 Node Provisioning
 
-Compute nodes are provisioned via a custom Alpine Linux ISO built with mkimage. The ISO embeds an answer file and deploy script that automates base configuration, disk partitioning (OS + Ceph split), SSH key installation, and hostname assignment.
+Compute nodes are provisioned via a custom Alpine Linux ISO built with mkimage. The ISO embeds an answer file and deploy script that automates base configuration, disk partitioning (OS + vg-nvme split), SSH key installation, and hostname assignment.
 
 Deploy script usage:
 
@@ -868,11 +584,11 @@ Deploy script usage:
 sh deploy-node.sh 4
 ```
 
-After OS install, join the cluster and enable Ceph:
+After OS install, join the cluster and enable storage:
 
 ```bash
 curl -sfL https://get.k3s.io | K3S_URL=https://10.0.0.21:6443 K3S_TOKEN=<token> sh -
-kubectl label nodes k3s-node-4 ceph-osd=true
+kubectl label nodes k3s-node-4 vg=nvme
 ```
 
 ### 12.2 IP Address Management
@@ -884,25 +600,21 @@ Nodes use DHCP to receive their addresses. OPNsense boots fast on the Topton N10
 ### 12.3 k3s Upgrades
 
 1. Read release notes for API deprecations and breaking changes.
-2. Verify Cilium/Ceph/CloudNativePG compatibility with the new version.
+2. Verify Cilium/SeaweedFS compatibility with the new version.
 3. Upgrade server node first, then agents one at a time.
 4. Never skip minor versions (e.g., v1.32 → v1.33 → v1.34).
 5. Run `kubectl get nodes` to verify all nodes are Ready on the new version.
 
-### 12.4 PostgreSQL Major Upgrades
+### 12.4 Adding Storage
 
-Handled declaratively by CloudNativePG. The operator performs pg_upgrade with `--link` mode, preserving tablespace data. A Barman Cloud backup is taken automatically before upgrading. Post-upgrade, `ANALYZE` is run on all databases to refresh query planner statistics.
+To add a new compute node to the SeaweedFS/hypha pool:
 
-### 12.5 Adding Ceph Storage
-
-To add a new compute node to the Ceph pool:
-
-1. Provision the node with the standard Alpine ISO (includes Ceph partition)
+1. Provision the node with the standard Alpine ISO (includes the `vg-nvme` partition)
 2. Join the k3s cluster
-3. Label the node: `kubectl label nodes compute-N ceph-osd=true`
-4. Rook auto-discovers the raw partition, creates an OSD, Ceph rebalances
+3. Create the volume group at bootstrap (`vgcreate vg-nvme /dev/nvme0n1p3`), then label the node: `kubectl label nodes compute-N vg=nvme`
+4. TopoLVM's lvmd/node plugins start on the node; add a SeaweedFS volume server (bump `volume.replicas`) to use the new capacity
 
-### 12.6 UPS Recommendations
+### 12.5 UPS Recommendations
 
 A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database node. These are the only stateful devices requiring graceful shutdown. Compute nodes are stateless and recover cleanly from hard power loss. Configure `apcupsd` or `nut` to trigger automatic shutdown when battery reaches low threshold.
 

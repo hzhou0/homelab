@@ -19,8 +19,15 @@ themselves**.
 | Images | allowlist only | allowlist only |
 
 Every `app-*`/`tool-*` namespace is auto-governed the moment it is created: Kyverno generates a
-`ResourceQuota`, `LimitRange`, and default-deny ingress `NetworkPolicy`, and stamps PSA labels.
+`ResourceQuota` and `LimitRange` (the operator deploy `RoleBinding` too) and stamps PSA labels.
 `synchronize: true` reverts any drift.
+
+The default-deny ingress `NetworkPolicy` is a separate, cluster-wide concern: `namespace-default-ingress`
+stamps it into **every** namespace — `app-*`, `tool-*` and foundational alike — except a small infra
+exclude-list (`networkPolicy.excludeNamespaces`: kube-system/CoreDNS, cert-manager, kyverno, …). So a
+new deployment of any kind is default-deny east-west unless explicitly granted. It pairs with the
+`homelab-cilium` `east-west-baseline-allow` CCNP, which re-allows the kubelet-probe / admission-webhook
+/ gateway flows a plain `NetworkPolicy` cannot express.
 
 ## Per-runtime resource ranges
 

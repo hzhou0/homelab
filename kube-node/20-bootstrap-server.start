@@ -79,7 +79,13 @@ cilium install \
   --set=kubeProxyReplacement=true
 cilium status --wait
 
-kubectl label nodes k3s-server ceph-osd=true
+# vg-nvme backs TopoLVM's node-local volumes (homelab-topolvm chart); nvme0n1p3 is the
+# same ex-Ceph partition, now an LVM PV instead of a Ceph OSD.
+apk add -q lvm2
+pvcreate /dev/nvme0n1p3
+vgcreate vg-nvme /dev/nvme0n1p3
+
+kubectl label nodes k3s-server vg=nvme
 
 touch /etc/local.d/20-bootstrap.done
 echo "==> k3s server bootstrap complete. Token:"

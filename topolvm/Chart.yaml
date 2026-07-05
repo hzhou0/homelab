@@ -1,0 +1,24 @@
+apiVersion: v2
+name: homelab-topolvm
+description: >-
+  TopoLVM CSI for the homelab k3s cluster. Carves node-local logical volumes out of the
+  vg-nvme LVM volume group, which lives on /dev/nvme0n1p3 (the partition formerly reserved
+  for Ceph) on vg=nvme nodes. Generic node-local block storage, not scoped to any consumer;
+  ships the topolvm-provisioner StorageClass that the homelab-seaweedfs chart's volumes
+  currently bind to. Foundational like cilium/cert-manager: it is a cluster-scoped CSI driver
+  needing privileged node access to LVM, so the autonomous operator cannot install it and it
+  lives in its own topolvm-system namespace, not an app-*/tool-* one.
+type: application
+version: 0.1.0
+appVersion: "0.41.0"
+keywords:
+  - topolvm
+  - csi
+  - lvm
+  - storage
+  - homelab
+dependencies:
+  - name: topolvm
+    version: "16.1.1"
+    repository: https://topolvm.github.io/topolvm
+    condition: topolvm.enabled

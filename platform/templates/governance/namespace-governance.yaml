@@ -10,9 +10,11 @@ metadata:
   annotations:
     policies.kyverno.io/title: Namespace governance (app-* / tool-*)
     policies.kyverno.io/description: >-
-      Generates a ResourceQuota, LimitRange, default-ingress NetworkPolicy and the
-      operator deploy RoleBinding into every app-*/tool-* namespace, kept in sync
-      so the operator cannot widen its own sandbox.
+      Generates the tier-specific resources — ResourceQuota, LimitRange and the operator
+      deploy RoleBinding — into every app-*/tool-* namespace, kept in sync so the operator
+      cannot widen its own sandbox. The default-ingress NetworkPolicy is NOT generated here:
+      it is a cluster-wide concern owned by namespace-default-ingress.yaml (which fences
+      foundational namespaces too).
 spec:
   evaluation:
     synchronize:
@@ -70,26 +72,6 @@ spec:
                  "defaultRequest": dyn({"cpu": "{{ $t.limitRange.defaultRequest.cpu }}", "memory": "{{ $t.limitRange.defaultRequest.memory }}"})})
           ])})
         }
-{{- if .Values.networkPolicy.enabled }}
-    - name: netpolRes
-      expression: >
-        {
-          "apiVersion": dyn("networking.k8s.io/v1"),
-          "kind": dyn("NetworkPolicy"),
-          "metadata": dyn({"name": "default-ingress", "namespace": variables.ns}),
-          "spec": dyn({
-            "podSelector": dyn({}),
-            "policyTypes": dyn(["Ingress"]),
-            "ingress": dyn([dyn({"from": dyn([
-              dyn({"podSelector": dyn({})}),
-              dyn({"namespaceSelector": dyn({"matchLabels": dyn({"{{ .Values.networkPolicy.ingressFromNamespaceLabel }}": "true"})})})
-              {{- if .Values.networkPolicy.monitoringNamespace }},
-              dyn({"namespaceSelector": dyn({"matchLabels": dyn({"kubernetes.io/metadata.name": "{{ .Values.networkPolicy.monitoringNamespace }}"})})})
-              {{- end }}
-            ])})])
-          })
-        }
-{{- end }}
 {{- if .Values.operator.enabled }}
     - name: rbRes
       expression: >
@@ -104,7 +86,6 @@ spec:
     - name: generatedResources
       expression: >-
         [variables.quotaRes, variables.limitRes
-        {{- if .Values.networkPolicy.enabled }}, variables.netpolRes{{ end }}
         {{- if .Values.operator.enabled }}, variables.rbRes{{ end }}]
   generate:
     - expression: generator.Apply(variables.ns, variables.generatedResources)

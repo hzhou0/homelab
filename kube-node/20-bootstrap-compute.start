@@ -34,6 +34,17 @@ curl -sfL https://get.k3s.io | \
 
 rc-service k3s-agent restart
 
+# vg-nvme backs TopoLVM's node-local volumes (homelab-topolvm chart); nvme0n1p3 is the
+# same ex-Ceph partition, now an LVM PV instead of a Ceph OSD. compute-spot shares this
+# script but has no p3 (root claims the whole disk, see 10-provision.start), so skip
+# when the device isn't there.
+if [ -b /dev/nvme0n1p3 ]; then
+  apk add -q lvm2
+  pvcreate /dev/nvme0n1p3
+  vgcreate vg-nvme /dev/nvme0n1p3
+fi
+
 touch /etc/local.d/20-bootstrap.done
 echo "==> k3s compute bootstrap complete. Run from control plane:"
 echo "  kubectl label nodes $(hostname) gvisor=true"
+[ -b /dev/nvme0n1p3 ] && echo "  kubectl label nodes $(hostname) vg=nvme"
