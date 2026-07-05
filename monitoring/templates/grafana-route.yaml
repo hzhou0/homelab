@@ -1,10 +1,4 @@
 {{- if and .Values.gateway.enabled (index .Values "kube-prometheus-stack" "grafana" "enabled") }}
-# Expose Grafana through the shared ingress Gateway.
-#
-# Same shape as the Hubble UI route in homelab-cilium: the HTTPRoute sits next to the Grafana
-# Service (monitoring namespace) so no ReferenceGrant is needed, and attaches cross-namespace to
-# the `internal` Gateway whose allowedRoutes.from: All permits it. TLS is terminated by the
-# Gateway's wildcard cert and reachability is bounded by the gateway's L3 allow-list.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:

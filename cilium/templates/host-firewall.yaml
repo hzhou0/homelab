@@ -1,17 +1,14 @@
 {{- if .Values.hostFirewall.enabled }}
 # Host firewall: default-deny host ingress, allowing in-cluster identities + admin hosts + all UDP.
 # Net effect: TCP/SCTP from `world` is dropped; DHCP/DNS/NTP/vxlan (UDP) and all in-cluster
-# traffic are unaffected. Egress is open (conntrack allows established-reply traffic in regardless).
+# traffic are unaffected. Egress is open (conntrack allows established reply traffic in regardless).
 #
 # nodeSelector must be non-empty: {} also matches pods and would flip the whole cluster to
 # default-deny ingress (breaks pod→coredns DNS). kubernetes.io/os=linux is on every node, no pod.
 #
 # Cilium's default-deny is per-direction, not per-protocol, so selecting the host with any ingress
 # rule default-denies ALL protocols. Re-allowing all UDP from world restores DHCP/DNS/NTP/vxlan.
-#
-# Enforces only on Cilium's managed devices; cilium.devices: "eth+" keeps wlan0 out of scope.
-#
-# Roll out in audit mode first: cilium endpoint config <host-ep-id> PolicyAuditMode=Enabled
+# Scope is cilium.devices: "eth+" — wlan0 stays out of the datapath.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:

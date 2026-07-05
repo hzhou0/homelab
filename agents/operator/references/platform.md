@@ -102,10 +102,14 @@ ServiceAccount directly.
 - **Tool resource governance** uses the generated `LimitRange`/`ResourceQuota` directly — no extra
   Kyverno policy needed. App ranges require Kyverno because they vary by the runtime label, which a
   static `LimitRange` can't express.
-- **CEL policies, not `ClusterPolicy`.** All constraints use the GA CEL types (`ValidatingPolicy`,
-  `MutatingPolicy`, `GeneratingPolicy`). Pod-level checks (`image-allowlist`, `no-bare-pods`,
+- **CEL policies, not `ClusterPolicy`.** Validate/mutate constraints use the GA CEL types
+  (`ValidatingPolicy`, `MutatingPolicy`). Pod-level checks (`image-allowlist`, `no-bare-pods`,
   `harden-defaults`) run at **Pod** admission (podController autogen is disabled), so a bad image
-  surfaces as a ReplicaSet `FailedCreate`.
+  surfaces as a ReplicaSet `FailedCreate`. The **generate** policies (`namespace-governance`,
+  `namespace-default-ingress`) temporarily use Kyverno `ClusterPolicy` instead of CEL
+  `GeneratingPolicy` because the upstream `GeneratingPolicy.syncExisting`/`synchronize` fix
+  (https://github.com/kyverno/kyverno/pull/16041) is not yet in a released Kyverno 1.19; migrate
+  them back when 1.19 ships.
 - **Operator confinement** is RBAC-first: the `homelab-operator` `ClusterRole` has no namespaced
   write power — all write rights live in `homelab-operator-deploy`, which `namespace-governance`
   binds into each `app-*`/`tool-*` namespace only. `restrict-operator-namespaces` (a native

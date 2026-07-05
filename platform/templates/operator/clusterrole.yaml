@@ -14,16 +14,54 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Broad cluster-wide read — lets the operator introspect state in any namespace.
+  # Secrets are excluded; the operator reads its own projected SA token only.
   - apiGroups: [""]
-    resources: ["nodes"]
+    resources:
+      - nodes
+      - pods
+      - pods/status
+      - services
+      - endpoints
+      - serviceaccounts
+      - persistentvolumes
+      - persistentvolumeclaims
+      - resourcequotas
+      - limitranges
+      - events
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["policies.kyverno.io"]
-    resources: ["validatingpolicies", "mutatingpolicies", "generatingpolicies", "imagevalidatingpolicies", "deletingpolicies", "policyexceptions"]
+  - apiGroups: ["apps", "batch", "autoscaling", "policy"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["cilium.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["cert-manager.io", "acme.cert-manager.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kyverno.io", "policies.kyverno.io", "reports.kyverno.io", "wgpolicyk8s.io"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["wgpolicyk8s.io"]
-    resources: ["policyreports", "clusterpolicyreports"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["topolvm.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["helm.cattle.io", "k3s.cattle.io"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
 {{- end }}

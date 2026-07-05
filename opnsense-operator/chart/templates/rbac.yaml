@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "opnsense-operator.labels" . | nindent 4 }}
 rules:
-  # Source objects: read, and patch metadata (finalizers + status annotations).
+  # patch covers finalizers + status annotations.
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch", "update", "patch"]
@@ -15,7 +15,6 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gateways/finalizers"]
     verbs: ["update"]
-  # Surface reconcile outcomes as Events.
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
@@ -35,7 +34,6 @@ subjects:
     name: {{ include "opnsense-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 ---
-# Leader-election lease lives in the operator's own namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

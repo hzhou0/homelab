@@ -92,11 +92,9 @@ gateway:
       serviceName: homelab-seaweedfs-filer
       servicePort: 8888
 
-# Cross-namespace allow grants for the plaintext surfaces (one CiliumNetworkPolicy each). Scoped by
-# source NAMESPACE only — a pod can self-apply any label, so labels are not a trust boundary; the
-# namespace (gated by who can create pods there) is. Namespaces need not exist yet — a grant matches
-# nothing until one does. hypha is the only client today: S3 for data, master + volume status APIs
-# for its optional `seaweedfs` cache-usage source. The filer stays internal-only, so it has no grant.
+# Cross-namespace allow grants for the plaintext surfaces (one CiliumNetworkPolicy each, see
+# templates/access-grants.yaml). hypha is the only client today: S3 for data, master + volume
+# status APIs for its optional `seaweedfs` cache-usage source. The filer stays internal-only.
 #
 # target: `component: <label>`, or `volumeServers: true` for every per-node volume group.
 accessGrants:

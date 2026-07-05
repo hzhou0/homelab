@@ -1,7 +1,4 @@
 {{- if .Values.gateway.enabled }}
-# HTTPRoutes exposing SeaweedFS UIs through the shared ingress Gateway. Each sits next to its Service
-# (this namespace, no ReferenceGrant needed) and attaches to the `internal` Gateway; reachability is
-# bounded by the gateway's L3 allow-list.
 {{- range $route := .Values.gateway.routes }}
 ---
 apiVersion: gateway.networking.k8s.io/v1

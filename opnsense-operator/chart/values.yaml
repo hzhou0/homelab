@@ -2,7 +2,6 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/hzhou0/opnsense-operator
-  # tag defaults to the chart appVersion when empty.
   tag: "sha-57db539"
   pullPolicy: IfNotPresent
 
@@ -13,8 +12,6 @@ opnsense:
   # Comma-separated DNS zones the operator may manage. Empty allows any zone.
   managedDomains: "internal.haustorium.net"
 
-  # Either reference an existing Secret holding OPNSENSE_API_KEY / OPNSENSE_API_SECRET,
-  # or set apiKey/apiSecret to have the chart create the Secret.
   existingSecret: "opnsense-operator-creds"
 
 leaderElect: true

@@ -1,8 +1,8 @@
 {{- if .Values.policies.enabled }}
 {{- $a := .Values.tiers.app -}}
 {{- $t := .Values.tiers.tool -}}
-apiVersion: policies.kyverno.io/v1
-kind: GeneratingPolicy
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
 metadata:
   name: namespace-governance
   labels:
@@ -14,77 +14,134 @@ metadata:
       deploy RoleBinding — into every app-*/tool-* namespace, kept in sync so the operator
       cannot widen its own sandbox. Ingress is governed separately by namespace-default-ingress.yaml.
 spec:
-  evaluation:
-    synchronize:
-      enabled: true
-    generateExisting:
-      enabled: true
-  matchConstraints:
-    resourceRules:
-      # CREATE and UPDATE: UPDATE is required so namespace patches (PSA label stamping, operator
-      # notes) don't cause the engine to treat the namespace as no-longer-qualifying and tear down
-      # all generated resources (quota, limitrange, deploy RoleBinding).
-      - apiGroups: [""]
-        apiVersions: ["v1"]
-        operations: ["CREATE", "UPDATE"]
-        resources: ["namespaces"]
-  matchConditions:
-    - name: tier-namespace
-      expression: >-
-        object.metadata.name.startsWith('{{ .Values.prefixes.app }}') ||
-        object.metadata.name.startsWith('{{ .Values.prefixes.tool }}')
-  variables:
-    - name: ns
-      expression: "string(object.metadata.name)"
-    - name: isApp
-      expression: "object.metadata.name.startsWith('{{ .Values.prefixes.app }}')"
-    - name: quotaRes
-      expression: >
-        {
-          "apiVersion": dyn("v1"),
-          "kind": dyn("ResourceQuota"),
-          "metadata": dyn({"name": "tier-quota", "namespace": variables.ns}),
-          "spec": dyn({"hard": dyn({
-            "requests.cpu": variables.isApp ? "{{ $a.quota.requestsCpu }}" : "{{ $t.quota.requestsCpu }}",
-            "requests.memory": variables.isApp ? "{{ $a.quota.requestsMemory }}" : "{{ $t.quota.requestsMemory }}",
-            "limits.cpu": variables.isApp ? "{{ $a.quota.limitsCpu }}" : "{{ $t.quota.limitsCpu }}",
-            "limits.memory": variables.isApp ? "{{ $a.quota.limitsMemory }}" : "{{ $t.quota.limitsMemory }}",
-            "pods": variables.isApp ? "{{ $a.quota.pods }}" : "{{ $t.quota.pods }}"
-          })})
-        }
-    - name: limitRes
-      expression: >
-        {
-          "apiVersion": dyn("v1"),
-          "kind": dyn("LimitRange"),
-          "metadata": dyn({"name": "tier-limits", "namespace": variables.ns}),
-          "spec": dyn({"limits": dyn([ variables.isApp ?
-            dyn({"type": dyn("Container"),
-                 "min": dyn({"cpu": "{{ $a.limitRange.min.cpu }}", "memory": "{{ $a.limitRange.min.memory }}"}),
-                 "max": dyn({"cpu": "{{ $a.limitRange.max.cpu }}", "memory": "{{ $a.limitRange.max.memory }}"})})
-            :
-            dyn({"type": dyn("Container"),
-                 "min": dyn({"cpu": "{{ $t.limitRange.min.cpu }}", "memory": "{{ $t.limitRange.min.memory }}"}),
-                 "max": dyn({"cpu": "{{ $t.limitRange.max.cpu }}", "memory": "{{ $t.limitRange.max.memory }}"}),
-                 "default": dyn({"cpu": "{{ $t.limitRange.default.cpu }}", "memory": "{{ $t.limitRange.default.memory }}"}),
-                 "defaultRequest": dyn({"cpu": "{{ $t.limitRange.defaultRequest.cpu }}", "memory": "{{ $t.limitRange.defaultRequest.memory }}"})})
-          ])})
-        }
+  rules:
+    - name: app-quota
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              # UPDATE required: namespace patches (PSA labels, operator notes) must not trigger
+              # teardown of generated resources.
+              operations: [CREATE, UPDATE]
+              names: ["{{ .Values.prefixes.app }}*"]
+      generate:
+        generateExisting: true
+        synchronize: true
+        apiVersion: v1
+        kind: ResourceQuota
+        name: tier-quota
+        namespace: "{{`{{ request.object.metadata.name }}`}}"
+        data:
+          spec:
+            hard:
+              requests.cpu: "{{ $a.quota.requestsCpu }}"
+              requests.memory: "{{ $a.quota.requestsMemory }}"
+              limits.cpu: "{{ $a.quota.limitsCpu }}"
+              limits.memory: "{{ $a.quota.limitsMemory }}"
+              pods: "{{ $a.quota.pods }}"
+
+    - name: tool-quota
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              operations: [CREATE, UPDATE]
+              names: ["{{ .Values.prefixes.tool }}*"]
+      generate:
+        generateExisting: true
+        synchronize: true
+        apiVersion: v1
+        kind: ResourceQuota
+        name: tier-quota
+        namespace: "{{`{{ request.object.metadata.name }}`}}"
+        data:
+          spec:
+            hard:
+              requests.cpu: "{{ $t.quota.requestsCpu }}"
+              requests.memory: "{{ $t.quota.requestsMemory }}"
+              limits.cpu: "{{ $t.quota.limitsCpu }}"
+              limits.memory: "{{ $t.quota.limitsMemory }}"
+              pods: "{{ $t.quota.pods }}"
+
+    - name: app-limits
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              operations: [CREATE, UPDATE]
+              names: ["{{ .Values.prefixes.app }}*"]
+      generate:
+        generateExisting: true
+        synchronize: true
+        apiVersion: v1
+        kind: LimitRange
+        name: tier-limits
+        namespace: "{{`{{ request.object.metadata.name }}`}}"
+        data:
+          spec:
+            limits:
+              - type: Container
+                min:
+                  cpu: "{{ $a.limitRange.min.cpu }}"
+                  memory: "{{ $a.limitRange.min.memory }}"
+                max:
+                  cpu: "{{ $a.limitRange.max.cpu }}"
+                  memory: "{{ $a.limitRange.max.memory }}"
+
+    - name: tool-limits
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              operations: [CREATE, UPDATE]
+              names: ["{{ .Values.prefixes.tool }}*"]
+      generate:
+        generateExisting: true
+        synchronize: true
+        apiVersion: v1
+        kind: LimitRange
+        name: tier-limits
+        namespace: "{{`{{ request.object.metadata.name }}`}}"
+        data:
+          spec:
+            limits:
+              - type: Container
+                min:
+                  cpu: "{{ $t.limitRange.min.cpu }}"
+                  memory: "{{ $t.limitRange.min.memory }}"
+                max:
+                  cpu: "{{ $t.limitRange.max.cpu }}"
+                  memory: "{{ $t.limitRange.max.memory }}"
+                default:
+                  cpu: "{{ $t.limitRange.default.cpu }}"
+                  memory: "{{ $t.limitRange.default.memory }}"
+                defaultRequest:
+                  cpu: "{{ $t.limitRange.defaultRequest.cpu }}"
+                  memory: "{{ $t.limitRange.defaultRequest.memory }}"
+
 {{- if .Values.operator.enabled }}
-    - name: rbRes
-      expression: >
-        {
-          "apiVersion": dyn("rbac.authorization.k8s.io/v1"),
-          "kind": dyn("RoleBinding"),
-          "metadata": dyn({"name": "{{ .Values.operator.serviceAccountName }}-deploy", "namespace": variables.ns}),
-          "roleRef": dyn({"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "{{ .Values.operator.serviceAccountName }}-deploy"}),
-          "subjects": dyn([dyn({"kind": "ServiceAccount", "name": "{{ .Values.operator.serviceAccountName }}", "namespace": "{{ .Values.operator.namespace }}"})])
-        }
+    - name: operator-rolebinding
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              operations: [CREATE, UPDATE]
+              names: ["{{ .Values.prefixes.app }}*", "{{ .Values.prefixes.tool }}*"]
+      generate:
+        generateExisting: true
+        synchronize: true
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        name: "{{ .Values.operator.serviceAccountName }}-deploy"
+        namespace: "{{`{{ request.object.metadata.name }}`}}"
+        data:
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: "{{ .Values.operator.serviceAccountName }}-deploy"
+          subjects:
+            - kind: ServiceAccount
+              name: "{{ .Values.operator.serviceAccountName }}"
+              namespace: "{{ .Values.operator.namespace }}"
 {{- end }}
-    - name: generatedResources
-      expression: >-
-        [variables.quotaRes, variables.limitRes
-        {{- if .Values.operator.enabled }}, variables.rbRes{{ end }}]
-  generate:
-    - expression: generator.Apply(variables.ns, variables.generatedResources)
 {{- end }}

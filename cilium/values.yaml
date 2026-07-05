@@ -35,10 +35,9 @@ cilium:
   # lock down wifi ingress too. eth+ covers both nodes' wired NICs (server eth0, spot eth1).
   devices: "eth+"
 
-  # Enables the host firewall so a CiliumClusterwideNetworkPolicy with a `nodeSelector` governs
-  # the node's HOST network namespace. Compatible with tunnel/vxlan: the host policy does NOT
-  # affect pod-to-pod traffic. IMPORTANT: the host policy's nodeSelector must be non-empty —
-  # empty `{}` matches pods too and takes the cluster down (see host-firewall.yaml).
+  # Host firewall. Compatible with tunnel/vxlan (host policy does NOT affect pod-to-pod traffic).
+  # The host policy's nodeSelector must be non-empty — empty `{}` matches pods too and takes the
+  # cluster down (see host-firewall.yaml).
   hostFirewall:
     enabled: true
 
@@ -49,17 +48,11 @@ cilium:
     qps: 50
     burst: 100
 
-# ---------------------------------------------------------------------------
-# East-west default-deny (the authoritative ingress fence)
-# ---------------------------------------------------------------------------
-# Static CCNP that default-denies east-west ingress for every governed pod and re-allows only the
-# node/control-plane/gateway flows a k8s NetworkPolicy can't express. The platform Kyverno policy
-# layers same-namespace/monitoring allows on top; because the deny lives HERE (not in that generated
-# policy), a namespace fails closed if Kyverno stops generating. See templates/east-west-default-deny.yaml.
+# East-west default-deny (the authoritative ingress fence). See templates/east-west-default-deny.yaml.
 eastWestDefaultDeny:
   enabled: true
-  # Infra namespaces exempt from the fence (left fully open). MUST match the platform chart's
-  # networkPolicy.excludeNamespaces — the two lists are one exclude-set split across two charts.
+  # MUST match the platform chart's networkPolicy.excludeNamespaces — one exclude-set split across
+  # two charts.
   excludeNamespaces:
     - kube-system
     - kube-public
@@ -89,7 +82,7 @@ loadBalancer:
     start: "10.0.0.101"
     stop: "10.0.0.150"
   # Dedicated single IP for the shared ingress Gateway. The gateway Service has no endpoints
-  # (Envoy is fronted by Cilium's BPF), so MetalLB-L2 wouldn't announce it — Cilium does.
+  # (Envoy is fronted by Cilium's BPF), so it needs its own pool rather than sharing lab-pool.
   gatewayPool:
     name: gateway-pool
     ip: "10.0.0.100"
@@ -123,11 +116,8 @@ gateway:
     - 10.0.0.232/32
     - 10.0.1.140/32
 
-  # Namespaces the gateway may reach on the back hop (Envoy `reserved:ingress` -> backend pods).
-  # The east-west-default-deny fence no longer grants `ingress` cluster-wide, so a fenced backend is
-  # unreachable until its namespace is listed here — add an entry whenever you attach an HTTPRoute
-  # whose backend lives in a fenced namespace. Namespaces in eastWestDefaultDeny.excludeNamespaces
-  # (e.g. kube-system hubble-ui, kyverno policy-reporter) are already open and need no entry.
+  # Backends the gateway may reach on the reverse hop. A fenced namespace is unreachable from the
+  # gateway until listed here; namespaces in eastWestDefaultDeny.excludeNamespaces are already open.
   backendNamespaces:
     - app-homepage
     - monitoring

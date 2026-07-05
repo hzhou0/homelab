@@ -10,8 +10,7 @@ cert-manager:
   cainjector:
     replicaCount: 1
 
-# Let's Encrypt ClusterIssuer solving DNS-01 via Cloudflare. Issues a publicly-trusted wildcard
-# cert for *.internal.haustorium.net without inbound reachability (only DNS zone access needed).
+# DNS-01 (not HTTP-01) so no inbound reachability is needed — only DNS zone access.
 acme:
   enabled: true
   email: "henryzhou000@gmail.com"
@@ -20,8 +19,8 @@ acme:
   issuerName: letsencrypt-cloudflare
   privateKeySecretName: letsencrypt-cloudflare-account-key
 
-# Cloudflare API token with Zone:DNS:Edit on haustorium.net. The Secret must live in this
-# release's namespace (cert-manager) — ClusterIssuer resolves apiTokenSecretRef from there.
+# Token needs Zone:DNS:Edit on haustorium.net. The Secret must live in this release's namespace
+# — ClusterIssuer resolves apiTokenSecretRef from there.
 cloudflare:
   existingSecret: "cloudflare-api-token"
   secretKey: api-token

@@ -1,16 +1,9 @@
 {{- if and .Values.policies.enabled .Values.networkPolicy.enabled }}
 {{ $np := .Values.networkPolicy -}}
-# Per-namespace ingress ALLOWS, layered on the cilium `east-west-default-deny` CCNP.
-#
-# The authoritative fence is that CCNP, not this policy: it statically default-denies every governed
-# pod, so if this generation ever stops (e.g. the 1.18 generateExisting/synchronize bug) namespaces
-# fail CLOSED — they keep the deny and merely lose the allows below until regeneration. This policy
-# supplies the allows a clusterwide CCNP can't express per-destination: same-namespace traffic and the
-# monitoring scraper (and any namespace labelled homelab.lab/ingress). Stamped into EVERY namespace
-# except the same infra exclude-list the CCNP exempts. The generated NetworkPolicy is itself an ingress
-# policy (so it also denies-by-default when present) — harmless redundancy with the CCNP, kept because
-# namespaceSelector is the clean way to express the label/monitoring allows. The tier governance policy
-# (namespace-governance.yaml) owns quota/limits/RoleBinding only.
+# Per-namespace ingress ALLOWS only. The deny is cilium's east-west-default-deny CCNP, so a
+# namespace fails closed if this generation stops. The generated NetworkPolicy is itself an
+# ingress policy (harmless redundant deny) — kept because same-namespace/monitoring/label allows
+# are cleaner as a per-namespace namespaceSelector than a clusterwide CCNP.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -20,10 +13,8 @@ metadata:
   annotations:
     policies.kyverno.io/title: Namespace ingress allows
     policies.kyverno.io/description: >-
-      Stamps a NetworkPolicy allowing same-namespace, monitoring-scrape and ingress-labelled traffic
-      into every namespace except the infra exclude-list. Layers on cilium's east-west-default-deny
-      CCNP, which is the authoritative fence — namespaces stay default-deny (fail closed) even if this
-      policy stops generating.
+      Stamps a NetworkPolicy allowing same-namespace, monitoring-scrape and ingress-labelled
+      traffic into every namespace except the infra exclude-list.
 spec:
   rules:
     - name: default-ingress
@@ -34,9 +25,8 @@ spec:
                 - Namespace
       preconditions:
         all:
-          # Infra namespaces the CCNP also exempts (kept fully open): CoreDNS (kube-system) receives DNS
-          # from every pod; the rest are vendor infra with cross-cutting apiserver/webhook flows or the
-          # gateway data path. Must match cilium's eastWestDefaultDeny.excludeNamespaces.
+          # MUST match cilium's eastWestDefaultDeny.excludeNamespaces — the two lists are one
+          # exclude-set split across two charts.
           - key: "{{`{{ request.object.metadata.name }}`}}"
             operator: NotIn
             value:

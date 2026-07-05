@@ -1,23 +1,17 @@
 {{- if .Values.eastWestDefaultDeny.enabled }}
-# East-west default-deny — the authoritative ingress fence.
+# The authoritative east-west deny. Static (no controller), so it cannot silently disappear —
+# the platform's per-namespace NetworkPolicy only LAYERS allows on top, so a governed namespace
+# fails CLOSED if Kyverno stops generating.
 #
-# This is the ONLY thing that establishes the cluster-wide east-west deny, and it does so statically:
-# no controller, no generation, so it cannot silently disappear. (The platform Kyverno policy only
-# LAYERS same-namespace/monitoring allows on top — if Kyverno stops generating, this CCNP still denies,
-# so a governed namespace fails CLOSED, never open. That inversion is the whole point of moving the
-# deny here rather than leaving it in a per-namespace generated NetworkPolicy.)
-#
-# enableDefaultDeny.ingress:true drops all ingress to every selected pod except what a policy allows.
-# The allows carried here are exactly the node- and control-plane-sourced flows a plain k8s
-# NetworkPolicy cannot express — Hubble on this cluster confirmed each is real and non-obvious:
-#   - kubelet health/liveness probes            -> `host` (and `remote-node`)
-#   - apiserver-invoked admission webhooks       -> `remote-node` / `kube-apiserver`
-#     (kyverno:9443, cert-manager:9403, prometheus-operator, ... arrive cross-node as remote-node)
-#   - cilium health checks                       -> `health`
-# The Cilium Gateway (`reserved:ingress`) is deliberately NOT granted here — it is scoped per backend
-# namespace by gateway-ingress-policy.yaml's allow-gateway-ingress-to-backends, so a fenced pod is not
-# reachable from the gateway unless its namespace hosts a route. Same-namespace / monitoring / ingress-
-# labelled sources come from the platform NetworkPolicy. `cluster` is absent (re-permits all pod-to-pod).
+# The allows here are the node/control-plane flows a plain k8s NetworkPolicy cannot express
+# (Hubble confirmed each is real):
+#   - kubelet health/liveness probes            -> host, remote-node
+#   - apiserver-invoked admission webhooks       -> remote-node, kube-apiserver
+#     (kyverno:9443, cert-manager:9403, ... arrive cross-node as remote-node)
+#   - cilium health checks                       -> health
+# The Cilium Gateway (reserved:ingress) is deliberately NOT granted here — scoped per backend
+# namespace by gateway-ingress-policy.yaml, so a fenced pod is unreachable from the gateway
+# unless its namespace hosts a route. `cluster` is absent (would re-permit all pod-to-pod).
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
@@ -28,11 +22,7 @@ metadata:
 spec:
   description: >-
     Cluster-wide default-deny ingress for all governed pods, re-allowing only the kubelet-probe,
-    apiserver-webhook and cilium-health flows (host/remote-node/health/kube-apiserver). Gateway
-    ingress is scoped per backend namespace elsewhere; same-namespace and scrape allows come from the
-    platform per-namespace NetworkPolicy.
-  # Exists restricts to real pods (skips label-less reserved identities); NotIn exempts the infra
-  # namespaces that must stay open (CoreDNS in kube-system, the gateway data path, webhook backends).
+    apiserver-webhook and cilium-health flows (host/remote-node/health/kube-apiserver).
   # This list MUST mirror the platform chart's networkPolicy.excludeNamespaces.
   endpointSelector:
     matchExpressions:

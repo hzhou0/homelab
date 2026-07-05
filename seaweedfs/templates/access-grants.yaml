@@ -1,6 +1,8 @@
 {{- $sw := .Values.seaweedfs -}}
 {{- range $grant := .Values.accessGrants }}
 ---
+# Scoped by source NAMESPACE only — a pod can self-apply any label, so labels are not a trust
+# boundary; the namespace (gated by who can create pods there) is.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:

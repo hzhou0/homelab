@@ -11,8 +11,8 @@ tombstones that point at the encrypted remote copy.
 
 It replaces the previously-planned Ceph/Rook RGW stack (which was built but never deployed, so there is
 no data to migrate). Hypha's in-cluster endpoint — `s3.internal.haustorium.net`, via the shared Cilium
-ingress Gateway — takes over the role Ceph's `rook-ceph-rgw-s3-store` would have served for CloudNativePG
-backups, application buckets, and any other S3 consumer.
+ingress Gateway — takes over the role Ceph's `rook-ceph-rgw-s3-store` would have served for application
+buckets, backups, and any other S3 consumer.
 
 ## Why this instead of Ceph
 
@@ -33,7 +33,7 @@ that moves nutrients between a store and the outside.
 ## Architecture
 
 ```
-   S3 clients (CNPG Barman, apps, rclone, ...)
+   S3 clients
              │  S3 API (+ conditional writes)
              ▼
         ┌─────────┐        plaintext (S3)     ┌───────────────────────┐
@@ -160,16 +160,21 @@ no completion-time re-encryption pass.
 
 - Each `UploadPart` is encrypted into an integral number of frames and streamed straight to the remote
   (write-through). Because frames are self-describing and independently keyed by random nonce, a part is
-  encrypted with no knowledge of the other parts.
+  encrypted with no knowledge of the other parts. That part's **plaintext length and plaintext MD5** are
+  stamped onto the remote part object's own S3 user-metadata — there is no separate manifest artifact.
 - Parts may arrive out of order, in parallel, or be re-uploaded. A re-upload simply replaces that part's
   frames with freshly-nonced ones — there is no nonce to reuse and nothing to coordinate.
 - Parts also land **plaintext in the cache**, which handles multipart natively, so reads are hot
   immediately. A simple (non-multipart) `PUT` is just the single-part degenerate case on the same path.
-- `CompleteMultipartUpload` writes and authenticates the **frame manifest** — the ordered list of parts
-  and, per frame, its plaintext length and ciphertext offset — into the object's metadata. The manifest
-  makes the concatenation canonical and lets hypha:
-  - serve **ranged GETs** by fetching only the covering frames from the remote (byte-range GET), and
-  - detect truncation or cross-object splicing when reassembling.
+- `CompleteMultipartUpload` `ListParts`s the remote upload, composes the S3-correct composite ETag from
+  the per-part MD5s, and writes a small **part table** (per-part plaintext lengths) into the composite
+  object's metadata when it fits. The table lets hypha:
+  - serve **ranged GETs** by mapping a plaintext range across part boundaries and fetching only the
+    covering frames from the remote (byte-range GET), and
+  - detect truncation or cross-object splicing when reassembling (the per-frame AAD does the binding).
+  A half-finished upload simply shows a missing part via `ListParts` — detectable as incomplete, never
+  as corrupt — because the per-part facts live on the per-part objects the remote already stores
+  atomically, with no second "manifest" write to order against the body.
 - An aborted multipart upload leaves orphaned frames on the remote keyed under the upload id; these are
   reclaimed by the same GC pass that manages eviction.
 
@@ -280,9 +285,8 @@ These grants are scoped by source **namespace** — the cluster's identity bound
 are single-tenant and pod labels are self-applied (see the design doc, §11.4). So "hypha may read the
 cache" means "workloads in hypha's namespace may."
 
-The master UI is additionally reachable through the shared gateway; the data surfaces are not routed.
+Hypha will reach seaweedFs by its cluster ip. 
 
 ## Open questions
 
-- Rehydrate-on-read policy: always, never, or size-thresholded.
 - Remote key rotation / re-encryption strategy for the single master key.

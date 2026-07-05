@@ -24,19 +24,19 @@ kube-prometheus-stack:
       # Lower the Go GC threshold from the default 100 (collect when the heap has grown 100%) to 40,
       # so Prometheus collects earlier and settles at a smaller resident heap. This is a soft knob,
       # not a memory limit: it trades a little CPU (which is near-idle here) for lower steady-state
-      # memory and cannot OOMKill the process. Env merged onto the operator-generated container.
+      # memory and cannot OOMKill the process.
       containers:
         - name: prometheus
           env:
             - name: GOGC
               value: "40"
-      # Default is emptyDir (metrics are lost on pod restart). Point storageClassName at the
-      # cluster's Ceph block class to make Prometheus durable; left unset to avoid assuming a
-      # storage class exists at install time.
+      # Default is emptyDir (metrics are lost on pod restart). Point storageClassName at
+      # topolvm-provisioner to make Prometheus durable; left unset to avoid assuming a storage
+      # class exists at install time.
       # storageSpec:
       #   volumeClaimTemplate:
       #     spec:
-      #       storageClassName: ceph-block
+      #       storageClassName: topolvm-provisioner
       #       accessModes: ["ReadWriteOnce"]
       #       resources:
       #         requests:
@@ -52,12 +52,10 @@ kube-prometheus-stack:
     # the grafana container is Go; the two k8s-sidecar (Python) containers ignore this.
     env:
       GOGC: "40"
-    # Exposed via the shared Cilium Gateway (templates/grafana-route.yaml), so the subchart's
-    # own Ingress is off.
+    # Exposed via the shared Cilium Gateway, so the subchart's own Ingress is off.
     ingress:
       enabled: false
-    # adminPassword defaults to the upstream "prom-operator". Override out-of-git, e.g. with
-    # admin.existingSecret pointing at a Secret pre-created in the monitoring namespace.
+    # adminPassword defaults to upstream "prom-operator"; override out-of-git.
     grafana.ini:
       server:
         root_url: "https://grafana.internal.haustorium.net"
@@ -70,9 +68,6 @@ kube-prometheus-stack:
       auth:
         disable_login_form: true
 
-# ---------------------------------------------------------------------------
-# Grafana ingress via the shared Cilium Gateway: grafana.internal.haustorium.net
-# ---------------------------------------------------------------------------
 gateway:
   enabled: true
   # Must match gateway.name / gateway.namespace in the homelab-cilium chart.
@@ -84,10 +79,7 @@ gateway:
   serviceName: homelab-monitoring-grafana
   servicePort: 80
 
-# ---------------------------------------------------------------------------
-# Prometheus ingress via the shared Cilium Gateway: prometheus.internal.haustorium.net
-# ---------------------------------------------------------------------------
-# Same shape as the Grafana gateway block above. Prometheus has no built-in auth.
+# Prometheus has no built-in auth.
 prometheusGateway:
   enabled: true
   name: internal

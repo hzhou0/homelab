@@ -91,10 +91,13 @@ Never edit `references/` by hand — it is generated.
 
 - LoadBalancer IPs are assigned and L2-announced by **Cilium LB IPAM**; MetalLB was removed.
   Don't reference MetalLB in new config.
-- `homelab-platform` constraints use the GA CEL policy types
-  (`ValidatingPolicy`/`MutatingPolicy`/`GeneratingPolicy`), not Kyverno `ClusterPolicy`. Pod-level
+- `homelab-platform` validate/mutate constraints use the GA CEL policy types
+  (`ValidatingPolicy`/`MutatingPolicy`), not Kyverno `ClusterPolicy`. Pod-level
   checks run at Pod admission, so a bad image surfaces as a ReplicaSet `FailedCreate`, not a
-  Deployment rejection.
+  Deployment rejection. The **generate** policies (`namespace-governance`, `namespace-default-ingress`)
+  temporarily use Kyverno `ClusterPolicy` instead of CEL `GeneratingPolicy` because the upstream
+  `GeneratingPolicy.syncExisting`/`synchronize` fix (https://github.com/kyverno/kyverno/pull/16041)
+  is not yet in a released Kyverno 1.19; migrate them back when 1.19 ships.
 - Foundational charts (`cilium`, `cert-manager`, `topolvm`, `seaweedfs`, `hypha`, plus
   `opnsense-operator`) need privileged/cluster-scoped access and are human-installed; the
   autonomous operator's RBAC is deliberately confined to `app-*`/`tool-*` namespaces.

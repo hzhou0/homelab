@@ -5,8 +5,8 @@
 # The reverse hop (ingress proxy → backend pods) is the second CCNP below. The fence deliberately
 # does NOT grant `ingress` cluster-wide, so the proxy can only reach fenced backends whose namespace
 # is in gateway.backendNamespaces — a route into a fenced namespace is dead until that namespace is
-# listed. (Envoy re-identifies proxied traffic as reserved:ingress; a namespaceSelector can't match
-# it, so this is Cilium-native. Namespaces exempt from the fence are already reachable, no entry needed.)
+# listed. Envoy re-identifies proxied traffic as reserved:ingress, which a namespaceSelector can't
+# match either, so the reverse hop is Cilium-native too.
 {{- if .Values.gateway.allowedCIDRs }}
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
