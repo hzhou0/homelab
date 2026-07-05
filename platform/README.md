@@ -20,12 +20,17 @@ Every `app-*`/`tool-*` namespace is auto-governed the moment it is created: Kyve
 `ResourceQuota` and `LimitRange` (the operator deploy `RoleBinding` too) and stamps PSA labels.
 `synchronize: true` reverts any drift.
 
-The default-deny ingress `NetworkPolicy` is a separate, cluster-wide concern: `namespace-default-ingress`
-stamps it into **every** namespace — `app-*`, `tool-*` and foundational alike — except a small infra
-exclude-list (`networkPolicy.excludeNamespaces`: kube-system/CoreDNS, cert-manager, kyverno, …). So a
-new deployment of any kind is default-deny east-west unless explicitly granted. It pairs with the
-`homelab-cilium` `east-west-baseline-allow` CCNP, which re-allows the kubelet-probe / admission-webhook
-/ gateway flows a plain `NetworkPolicy` cannot express.
+The east-west fence is a separate, cluster-wide concern. The authoritative default-deny is the
+`homelab-cilium` `east-west-default-deny` CCNP — a static policy that denies ingress to every governed
+pod and re-allows only the kubelet-probe / admission-webhook / cilium-health flows a plain
+`NetworkPolicy` cannot express (gateway reach is a separate per-backend-namespace allow-list). Because
+the deny is static (not generated), a namespace fails **closed** even if
+Kyverno stops reconciling. On top of it, `namespace-default-ingress` generates a per-namespace
+`NetworkPolicy` carrying the additive allows a clusterwide CCNP can't express per-destination:
+same-namespace traffic, the monitoring scraper, and any namespace labelled `homelab.lab/ingress`. Both
+skip the same infra exclude-list (`networkPolicy.excludeNamespaces`, which must match the CCNP's
+`eastWestDefaultDeny.excludeNamespaces`: kube-system/CoreDNS, cert-manager, kyverno, …). So a new
+deployment of any kind is default-deny east-west unless explicitly granted.
 
 ## Per-runtime resource ranges
 

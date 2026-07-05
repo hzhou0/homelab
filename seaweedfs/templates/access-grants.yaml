@@ -1,0 +1,41 @@
+{{- $sw := .Values.seaweedfs -}}
+{{- range $grant := .Values.accessGrants }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-{{ $grant.name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-seaweedfs
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: seaweedfs
+      {{- if $grant.target.component }}
+      app.kubernetes.io/component: {{ $grant.target.component }}
+      {{- end }}
+    {{- if $grant.target.volumeServers }}
+    # Volume groups carry per-node component labels (volume-<node>), so enumerate them from the map.
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          {{- range $vname, $_ := $sw.volumes }}
+          - volume-{{ $vname }}
+          {{- end }}
+    {{- end }}
+  ingress:
+    - fromEndpoints:
+        {{- range $ns := $grant.fromNamespaces }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns }}
+        {{- end }}
+      toPorts:
+        - ports:
+            {{- range $p := $grant.ports }}
+            - port: {{ $p | quote }}
+              protocol: TCP
+            {{- end }}
+{{- end }}

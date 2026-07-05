@@ -19,10 +19,10 @@ The HTTPRoute attaches to the `internal` Gateway in `cilium-gateway` (matching `
 wildcard cert and access is bounded by the gateway's L3 allow-list (`gateway.allowedCIDRs` over
 there). Grafana's own Ingress is disabled in favour of the Gateway API.
 
-This `monitoring` namespace is itself default-deny ingress (the platform `namespace-default-ingress`
-policy fences every namespace, not just `app-*`/`tool-*`). Gateway traffic to Grafana/Prometheus
-still flows because the `homelab-cilium` `east-west-baseline-allow` CCNP admits the `ingress`
-identity to every pod — no per-namespace carve-out needed.
+This `monitoring` namespace is itself default-deny ingress (the cilium `east-west-default-deny` CCNP
+fences every namespace, not just `app-*`/`tool-*`). Gateway traffic to Grafana/Prometheus flows
+because `monitoring` is in the gateway's `backendNamespaces` allow-list (cilium chart), which re-opens
+the `ingress` identity to this namespace — the gateway can only reach namespaces that host a route.
 
 ## Scraping governed namespaces
 

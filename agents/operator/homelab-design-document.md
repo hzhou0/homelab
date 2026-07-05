@@ -563,6 +563,15 @@ Practical mitigation: encrypt all traffic at L3+ (HTTPS, WireGuard, TLS, encrypt
 
 ### 11.4 Kubernetes Security
 
+- **Namespaces are single-tenant.** Every namespace holds one app/tool/component, so the namespace
+  *is* the workload's identity. NetworkPolicy grants are therefore scoped by source namespace, never
+  by pod labels — a pod can self-apply any label, so labels are not a trust boundary; namespace
+  membership is, because creating a pod there is gated by RBAC. Granting a namespace access means
+  trusting every pod in it equally, which single-tenancy makes safe.
+- Every namespace is default-deny ingress. The fence is the static cilium `east-west-default-deny`
+  CCNP (so it holds even if Kyverno stops reconciling — fail closed); the platform
+  `namespace-default-ingress` policy layers the same-namespace and scrape allows on top. East-west
+  reachability past those requires an explicit grant.
 - Database node is tainted — only authorized workloads schedule there
 - Storage nodes are labelled `vg=nvme` — TopoLVM's lvmd/node plugins are scoped by label
 - TopoLVM manages only the `vg-nvme` volume group, so it never claims unintended devices

@@ -7,9 +7,8 @@ description: >-
   Foundational like cilium/cert-manager: it ships CRDs (Prometheus, ServiceMonitor, ...) and
   needs cluster-scoped RBAC to discover and scrape targets across all namespaces, so the
   autonomous operator cannot install it and it lives in its own namespace rather than an
-  app-*/tool-* one. On top it ships a single HTTPRoute that exposes Grafana through the shared
-  Cilium ingress Gateway at grafana.internal.haustorium.net (TLS terminated by the gateway's
-  wildcard cert, reachability bounded by the gateway's L3 allow-list).
+  app-*/tool-* one. On top it ships HTTPRoutes that expose Grafana and Prometheus through the
+  shared Cilium ingress Gateway.
 type: application
 version: 0.1.0
 appVersion: "v0.92.0"

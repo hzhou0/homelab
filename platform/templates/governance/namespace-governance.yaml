@@ -12,9 +12,7 @@ metadata:
     policies.kyverno.io/description: >-
       Generates the tier-specific resources — ResourceQuota, LimitRange and the operator
       deploy RoleBinding — into every app-*/tool-* namespace, kept in sync so the operator
-      cannot widen its own sandbox. The default-ingress NetworkPolicy is NOT generated here:
-      it is a cluster-wide concern owned by namespace-default-ingress.yaml (which fences
-      foundational namespaces too).
+      cannot widen its own sandbox. Ingress is governed separately by namespace-default-ingress.yaml.
 spec:
   evaluation:
     synchronize:
@@ -25,7 +23,7 @@ spec:
     resourceRules:
       # CREATE and UPDATE: UPDATE is required so namespace patches (PSA label stamping, operator
       # notes) don't cause the engine to treat the namespace as no-longer-qualifying and tear down
-      # all generated resources (quota, limitrange, NetworkPolicy, deploy RoleBinding).
+      # all generated resources (quota, limitrange, deploy RoleBinding).
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]

@@ -50,13 +50,25 @@ cilium:
     burst: 100
 
 # ---------------------------------------------------------------------------
-# East-west baseline allow (pairs with the platform chart's per-namespace default-deny)
+# East-west default-deny (the authoritative ingress fence)
 # ---------------------------------------------------------------------------
-# Additive CCNP that re-allows node/control-plane/gateway ingress (kubelet probes, admission
-# webhooks, cilium health, Cilium Gateway) to every pod, so the platform's default-deny does not
-# break them. See templates/east-west-baseline-allow.yaml. Land this BEFORE the platform deny.
-eastWestBaseline:
+# Static CCNP that default-denies east-west ingress for every governed pod and re-allows only the
+# node/control-plane/gateway flows a k8s NetworkPolicy can't express. The platform Kyverno policy
+# layers same-namespace/monitoring allows on top; because the deny lives HERE (not in that generated
+# policy), a namespace fails closed if Kyverno stops generating. See templates/east-west-default-deny.yaml.
+eastWestDefaultDeny:
   enabled: true
+  # Infra namespaces exempt from the fence (left fully open). MUST match the platform chart's
+  # networkPolicy.excludeNamespaces — the two lists are one exclude-set split across two charts.
+  excludeNamespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+    - default
+    - cilium-gateway
+    - cilium-secrets
+    - cert-manager
+    - kyverno
 
 # ---------------------------------------------------------------------------
 # Host firewall
@@ -110,6 +122,17 @@ gateway:
   allowedCIDRs:
     - 10.0.0.232/32
     - 10.0.1.140/32
+
+  # Namespaces the gateway may reach on the back hop (Envoy `reserved:ingress` -> backend pods).
+  # The east-west-default-deny fence no longer grants `ingress` cluster-wide, so a fenced backend is
+  # unreachable until its namespace is listed here — add an entry whenever you attach an HTTPRoute
+  # whose backend lives in a fenced namespace. Namespaces in eastWestDefaultDeny.excludeNamespaces
+  # (e.g. kube-system hubble-ui, kyverno policy-reporter) are already open and need no entry.
+  backendNamespaces:
+    - app-homepage
+    - monitoring
+    - seaweedfs
+    - tool-headlamp
 
   hubbleUI:
     enabled: true

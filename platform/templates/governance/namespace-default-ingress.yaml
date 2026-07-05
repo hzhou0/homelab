@@ -1,79 +1,72 @@
 {{- if and .Values.policies.enabled .Values.networkPolicy.enabled }}
-{{- $np := .Values.networkPolicy -}}
-# Default-deny ingress for (almost) every namespace.
+{{ $np := .Values.networkPolicy -}}
+# Per-namespace ingress ALLOWS, layered on the cilium `east-west-default-deny` CCNP.
 #
-# The network fence is one concern applied cluster-wide: stamp a default-ingress NetworkPolicy into
-# EVERY namespace except a small infra exclude-list. This is deliberately not split by tier — app-*,
-# tool-* and foundational (cluster-admin) namespaces all get the same fence from here. The tier
-# governance policy (namespace-governance.yaml) owns only the tier-specific resources (quota,
-# limits, operator RoleBinding); it no longer generates the NetworkPolicy.
-#
-# Deny-by-default is the point: a new namespace is unreachable east-west until an explicit grant is
-# added (the destination ships a CiliumNetworkPolicy naming its callers + port). Pairs with the
-# cilium `east-west-baseline-allow` CCNP, which re-allows the kubelet-probe / admission-webhook /
-# Cilium-Gateway flows a plain NetworkPolicy cannot express — land that CCNP FIRST or webhooks and
-# gateway UIs in denied namespaces break.
-apiVersion: policies.kyverno.io/v1
-kind: GeneratingPolicy
+# The authoritative fence is that CCNP, not this policy: it statically default-denies every governed
+# pod, so if this generation ever stops (e.g. the 1.18 generateExisting/synchronize bug) namespaces
+# fail CLOSED — they keep the deny and merely lose the allows below until regeneration. This policy
+# supplies the allows a clusterwide CCNP can't express per-destination: same-namespace traffic and the
+# monitoring scraper (and any namespace labelled homelab.lab/ingress). Stamped into EVERY namespace
+# except the same infra exclude-list the CCNP exempts. The generated NetworkPolicy is itself an ingress
+# policy (so it also denies-by-default when present) — harmless redundancy with the CCNP, kept because
+# namespaceSelector is the clean way to express the label/monitoring allows. The tier governance policy
+# (namespace-governance.yaml) owns quota/limits/RoleBinding only.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
 metadata:
   name: namespace-default-ingress
   labels:
 {{ include "platform.labels" . | indent 4 }}
   annotations:
-    policies.kyverno.io/title: Namespace default-deny ingress
+    policies.kyverno.io/title: Namespace ingress allows
     policies.kyverno.io/description: >-
-      Stamps the default-ingress NetworkPolicy into every namespace except the infra exclude-list,
-      so every deployment (app-*, tool-*, or foundational) is default-deny east-west unless
-      explicitly granted. Pairs with cilium's east-west-baseline-allow CCNP.
+      Stamps a NetworkPolicy allowing same-namespace, monitoring-scrape and ingress-labelled traffic
+      into every namespace except the infra exclude-list. Layers on cilium's east-west-default-deny
+      CCNP, which is the authoritative fence — namespaces stay default-deny (fail closed) even if this
+      policy stops generating.
 spec:
-  evaluation:
-    synchronize:
-      enabled: true
-    # Fences already-existing namespaces on install, not just future CREATEs. This is why it must
-    # be staged behind the cilium baseline CCNP.
-    generateExisting:
-      enabled: true
-  matchConstraints:
-    resourceRules:
-      # UPDATE as well as CREATE: a namespace patch (PSA label stamping, operator notes) must not
-      # make the engine treat the namespace as no-longer-qualifying and tear the NetworkPolicy down.
-      - apiGroups: [""]
-        apiVersions: ["v1"]
-        operations: ["CREATE", "UPDATE"]
-        resources: ["namespaces"]
-  matchConditions:
-    # Infra namespaces that must NOT be namespaced-default-denied: CoreDNS (kube-system) receives
-    # DNS from every pod cluster-wide; the rest are vendor infra with cross-cutting apiserver/webhook
-    # flows or the gateway data path.
-    - name: not-excluded
-      expression: >-
-        !(object.metadata.name in [
-        {{- range $i, $ns := $np.excludeNamespaces }}{{ if $i }}, {{ end }}'{{ $ns }}'{{- end }}])
-  variables:
-    - name: ns
-      expression: "string(object.metadata.name)"
-    # default-deny ingress, re-allowing same-namespace pods, ingress-labelled namespaces (the
-    # gateway), and the monitoring scraper.
-    - name: netpolRes
-      expression: >
-        {
-          "apiVersion": dyn("networking.k8s.io/v1"),
-          "kind": dyn("NetworkPolicy"),
-          "metadata": dyn({"name": "default-ingress", "namespace": variables.ns}),
-          "spec": dyn({
-            "podSelector": dyn({}),
-            "policyTypes": dyn(["Ingress"]),
-            "ingress": dyn([dyn({"from": dyn([
-              dyn({"podSelector": dyn({})}),
-              dyn({"namespaceSelector": dyn({"matchLabels": dyn({"{{ $np.ingressFromNamespaceLabel }}": "true"})})})
-              {{- if $np.monitoringNamespace }},
-              dyn({"namespaceSelector": dyn({"matchLabels": dyn({"kubernetes.io/metadata.name": "{{ $np.monitoringNamespace }}"})})})
-              {{- end }}
-            ])})])
-          })
-        }
-    - name: generatedResources
-      expression: "[variables.netpolRes]"
-  generate:
-    - expression: generator.Apply(variables.ns, variables.generatedResources)
+  rules:
+    - name: default-ingress
+      match:
+        any:
+          - resources:
+              kinds:
+                - Namespace
+      preconditions:
+        all:
+          # Infra namespaces the CCNP also exempts (kept fully open): CoreDNS (kube-system) receives DNS
+          # from every pod; the rest are vendor infra with cross-cutting apiserver/webhook flows or the
+          # gateway data path. Must match cilium's eastWestDefaultDeny.excludeNamespaces.
+          - key: "{{`{{ request.object.metadata.name }}`}}"
+            operator: NotIn
+            value:
+{{- range $ns := $np.excludeNamespaces }}
+              - {{ $ns | quote }}
+{{- end }}
+      generate:
+        generateExisting: true
+        synchronize: true
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: default-ingress
+        namespace: "{{`{{ request.object.metadata.name }}`}}"
+        data:
+          metadata:
+            labels:
+              created-by: kyverno
+          spec:
+            podSelector: { }
+            policyTypes:
+              - Ingress
+            ingress:
+              - from:
+                  - podSelector: { }
+                  - namespaceSelector:
+                      matchLabels:
+                        {{ $np.ingressFromNamespaceLabel | quote }}: "true"
+{{- if $np.monitoringNamespace }}
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: {{ $np.monitoringNamespace | quote }}
+{{- end }}
 {{- end }}

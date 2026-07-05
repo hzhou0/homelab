@@ -98,28 +98,17 @@ namespaceMetadata:
   enabled: true
   managedBy: operator-agent
 
-protectedNamespaces:
-  - kube-system
-  - kube-public
-  - kube-node-lease
-  - database
-  - rook-ceph
-
 networkPolicy:
   enabled: true
   ingressFromNamespaceLabel: "homelab.lab/ingress"
-  # Namespace whose pods (Prometheus) are allowed to scrape /metrics on every governed app-*/tool-*
-  # pod, on top of the default-deny ingress. Matched by the immutable kubernetes.io/metadata.name
-  # label Kubernetes stamps on every namespace, so the monitoring namespace needs no extra labeling.
-  # Set empty to drop the allowance.
+  # Namespace whose pods (Prometheus) may scrape /metrics on every governed app-*/tool-* pod.
+  # Matched by the immutable kubernetes.io/metadata.name label Kubernetes stamps on every
+  # namespace, so the monitoring namespace needs no extra labeling. Set empty to drop the allowance.
   monitoringNamespace: "monitoring"
 
-  # The default-ingress fence (namespace-default-ingress.yaml) is stamped into EVERY namespace
-  # except these — app-*, tool-* and foundational (cluster-admin) namespaces all get it, so a new
-  # deployment is default-deny east-west unless explicitly granted. Requires cilium's
-  # east-west-baseline-allow CCNP live first (it re-allows kubelet probes / admission webhooks /
-  # gateway). Excluded here: CoreDNS (kube-system) receives DNS from every pod; the rest are vendor
-  # infra with cross-cutting apiserver/webhook flows or the gateway data path.
+  # Namespaces the per-namespace ingress-allow NetworkPolicy is NOT stamped into. MUST match
+  # cilium's eastWestDefaultDeny.excludeNamespaces — the two lists are one exclude-set split
+  # across two charts. See namespace-default-ingress.yaml for the fence model.
   excludeNamespaces:
     - kube-system
     - kube-public

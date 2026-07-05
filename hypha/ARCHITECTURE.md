@@ -269,8 +269,18 @@ each in its own namespace, mirroring the `cilium` / `cert-manager` / `monitoring
   (`s3-direct.internal.haustorium.net`) for zero-loss clients — each scoped to its own remote account or,
   on a shared remote, its own key prefix.
 
-The gateway backends allow-list in the `cilium` chart must exempt these namespaces
-(`gateway.backendsExcludeNamespaces`) so the exposed S3 endpoint is reachable.
+### Access to the cache surfaces
+
+SeaweedFS's surfaces (S3, filer, volume, master) are plaintext and unauthenticated, so the network is
+their only fence. Their namespace is default-deny ingress, and each cross-namespace consumer is named
+explicitly by the `seaweedfs` chart (a `CiliumNetworkPolicy` per surface) — hypha for the S3 data path
+and, if the `seaweedfs` usage source is enabled, the master/volume status APIs.
+
+These grants are scoped by source **namespace** — the cluster's identity boundary, since namespaces
+are single-tenant and pod labels are self-applied (see the design doc, §11.4). So "hypha may read the
+cache" means "workloads in hypha's namespace may."
+
+The master UI is additionally reachable through the shared gateway; the data surfaces are not routed.
 
 ## Open questions
 

@@ -26,19 +26,14 @@ seaweedfs:
       storageClass: topolvm-provisioner
       size: 1Gi
 
-  # Shared defaults for every entry in `volumes:` below (port, grpcPort, index mode, etc.).
-  # `enabled: false` here turns off the chart's own generic, unnamed volume-server group — we
-  # only want the explicitly pinned per-node groups.
+  # Shared defaults for the per-node volume groups below (`enabled: false` disables the chart's
+  # own generic group).
   volume:
     enabled: false
+    # On-disk index instead of the default in-memory one, whose RAM grows ~20 bytes/object
+    # unbounded — these N100 nodes have little to spare. leveldbLarge is the fastest leveldb tier.
+    index: leveldbLarge
 
-  # One named StatefulSet per storage node (seaweedfs.volumes, not the singular seaweedfs.volume
-  # a StatefulSet + a replica count can't guarantee one pod per specific node — nothing stops the
-  # scheduler from double-stacking two replicas on the same node while a third sits elsewhere, and
-  # the replica count silently drifts from the real node count as nodes are added/removed. Each
-  # entry here pins one volume server to one named node and sizes its PVC to that node's actual
-  # vg-nvme capacity (read from topolvm_volumegroup_size_bytes), leaving headroom for TopoLVM's
-  # own spare-gb reservation and the master/filer PVCs that may also land on that node.
   volumes:
     k3s-server:
       replicas: 1
@@ -75,29 +70,45 @@ seaweedfs:
       storageClass: topolvm-provisioner
       size: 10Gi
 
-  # Dedicated S3 gateway → a stable <release>-seaweedfs-s3 Service on :8333 for hypha to point at.
-  # Auth is off: reachability is fenced by the namespace NetworkPolicy, and hypha is the only client.
+  # Auth off — the S3 surface is plaintext; fenced by accessGrants below.
   s3:
     enabled: true
     port: 8333
     enableAuth: false
 
-# ---------------------------------------------------------------------------
-# Master status UI via the shared Cilium Gateway: seaweedfs.internal.haustorium.net
-# ---------------------------------------------------------------------------
-# Only the MASTER UI (:9333 — cluster topology/health) is exposed, and only to the admin CIDRs the
-# gateway already allow-lists. The S3 (:8333), filer (:8888) and volume (:8080) surfaces are NOT
-# routed: those serve plaintext object bytes and have no auth, so the namespace NetworkPolicy must
-# stay their only door (hypha is the sole intended client). Mirrors the monitoring chart's Grafana/
-# Prometheus routes. NOTE: `seaweedfs` must be in gateway.backendsExcludeNamespaces in the cilium
-# chart (already added) so the gateway→backends policy doesn't flip this namespace to default-deny.
+# Gateway-routed UIs. The filer UI browses object *contents* (plaintext); the raw S3/volume
+# ports stay unrouted.
 gateway:
   enabled: true
-  # Must match gateway.name / gateway.namespace in the homelab-cilium chart.
   name: internal
   namespace: cilium-gateway
-  hostname: seaweedfs.internal.haustorium.net
-  # Master Service created by the subchart: <release>-master. Default assumes the release is
-  # named `homelab-seaweedfs`.
-  serviceName: homelab-seaweedfs-master
-  servicePort: 9333
+  routes:
+    - name: seaweedfs-master
+      hostname: seaweedfs.internal.haustorium.net
+      serviceName: homelab-seaweedfs-master
+      servicePort: 9333
+    - name: seaweedfs-filer
+      hostname: seaweedfs-filer.internal.haustorium.net
+      serviceName: homelab-seaweedfs-filer
+      servicePort: 8888
+
+# Cross-namespace allow grants for the plaintext surfaces (one CiliumNetworkPolicy each). Scoped by
+# source NAMESPACE only — a pod can self-apply any label, so labels are not a trust boundary; the
+# namespace (gated by who can create pods there) is. Namespaces need not exist yet — a grant matches
+# nothing until one does. hypha is the only client today: S3 for data, master + volume status APIs
+# for its optional `seaweedfs` cache-usage source. The filer stays internal-only, so it has no grant.
+#
+# target: `component: <label>`, or `volumeServers: true` for every per-node volume group.
+accessGrants:
+  - name: hypha-s3
+    target: { component: s3 }
+    ports: [8333]
+    fromNamespaces: [hypha]
+  - name: hypha-master
+    target: { component: master }
+    ports: [9333, 19333]          # 19333 = gRPC, for weed shell (volume.vacuum)
+    fromNamespaces: [hypha]
+  - name: hypha-volume
+    target: { volumeServers: true }
+    ports: [8080]
+    fromNamespaces: [hypha]

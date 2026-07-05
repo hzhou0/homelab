@@ -2,10 +2,11 @@
 # Clients → `ingress` proxy L3 allow-list. A vanilla k8s NetworkPolicy cannot match the reserved
 # `ingress` identity, so this front-door allow is Cilium-native.
 #
-# The reverse hop (ingress proxy → backend pods) needs no policy here: the east-west-baseline-allow
-# CCNP already grants `fromEntities: [ingress]` to every pod, so any Gateway backend is reachable by
-# the proxy regardless of namespace. (It used to be a second CCNP scoped by backendsExcludeNamespaces;
-# that became redundant once the baseline allow + the platform's namespace-default-ingress landed.)
+# The reverse hop (ingress proxy → backend pods) is the second CCNP below. The fence deliberately
+# does NOT grant `ingress` cluster-wide, so the proxy can only reach fenced backends whose namespace
+# is in gateway.backendNamespaces — a route into a fenced namespace is dead until that namespace is
+# listed. (Envoy re-identifies proxied traffic as reserved:ingress; a namespaceSelector can't match
+# it, so this is Cilium-native. Namespaces exempt from the fence are already reachable, no entry needed.)
 {{- if .Values.gateway.allowedCIDRs }}
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
@@ -39,5 +40,32 @@ spec:
     - fromEntities:
         - world
         - cluster
+{{- end }}
+{{- if .Values.gateway.backendNamespaces }}
+---
+# Reverse hop: Envoy `reserved:ingress` → backend pods, scoped to the namespaces that host routes.
+# Additive (enableDefaultDeny:false) — the east-west-default-deny fence owns the deny; this only
+# re-opens `ingress` for the listed backends, so the gateway's reach is an explicit allow-list.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: allow-gateway-ingress-to-backends
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  endpointSelector:
+    matchExpressions:
+      - key: k8s:io.kubernetes.pod.namespace
+        operator: In
+        values:
+{{- range $ns := .Values.gateway.backendNamespaces }}
+          - {{ $ns | quote }}
+{{- end }}
+  enableDefaultDeny:
+    ingress: false
+  ingress:
+    - fromEntities:
+        - ingress
 {{- end }}
 {{- end }}
