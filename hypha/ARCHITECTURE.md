@@ -41,7 +41,7 @@ that moves nutrients between a store and the outside.
         │ (Rust)  │ ◀───────────────────────── │  hot · working tier   │
         └─────────┘                            │  (SeaweedFS / TopoLVM)│
              │                                 └───────────────────────┘
-             │  ciphertext (framed AEAD), write-through + GC eviction
+             │  ciphertext (age v1), write-through + GC eviction
              ▼
    ┌────────────────────────────┐
    │ remote S3 endpoint         │  cold · durable · encrypted
@@ -105,11 +105,12 @@ node-local PVC from TopoLVM.
 - **Tuned for latency**: in-memory needle maps, NVMe-backed volumes, local filer metadata store.
 - **Self-documenting objects, no separate index.** hypha keeps no side index. A live object is just a
   cache object; an evicted one is a **tombstone** — a zero-byte cache object at the same key whose S3
-  user-metadata records that the body now lives only on the remote (plus its frame offsets). There is no
-  per-object key material to track: a single master key encrypts every body and the nonces travel inside
-  the ciphertext frames. Because the remote keeps the real key name and metadata in plaintext (standard
-  S3 client-side encryption), the filer is only a cache index — discard it and it repopulates lazily
-  from the remote.
+  user-metadata records that the body now lives only on the remote (plus its offset info). There is no
+  per-object key material to track on the cache side: hypha encrypts each remote object with age to a
+  static X25519 recipient, age wraps a fresh random file key into the age header stored on the remote
+  object itself, and the cache stores only plaintext. Because the remote keeps the real key name and
+  metadata in plaintext (standard S3 client-side encryption), the filer is only a cache index — discard
+  it and it repopulates lazily from the remote.
 
 ## S3 surface and conditional writes
 
@@ -125,72 +126,104 @@ create/update semantics, regardless of what the underlying backends guarantee on
 
 ## Encryption
 
-- **One symmetric master key**, 32 bytes, delivered to hypha through a Kubernetes Secret kept out of
-  git; the authoritative copy lives outside the cluster (password manager / safe). Losing it renders the
-  remote copies unrecoverable — the same key-custody rule as the rest of the homelab's backups.
-- **AEAD: XChaCha20-Poly1305.** Its 192-bit nonce is the crux of the design: nonces are chosen at random
-  per frame, and a 192-bit random nonce is collision-safe across an effectively unbounded number of
-  frames under a single key. That removes any need for a global counter or per-writer nonce coordination,
-  which in turn is what makes independent per-part encryption (below) sound. (AES-256-GCM-SIV is a viable
-  nonce-misuse-resistant alternative but is not the primary choice.)
+- **One asymmetric master identity**, an X25519 keypair delivered to hypha through a Kubernetes Secret
+  kept out of git; the authoritative copy lives outside the cluster (password manager / safe). Losing it
+  renders the remote copies unrecoverable — the same key-custody rule as the rest of the homelab's backups.
+- **Envelope format: [age](https://age-encryption.org/v1).** Rather than design a custom AEAD framing,
+  hypha uses the reviewed age v1 format — Filippo's modern streaming AEAD — which has the exact
+  properties hypha needs (per-chunk authentication, seekable decryption for range GET, splice/truncation
+  detection via a finalizer chunk). Each remote object (single-part body, or one age file per multipart
+  part) is an independent age file encrypted to hypha's static X25519 recipient; age generates a fresh
+  random **file key** per invocation, so parallel `UploadPart` workers and concurrent PUTs need no nonce
+  or key coordination — the per-file file key *is* the coordination-free property. Each file key is
+  wrapped to hypha's recipient key in the age header stored alongside the ciphertext on the remote object.
+  This is cryptographically cleaner than a single master key encrypting every frame with random nonces:
+  per-file key isolation removes any cross-object nonce-reuse budget, and a hypothetical compromise of one
+  file's ciphertext does not leak information about another's.
 - **Only bodies are encrypted — standard S3 client-side encryption.** The key name and object metadata
   are stored in plaintext on the remote, exactly as an S3 client-side-encryption client does; only the
   body is ciphertext. The provider can see names and sizes, never contents.
 - The cache itself stores plaintext — it is node-local NVMe inside the trusted network, and keeping it
   plaintext is what keeps the hot path fast.
 
-### Framed ciphertext format
+### age format specifics that hypha relies on
 
-An object's ciphertext is a sequence of self-describing **frames**:
+age v1 chunks the plaintext into fixed **64 KiB chunks** (specifically 65520 plaintext bytes + 16-byte
+Poly1305 tag = 65536 ciphertext bytes per chunk), each independently authenticated with ChaCha20-Poly1305
+under a key derived from the file key. Nonces are *deterministic* — derived from the chunk index, not
+random — so:
 
-```
-frame := [ u32 plaintext_len ] [ 24B nonce ] [ ciphertext ] [ 16B Poly1305 tag ]
-AAD   := object_uuid ‖ part_number ‖ frame_index_in_part ‖ flags   (last-frame, ...)
-```
-
-Every frame is independently authenticated and carries its own random nonce, so frames — and therefore
-whole encrypted parts — can be produced independently and concatenated in order to form a valid object.
-The AAD binds each frame to its object and position, so truncating, reordering, or splicing frames from
-another object fails authentication.
+- **Range GET** maps a plaintext byte range to a contiguous ciphertext byte range (`chunk_index =
+  floor(plaintext_byte / 65520)`, ciphertext offset = `chunk_index * 65536`), one byte-range GET on the
+  remote, no prefix read. age's `StreamReader` implements `std::io::Seek` directly when given a seekable
+  underlying reader (which `aws-sdk-s3` byte-range GET provides), so hypha does not reimplement chunk
+  decryption.
+- **Per-part independence** is achieved by giving each multipart part its own age file (and therefore
+  its own fresh file key and its own nonce space starting at chunk 0). No cross-part coordination; a
+  re-upload of a part just creates a new age file with a fresh random file key. Equivalent to the
+  previous custom-format property, achieved without relying on a 192-bit random-nonce collision budget
+  under one shared key.
+- **Splice / truncation / reorder detection** falls out of key separation (a chunk from object A dropped
+  into object B's slot fails to decrypt with B's file key) plus chunk-index-in-nonce derivation (reordered
+  chunks fail authentication) plus age's finalizer chunk (truncation is detectable cleanly).
 
 ## Multipart upload with encryption
 
-Multipart is supported by encrypting **each part directly**, using the framing format above — there is
-no completion-time re-encryption pass.
+Multipart uploads are **routed around the cache** and streamed straight to the remote each part —
+parts are not readable individually until `CompleteMultipartUpload` commits the composite, the
+cache's latency win doesn't help throughput bound multipart traffic, and routing parts through the
+cache would impose S3 multipart plumbing on the cache with no upside. Multipart takes the cacheless
+data path of § *Write-through durability* regardless of whether the deployment is cached. A completed
+composite becomes cachable on first read: a GET fetches and decrypts from the remote, then
+asynchronously populates the cache from the decrypted plaintext, so subsequent reads are hot — the
+same rehydrate path used for tombstoned bodies.
 
-- Each `UploadPart` is encrypted into an integral number of frames and streamed straight to the remote
-  (write-through). Because frames are self-describing and independently keyed by random nonce, a part is
-  encrypted with no knowledge of the other parts. That part's **plaintext length and plaintext MD5** are
-  stamped onto the remote part object's own S3 user-metadata — there is no separate manifest artifact.
-- Parts may arrive out of order, in parallel, or be re-uploaded. A re-upload simply replaces that part's
-  frames with freshly-nonced ones — there is no nonce to reuse and nothing to coordinate.
-- Parts also land **plaintext in the cache**, which handles multipart natively, so reads are hot
-  immediately. A simple (non-multipart) `PUT` is just the single-part degenerate case on the same path.
+Multipart is supported by encrypting **each part directly as its own age file**, using the format
+above — there is no completion-time re-encryption pass.
+
+- Each `UploadPart` is encrypted into an age file (fresh random file key per part) and streamed
+  straight to the remote. Because each part has its own file key and its own nonce space starting at
+  chunk 0, a part is encrypted with no knowledge of the other parts. That part's **plaintext length
+  and plaintext MD5** are stamped onto the remote part object's own S3 user-metadata — there is no
+  separate manifest artifact.
+- Parts may arrive out of order, in parallel, or be re-uploaded. A re-upload simply creates a new age
+  file with a fresh file key, replacing that part's bytes on the remote — nothing to coordinate.
 - `CompleteMultipartUpload` `ListParts`s the remote upload, composes the S3-correct composite ETag from
   the per-part MD5s, and writes a small **part table** (per-part plaintext lengths) into the composite
   object's metadata when it fits. The table lets hypha:
   - serve **ranged GETs** by mapping a plaintext range across part boundaries and fetching only the
-    covering frames from the remote (byte-range GET), and
-  - detect truncation or cross-object splicing when reassembling (the per-frame AAD does the binding).
+    covering age chunks from the remote (byte-range GET), and
+  - detect truncation or cross-object splicing when reassembling (per-part file-key separation plus
+    age's chunk-index-in-nonce derivation plus finalizer chunk do the binding).
   A half-finished upload simply shows a missing part via `ListParts` — detectable as incomplete, never
   as corrupt — because the per-part facts live on the per-part objects the remote already stores
   atomically, with no second "manifest" write to order against the body.
-- An aborted multipart upload leaves orphaned frames on the remote keyed under the upload id; these are
-  reclaimed by the same GC pass that manages eviction.
+- Each part's plaintext size is capped at **4 GiB** (one line below the S3 `UploadPart` 5 GiB max) so
+  the age envelope (~1.3 MiB overhead per GiB plus a ~200 B header) never pushes the framed part over
+  the remote's part-size cap. Homelab parts are 5–128 MiB in practice; transparent re-splitting of a
+  larger client part at the 4 GiB boundary is a later refinement, not launch scope.
+- An aborted multipart upload leaves orphaned age files on the remote keyed under the upload id; these
+  are reclaimed by the same GC pass that manages eviction.
 
 ## Data path
 
-- **PUT / UploadPart** → write plaintext to the cache; frame-encrypt and stream to the remote
-  asynchronously (write-through); record the manifest + remote key in metadata; mark the object durable
-  once the remote write is confirmed.
+- **PUT** (single-object) → in a cached deployment, write plaintext to the cache, write a pending
+  marker, and ack; a background reconcile pass frame-encrypts and uploads to the remote (write-through
+  async). In a cacheless deployment, frame-encrypt and upload straight to the remote, acking once it
+  is durable.
+- **UploadPart** → routed around the cache in both deployments: frame-encrypt and stream straight to
+  the remote (the cacheless path), ack each part once the remote confirms. The composite is not
+  readable until `CompleteMultipartUpload` commits it, and a multipart's size is throughput-bound, so
+  the cache's latency win doesn't apply.
 - **GET** → if the body is local, serve from the cache. If tombstoned (or the local body was lost to a
-  node failure), consult the manifest, fetch the covering frames from the remote, authenticate and
-  decrypt, and stream to the client; optionally rehydrate the body locally and bump its LRU position.
+  node failure), consult the manifest, fetch the covering age chunks from the remote, authenticate and
+  decrypt, and stream to the client; **rehydrate the body locally and bump its LRU position** — this
+  is also how a completed multipart composite first enters the cache.
 - **HEAD / LIST** → served from cache metadata when warm, otherwise from the remote (which holds the same
   keys and metadata).
 - **DELETE** → remove locally and enqueue the remote deletion.
-- **Cacheless deployment** → the same operations with no cache: a PUT frame-encrypts and writes straight
-  to the remote, acking only once it is durable; a GET fetches and decrypts from the remote.
+- **Cacheless deployment** → single-object PUT takes the same inline-to-remote path that multipart
+  always takes; a GET fetches and decrypts from the remote, with no rehydrate target.
 
 ## Write-through durability
 
@@ -220,12 +253,12 @@ pluggable *usage source* (below) — against a high-water and low-water mark:
 
 - Crossing the **high-water mark** starts GC: evict least-recently-used object *bodies*. Eviction
   confirms the remote copy is durable, deletes the local body from the cache, and leaves a **tombstone** —
-  the metadata and frame manifest stay, marking the body as remote-only. GC continues until the
+  the metadata and part-table stay, marking the body as remote-only. GC continues until the
   **low-water mark** is reached.
 - LRU is tracked by hypha (access time updated on GET/HEAD) in object metadata.
 - Reading a tombstoned object rehydrates it (optionally) and refreshes its LRU position, so working sets
   stay hot and cold data drifts out to the remote.
-- The same pass reclaims orphaned frames from aborted multipart uploads.
+- The same pass reclaims orphaned age files from aborted multipart uploads.
 
 **Usage source (pluggable).** How hypha measures cache usage is an interface with several
 implementations; a deployment picks the highest-fidelity one its cache supports:
