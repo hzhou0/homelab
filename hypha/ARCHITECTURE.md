@@ -104,13 +104,15 @@ node-local PVC from TopoLVM.
   encrypted remote. This is the deliberate latency/simplicity trade.
 - **Tuned for latency**: in-memory needle maps, NVMe-backed volumes, local filer metadata store.
 - **Self-documenting objects, no separate index.** hypha keeps no side index. A live object is just a
-  cache object; an evicted one is a **tombstone** — a zero-byte cache object at the same key whose S3
-  user-metadata records that the body now lives only on the remote (plus its offset info). There is no
+  cache object; an evicted one is a **tombstone** — a cache object at the same key holding a fixed
+  sentinel body (so its size and ETag identify it straight off a LIST) whose S3 user-metadata
+  records that the body now lives only on the remote (plus the client-visible ETag). There is no
   per-object key material to track on the cache side: hypha encrypts each remote object with age to a
   static X25519 recipient, age wraps a fresh random file key into the age header stored on the remote
   object itself, and the cache stores only plaintext. Because the remote keeps the real key name and
   metadata in plaintext (standard S3 client-side encryption), the filer is only a cache index — discard
-  it and it repopulates lazily from the remote.
+  it and hypha's startup reconciliation rebuilds the namespace from the remote as tombstones, with
+  bodies rehydrating on read.
 
 ## S3 surface and conditional writes
 
@@ -169,14 +171,15 @@ random — so:
 
 ## Multipart upload with encryption
 
-Multipart uploads are **routed around the cache** and streamed straight to the remote each part —
-parts are not readable individually until `CompleteMultipartUpload` commits the composite, the
-cache's latency win doesn't help throughput bound multipart traffic, and routing parts through the
-cache would impose S3 multipart plumbing on the cache with no upside. Multipart takes the cacheless
-data path of § *Write-through durability* regardless of whether the deployment is cached. A completed
-composite becomes cachable on first read: a GET fetches and decrypts from the remote, then
-asynchronously populates the cache from the decrypted plaintext, so subsequent reads are hot — the
-same rehydrate path used for tombstoned bodies.
+Multipart uploads **route parts around the cache** — parts are not readable individually until
+`CompleteMultipartUpload` commits the composite, the cache's latency win doesn't help throughput-bound
+multipart traffic, and routing parts through the cache would impose S3 multipart plumbing on the
+cache with no upside. Multipart takes the cacheless data path of § *Write-through durability*
+regardless of whether the deployment is cached; only `CompleteMultipartUpload` touches the cache,
+atomically writing a tombstone at the composite's key to replace any stale cached body and keep the
+cache namespace complete for LIST. A completed composite becomes cachable on first read: a GET
+fetches and decrypts from the remote, then asynchronously populates the cache from the decrypted
+plaintext, so subsequent reads are hot — the same rehydrate path used for tombstoned bodies.
 
 Multipart is supported by encrypting **each part directly as its own age file**, using the format
 above — there is no completion-time re-encryption pass.
@@ -219,9 +222,18 @@ above — there is no completion-time re-encryption pass.
   node failure), consult the manifest, fetch the covering age chunks from the remote, authenticate and
   decrypt, and stream to the client; **rehydrate the body locally and bump its LRU position** — this
   is also how a completed multipart composite first enters the cache.
-- **HEAD / LIST** → served from cache metadata when warm, otherwise from the remote (which holds the same
-  keys and metadata).
-- **DELETE** → remove locally and enqueue the remote deletion.
+- **HEAD / LIST** → served from the cache while its **sync marker** is present — a reserved cache
+  object recording that reconciliation has made the namespace complete (every remote key has a
+  local body or tombstone, so an absent key is authoritatively a 404). While the marker is absent,
+  reads use the remote as the source of truth until reconciliation finishes and rewrites it.
+  Buckets map one-to-one across cache and remote; bucket create/delete is synchronous
+  write-through (acked only once both sides confirm), and nothing else touches the remote, so
+  `ListBuckets` follows the same rule.
+- **DELETE** → overwrite the local body at K with a delete-tombstone (so GET answers 404 and LIST
+  omits K) and write a pending marker; a background reconcile propagates `DeleteObject` to the
+  remote, then clears the marker and the tombstone. The tombstone-and-marker path keeps the local
+  namespace authoritative for HEAD/LIST and a crash after a local-only delete cannot resurrect the
+  object from the remote.
 - **Cacheless deployment** → single-object PUT takes the same inline-to-remote path that multipart
   always takes; a GET fetches and decrypts from the remote, with no rehydrate target.
 
@@ -253,7 +265,7 @@ pluggable *usage source* (below) — against a high-water and low-water mark:
 
 - Crossing the **high-water mark** starts GC: evict least-recently-used object *bodies*. Eviction
   confirms the remote copy is durable, deletes the local body from the cache, and leaves a **tombstone** —
-  the metadata and part-table stay, marking the body as remote-only. GC continues until the
+  the metadata stays, marking the body as remote-only. GC continues until the
   **low-water mark** is reached.
 - LRU is tracked by hypha (access time updated on GET/HEAD) in object metadata.
 - Reading a tombstoned object rehydrates it (optionally) and refreshes its LRU position, so working sets
@@ -282,11 +294,13 @@ data stays on NVMe.
   copy means hypha transparently serves those objects from the remote — a lost local body is
   indistinguishable from a tombstone at read time.
 - **Cache loss is not fatal — just discard it.** The cache holds nothing the remote doesn't (keys and
-  metadata are plaintext there, bodies are encrypted there), so there is nothing to reconstruct. Start
-  with an empty cache and it repopulates lazily: a LIST or GET falls through to the remote, and reads warm
-  the cache on the way back. No rebuild, no filer replication, no metadata backup. The only unrecoverable
-  loss is the **bounded** set of objects still within the async write-through lag — written but not yet on
-  the remote — which is accepted under the no-redundancy design. This applies only to a cached deployment;
+  metadata are plaintext there, bodies are encrypted there), so there is nothing to reconstruct beyond
+  the namespace itself. Start with an empty cache: the sync marker is gone with it, so hypha serves
+  reads from the remote while reconciliation relists it and rebuilds every bucket and key as
+  tombstones, then restores the marker; bodies rehydrate on read. No filer replication, no
+  metadata backup. The only unrecoverable loss is the **bounded** set of operations still within the
+  async write-through lag — written (or deleted) but not yet propagated to the remote — which is
+  accepted under the no-redundancy design. This applies only to a cached deployment;
   a cacheless one writes synchronously to its remote, so it has no such window.
 - **Remote unavailable.** Reads of hot (local) objects are unaffected; reads of tombstoned objects fail
   cleanly until the remote returns. Write-through uploads queue and retry.

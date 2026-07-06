@@ -66,8 +66,8 @@ SDK type pointed at different endpoints.
 
 Using `age` rather than hand-rolling an AEAD framing is a deliberate crypto-audit choice: age v1 is
 a reviewed streaming AEAD format with per-chunk authentication, seekable decryption (the crate's
-`StreamReader` implements `std::io::Seek` when the underlying reader does — which `aws-sdk-s3`'s
-byte-range GET provides), and a finalizer chunk for truncation. Per-file random file keys give
+`StreamReader` implements `std::io::Seek` when the underlying reader does — hypha supplies a
+seekable adapter over ranged GETs, §6), and a finalizer chunk for truncation. Per-file random file keys give
 hypha the same parallel-`UploadPart`-without-coordination property the prior custom frame format
 sought via 192-bit random nonces — but with per-file key isolation instead of a single master key
 encrypting every frame.
@@ -78,7 +78,7 @@ encrypting every frame.
 hypha-format/            (thin wrapper around the age crate)
   envelope.rs            Encryptor/Decryptor setup against hypha's static X25519 identity
   offset.rs              plaintext-byte ⇄ age-chunk ciphertext-byte arithmetic (see §6)
-  stream.rs              `StreamReader`/`StreamWriter` adapters over ByteStream for ranged GET
+  stream.rs              seekable reader over ranged GETs (seek ⇒ new byte-range request) + write adapters
 
 hypha-core/src/          (shared by the binaries)
   config.rs              typed config + validation (fail fast on bad values)
@@ -96,7 +96,8 @@ hypha/src/               (serving binary — active-passive)
   replication.rs         remote-upload orchestration (§7); single-object PUT has no queue
   gc/                    scavenger task, runs only while active (§8)
     walk.rs              partial-scan cursor + windowed LRU eviction (single-part objects only)
-    reconcile.rs        continual pending-marker sweep → remote upload, shares this task with GC (§7)
+    reconcile.rs         continual pending-marker sweep → remote upload, shares this task with GC (§7)
+    restore.rs           sync-marker check + parallel namespace reconciliation (§10)
     usage.rs             backend usage measurement (SeaweedFS metrics)
   telemetry.rs           tracing + metrics wiring, health endpoint
 
@@ -133,12 +134,40 @@ S3's own per-(upload-id, part-number) write semantics serialize them, and `Compl
 is the durability commit. No in-process session lock is needed — the remote is the serializing
 resource, not hypha.
 
+The cache's own ETag is the **version token**, but it is not always the client-visible ETag: a
+multipart composite's ETag (`md5(part-md5s)-N`) cannot be reproduced by a single cache `PutObject`,
+and a tombstone's cache ETag is the fixed sentinel UUID's ETag (§8/§9), not the client-visible ETag
+of the object it stands in for. Hypha stores the client-visible ETag in cache user-metadata
+whenever the two differ, and a conditional write resolves by key state:
+
+- **Ordinary body** (cache ETag == client ETag, the common case): forward the client's condition
+  as-is — the cache compares.
+- **Composite in cache**: `HEAD` K for the cache ETag `E_c` and the metadata client-ETag; compare
+  the client's `If-Match` against the metadata, then issue the `PutObject` with `If-Match: E_c`.
+  The cache ETag stays the atomicity token; the metadata is only the client-facing mapping.
+- **Eviction-tombstoned key**: **restore, then compare** — rehydrate the body from the remote with
+  `If-Match: <eviction-sentinel-etag>` (a concurrent writer aborts the restore), turning the key
+  back into one of the two cases above. `If-None-Match: *` needs no restore: the tombstone already
+  proves existence.
+- **Delete-tombstoned key**: client-visibly absent, so `If-Match` fails with 412 outright, and a
+  create (`If-None-Match: *` or plain PUT) is forwarded as `If-Match: <delete-sentinel-etag>` — the
+  sentinel ETag stands in for "still deleted" as the atomicity token.
+
 Marker, tombstone, and body share one keyspace — no `cache/` prefix on the key, no separate
-tombstone object path. The body lives at `K`; the tombstone overwrites `K` in place (§8). The per-
-snapshot pending marker lives at `<marker-uuid-prefix>/<K>/<upload-id>`, where the prefix is a
-fixed reserved UUID compiled into hypha — astronomically unlikely to collide with any client key
-without needing an admission-reject rule. Markers apply only to single-object PUTs (§7); multipart
-uploads don't touch the cache or the marker namespace.
+tombstone object path. The body lives at `K`; the tombstone overwrites `K` in place (§8).
+Tombstones carry **fixed sentinel bodies** — one reserved 16-byte value for eviction tombstones,
+another for delete tombstones (§9), compiled in like the marker prefix — so each type has a
+deterministic (size, ETag) pair and a plain LIST classifies every key as live / evicted / deleted
+with no HEAD or metadata read. (A zero-byte tombstone would not: every empty body shares the
+empty-MD5 ETag, so it would be indistinguishable from a legitimately empty client object.) The
+16-byte width fully saturates an MD5 ETag's 128-bit entropy, so a collision with a client body
+needs both a length match *and* a 2^-128 byte match; that holds well past a billion keys (the
+fixed-target collision probability is `N / 2^128`, dominated by the length-match precondition in
+practice — most client bodies aren't 16 bytes) and needs no admission-reject rule. The per-snapshot
+pending marker lives at `<marker-uuid-prefix>/<K>/<upload-id>`, where the prefix is a fixed
+reserved 16-byte value compiled into hypha — same collision math, same non-need for an
+admission-reject rule. Markers apply only to single-object PUTs (§7); multipart uploads don't touch
+the cache or the marker namespace.
 
 The correctness of "single writer" cannot rest on *observing* that the old active is dead — a remote
 observer can never distinguish dead from partitioned-but-still-writing. So it rests on **fabric
@@ -155,6 +184,13 @@ collapse them into one invariant, maintained by a small **`hypha-fence` controll
 "Who holds the lease" and "who can write" become the same fact. Two pods may each *believe* they are
 active, but **belief is free — only the network-allowed pod can write**, so the writer set is always
 ≤ 1. The old active's belief is harmless because its packets to the backend are dropped.
+
+**Identities are static; only the policy moves.** A pod's Cilium identity is computed from its
+labels by the agent on its *own* node, so fencing must never depend on relabeling the active — a
+partitioned node would never apply the change, and remote ipcaches would keep honoring the old
+identity. Serving therefore runs as a **two-pod StatefulSet**: the automatic
+`statefulset.kubernetes.io/pod-name` label gives each pod a distinct identity from birth, and
+`hypha-fence` only flips which of the two identities the destination-side allow admits.
 
 **Failover is ordered fence-before-promote** (correctness is in the ordering, not atomicity):
 
@@ -199,6 +235,15 @@ builds on existing posture: SeaweedFS ingress is **already default-deny** with a
 baseline), so fencing is just narrowing "allow hypha's namespace" to "allow the *active* hypha
 identity" — the *absence* of an allow is the fence.
 
+The remote leg is weaker: Cilium *egress* policy is enforced at the source node — the partitioned
+one — and OPNsense may see only SNAT'd node IPs, so a partitioned-but-alive old active can retain
+remote reach. Harmless on the cached PUT path (fenced off the cache, it has no new snapshots to
+upload), but multipart writes go straight to the remote (§7): an in-flight
+`CompleteMultipartUpload` from the old active can commit after promotion. If that window matters,
+escalate the fence to the remote itself — per-replica remote credentials that `hypha-fence`
+revokes, an S3/IAM policy being destination-enforced like the Cilium ingress deny. Until then it
+is a documented carve-out (§14).
+
 Reads/HEAD/LIST take no lock either way. Since serving is active-passive, the passive does not serve;
 during the failover gap the surface is briefly write-unavailable, not degraded.
 
@@ -227,13 +272,18 @@ age v1:
   chunk), so offset math is **closed-form**, not a per-chunk lookup table:
   - Ciphertext offset of chunk *i* = `i * 65536` plus the age header length (constant per file, so
     folded into a one-time offset for the part).
-  - A ranged GET for plaintext bytes `[a, b)` covers chunks `⌊a / 65520⌋ .. ⌊b / 65520⌋`, which maps
-    to a single contiguous **byte-range GET** on the remote.
+  - A ranged GET for plaintext bytes `[a, b)` covers chunks `⌊a / 65520⌋ .. ⌊b / 65520⌋`, one
+    contiguous ciphertext range. A cold ranged GET is **two remote reads** — the age header at
+    offset 0 (to unwrap the file key) and the chunk range — coalesced into one when the range abuts
+    the file head; caching unwrapped file keys for hot objects is a later win.
 - **Seekable decryption.** age's `StreamReader` implements `std::io::Seek` when the underlying reader
-  does (§2 — `aws-sdk-s3` ByteStream over a byte-range GET provides this). So hypha **does not
-  reimplement chunk decryption** for ranged reads — it asks `StreamReader` to seek to the plaintext
-  offset and reads from there. The crate's deterministic nonces (chunk-index-derived) are what makes
-  the seek meaningful, since no chunk's decrypt depends on a prior chunk's state.
+  does. An S3 ranged-GET body is *not* seekable — it is a one-shot stream — so
+  `hypha-format/stream.rs` supplies the adapter that satisfies `Seek` by issuing a fresh byte-range
+  GET (one seek per request in practice: to the plaintext offset, then sequential reads). age's
+  `Seek` lives on the sync `Read` path, so ranged decrypt drives the sync reader over the adapter
+  (bridged per §5). Hypha still **does not reimplement chunk decryption**; the crate's deterministic
+  nonces (chunk-index-derived) are what make the seek meaningful, since no chunk's decrypt depends
+  on a prior chunk's state.
 - **Per-file file key.** Each `Encryptor::with_recipients` invocation generates a fresh random file
   key, wrapped to hypha's static X25519 recipient in the age header on the same remote object.
   Parallel `UploadPart` workers and concurrent PUTs need no key/nonce coordination — the random file
@@ -299,24 +349,33 @@ confirms. No marker, no pending set, no loss window, higher per-op latency — e
 profile the architecture reserves for clients like ZeroFS. **Multipart always takes this path**,
 cached deployment or not — `UploadPart` encrypts and streams straight to the remote per part,
 `CompleteMultipartUpload` is the durability commit (parts already durable on the remote, this just
-glues them into the composite at K), `AbortMultipartUpload` deletes the orphaned parts. The cache is
-bypassed entirely on the multipart write path; the composite becomes cachable later, on first read,
-via the same rehydrate path used for tombstoned bodies (§8) — a GET fetches and decrypts from the
-remote, then asynchronously populates the cache from the decrypted plaintext.
+glues them into the composite at K) — and, in a cached deployment, it also writes an **eviction
+tombstone into the cache at K** (conditional on the prior cache ETag when one exists), atomically
+replacing any stale cached body and keeping the cache namespace complete for LIST.
+`AbortMultipartUpload` deletes the orphaned parts. Parts stream around the cache; only
+`CompleteMultipartUpload` touches it (with the eviction tombstone above). The composite becomes
+cachable later, on first read, via the same rehydrate path used for tombstoned bodies (§8) — a GET
+fetches and decrypts from the remote, then asynchronously populates the cache from the decrypted
+plaintext.
 
 **Reconcile is the upload path (`replication.rs` + `gc/reconcile.rs`).** There is no in-memory upload
 queue; reconcile drives remote uploads. It runs as a continual background duty of the active, sharing
-the scavenger task/thread with GC (§8). Each pass:
+the scavenger task/thread with GC (§8) — one task, so same-key uploads never overlap. Each pass:
 
 1. `ListObjectsV2` the **cache** with `prefix=<marker-uuid-prefix>/` — a local SeaweedFS LIST over
-   NVMe, `O(in-flight + pending)` per pass, not a full-keysapce scan and not a remote round-trip.
-2. Group markers by key. For each key K, `HEAD` the cache at K for its current etag — the latest
-   acked version. The cache-side conditional-write chain IS the ack order, so cache(K)'s etag is
-   the linearization result, no in-process ordering invariant needed.
-3. Among K's pending markers, the one whose etag matches cache(K)'s current etag is the snapshot
-   to upload. The others are older snapshots superseded in cache before they reached the remote —
-   drop them (their conditional delete at step 5 also clears them). No LIFO, no per-key upload
-   lock: the cache's etag *is* the truth of "what to upload," and reconcile just reads it.
+   NVMe, `O(in-flight + pending)` per pass, not a full-keyspace scan and not a remote round-trip.
+2. Group markers by key, and **dispatch per key on the cache body at K**: a key whose cache body is
+   the delete-sentinel UUID is a DELETE pending (§9); any other body (including the eviction
+   sentinel, which restore has already turned back into a live body) is an upload pending. The two
+   branches share the marker machinery but propagate different operations to the remote. The
+   cache-side conditional-write chain IS the ack order in both cases, so cache(K)'s state is the
+   linearization result, no in-process ordering invariant needed.
+3. **Upload branch.** For each key K dispatched here, `HEAD` the cache at K for its current etag —
+   the latest acked version. Among K's pending markers, the one whose etag matches cache(K)'s
+   current etag is the snapshot to upload. The others are older snapshots superseded in cache
+   before they reached the remote — drop them (their conditional delete at step 6 also clears
+   them). No LIFO, no per-key upload lock: the cache's etag *is* the truth of "what to upload,"
+   and reconcile just reads it.
 4. Upload the cache body (frame-encrypted) to the remote at key K **unconditionally**. A concurrent
    overwrite of cache(K) racing the read is harmless: the body reconcile read is a coherent
    snapshot of `E_n`; if cache moves to `E_{n+1}` mid-upload, that snapshot lands on the remote
@@ -324,10 +383,17 @@ the scavenger task/thread with GC (§8). Each pass:
    ≤ one pass under sustained overwrite contention on K, which clients cannot observe (cache is
    current, remote is read only on tombstoned post-eviction GET, by which time reconcile has
    caught up).
-5. **Conditionally delete** each marker for K with `If-Match: <etag-the-marker-was-written-with>`.
+5. **Delete branch.** For each key K dispatched here, issue the remote `DeleteObject` at K, then
+   clear the delete-tombstone in the cache with `If-Match: <delete-sentinel-etag>` (K goes back to
+   an ordinary absent key for LIST) and conditionally delete the marker. A concurrent create at K
+   races the tombstone clear benignly: its `PutObject If-Match: <delete-sentinel-etag>` either
+   wins first (K is live; the clear's `If-Match` fails and reconcile drops only the marker, leaving
+   the live body) or loses (the clear wins, then the create fails 412 and the client retries — the
+   same semantics as if the delete had fully propagated before the create arrived).
+6. **Conditionally delete** each remaining marker for K with `If-Match: <etag-the-marker-was-written-with>`.
    Load-bearing for two races in one: (a) if reconcile is ever scaled to multiple workers on the
    same key, two workers can both upload the same snapshot but only one's conditional delete
-   succeeds; (b) if a writer C lands on cache(K) between step 2's HEAD and step 4, C writes a
+   succeeds; (b) if a writer C lands on cache(K) between step 3's HEAD and step 4, C writes a
    new marker for `E_{n+1}` — reconcile's conditional delete against the old marker still
    succeeds, because per-snapshot markers are append-only (writers create new markers; they never
    overwrite old ones in place).
@@ -403,11 +469,18 @@ is what makes eviction auto-healing under concurrent writers on K:
 3. **Confirm remote.** `HEAD` the remote at K. If absent, K isn't durable yet — skip (§7's
    durability-gates-GC invariant; rare given step 2 typically catches this first, but covers a
    marker-delete racing an eviction pass).
-4. **Conditional tombstone overwrite.** Cache `PutObject` at K with `If-Match: E_v`, body a small
-   tombstone (the encrypted remote key + part table, if multipart) — an **atomic replace** of the body at the
-   same key, not a separate object. A GET racing the eviction sees either the body or the
+4. **Conditional tombstone overwrite.** Cache `PutObject` at K with `If-Match: E_v`, body the
+   **eviction-sentinel UUID** (§4), user-metadata recording the client-visible ETag; no part table
+   (recoverable from the remote's per-part metadata). An **atomic replace** of the body at the
+   same key, not a separate object: a GET racing the eviction sees either the body or the
    tombstone, never a 404, by S3's single-object atomicity; no separate "write tombstone then
    delete body" sequence is needed.
+
+The reverse path — rehydrate — is conditional the same way (`If-Match: <eviction-sentinel-etag>`),
+so eviction and rehydrate can never clobber a client write in either direction. The sentinel ETag
+is constant across tombstone generations, so rehydrate also holds the in-flight ref count while it
+runs — the scavenger skips the key, closing the evict → rehydrate → re-evict ABA that a
+constant-ETag CAS alone cannot see.
 
 Two race windows remain by construction, both auto-healing — neither aborts durability:
 
@@ -424,7 +497,7 @@ Two race windows remain by construction, both auto-healing — neither aborts du
 
 Repeat until the slice has freed its share toward the low-water mark. Successive passes cover the
 whole namespace: exact-LRU inside each window, approximate-LRU globally, with no index. Evicting a
-still-warm object costs only a rehydrating cache miss, never data. The same sweep reclaims orphaned
+still-warm object costs only a rehydrating cache miss, never data. The same sweep reclaims
 orphaned age files from aborted multipart uploads.
 
 **Usage measured from the backend.** Per-object byte accounting scattered across the data path is
@@ -440,11 +513,22 @@ figure, scavenges while above the high-water mark until the low-water mark, and 
   sent, independent of framing/encryption. Single-part = MD5 of the object; multipart = the composite
   `MD5(concat of part MD5s)-N`. Per-part plaintext MD5s are carried as `x-amz-meta-pmd5` on each remote
   part object; `CompleteMultipartUpload` reads them and composes the ETag (§6).
-- **Range GET** maps to a computed remote byte-range GET (§6), then drives the age `StreamReader`
-  with `seek` to the plaintext offset — the crate handles per-chunk decrypt-authenticate — and trims
+- **Range GET** maps to a computed chunk range plus the age header read (§6), then drives the age
+  `StreamReader` with `seek` to the plaintext offset — the crate handles per-chunk decrypt-authenticate — and trims
   to the exact requested `[a,b)` before emitting.
-- **HEAD/LIST** served from cache metadata when warm, else the remote (same keys/metadata, plaintext
-  there), correct whether a body is local or tombstoned.
+- **Buckets map one-to-one** across client ⇄ cache ⇄ remote. `CreateBucket` is synchronous
+  write-through: create on the cache, then the remote, ack only after both succeed (bucket ops are
+  rare control-plane events — no marker machinery). `DeleteBucket` mirrors it in reverse order
+  (remote first, so a crash between leaves a retryable still-visible bucket, never a remote orphan
+  for the §10 sweep to resurrect). Nothing else touches the remote, so `ListBuckets` — like all
+  namespace reads — is served from the cache alone.
+- **HEAD/LIST** are served from the cache while the **sync marker** is present (§10) — the cache is
+  then namespace-complete (every remote key has a cache body or tombstone), so an absent key is
+  authoritatively a 404. While the marker is absent, the **remote is the source of truth** for
+  GET/HEAD/LIST until reconciliation completes. The client-visible ETag comes from user-metadata
+  where it differs from the cache's own (§4). LIST filters hypha's internals from responses — the
+  marker prefix and delete-tombstoned keys — classifying each entry from its (size, ETag) sentinel
+  pair alone (§4), no per-key HEAD.
 - **Multipart** takes the §7 cacheless path: each `UploadPart` is encrypted as its own age file
   (fresh random file key per part) and streamed straight to the remote, with that part's plaintext
   length and MD5 stamped onto the part object's user-metadata. The cache is bypassed entirely on the
@@ -461,15 +545,49 @@ figure, scavenges while above the high-water mark until the low-water mark, and 
   lazily — on first GET, hypha fetches and decrypts from the remote, then asynchronously populates
   the cache body from the decrypted plaintext, the same rehydrate path used for tombstoned bodies;
   thereafter the composite is an ordinary cache body subject to §8 LRU eviction.
-- **DELETE** removes locally and enqueues the remote delete (write-through, so it *propagates* — the
-  versioning/object-lock recovery story is a property of the remote bucket, per the architecture).
+- **DELETE** is write-through via the same marker machinery as PUT: overwrite K with a
+  **delete-tombstone** (body the delete-sentinel UUID, §4; GET answers 404, LIST omits it) and
+  write a pending marker; reconcile propagates the remote `DeleteObject`, then clears the marker
+  and the tombstone with `If-Match: <delete-sentinel-etag>`. Without the mask,
+  a crash after a local-only delete would let the next GET resurrect the object from the remote.
+  Recovery from deletion stays a property of the remote bucket (versioning/object-lock), per the
+  architecture.
 
 ## 10. Startup, shutdown, failure
 
-- **Stateless startup.** No rebuild, no filer replication, no metadata restore, no LRU index to warm —
-  a replica starts serving immediately and LIST/GET fall through to the remote and rewarm the cache.
-  This is what makes the pre-warmed passive's promotion instant. The active's continual background
-  sweep (§7 pending-marker reconcile + §8 GC) starts on claim acquisition; it does not gate serving.
+- **Stateless startup + sync marker.** No LRU index to warm, no process-local state — a replica
+  starts serving immediately, which is what makes the pre-warmed passive's promotion instant.
+  Whether the cache namespace is trustworthy is recorded **in the cache itself**: a reserved
+  **sync marker** object (a distinguished key under the marker prefix), present iff a namespace
+  reconciliation has completed — it dies with the cache volume by construction, so no external
+  state can go stale about the cache's health. On claim acquisition the active checks it.
+  **Present** → cache-authoritative reads (§9), no sweep — the steady-state path for every restart
+  and failover. **Absent** → the remote becomes the source of truth for GET/HEAD/LIST, and the
+  active runs a **full namespace reconciliation**: LIST all buckets and keys on remote and cache,
+  recreate any bucket missing from the cache, write an eviction tombstone for any remote key with
+  no cache entry (body or tombstone — either counts as present, so pending deletes are not
+  resurrected while their tombstone survives), then write the sync marker and flip reads back to
+  the cache. The sweep is **parallel**: a LIST page chain is inherently serial (continuation
+  tokens), so throughput scales by sharding the keyspace. Shard boundaries come from a **prefix
+  distribution hint** — a small file the active periodically writes to the remote at a reserved key
+  under the marker-UUID prefix (so LIST filtering already excludes it), holding approximate key
+  counts per prefix; the §8 walk cursor is already listing keyspace windows, so maintaining the
+  histogram is free. The hint is advisory, not an index: it carries no per-object facts, every key
+  is still listed, and a stale or missing hint costs only shard balance — restore then falls back
+  to `delimiter=/` discovery (recursing until shards exceed the concurrency budget) with
+  `start-after` range splits inside any giant flat prefix. Shards feed a pooled tombstone-writer
+  over the cache (tombstones are sentinel-sized, so the cache side is bounded by request rate, not
+  bytes). No off-the-shelf crate implements the fan-out (aws-samples' `s3-fast-list` is a CLI
+  wanting pre-segmented prefixes — its input file is exactly this hint), so `restore.rs` hand-rolls
+  it over the SDK paginator + a semaphore. Parallelism doesn't disturb idempotence: the sweep only
+  fills gaps, and the marker is written only after every shard drains.
+
+  Serving is never gated; a conditional write to K during resync first materializes K's
+  remote state into the cache (a tombstone, if K exists remotely with no cache entry), then runs
+  the normal §4 path — the cache-ETag linearization point holds per key even mid-sweep. Pending
+  markers lost with a wiped cache are lost outright: un-uploaded writes are the bounded loss
+  window, and a pending-but-unpropagated DELETE is resurrected by the sweep (the remote still
+  holds the object) — the same cache-volume-loss window §7 already prices in.
 - **Graceful drain.** On `SIGTERM`, the active stops accepting new requests, releases its active claim
   so `hypha-fence` promotes the passive cleanly (sub-second, no fence needed), then best-effort runs
   one more reconcile pass before exit to *shrink* the pending set (markers + bodies stay in the cache
@@ -489,16 +607,19 @@ Config via `figment` (file + env), validated at boot. Surface (maps to chart val
 - **cache** (optional): endpoint, bucket, credentials — omit for a cacheless deployment.
 - **master key**: 32 bytes from a Secret, `zeroize`d in memory; never logged.
 - **hypha's own credentials**: the access-key/secret its clients authenticate with (`S3Auth`).
-- **fencing**: the active-identity label/selector `hypha-fence` toggles, the lease/renew timings, the
+- **fencing**: the per-pod identity selectors `hypha-fence` flips the allow between, the lease/renew timings, the
   fence-confirm timeout, and the post-fence **settle delay** + server-side request timeout that bound
   the in-flight-write drain (§4).
 - **serving tuning**: offload threshold (§5), **reconcile pass interval/concurrency**,
   max in-flight conditional PUTs to the cache.
-- **GC tuning**: high/low water marks, walk window size, scavenge interval.
+- **GC tuning**: high/low water marks, walk window size, scavenge interval; restore-sweep fan-out
+  (max concurrent LIST shards, tombstone-writer concurrency) and prefix-hint refresh interval (§10).
 
 Delivered as the `hypha/` chart described in the architecture, installed by cluster-admin. It renders
-**two workloads** sharing config/Secret refs: the serving `Deployment` (`replicas: 2` — active +
-pre-warmed passive, GC running inside the active) + `Service` + `HTTPRoute`, and the `hypha-fence`
+**two workloads** sharing config/Secret refs: the serving **StatefulSet** (2 pods — active +
+pre-warmed passive, GC inside the active; a StatefulSet so the automatic
+`statefulset.kubernetes.io/pod-name` label gives each pod the distinct Cilium identity the §4
+fence selects on) + `Service` + `HTTPRoute`, and the `hypha-fence`
 controller (2 replicas, leader-elected; RBAC to write `CiliumNetworkPolicy` and the OPNsense allow, and
 to read Cilium endpoint policy revisions for fence confirmation). The active-identity fence is the
 **write-path** narrowing of the default-deny SeaweedFS ingress grant; that grant and the rest of the
@@ -528,7 +649,8 @@ condition, not a readiness gate (the passive is intentionally ready-but-idle).
 - **Concurrency**: hammer concurrent CAS against a single active with the cache behind it, and
   assert linearizability of the *cache* (no double-create, no lost update, `If-Match` honored). The
   cache's conditional PUT is the linearization point — this test pins SeaweedFS's `If-Match`
-  semantics as the load-bearing piece (§ *Risks*). A second test exercises bursty overwrite contention
+  semantics as the load-bearing piece (§ *Risks*). Cover CAS against tombstoned keys
+  (restore-then-compare) and cached composites (metadata-ETag mapping) per §4. A second test exercises bursty overwrite contention
   on one key: many writers ack in some order, then assert the remote converges to the last-acked etag
   within one reconcile pass, with no intermediate ordering visible post-eviction.
 - **Eviction vs. concurrent writer**: drive sustained PUTs to one key while the scavenger is
@@ -559,7 +681,7 @@ condition, not a readiness gate (the passive is intentionally ready-but-idle).
   uploaded remain recoverable via rehydrate from remote.
 - **Integration**: `testcontainers` bringing up real SeaweedFS (cache) and MinIO (remote); run an S3
   conformance pass and the specific conditional-write, multipart-out-of-order, range-GET, scavenge/
-  rehydrate, and cache-wipe-then-rewarm scenarios end to end.
+  rehydrate, and cache-wipe → restore-sweep → rehydrate scenarios end to end.
 
 ## 14. Risks & open questions
 
@@ -569,14 +691,14 @@ condition, not a readiness gate (the passive is intentionally ready-but-idle).
   one: add the new recipient to the encryptor's recipient set, deploy, then run a (deferred) re-encrypt
   pass over the remote to drop the old recipient from existing files. No key-epoch tag in metadata
   needed — the recipient set in each age file *is* the epoch. Re-encryption job is deferred.
-- **SeaweedFS-cache must implement `If-Match` on `PutObject` and `DeleteObject`** — it is the
-  linearization point for both the PUT path (§4) and the eviction path (§8). Hypha's entire
-  per-key concurrency story delegates to it; an absent or buggy conditional-write implementation
-  in the cache backend breaks linearizability on contended writes and on concurrent eviction.
-  Spike early on real SeaweedFS (the §13 concurrency test pins this). If it cannot be relied on,
-  the fallback is a short-hold in-process per-key lock held through the cache-side RMW — same
-  overhead as the original §4 design, with all the async-latency caveats that brought. Multipart is
-  unaffected — it takes the cacheless path (§7) and never touches the cache-side conditional write.
+- **Both backends are assumed to speak the full S3 API, conditional writes included.** The cache's
+  `If-Match` on `PutObject`/`DeleteObject` is the linearization point for the PUT path (§4) and the
+  eviction path (§8); the remote's conditional PUT / `CompleteMultipartUpload` serialize the
+  cacheless and multipart paths. An absent or buggy implementation on either side breaks
+  linearizability on contended writes. Spike early on real SeaweedFS (the §13 concurrency test pins
+  this); if the cache side cannot be relied on, the fallback is a short-hold in-process per-key
+  lock held through the cache-side RMW — same overhead as the original §4 design, with all the
+  async-latency caveats that brought.
 - **`hypha-fence` is a bespoke controller, and the load-bearing one.** It replaces distributed locking
   with fabric fencing, so its correctness *is* the single-writer guarantee. The ordered
   fence→confirm→drain→promote sequence and the Cilium policy-revision confirmation must be gotten exactly
@@ -590,6 +712,11 @@ condition, not a readiness gate (the passive is intentionally ready-but-idle).
   flat homelab failure domain means an unreachable-enforcer partition also cuts the old active off from
   the backend (and a near-side passive couldn't serve it either). Document the assumption; it would not
   hold if cache/remote lived in a separate failure domain from the control path.
+- **The remote leg of the fence is source-enforced.** Cilium egress applies at the (partitioned)
+  source node and OPNsense may see only SNAT'd node IPs, so the fence guarantees isolation from the
+  *cache*, not the remote; the exposed window is an in-flight multipart commit from the old active
+  (§4). Escalation if it matters: per-replica remote credentials revoked by `hypha-fence` —
+  destination-enforced like the ingress deny.
 - **`hypha-fence` availability is a liveness, not safety, concern.** It sits off the data path and only
   acts on transitions, so while it is down the running active is unaffected and Cilium/OPNsense keep
   enforcing the existing allow. The only cost is a *delayed failover* if the active dies during that
