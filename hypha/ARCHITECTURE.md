@@ -106,7 +106,8 @@ node-local PVC from TopoLVM.
 - **Self-documenting objects, no separate index.** hypha keeps no side index. A live object is just a
   cache object; an evicted one is a **tombstone** — a cache object at the same key holding a fixed
   sentinel body (so its size and ETag identify it straight off a LIST) whose S3 user-metadata
-  records that the body now lives only on the remote (plus the client-visible ETag). There is no
+  records that the body now lives only on the remote (plus the client-visible ETag), paired with a
+  zero-byte *facts twin* at a suffixed key that carries the LIST-visible facts. There is no
   per-object key material to track on the cache side: hypha encrypts each remote object with age to a
   static X25519 recipient, age wraps a fresh random file key into the age header stored on the remote
   object itself, and the cache stores only plaintext. Because the remote keeps the real key name and
@@ -121,6 +122,10 @@ enforces atomically against the object metadata it owns in the cache:
 
 - `If-None-Match: *` — atomic create; succeeds only if the key does not already exist.
 - `If-Match: <etag>` — compare-and-swap update; succeeds only if the current ETag matches.
+
+Hypha constrains client keys slightly beyond stock S3: no bytes below `0x20` (AWS already tells
+clients to avoid them) and a length cap short of 1024 — what makes the suffixed facts-twin scheme
+sort correctly and fit.
 
 Hypha serializes these against the current object state so concurrent writers see linearizable
 create/update semantics, regardless of what the underlying backends guarantee on their own. `HEAD` and
@@ -150,14 +155,15 @@ create/update semantics, regardless of what the underlying backends guarantee on
 
 ### age format specifics that hypha relies on
 
-age v1 chunks the plaintext into fixed **64 KiB chunks** (specifically 65520 plaintext bytes + 16-byte
-Poly1305 tag = 65536 ciphertext bytes per chunk), each independently authenticated with ChaCha20-Poly1305
+age v1 chunks the plaintext into fixed **64 KiB chunks** (65536 plaintext bytes + 16-byte
+Poly1305 tag = 65552 ciphertext bytes per chunk), each independently authenticated with ChaCha20-Poly1305
 under a key derived from the file key. Nonces are *deterministic* — derived from the chunk index, not
 random — so:
 
 - **Range GET** maps a plaintext byte range to a contiguous ciphertext byte range (`chunk_index =
-  floor(plaintext_byte / 65520)`, ciphertext offset = `chunk_index * 65536`), one byte-range GET on the
-  remote, no prefix read. age's `StreamReader` implements `std::io::Seek` directly when given a seekable
+  floor(plaintext_byte / 65536)`, ciphertext offset = `chunk_index * 65552` plus the per-file
+  header + payload-nonce offset, derived from the object's plaintext and ciphertext lengths), one
+  byte-range GET on the remote, no prefix read. age's `StreamReader` implements `std::io::Seek` directly when given a seekable
   underlying reader (which `aws-sdk-s3` byte-range GET provides), so hypha does not reimplement chunk
   decryption.
 - **Per-part independence** is achieved by giving each multipart part its own age file (and therefore
@@ -226,6 +232,11 @@ above — there is no completion-time re-encryption pass.
   object recording that reconciliation has made the namespace complete (every remote key has a
   local body or tombstone, so an absent key is authoritatively a 404). While the marker is absent,
   reads use the remote as the source of truth until reconciliation finishes and rewrites it.
+  LIST entries always report plaintext sizes and client ETags: for tombstoned keys and cached
+  multipart composites these ride **facts twins** — zero-byte cache objects whose key is the
+  object's key plus a low-sorting suffix encoding the facts, so they arrive adjacent to their key
+  inside the same LIST page. Listing the remote (the resync window) instead requires a bounded
+  per-entry HEAD fan-out.
   Buckets map one-to-one across cache and remote; bucket create/delete is synchronous
   write-through (acked only once both sides confirm), and nothing else touches the remote, so
   `ListBuckets` follows the same rule.
@@ -267,7 +278,11 @@ pluggable *usage source* (below) — against a high-water and low-water mark:
   confirms the remote copy is durable, deletes the local body from the cache, and leaves a **tombstone** —
   the metadata stays, marking the body as remote-only. GC continues until the
   **low-water mark** is reached.
-- LRU is tracked by hypha (access time updated on GET/HEAD) in object metadata.
+- Recency is tracked by an in-memory **Bloom-ring sketch** (one filter per time slice, fed by
+  GET/HEAD, sealed slices persisted to the cache), consulted to skip recently-read candidates;
+  eviction otherwise orders by LastModified, and a rehydrated body's fresh mtime is the
+  second-chance bit (CLOCK). If the sketch is lost or absent (first boot), eviction falls back to
+  LastModified alone — churnier for one cycle, never incorrect.
 - Reading a tombstoned object rehydrates it (optionally) and refreshes its LRU position, so working sets
   stay hot and cold data drifts out to the remote.
 - The same pass reclaims orphaned age files from aborted multipart uploads.

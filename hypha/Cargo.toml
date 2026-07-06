@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["hypha-format"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/hzhou0/homelab"
+
+[workspace.dependencies]
+age = "0.11"
+thiserror = "2"
+proptest = "1"
+criterion = "0.5"

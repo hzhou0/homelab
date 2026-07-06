@@ -98,6 +98,7 @@ hypha/src/               (serving binary — active-passive)
     walk.rs              partial-scan cursor + windowed LRU eviction (single-part objects only)
     reconcile.rs         continual pending-marker sweep → remote upload, shares this task with GC (§7)
     restore.rs           sync-marker check + parallel namespace reconciliation (§10)
+    recency.rs           Bloom-ring recency sketch + slice persistence (§8)
     usage.rs             backend usage measurement (SeaweedFS metrics)
   telemetry.rs           tracing + metrics wiring, health endpoint
 
@@ -163,7 +164,16 @@ empty-MD5 ETag, so it would be indistinguishable from a legitimately empty clien
 16-byte width fully saturates an MD5 ETag's 128-bit entropy, so a collision with a client body
 needs both a length match *and* a 2^-128 byte match; that holds well past a billion keys (the
 fixed-target collision probability is `N / 2^128`, dominated by the length-match precondition in
-practice — most client bodies aren't 16 bytes) and needs no admission-reject rule. The per-snapshot
+practice — most client bodies aren't 16 bytes) and needs no admission-reject rule.
+
+Evicted keys and cached composites additionally carry a **facts twin** for LIST (§9) — a
+zero-byte object at `K ‖ 0x01 ‖ facts`. Two admission rules make the twin scheme sound: client
+keys may not contain bytes below `0x20` (so the `0x01` separator sorts below every admissible key
+byte and a twin sorts immediately after its own key without disturbing LIST's lexicographic
+order — the prefix-key case is where a higher separator would flip it), and key length is capped
+to leave suffix headroom.
+
+The per-snapshot
 pending marker lives at `<marker-uuid-prefix>/<K>/<upload-id>`, where the prefix is a fixed
 reserved 16-byte value compiled into hypha — same collision math, same non-need for an
 admission-reject rule. Markers apply only to single-object PUTs (§7); multipart uploads don't touch
@@ -259,20 +269,30 @@ encrypts in single-digit microseconds — short enough to run **inline on the as
 starving the runtime. The age `StreamWriter` already drives the AEAD chunk-at-a-time from the async
 writer, so hypha doesn't hand-roll a chunk loop; to keep any single `poll` bounded we offload to
 `tokio::task::spawn_blocking` only when a single contiguous encrypt/decrypt would exceed a threshold
-(configurable, default ~4 MiB of pending plaintext). This avoids a blanket `rayon` pool while
-protecting tail latency under large sequential transfers. The choice is measured, not assumed: a
-`criterion` bench in `hypha-format` sets the offload threshold empirically against age's chunk throughput.
+(configurable, default ~1 MiB of pending plaintext). This avoids a blanket `rayon` pool while
+protecting tail latency under large sequential transfers. The `criterion` bench in `hypha-format`
+calibrates the threshold per machine; first measurements: ~1.5 GiB/s/core encrypt, ~1.3 GiB/s
+decrypt steady-state (so 1 MiB ≈ 0.7 ms of poll time), plus a per-file fixed cost of ~60–90 µs
+for the X25519 file-key wrap/unwrap — which prices the per-file key isolation at noise level, and
+puts one core comfortably ahead of a 10 GbE link.
 
 ## 6. age envelope, offsets, and the part table
 
 `ARCHITECTURE.md` describes the age envelope; the implementation relies on three fixed properties of
 age v1:
 
-- **Fixed 64 KiB chunks** (65520 plaintext bytes + 16-byte Poly1305 tag = 65536 ciphertext bytes per
+- **Fixed 64 KiB chunks** (65536 plaintext bytes + 16-byte Poly1305 tag = 65552 ciphertext bytes per
   chunk), so offset math is **closed-form**, not a per-chunk lookup table:
-  - Ciphertext offset of chunk *i* = `i * 65536` plus the age header length (constant per file, so
-    folded into a one-time offset for the part).
-  - A ranged GET for plaintext bytes `[a, b)` covers chunks `⌊a / 65520⌋ .. ⌊b / 65520⌋`, one
+  - Ciphertext offset of chunk *i* = `i * 65552` plus the age header length and the 16-byte payload
+    nonce (both constant per file, so folded into a one-time offset for the part). The header
+    length varies **across** files — rage greases headers with a random stanza (found empirically;
+    it broke the constant-header assumption in `hypha-format`'s first test run) — but needs no
+    stored metadata: it derives in closed form from lengths hypha already has,
+    `hlen = ct_len − 16 − plen − 16·⌈plen/64 KiB⌉`, where `ct_len` is the remote object's
+    Content-Length and `plen` (plaintext length) is stamped on every remote object anyway (HEAD
+    must report plaintext sizes). A ciphertext-prefix parse (`--- <mac>` ends the header
+    unambiguously; stanza bodies are base64, no `-`) remains as validation/fallback.
+  - A ranged GET for plaintext bytes `[a, b)` covers chunks `⌊a / 65536⌋ .. ⌊b / 65536⌋`, one
     contiguous ciphertext range. A cold ranged GET is **two remote reads** — the age header at
     offset 0 (to unwrap the file key) and the chunk range — coalesced into one when the range abuts
     the file head; caching unwrapped file keys for hot objects is a later win.
@@ -293,12 +313,13 @@ This collapses the "frame manifest" from a per-frame offset table into, at most,
 length per part** (parts may have unequal sizes, so cumulative part offsets still need the part
 table; age chunks *within* a part are arithmetic). Consequences:
 
-- **Single-part PUT (the common case): no part table at all** — total length + the fixed age chunk
-  size is sufficient; a ranged GET needs only the object's total size.
+- **Single-part PUT (the common case): no part table at all** — the stamped plaintext length +
+  the object's Content-Length + the fixed age chunk size suffice (`hlen` is derived, not stored);
+  a ranged GET needs nothing beyond them.
 - **Multipart: the part table is distributed across the parts themselves.** Each remote part object
   already exists and already carries S3 user-metadata, so hypha records each part's **plaintext
-  length** and **plaintext MD5** (`x-amz-meta-plen`, `x-amz-meta-pmd5`) on the part object that holds
-  that part's age ciphertext. There is no separate manifest artifact — the per-part facts live on
+  length** and **plaintext MD5** (`x-amz-meta-plen`, `x-amz-meta-pmd5`) on the part object that
+  holds that part's age ciphertext (per-part `hlen` derives from `plen` + the part's own size). There is no separate manifest artifact — the per-part facts live on
   the per-part objects the remote already stores.
 - **`CompleteMultipartUpload` assembles the composite.** It `ListParts`s the remote upload, reads the
   per-part headers, and writes a small **composite part table** (`Vec<PartLen>` + `Vec<PartMD5>`,
@@ -350,7 +371,8 @@ profile the architecture reserves for clients like ZeroFS. **Multipart always ta
 cached deployment or not — `UploadPart` encrypts and streams straight to the remote per part,
 `CompleteMultipartUpload` is the durability commit (parts already durable on the remote, this just
 glues them into the composite at K) — and, in a cached deployment, it also writes an **eviction
-tombstone into the cache at K** (conditional on the prior cache ETag when one exists), atomically
+tombstone into the cache at K** plus its facts twin carrying the composite ETag/`plen`/mtime
+(twin-before-tombstone, §8/§9; conditional on the prior cache ETag when one exists), atomically
 replacing any stale cached body and keeping the cache namespace complete for LIST.
 `AbortMultipartUpload` deletes the orphaned parts. Parts stream around the cache; only
 `CompleteMultipartUpload` touches it (with the eviction tombstone above). The composite becomes
@@ -448,14 +470,20 @@ the §4 linearization point — not via this counter). Eviction re-checks the pe
 pipeline (below) to also catch markers from a prior hypha generation that wouldn't show up in the
 in-process ref count.
 
-**No global LRU index; windowed LRU by partial scan.** Eviction need not be exact, so the scavenger
-keeps no in-memory recency index — nothing to rebuild or lose on restart. Each cache object carries a
-**last-access timestamp** stamped by the active on GET/HEAD, but **coarsely**: only rewritten once it
-has aged past the LRU granularity, so a hot object costs at most ~one metadata touch per granularity
-window rather than one write per read. On the SeaweedFS cache this is a cheap filer attribute update,
-not a full object rewrite. Each pass, the scavenger advances a **rotating cursor** over a contiguous
-keyspace slice (`LIST` window), reads the access times in that slice, and evicts the
-least-recently-used *within the window*. Eviction of a candidate K runs in four steps; the layering
+**No global LRU index; windowed CLOCK by partial scan.** Eviction need not be exact, so no
+per-object access time is ever written — the read path stays write-free. Recency is a **Bloom-ring
+sketch** in the active: one Bloom filter per time slice, GET/HEAD insert the key, and the newest
+k slices together answer "accessed recently?". Sealed slices persist to the cache under the
+reserved prefix (`<marker-uuid-prefix>/recency/<slice>`), are loaded to warm the ring on
+promotion, and are retained k deep (older ones swept). The sketch is advisory, same class as the
+prefix hint: a Bloom false positive only spares an object a cycle, and a fully lost or corrupt
+ring — or first boot — falls back to **LastModified ordering alone**, costing one churnier GC
+cycle, never correctness. Each pass, the scavenger advances a **rotating cursor** over a
+contiguous keyspace slice (`LIST` window), orders candidates by LastModified (free in every LIST
+entry), skips any key the ring has seen recently, and evicts the oldest *within the window*. A
+hot-but-old object that does get evicted simply rehydrates on its next read with a fresh mtime,
+protecting it for the next cycle — rehydration is the second-chance bit, so this is CLOCK with
+the ring suppressing the churn. Eviction of a candidate K runs in four steps; the layering
 is what makes eviction auto-healing under concurrent writers on K:
 
 1. **Skip if writer in flight.** Read the in-flight-PUT ref count for K; if `> 0`, skip K for this
@@ -469,10 +497,14 @@ is what makes eviction auto-healing under concurrent writers on K:
 3. **Confirm remote.** `HEAD` the remote at K. If absent, K isn't durable yet — skip (§7's
    durability-gates-GC invariant; rare given step 2 typically catches this first, but covers a
    marker-delete racing an eviction pass).
-4. **Conditional tombstone overwrite.** Cache `PutObject` at K with `If-Match: E_v`, body the
-   **eviction-sentinel UUID** (§4), user-metadata recording the client-visible ETag; no part table
-   (recoverable from the remote's per-part metadata). An **atomic replace** of the body at the
-   same key, not a separate object: a GET racing the eviction sees either the body or the
+4. **Twin, then conditional tombstone overwrite.** Delete any stale facts twins for K, write the
+   fresh twin (§9: facts in the key, bound to the sentinel ETag), then cache `PutObject` at K with
+   `If-Match: E_v`, body the **eviction-sentinel UUID** (§4), user-metadata recording the
+   client-visible ETag, plaintext length, and original mtime; no part table (recoverable from the
+   remote's per-part metadata). Twin-before-tombstone means a sentinel always has its twin; a
+   crash in between leaves only a twin bound to the sentinel next to a live body — unbound,
+   HEAD-fallback, swept (§9). The tombstone write itself is an **atomic replace** of the body at
+   the same key, not a separate object: a GET racing the eviction sees either the body or the
    tombstone, never a 404, by S3's single-object atomicity; no separate "write tombstone then
    delete body" sequence is needed.
 
@@ -480,7 +512,10 @@ The reverse path — rehydrate — is conditional the same way (`If-Match: <evic
 so eviction and rehydrate can never clobber a client write in either direction. The sentinel ETag
 is constant across tombstone generations, so rehydrate also holds the in-flight ref count while it
 runs — the scavenger skips the key, closing the evict → rehydrate → re-evict ABA that a
-constant-ETag CAS alone cannot see.
+constant-ETag CAS alone cannot see. Rehydrate also settles the twin: a simple body deletes it
+after landing (unbound meanwhile — HEAD fallback, never wrong), a composite **rebinds** it to the
+new body's cache ETag after landing, since a cached composite keeps needing its ETag override
+(§9). Writers overwriting a restored key delete the twin the same way, after the body lands.
 
 Two race windows remain by construction, both auto-healing — neither aborts durability:
 
@@ -529,6 +564,25 @@ figure, scavenges while above the high-water mark until the low-water mark, and 
   where it differs from the cache's own (§4). LIST filters hypha's internals from responses — the
   marker prefix and delete-tombstoned keys — classifying each entry from its (size, ETag) sentinel
   pair alone (§4), no per-key HEAD.
+- **LIST entries must report plaintext sizes, client ETags, and original mtimes**, and a raw
+  `ListObjectsV2` entry has the wrong facts for tombstoned keys (sentinel size/ETag), rehydrated
+  composites (cache MD5, not `hash-N`), and remote objects (ciphertext length; `plen` is not
+  derivable from a LIST entry — the §6 `hlen` derivation needs `plen` as input). Cache LISTs
+  solve this with **facts twins**: a zero-byte cache object at `K ‖ 0x01 ‖ facts`, the facts
+  (type, bound ETag, `plen`, client ETag, mtime) encoded in the twin's *key name* — the one
+  per-entry field LIST does return. Because the separator sorts below every admissible key byte,
+  a twin sorts immediately after its own key: one backend page yields `(K, K's twin)` adjacent,
+  and a single pass emits correct client entries with **zero extra requests**. A twin applies
+  only when its **bound ETag** equals the adjacent `K` entry's actual ETag (the sentinel ETag for
+  tombstones, the body's cache ETag for composites); an unbound twin — a crash-window leftover —
+  triggers a per-key cache `HEAD` fallback (the tombstone/object user-metadata stays the
+  authoritative copy of the facts; the twin is only their LIST-visible projection) and is swept.
+  Delete-tombstones need no twin — LIST omits them, classified from the sentinel pair alone.
+  Against a plain S3 endpoint — the cacheless deployment's remote, or the remote during the
+  resync window — no projection exists: LIST pages fan out per-entry `HEAD`s under a concurrency
+  bound, and during resync the page is additionally merged with the active's in-memory **pending
+  overlay** (acked-but-unuploaded PUTs patched in, pending DELETEs dropped; rebuilt from the
+  marker LIST on promotion) so read-after-write holds while the cache is untrusted.
 - **Multipart** takes the §7 cacheless path: each `UploadPart` is encrypted as its own age file
   (fresh random file key per part) and streamed straight to the remote, with that part's plaintext
   length and MD5 stamped onto the part object's user-metadata. The cache is bypassed entirely on the
@@ -611,9 +665,10 @@ Config via `figment` (file + env), validated at boot. Surface (maps to chart val
   fence-confirm timeout, and the post-fence **settle delay** + server-side request timeout that bound
   the in-flight-write drain (§4).
 - **serving tuning**: offload threshold (§5), **reconcile pass interval/concurrency**,
-  max in-flight conditional PUTs to the cache.
-- **GC tuning**: high/low water marks, walk window size, scavenge interval; restore-sweep fan-out
-  (max concurrent LIST shards, tombstone-writer concurrency) and prefix-hint refresh interval (§10).
+  max in-flight conditional PUTs to the cache, remote-LIST `HEAD` fan-out concurrency (§9).
+- **GC tuning**: high/low water marks, walk window size, scavenge interval; recency ring (slice
+  duration, slice count k, filter size) (§8); restore-sweep fan-out (max concurrent LIST shards,
+  tombstone-writer concurrency) and prefix-hint refresh interval (§10).
 
 Delivered as the `hypha/` chart described in the architecture, installed by cluster-admin. It renders
 **two workloads** sharing config/Secret refs: the serving **StatefulSet** (2 pods — active +
@@ -653,6 +708,13 @@ condition, not a readiness gate (the passive is intentionally ready-but-idle).
   (restore-then-compare) and cached composites (metadata-ETag mapping) per §4. A second test exercises bursty overwrite contention
   on one key: many writers ack in some order, then assert the remote converges to the last-acked etag
   within one reconcile pass, with no intermediate ordering visible post-eviction.
+- **Twin coherence (LIST facts)**: crash-inject at every point of the twin sequences (§8's
+  delete-stale → write-twin → tombstone; rehydrate's body → delete/rebind) and assert LIST never
+  reports wrong facts — an unbound twin must trigger the HEAD fallback, at most one twin exists
+  per key, and the sweep collects orphans. Separately, LIST under concurrent evict / rehydrate /
+  overwrite of the same keys, plus the ordering property: an interleaved population of keys where
+  some are prefixes of others (`a`, `a!b`, `a/b`) lists in correct lexicographic order with twins
+  present.
 - **Eviction vs. concurrent writer**: drive sustained PUTs to one key while the scavenger is
   evicting candidates including K, and assert that the four-step §8 pipeline never deletes a body
   whose marker is in flight or whose etag has already moved. Specifically: (a) a writer landing
@@ -695,10 +757,14 @@ condition, not a readiness gate (the passive is intentionally ready-but-idle).
   `If-Match` on `PutObject`/`DeleteObject` is the linearization point for the PUT path (§4) and the
   eviction path (§8); the remote's conditional PUT / `CompleteMultipartUpload` serialize the
   cacheless and multipart paths. An absent or buggy implementation on either side breaks
-  linearizability on contended writes. Spike early on real SeaweedFS (the §13 concurrency test pins
-  this); if the cache side cannot be relied on, the fallback is a short-hold in-process per-key
-  lock held through the cache-side RMW — same overhead as the original §4 design, with all the
-  async-latency caveats that brought.
+  linearizability on contended writes. The only SeaweedFS-specific surface left is the
+  usage/vacuum API (§8), already pluggable — LIST facts, recency, and every marker ride ordinary
+  S3 objects, so the cache stays swappable. SeaweedFS implements conditional PUT/DELETE as of
+  **4.07**,
+  broken under versioning/object-lock (seaweedfs#8073) — the cache bucket enables neither, so pin
+  ≥ 4.07 and let the §13 concurrency test re-verify. If it still cannot be relied on, the fallback
+  is a short-hold in-process per-key lock held through the cache-side RMW — same overhead as the
+  original §4 design, with all the async-latency caveats that brought.
 - **`hypha-fence` is a bespoke controller, and the load-bearing one.** It replaces distributed locking
   with fabric fencing, so its correctness *is* the single-writer guarantee. The ordered
   fence→confirm→drain→promote sequence and the Cilium policy-revision confirmation must be gotten exactly
@@ -725,3 +791,50 @@ condition, not a readiness gate (the passive is intentionally ready-but-idle).
   policy to the same value, unlike a data-plane split-brain.
 - **`s3s` coverage** for every conditional-write / SigV4-chunked corner hypha's clients use should be
   spiked early — it's the load-bearing dependency; a gap there is the highest-impact unknown.
+
+## 15. Implementation plan
+
+Ordered so that every phase ends in something independently testable — and from phase 2 on,
+independently deployable — with the hardest machinery (cache coherence, fencing) landing last, on
+top of already-proven layers. The former §14 unknowns resolved by research: SeaweedFS implements
+conditional PUT/DELETE as of **4.07** (broken only under versioning/object-lock, which the cache
+bucket doesn't enable — pin ≥ 4.07; the §13 integration suite re-verifies), and `s3s` surfaces the
+precondition headers through its DTOs (strict ETag-quoting is the known sharp edge). Cilium's
+established-connection behavior on deny stays a phase-6 deploy-time check, with the settle delay
+as fallback.
+
+**Phase 1 — `hypha-format`.** Pure codec: envelope, offset arithmetic, seekable-reader adapter.
+*Exit*: §13 proptest/fuzz suite green; `criterion` bench sets the §5 offload threshold.
+
+**Phase 2 — cacheless serving MVP.** `hypha-core` (config, backend, meta, error) + the `s3s` trait
+over the cacheless path only: inline-encrypt PUT, GET/range via the seek adapter, HEAD/LIST/buckets
+from the remote, DELETE, `S3Auth`. This is the `s3-direct` deployment in full — a shippable
+encrypting proxy that proves s3s + age + SDK end-to-end while deferring every cache mechanism.
+*Exit*: integration conformance pass against MinIO; a real zero-loss client (ZeroFS) works.
+
+**Phase 3 — multipart.** Per-part age files, part-object metadata, `CompleteMultipartUpload`
+composite table/ETag, abort, the 4 GiB admission cap. Extends phase 2 only. *Exit*: §13 multipart
+scenarios (out-of-order, re-upload, `ListParts` overflow fallback).
+
+**Phase 4 — cached path, single replica.** Conditional pass-through with the §4 ETag rules
+(version-token mapping, restore-then-compare), pending markers, the reconcile sweep, delete
+tombstones, CMU cache tombstone, rehydrate. Deployed with one replica and **no fencing** — a single
+writer is trivially single, so this ships the default `s3.internal` deployment with correctness
+intact and only failover seamlessness missing. *Exit*: §13 concurrency, reconcile, and
+eviction-vs-writer suites against real SeaweedFS.
+
+**Phase 5 — GC + restore.** Walk cursor, windowed CLOCK, recency ring + slice persistence, usage source +
+vacuum, prefix-hint writer, sync marker + parallel restore sweep. *Exit*: scavenge/rehydrate and
+cache-wipe → restore-sweep → rehydrate scenarios.
+
+**Phase 6 — `hypha-fence` + active-passive.** Two-pod StatefulSet, leader-elected controller,
+lease, fence→confirm→drain→promote, graceful-release fast path. Its first step verifies the fence
+primitives on the live cluster — per-endpoint policy-revision observability and
+established-connection reset on deny — before the controller logic lands. *Exit*: the §13
+partition harness — old active's writes refused at the backend before the new active writes, plus
+the graceful path.
+
+**Phase 7 — chart + operations.** The `hypha/` Helm chart (both workloads, Secrets, `HTTPRoute`,
+the fence's policy RBAC, per repo networking conventions), dashboards for the §12 metrics, then the
+two production installs (cached + cacheless). *Exit*: both endpoints live behind the shared
+Gateway.
