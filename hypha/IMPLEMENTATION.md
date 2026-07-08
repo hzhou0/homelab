@@ -42,15 +42,15 @@ decryption, a finalizer chunk for truncation detection, and per-file random file
 parallel part encryption without key/nonce coordination, with per-file key isolation. The crate is
 sync; hypha drives it over adapters bridged via `spawn_blocking` (§5).
 
-| Concern | Crate(s) |
-|---|---|
-| Runtime / streaming | `tokio`, `tokio-util`, `bytes`, `futures` |
-| S3 server / clients | `s3s`, `s3s-aws`, `aws-sdk-s3`, `aws-config` |
-| Encryption / hashing | `age`, `md-5`, `hex` (client ETags, sentinel ETags) |
-| Config / errors | `serde`, `figment`; `thiserror`, `anyhow` (bootstrap) |
-| Observability | `tracing`(+`subscriber`); `metrics` + Prometheus exporter (planned) |
-| Concurrency | `dashmap` (planned: the §8 in-flight-PUT ref count) |
-| Testing | `proptest`, `criterion`, `cargo fuzz`, `testcontainers` |
+| Concern              | Crate(s)                                                            |
+|----------------------|---------------------------------------------------------------------|
+| Runtime / streaming  | `tokio`, `tokio-util`, `bytes`, `futures`                           |
+| S3 server / clients  | `s3s`, `s3s-aws`, `aws-sdk-s3`, `aws-config`                        |
+| Encryption / hashing | `age`, `md-5`, `hex` (client ETags, sentinel ETags)                 |
+| Config / errors      | `serde`, `figment`; `thiserror`, `anyhow` (bootstrap)               |
+| Observability        | `tracing`(+`subscriber`); `metrics` + Prometheus exporter (planned) |
+| Concurrency          | `dashmap` (planned: the §8 in-flight-PUT ref count)                 |
+| Testing              | `proptest`, `criterion`, `cargo fuzz`, `testcontainers`             |
 
 ## 3. Module layout
 
@@ -140,7 +140,7 @@ are fenced against eviction by the §8 in-flight ref count and conditional tombs
 lock.
 
 The cache's own ETag is the **version token**, but not always the client-visible ETag (tombstones
-carry a sentinel ETag; a rehydrated composite's cache MD5 isn't the `hash-N` — §6 `cetag`). A
+carry a sentinel ETag; the client ETag rides their metadata — §6). A
 conditional write resolves by key state: **live body** → native cache ETag;
 **eviction-tombstoned** → `cetag` from tombstone metadata; **delete-tombstoned / absent** →
 client-visibly absent (`If-Match` 412s; creates proceed); **transition-marked** (always a crash
@@ -234,23 +234,33 @@ a deterministic (size, ETag) pair, so a plain LIST classifies every key with no 
 sentinel's constant ETag doubles as a CAS token. 16 bytes saturate MD5's entropy: a collision with
 a real client body needs a length match *and* a 2⁻¹²⁸ byte match.
 
-**Facts twins** — a zero-byte object at `K ‖ 0x01 ‖ facts`, the facts (kind, bound ETag, `plen`,
-client ETag, mtime) encoded in the key name, the one field LIST returns per entry. The separator
-sorts below every admissible key byte, so the twin arrives adjacent to K in the same LIST page. A
-twin applies only while its **bound ETag** equals K's actual ETag (the sentinel for tombstones,
-the body's cache ETag for rehydrated composites); an unbound twin is a crash-window leftover —
-readers fall back to a per-key HEAD (the object's metadata is the authoritative copy; the twin is
-its LIST projection) and the sweep collects it. Twins exist for exactly the listable entries
-whose raw LIST facts are wrong: eviction tombstones and rehydrated composites.
+**Facts twins** — a zero-byte object at `K ‖ 0x01 ‖ cetag ; plen ; mtime`, carrying in its key
+name (the one field LIST returns per entry) exactly the facts LIST needs for an evicted key: the
+client ETag, the plaintext size, and the original client-write mtime. The separator sorts below every admissible key byte, so the twin
+arrives adjacent to K in the same LIST page. A twin **applies iff K's own entry classifies as an
+eviction tombstone**; next to anything else it is a crash-window leftover, ignored and swept — a
+live body's facts are native, so a stale twin can never override them. An eviction tombstone
+whose twin is missing or unparseable falls back to a per-key HEAD (the tombstone's metadata is
+the authoritative copy; the twin is its LIST projection). Twins are written in the same locked
+sequence as their tombstone (twin-before-tombstone), and every path that replaces an eviction
+tombstone passes through a live body or a transition mark first — so an eviction tombstone is
+never adjacent to another epoch's twin, and the classification gate is the entire validity
+check.
 
 **Key admission** is what makes the twin scheme sound: client keys may not contain bytes below
 `0x20` (the `0x01` separator must sort below every admissible byte, or a prefix key would flip
 LIST order) and are capped at 900 bytes, leaving twin-suffix headroom
 (`meta::validate_client_key`). Enforced at every op that takes a key.
 
-**`cetag` metadata**: whenever an entry's client-visible ETag differs from the cache's own ETag
-(every tombstone; a rehydrated composite), the client ETag rides the entry's user-metadata, with
-`plen` beside it.
+**Tombstone metadata**: every tombstone carries the full facts — kind, `cetag`, `plen`, original
+mtime — in its user-metadata, the authoritative copy; HEAD and GET serve from it, and the twin is
+its LIST projection. Eviction never changes a key's client-visible `LastModified`: LIST reads it
+from the twin, HEAD from the metadata.
+
+**Shadow body** (cached mode): a rehydrated composite's plaintext at `<marker-prefix>/body/<K>`.
+The tombstone and twin at K stay untouched — K never changes classification, so composite
+rehydration is invisible to LIST/HEAD and rewrites no twin. A tombstoned GET probes the shadow
+before the remote; evicting a shadow is a single delete.
 
 **The pending marker** (cached mode) lives at `<marker-prefix>/<K>` — **one per key**, body = the
 body ETag of the most recently acked PUT. Concurrent PUTs overwrite it; last writer wins — the
@@ -420,14 +430,14 @@ leftovers of abandoned uploads.
 
 1. HEAD the cache at K, dispatch on what's there:
    - **Live body** (cached mode): serve from the cache; ranges forwarded.
-   - **Eviction tombstone**: facts from its metadata; body decrypted from the remote. A
+   - **Eviction tombstone**: facts from its metadata. In cached mode, probe the shadow body (§6)
+     and serve it on a hit; otherwise decrypt from the remote and rehydrate asynchronously (§8) —
+     single-part into K, composite into the shadow. Durable mode always reads the remote. A
      single-part range maps to a closed-form chunk range + header read (§6), driven through
      `RangeReader` + age seek and trimmed to the exact `[a,b)`. A composite range first fetches
      the remote's part index, then derives each needed part's `plen` from its `ct_len` after a
      small header-prefix read (grease makes `hlen` per-part random), walking parts to the range —
-     uniform-part-size fast path first, since clients almost always use fixed part sizes. Cached
-     mode rehydrates asynchronously (§8), so subsequent reads serve locally; durable mode always
-     reads the remote.
+     uniform-part-size fast path first, since clients almost always use fixed part sizes.
    - **Delete-tombstone**: 404.
    - **Transition tombstone**: remote-as-truth — HEAD the remote, serve (or 404) per its actual
      state, and opportunistically repair.
@@ -437,10 +447,12 @@ leftovers of abandoned uploads.
 ### ListObjectsV2
 
 1. One cache LIST page; strip the deployment prefix; filter the reserved prefix.
-2. Classify each entry from its (size, ETag) sentinel pair with its adjacent twin (§6): **live
-   body** → native facts; **eviction tombstone** → bound twin's facts, unbound ⇒ per-key cache
-   HEAD fallback; **delete-tombstone** → omitted; **transition tombstone** → per-key *remote*
-   HEAD (the one classification that leaves the cache).
+2. Classify each entry from its (size, ETag) sentinel pair (§6): **live body** → native facts
+   (any adjacent twin is stale — ignored); **eviction tombstone** → the adjacent twin's
+   `{cetag, plen, mtime}`, per-key cache HEAD fallback when the twin is missing;
+   **delete-tombstone** →
+   omitted; **transition tombstone** → per-key *remote* HEAD (the one classification that leaves
+   the cache).
 
 ### Buckets
 
@@ -554,19 +566,21 @@ version-token ETag `E_v`:
 4. Under K's lock: delete stale twins, write the fresh twin, then overwrite K with the eviction
    sentinel via `PutObject If-Match: E_v` — metadata carrying `cetag`/`plen`/original mtime. The
    tombstone is an atomic in-place replace: a racing GET sees body or tombstone, never 404.
-   Twin-before-tombstone means a sentinel always has its twin; a crash between leaves an unbound
-   twin next to a live body — HEAD-fallback for LIST, swept later (§6).
+   Twin-before-tombstone means a sentinel always has its twin; a crash between leaves a twin next
+   to a live body — ignored by classification (§6), swept later.
 
 A writer landing anywhere between steps 1 and 4 has moved the ETag, so step 4's `If-Match: E_v`
 fails and eviction retries next pass — the layering (ref count → marker → remote HEAD →
-conditional CAS) makes every interleaving auto-healing, never lossy.
+conditional CAS) makes every interleaving auto-healing, never lossy. **Shadow bodies** (§6) are
+evicted from their own reserved-prefix windows: confirm the remote composite (HEAD), then delete
+the shadow — K's tombstone and twin are already in place.
 
-**Rehydrate** (cached mode) is the mirror: fetch + decrypt from the remote, write the body with
-`If-Match: <evict-sentinel-etag>` under the lock, holding the ref count while it runs (the
-sentinel ETag is constant across generations, so the count is what closes the
-evict → rehydrate → re-evict ABA a constant-ETag CAS can't see). Then settle the twin: delete it
-for a single-part body (facts are native again), **rebind** it to the new body's cache ETag for a
-composite — a live cached composite keeps needing its `hash-N` override (§6).
+**Rehydrate** (cached mode) is the mirror: fetch + decrypt from the remote under the lock,
+holding the ref count while it runs (the sentinel ETag is constant across generations, so the
+count is what closes the evict → rehydrate → re-evict ABA a constant-ETag CAS can't see). A
+single-part body lands at K with `If-Match: <evict-sentinel-etag>`, then its twin is deleted —
+K's facts are native again. A composite lands in the shadow body (§6); K's tombstone and twin
+stay untouched.
 
 **Usage from the backend.** The scavenger reads SeaweedFS volume/master metrics (physically
 accurate, sees dead bytes), scavenges from high- to low-water mark, and can drive
@@ -627,10 +641,11 @@ condition, not a readiness gate.
 - **Eviction vs. writers**: sustained PUTs against a key under eviction; assert the §8 layering
   (ref-count skip, marker skip, `If-Match` abort) never tombstones an acked-but-unuploaded body,
   including the prior-generation-marker case.
-- **Twin coherence**: crash-inject every point of twin sequences (delete-stale → write → tombstone;
-  rehydrate delete/rebind); LIST never reports wrong facts, unbound twins HEAD-fallback and get
-  swept, ≤ 1 twin per key; lexicographic order holds with prefix-key populations (`a`, `a!b`,
-  `a/b`).
+- **Twin coherence**: crash-inject every point of twin sequences (delete-stale → write →
+  tombstone; rehydrate's body-then-twin-delete); LIST never reports wrong facts — a twin next to
+  a non-evict entry is ignored and swept, an evict tombstone with a missing twin HEAD-falls-back,
+  ≤ 1 twin per key; shadow-body probe/evict races; lexicographic order holds with prefix-key
+  populations (`a`, `a!b`, `a/b`).
 - **Transition bracket**: crash-inject at every step of the §7 durable PUT / DELETE / complete
   brackets and assert the contract — readers never see hybrid facts/bytes, an unacked op leaves
   the old object fully readable or the new one fully committed, and repair settles K
@@ -675,8 +690,9 @@ pairing), buckets, auth, `Reconciler` + `KeyLocks`. **Remaining**: implement the
 bracket — add the transition sentinel to `meta.rs`, rework `put.rs` (no mark today, and it stamps
 only `plen`; the §7 restore sweep needs `cetag` too) and `delete.rs` (currently a cache-first hard
 delete) to the mark → commit → settle sequences, and add the repair rule to the read and
-conditional paths; align `meta.rs`'s twin-scope comment with this document; integration
-conformance vs. MinIO + SeaweedFS.
+conditional paths; slim the twin to `{cetag, plen, mtime}` with the classification gate
+(`meta::Facts` drops kind/bound-ETag; `list_head.rs`/`tier.rs` follow); integration conformance
+vs. MinIO + SeaweedFS.
 *Exit*: conformance pass; ZeroFS works against the durable endpoint.
 
 **Phase 3 — multipart.** Native-remote-multipart proxy (§7): per-part encryption + inline `pmd5`,
@@ -686,14 +702,15 @@ facts tags at complete (the full six-step bracket), abort, the 4 GiB cap, compos
 *Exit*: §11 multipart scenarios including restart-mid-upload and record-based restore recovery.
 
 **Phase 4 — cached mode, single replica.** Marker writes + the in-flight ref count on the PUT
-path, the reconcile sweep, cached DELETE propagation, rehydrate + twin settle (delete/rebind).
-Deployed with one replica and no fencing — a single writer is trivially single, so this ships the
+path, the reconcile sweep, cached DELETE propagation, rehydrate (single-part into K + twin
+delete; composite into the shadow body). Deployed with one replica and no fencing — a single writer is trivially single, so this ships the
 default `s3.internal` deployment with correctness intact, only failover seamlessness missing.
 *Exit*: §11 concurrency, marker/reconcile, and eviction-vs-writer suites against real SeaweedFS.
 
 **Phase 5 — GC + restore.** Walk cursor, windowed CLOCK, Bloom ring + slice persistence, usage
 source + vacuum, prefix-hint writer, sync marker + parallel restore sweep, debris sweeps (orphan
-twins, leftover transition marks, orphan completion records, abandoned mpu state). *Exit*:
+twins, orphan shadow bodies, leftover transition marks, orphan completion records, abandoned mpu
+state). *Exit*:
 scavenge/rehydrate and cache-wipe → restore-sweep → rehydrate scenarios.
 
 **Phase 6 — `hypha-fence` + active-passive.** Two-pod StatefulSet, leader-elected controller,
