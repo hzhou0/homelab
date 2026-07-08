@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hypha-format"]
+members = ["hypha-format", "hypha-core", "hypha"]
 
 [workspace.package]
 edition = "2021"
@@ -8,7 +8,32 @@ license = "MIT"
 repository = "https://github.com/hzhou0/homelab"
 
 [workspace.dependencies]
+hypha-format = { path = "hypha-format" }
+hypha-core = { path = "hypha-core" }
+
+# Encryption
 age = "0.11"
-thiserror = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+tokio-util = { version = "0.7", features = ["io", "io-util", "codec"] }
+
+# S3 server surface + client
+async-trait = "0.1"
+md-5 = "0.10"
+hex = "0.4"
+s3s = "0.14"
+s3s-aws = "0.14"
+aws-sdk-s3 = "1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio"] }
+
+# Config / errors / observability
+serde = { version = "1", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Testing
 proptest = "1"
 criterion = "0.5"

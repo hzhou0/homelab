@@ -1,0 +1,27 @@
+[package]
+name = "hypha"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hypha"
+path = "src/main.rs"
+
+[dependencies]
+hypha-core = { workspace = true }
+hypha-format = { workspace = true }
+s3s = { workspace = true }
+s3s-aws = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+age = { workspace = true }
+md-5 = { workspace = true }
+hex = { workspace = true }

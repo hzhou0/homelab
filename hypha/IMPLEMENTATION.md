@@ -93,7 +93,7 @@ hypha/src/               (serving binary — active-passive)
   auth.rs                S3Auth impl for hypha's own client credentials
   s3/                    the s3s::S3 trait implementation, split by op group
     get.rs put.rs multipart.rs list_head.rs delete.rs conditional.rs
-  replication.rs         remote-upload orchestration (§7); single-object PUT has no queue
+  replication.rs         cached-path reconcile orchestration (§7); durable PUT uploads inline via per-key coalescing slot
   gc/                    scavenger task, runs only while active (§8)
     walk.rs              partial-scan cursor + windowed LRU eviction (single-part objects only)
     reconcile.rs         continual pending-marker sweep → remote upload, shares this task with GC (§7)
@@ -107,9 +107,9 @@ hypha-fence/src/         (fencing controller — HA via leader election)
   fence.rs               ordered fence-before-promote; Cilium/OPNsense policy writes (§4)
 ```
 
-The `s3/` modules are thin: they parse intent, take the key lock, and orchestrate `backend`,
-`hypha-format`, `meta`, and `replication`. Business rules live in `hypha-core` so they're unit-testable
-without an HTTP layer.
+The `s3/` modules are thin: they parse intent, take the key's write lock when the operation is
+conditional, and orchestrate `backend`, `hypha-format`, `meta`, and `replication`. Business rules
+live in `hypha-core` so they're unit-testable without an HTTP layer.
 
 ## 4. Concurrency model & the linearizability guarantee
 
@@ -124,16 +124,22 @@ passive** standby. Because a replica is stateless (§10) and holds no side index
 means already running with connections open to cache/remote — on promotion it has nothing to load and
 serves immediately.
 
-With a single writer, single-object conditional writes need **no in-process lock at all**: hypha
-forwards the client's `If-Match` / `If-None-Match` straight to the cache `PutObject` at the same
-key K that the client named, and the cache's own conditional write **is** the linearization point.
-The cache must implement `If-Match` on `PutObject` (SeaweedFS does; § *Risks* flags the spike).
-Authoritative existence/ETag stay in the self-describing backend objects; there is no metadata
-database (the architecture's "no side index" holds in full) and no per-key lock table for the PUT
-path. **Multipart takes the cacheless path** (§7): parts stream straight to the remote, where
-S3's own per-(upload-id, part-number) write semantics serialize them, and `CompleteMultipartUpload`
-is the durability commit. No in-process session lock is needed — the remote is the serializing
-resource, not hypha.
+With a single writer, single-object conditional writes serialize on a **per-key async write lock**:
+a conditional PUT or DELETE acquires the key's exclusive write lock, HEADs the cache to resolve the
+*current client-visible ETag* (`None` for absent or delete-tombstoned keys, the `cetag` metadata
+field for eviction-tombstoned keys, the native cache ETag for a live body), evaluates the
+precondition, and — on success — writes to the cache unconditionally. The write lock is the
+linearization point; conditional-write semantics are enforced by hypha, not delegated to the
+backend. **Unconditional PUTs take no lock.** In the cached path they write directly to the cache then write
+a marker; concurrent writers race on the cache and both are acked (S3 last-writer-wins). In the
+durable path they coalesce through a per-key `UploadSlot` (§7) — no cache write, no marker. The
+write lock covers only the HEAD → evaluate → write critical section for conditional operations and
+is never held across uploads or remote I/O, so it does not bound latency on the common
+unconditional path. The cache must speak the S3 API but does not need
+conditional-PUT support for the write path. **Multipart takes the durable path** (§7):
+parts stream straight to the remote, where S3's own per-(upload-id, part-number) write semantics
+serialize them, and `CompleteMultipartUpload` is the durability commit. No per-key lock is needed
+— the remote is the serializing resource, not hypha.
 
 The cache's own ETag is the **version token**, but it is not always the client-visible ETag: a
 multipart composite's ETag (`md5(part-md5s)-N`) cannot be reproduced by a single cache `PutObject`,
@@ -141,18 +147,12 @@ and a tombstone's cache ETag is the fixed sentinel UUID's ETag (§8/§9), not th
 of the object it stands in for. Hypha stores the client-visible ETag in cache user-metadata
 whenever the two differ, and a conditional write resolves by key state:
 
-- **Ordinary body** (cache ETag == client ETag, the common case): forward the client's condition
-  as-is — the cache compares.
-- **Composite in cache**: `HEAD` K for the cache ETag `E_c` and the metadata client-ETag; compare
-  the client's `If-Match` against the metadata, then issue the `PutObject` with `If-Match: E_c`.
-  The cache ETag stays the atomicity token; the metadata is only the client-facing mapping.
-- **Eviction-tombstoned key**: **restore, then compare** — rehydrate the body from the remote with
-  `If-Match: <eviction-sentinel-etag>` (a concurrent writer aborts the restore), turning the key
-  back into one of the two cases above. `If-None-Match: *` needs no restore: the tombstone already
-  proves existence.
-- **Delete-tombstoned key**: client-visibly absent, so `If-Match` fails with 412 outright, and a
-  create (`If-None-Match: *` or plain PUT) is forwarded as `If-Match: <delete-sentinel-etag>` — the
-  sentinel ETag stands in for "still deleted" as the atomicity token.
+- **Live body** (cache ETag == client ETag, common case): `current_client_etag` = native cache ETag.
+- **Eviction-tombstoned key**: `current_client_etag` = `cetag` from the tombstone's user-metadata.
+  No restore needed — the lock prevents any race between the HEAD and the subsequent write that
+  restore-then-compare was designed to close.
+- **Delete-tombstoned key / absent key**: client-visibly absent; `current_client_etag` = `None`.
+  `If-Match` fails 412; unconditional PUTs and `If-None-Match: *` proceed.
 
 Marker, tombstone, and body share one keyspace — no `cache/` prefix on the key, no separate
 tombstone object path. The body lives at `K`; the tombstone overwrites `K` in place (§8).
@@ -173,11 +173,11 @@ byte and a twin sorts immediately after its own key without disturbing LIST's le
 order — the prefix-key case is where a higher separator would flip it), and key length is capped
 to leave suffix headroom.
 
-The per-snapshot
-pending marker lives at `<marker-uuid-prefix>/<K>/<upload-id>`, where the prefix is a fixed
-reserved 16-byte value compiled into hypha — same collision math, same non-need for an
-admission-reject rule. Markers apply only to single-object PUTs (§7); multipart uploads don't touch
-the cache or the marker namespace.
+The **pending marker** lives at `<marker-uuid-prefix>/<K>` — one per key, not one per snapshot.
+Its body is the body ETag of the most recently acked PUT; concurrent PUTs overwrite it (last writer
+wins). The prefix is a fixed reserved 16-byte value compiled into hypha — same collision math, same
+non-need for an admission-reject rule. Markers apply only to single-object cached-path PUTs (§7);
+durable-mode and multipart uploads don't touch the marker namespace.
 
 The correctness of "single writer" cannot rest on *observing* that the old active is dead — a remote
 observer can never distinguish dead from partitioned-but-still-writing. So it rests on **fabric
@@ -352,22 +352,32 @@ for AAD binding; age's per-file file key is the binding.
 
 Two code paths, selected by whether a cache is configured:
 
-**Cached (default).** Hypha forwards the client's `If-Match` / `If-None-Match` straight to the
-cache `PutObject` at the client's key K — the cache's own conditional write is the linearization
-point (§4). On the way through the request body, hypha streams plaintext to K (the cache absorbs
-the overwrite atomically with the precondition check) and computes the ETag. Once the cache
-confirms the conditional PUT, hypha writes a small **pending marker** to the cache at
-`<marker-uuid-prefix>/<K>/<upload-id>` — a per-snapshot marker carrying the etag of the cache body
-it represents — and **acks the client**. No remote round-trip before ack; the marker is the only
-extra cache write on the hot path. The marker prefix is a fixed reserved UUID compiled into hypha
-(§4); no admission-reject rule is needed. The marker and the body it tracks both live in the cache,
-on the same NVMe volume; both survive a process crash, both die together on cache-volume loss. There
-is no in-process upload queue, no per-key upload lock, and no `durable` flag in cache object metadata
-— the pending set IS the durability signal, in the local tier where it is cheap to enumerate.
+**Cached (default).** For a conditional PUT, hypha acquires the per-key write lock (§4), HEADs the
+cache, evaluates the precondition, and — on success — streams plaintext to K unconditionally (the
+lock is the linearization point). For an unconditional PUT, hypha skips the lock and HEAD entirely
+and streams plaintext to K directly. In both cases the cache write computes the ETag natively. Once
+the cache confirms the PUT, hypha writes a small **pending marker** to the cache at
+`<marker-uuid-prefix>/<K>` — a single per-key object whose body is the body ETag just written —
+releases the write lock if held, and **acks the client immediately**. No remote round-trip before
+ack. Concurrent PUTs to K overwrite this one marker (last writer wins); the marker's own S3 ETag
+changes with each overwrite, which the reconciler uses as a CAS handle (§7 reconcile). The marker
+and the body it tracks both live in the cache on the same NVMe volume; both survive a process
+crash, both die together on cache-volume loss. There is no in-process upload queue and no `durable`
+flag in cache object metadata — the pending set IS the durability signal, cheap to enumerate as a
+flat per-key LIST.
 
-**Cacheless.** PUT frame-encrypts and uploads to the remote **inline**, acking only after the remote
-confirms. No marker, no pending set, no loss window, higher per-op latency — exactly the zero-loss
-profile the architecture reserves for clients like ZeroFS. **Multipart always takes this path**,
+**Durable.** Each key holds a per-key **`UploadSlot`** — a small
+`Mutex<{in_flight: bool, pending: Option<(body, plen, Vec<Sender>)>}>` in a swept `DashMap`. An
+unconditional durable PUT either starts the inline upload immediately (slot idle) or coalesces into
+the pending slot, replacing any earlier buffered body (last writer wins). When an upload finishes
+it signals all current waiters, then drains the pending slot into a new upload if occupied — at
+most one remote upload is in flight per key, concurrent writers batched into at most two uploads
+(in-flight + one pending). The inline path: encrypt the body computing the client ETag alongside →
+PUT ciphertext to remote → write eviction tombstone to cache. No cache body write, no marker. Acks
+only after the tombstone confirms. Conditional durable PUTs take the per-key write lock (§4),
+bypassing the slot — their HEAD → evaluate → write sequence is serialized and proceeds directly to
+the inline path. Higher per-op latency than cached (remote upload + tombstone round-trip on the
+critical path), zero-loss guarantee, no marker or reconcile machinery. **Multipart always takes this path**,
 cached deployment or not — `UploadPart` encrypts and streams straight to the remote per part,
 `CompleteMultipartUpload` is the durability commit (parts already durable on the remote, this just
 glues them into the composite at K) — and, in a cached deployment, it also writes an **eviction
@@ -380,54 +390,41 @@ cachable later, on first read, via the same rehydrate path used for tombstoned b
 fetches and decrypts from the remote, then asynchronously populates the cache from the decrypted
 plaintext.
 
-**Reconcile is the upload path (`replication.rs` + `gc/reconcile.rs`).** There is no in-memory upload
-queue; reconcile drives remote uploads. It runs as a continual background duty of the active, sharing
+**Reconcile is the cached-path upload path (`replication.rs` + `gc/reconcile.rs`).** Durable-mode
+objects are uploaded inline via the per-key coalescing slot above; reconcile handles only the
+cached path. There is no in-memory upload queue; reconcile drives remote uploads. It runs as a continual background duty of the active, sharing
 the scavenger task/thread with GC (§8) — one task, so same-key uploads never overlap. Each pass:
 
 1. `ListObjectsV2` the **cache** with `prefix=<marker-uuid-prefix>/` — a local SeaweedFS LIST over
-   NVMe, `O(in-flight + pending)` per pass, not a full-keyspace scan and not a remote round-trip.
-2. Group markers by key, and **dispatch per key on the cache body at K**: a key whose cache body is
-   the delete-sentinel UUID is a DELETE pending (§9); any other body (including the eviction
-   sentinel, which restore has already turned back into a live body) is an upload pending. The two
-   branches share the marker machinery but propagate different operations to the remote. The
-   cache-side conditional-write chain IS the ack order in both cases, so cache(K)'s state is the
-   linearization result, no in-process ordering invariant needed.
-3. **Upload branch.** For each key K dispatched here, `HEAD` the cache at K for its current etag —
-   the latest acked version. Among K's pending markers, the one whose etag matches cache(K)'s
-   current etag is the snapshot to upload. The others are older snapshots superseded in cache
-   before they reached the remote — drop them (their conditional delete at step 6 also clears
-   them). No LIFO, no per-key upload lock: the cache's etag *is* the truth of "what to upload,"
-   and reconcile just reads it.
-4. Upload the cache body (frame-encrypted) to the remote at key K **unconditionally**. A concurrent
-   overwrite of cache(K) racing the read is harmless: the body reconcile read is a coherent
-   snapshot of `E_n`; if cache moves to `E_{n+1}` mid-upload, that snapshot lands on the remote
-   and the next pass uploads `E_{n+1}`. Self-heals within one pass; the remote lags the cache by
-   ≤ one pass under sustained overwrite contention on K, which clients cannot observe (cache is
-   current, remote is read only on tombstoned post-eviction GET, by which time reconcile has
-   caught up).
-5. **Delete branch.** For each key K dispatched here, issue the remote `DeleteObject` at K, then
-   clear the delete-tombstone in the cache with `If-Match: <delete-sentinel-etag>` (K goes back to
-   an ordinary absent key for LIST) and conditionally delete the marker. A concurrent create at K
-   races the tombstone clear benignly: its `PutObject If-Match: <delete-sentinel-etag>` either
-   wins first (K is live; the clear's `If-Match` fails and reconcile drops only the marker, leaving
-   the live body) or loses (the clear wins, then the create fails 412 and the client retries — the
-   same semantics as if the delete had fully propagated before the create arrived).
-6. **Conditionally delete** each remaining marker for K with `If-Match: <etag-the-marker-was-written-with>`.
-   Load-bearing for two races in one: (a) if reconcile is ever scaled to multiple workers on the
-   same key, two workers can both upload the same snapshot but only one's conditional delete
-   succeeds; (b) if a writer C lands on cache(K) between step 3's HEAD and step 4, C writes a
-   new marker for `E_{n+1}` — reconcile's conditional delete against the old marker still
-   succeeds, because per-snapshot markers are append-only (writers create new markers; they never
-   overwrite old ones in place).
+   NVMe, one entry per pending key, `O(pending)` per pass, not a full-keyspace scan and not a
+   remote round-trip. Each LIST entry yields the key K and the marker's own S3 object ETag
+   (`M_etag`), which serves as the CAS handle for deletion.
+2. **Dispatch per key on the cache body at K**: a key whose cache body is the delete-sentinel UUID
+   is a DELETE pending (§9); any other body is an upload pending.
+3. **Upload branch.** `HEAD` the cache at K for its current body ETag `E_n` — the latest acked
+   version. No per-key lock, no LIFO: the cache's ETag is the truth of what to upload.
+4. Upload the cache body (frame-encrypted) to the remote at K **unconditionally**. A concurrent
+   overwrite racing the read is harmless: if cache moves to `E_{n+1}` mid-upload, `E_n` lands on
+   the remote and the next pass uploads `E_{n+1}`. Self-heals within one pass. After the upload,
+   write an **eviction tombstone** to cache at K with `If-Match: E_n` — if a new PUT came in and
+   moved the ETag, this 412s and reconcile skips the cleanup; the new body's marker remains and the
+   next pass handles it. If two reconciler workers race on the same snapshot, both uploads succeed
+   (idempotent) but only one tombstone CAS wins; the other sees the tombstone and is done.
+5. **Conditionally delete the marker** with `If-Match: M_etag`. If a new PUT overwrote the marker
+   between step 1 and now, `M_etag` is stale and this 412s — the new marker survives for the next
+   pass. Both CASes (tombstone in step 4, marker delete in step 5) are independently safe: a 412
+   on either leaves the system in a consistent, self-healing state.
+6. **Delete branch.** Issue the remote `DeleteObject` at K, then clear the delete-tombstone with
+   `If-Match: <delete-sentinel-etag>` (K returns to an ordinary absent key for LIST), then
+   conditionally delete the marker with `If-Match: M_etag`. A concurrent create at K races the
+   tombstone clear benignly: the create's `PutObject` either wins first (K is live; the clear
+   fails, reconcile drops only the marker) or loses (the clear wins, then the create fails 412 and
+   retries — same semantics as if the delete had fully propagated before the create arrived).
 
-Reconcile runs concurrently with serving; the durability-gates-GC fence below keeps markered
-cache objects safe until reconcile resolves them, so neither serving nor promotion blocks on it. On
-failover the new active's sweep simply lists the marker prefix from the start — markers and bodies
-both survived in the shared cache. The set is bounded by `O(in-flight + pending)`, so each pass is
-cheap; the cacheless path writes no markers and has nothing to reconcile. Without reconcile, a
-marker whose delete was lost would remain forever in the cache — a small local-space leak (markers
-are sub-1-KB objects), never a correctness bug, since a present marker only means "worth checking
-the remote," not "the remote is missing the data."
+Reconcile runs concurrently with serving; the durability-gates-GC fence below keeps markered cache
+objects safe until reconcile resolves them. On failover the new active's sweep lists the marker
+prefix from the start — markers and bodies both survived in the shared cache. The set is `O(pending)`
+— exactly one marker per pending key — so each pass is cheap and the LIST result needs no grouping.
 
 **Bounded loss window.** A *process* crash drops nothing important: every acked body is in the
 cache and every unfinished upload still has its marker; the new active's reconcile re-uploads from
@@ -459,14 +456,14 @@ stops. Serving holds **no persistent eviction state** — no LRU index, nothing 
 **Write-awareness on the eviction path.** The PUT path's only in-process state is a per-key
 `Arc<AtomicUsize>` ref count of in-flight PUT handlers, kept in a swept `DashMap` (the same
 data structure the original §4 lock table used, but as a counter — not a mutex — and only consulted
-by eviction). The PUT handler: `inc` on enter → cache `PutObject` at K (conditional, the
-linearization point) → cache `PutObject` at `<marker-uuid-prefix>/<K>/<upload-id>` (the marker) →
-`dec` on exit. The `inc ⇒ dec` window therefore covers the otherwise-racy gap between
-body-write-confirmed and marker-write-confirmed, which is exactly the window eviction can't
-otherwise observe. Eviction skips any key with `count > 0`, so it can never pick up a body whose
-marker is still in flight. The ref count gates only eviction; PUTs themselves never block on it
-(different keys still parallelize; same-key writers serialize via the cache-side conditional PUT,
-the §4 linearization point — not via this counter). Eviction re-checks the pending-LIST late in its
+by eviction). The PUT handler: `inc` on enter → cache `PutObject` at K → cache `PutObject` at
+`<marker-uuid-prefix>/<K>/<upload-id>` (the marker) → `dec` on exit. The `inc ⇒ dec` window
+therefore covers the otherwise-racy gap between body-write-confirmed and
+marker-write-confirmed, which is exactly the window eviction can't otherwise observe. Eviction
+skips any key with `count > 0`, so it can never pick up a body whose marker is still in flight.
+The ref count gates only eviction; PUTs themselves never block on it (unconditional PUTs
+parallelize freely; conditional PUTs serialize via the §4 per-key write lock — not via this
+counter). Eviction re-checks the pending-LIST late in its
 pipeline (below) to also catch markers from a prior hypha generation that wouldn't show up in the
 in-process ref count.
 
@@ -489,11 +486,10 @@ is what makes eviction auto-healing under concurrent writers on K:
 1. **Skip if writer in flight.** Read the in-flight-PUT ref count for K; if `> 0`, skip K for this
    pass. This covers the body-confirmed-but-marker-not-yet-written window that no purely
    cache-side observation could otherwise catch.
-2. **Skip if pending.** `ListObjectsV2` the cache with `prefix=<marker-uuid-prefix>/<K>/` — if any
-   marker is present, skip K. This catches markers from a previous hypha generation (e.g., a
-   failover where the
-   writer died between body and marker write and the in-flight counter died with it). Same LIST
-   serves §7 reconcile.
+2. **Skip if pending.** `HEAD` the cache at `<marker-uuid-prefix>/<K>` — if the marker object
+   exists, K has a pending upload; skip. This catches markers from a previous hypha generation
+   (e.g., a failover where the writer died between body and marker write and the in-flight counter
+   died with it).
 3. **Confirm remote.** `HEAD` the remote at K. If absent, K isn't durable yet — skip (§7's
    durability-gates-GC invariant; rare given step 2 typically catches this first, but covers a
    marker-delete racing an eviction pass).
@@ -753,18 +749,17 @@ condition, not a readiness gate (the passive is intentionally ready-but-idle).
   one: add the new recipient to the encryptor's recipient set, deploy, then run a (deferred) re-encrypt
   pass over the remote to drop the old recipient from existing files. No key-epoch tag in metadata
   needed — the recipient set in each age file *is* the epoch. Re-encryption job is deferred.
-- **Both backends are assumed to speak the full S3 API, conditional writes included.** The cache's
-  `If-Match` on `PutObject`/`DeleteObject` is the linearization point for the PUT path (§4) and the
-  eviction path (§8); the remote's conditional PUT / `CompleteMultipartUpload` serialize the
-  cacheless and multipart paths. An absent or buggy implementation on either side breaks
-  linearizability on contended writes. The only SeaweedFS-specific surface left is the
-  usage/vacuum API (§8), already pluggable — LIST facts, recency, and every marker ride ordinary
-  S3 objects, so the cache stays swappable. SeaweedFS implements conditional PUT/DELETE as of
-  **4.07**,
-  broken under versioning/object-lock (seaweedfs#8073) — the cache bucket enables neither, so pin
-  ≥ 4.07 and let the §13 concurrency test re-verify. If it still cannot be relied on, the fallback
-  is a short-hold in-process per-key lock held through the cache-side RMW — same overhead as the
-  original §4 design, with all the async-latency caveats that brought.
+- **Both backends are assumed to speak the full S3 API, conditional writes included.** The
+  linearization point for the PUT path (§4) is the in-process per-key write lock, not the cache's
+  `If-Match` — the cache write after condition evaluation is unconditional. Cache conditional writes
+  are still required for the eviction path (§8): eviction tombstones use `If-Match: body_etag`,
+  and so does the reconciler's tombstone CAS (§7). An absent or buggy `If-Match` on the cache
+  breaks the eviction and reconciler CAS but not the write path's conditional correctness. The
+  remote's `CompleteMultipartUpload` still serializes the multipart path. The only SeaweedFS-specific
+  surface left is the usage/vacuum API (§8), already pluggable — LIST facts, recency, and every
+  marker ride ordinary S3 objects, so the cache stays swappable. SeaweedFS implements conditional
+  PUT/DELETE as of **4.07**, broken under versioning/object-lock (seaweedfs#8073) — the cache
+  bucket enables neither, so pin ≥ 4.07 and let the §13 concurrency test re-verify.
 - **`hypha-fence` is a bespoke controller, and the load-bearing one.** It replaces distributed locking
   with fabric fencing, so its correctness *is* the single-writer guarantee. The ordered
   fence→confirm→drain→promote sequence and the Cilium policy-revision confirmation must be gotten exactly
