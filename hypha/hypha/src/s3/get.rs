@@ -114,7 +114,7 @@ pub(crate) fn require_plen(m: &Option<Metadata>) -> Result<u64, Error> {
         .ok_or_else(|| Error::Backend("object missing hypha plaintext-length metadata".into()))
 }
 
-/// Client-visible ETag from a tombstone's / remote object's metadata (§9). Strong validator; s3s
+/// Client-visible ETag from a tombstone's / remote object's metadata (§6). Strong validator; s3s
 /// renders the quotes.
 pub(crate) fn client_etag(m: &Option<Metadata>) -> Option<ETag> {
     meta_get(m, meta::CETAG).map(|e| ETag::Strong(e.to_string()))

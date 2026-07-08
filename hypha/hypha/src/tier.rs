@@ -26,14 +26,15 @@ pub struct Reconciler {
 
 impl Reconciler {
     /// Encrypt the current cache body at `key` and PUT it to the remote at `key`, stamping the
-    /// plaintext facts the §10 restore sweep needs. `plen` and `cetag` are read from the *same*
+    /// plaintext facts the §7 restore sweep needs. `plen` and `cetag` are read from the *same*
     /// GET response that streams the body, so the ciphertext length can never disagree with the
     /// bytes uploaded. Assumes the caller holds `key`'s lock.
     ///
-    /// Phase 4 note: the cached-mode reconciler must NOT hold the lock for this step — only for
-    /// the tombstone. Remote PUTs are unconditional and idempotent; lock contention during a large
-    /// upload would block same-key PUTs for seconds. Split: upload without lock → acquire lock →
-    /// call `tombstone_locked`.
+    /// Phase 4 note: the cached-mode reconciler serializes same-key passes on a dedicated per-key
+    /// *upload* lock (a second `KeyLocks` instance), not the write lock — held across the whole
+    /// upload + marker CAS. Unserialized same-key uploads can finish out of order and leave the
+    /// remote stale with an empty pending set (IMPLEMENTATION §7); the separate instance keeps a
+    /// conditional PUT from ever queuing behind a multi-second transfer.
     pub(crate) async fn upload_locked(&self, key: &str) -> Result<()> {
         let out = self.cache.get(key, None).await?;
         let plen = out.content_length().unwrap_or(0).max(0) as u64;
@@ -91,7 +92,7 @@ impl Reconciler {
 
     /// Delete any stale twins of `key`, then write the fresh zero-byte twin. A crash between
     /// leaves only a twin next to a live body — unbound (its `bound_etag` ≠ the body's), so LIST
-    /// falls back to HEAD and the sweep collects it (§9).
+    /// falls back to HEAD and the sweep collects it (§6).
     async fn refresh_twin(&self, key: &str, facts: &meta::Facts) -> Result<()> {
         self.delete_twins(key).await?;
         self.cache

@@ -1,4 +1,4 @@
-//! Bucket ops. Buckets map one-to-one client ⇄ cache ⇄ remote (§9). Create is write-through
+//! Bucket ops. Buckets map one-to-one client ⇄ cache ⇄ remote (§7). Create is write-through
 //! (cache then remote); delete mirrors it in reverse (remote first, so a crash between leaves a
 //! retryable still-visible bucket, never a remote orphan). Rare control-plane events — no marker
 //! machinery.

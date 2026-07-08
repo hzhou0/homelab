@@ -48,10 +48,10 @@ that moves nutrients between a store and the outside.
    └────────────────────────────┘
 ```
 
-- **Loose coupling.** Hypha talks plain S3 to a required *remote* and an optional *cache*. Neither is
+- **Loose coupling.** Hypha talks plain S3 to a *remote* and a *cache* — both required. Neither is
   embedded in the proxy: swap SeaweedFS for any S3 cache, or the remote for any S3 provider, without
-  touching hypha; omit the cache entirely for a synchronous pass-through. In this homelab the cache is
-  `homelab-seaweedfs` (backed by `homelab-topolvm`), each its own chart.
+  touching hypha. In this homelab the cache is `homelab-seaweedfs` (backed by `homelab-topolvm`),
+  each its own chart.
 - **The cache** holds the hot working set and the freshest writes — buckets, keys, metadata, and ETags
   as S3 objects, plus object *bodies* while they are hot. It is a disposable read-/write-through cache,
   not a store to reconstruct.
@@ -60,20 +60,22 @@ that moves nutrients between a store and the outside.
 - **Hypha** is the only component clients talk to. It brokers between the cache (when configured) and the
   remote, owns the encryption, and owns the S3 semantics (conditional writes, multipart, range reads).
 
-## Caching is optional — compose tiers with deployments
+## Two modes — compose tiers with deployments
 
-Hypha is a single-mode encrypting S3 proxy: it always has a **remote**, and a **cache is optional**.
-Rather than build durability tiers into one service, run hypha more than once, each deployment scoped to
-its own remote namespace — a distinct account/bucket, or a shared remote under a forced key prefix:
+Hypha always has a **remote** and a **cache**; a deployment runs in one of two modes that differ only
+in *when* a write becomes durable on the remote and whether the cache retains bodies. Rather than
+build durability tiers into one service, run hypha more than once, each deployment scoped to its own
+remote namespace — a distinct account/bucket, or a shared remote under a forced key prefix:
 
-- **Cached deployment (default)** — `s3.internal.haustorium.net`, backed by the SeaweedFS cache plus a
-  remote. Reads and writes go through the cache; writes are acked locally and replicated to the remote
-  asynchronously (write-through). Low latency, at the cost of the bounded async-lag loss window (see
-  *Write-through durability*).
-- **Cacheless deployment** — `s3-direct.internal.haustorium.net`, backed by a remote only. A pass-through
-  encrypting proxy: a write is **not acked until the object is durably on the remote**, and reads come
-  straight from the remote. No cache, so no loss window — for clients that cannot tolerate any loss, such
-  as ZeroFS. Higher per-op latency, and it does not depend on SeaweedFS.
+- **Cached deployment (default)** — `s3.internal.haustorium.net`. Reads and writes go through the
+  cache; writes are acked locally and replicated to the remote asynchronously (write-through). Low
+  latency, at the cost of the bounded async-lag loss window (see *Write-through durability*).
+- **Durable deployment** — `s3-direct.internal.haustorium.net`. A write is **not acked until the
+  object is durably on the remote**, and the cache holds no bodies — only the tombstones and metadata
+  that make it the namespace and ETag source of truth (HEAD/LIST and conditional writes are still
+  cache-served). No loss window — for clients that cannot tolerate any loss, such as ZeroFS. Higher
+  per-op write latency, and it still depends on the SeaweedFS cache; the only guarantee it trades
+  away from the cached mode is exposure to the bounded loss window.
 
 Each deployment prepends a configured **remote prefix** to every object key it stores (and strips it on
 read), so deployments that share one remote account or bucket still land in disjoint key-spaces. Because
@@ -136,6 +138,9 @@ create/update semantics, regardless of what the underlying backends guarantee on
 - **One asymmetric master identity**, an X25519 keypair delivered to hypha through a Kubernetes Secret
   kept out of git; the authoritative copy lives outside the cluster (password manager / safe). Losing it
   renders the remote copies unrecoverable — the same key-custody rule as the rest of the homelab's backups.
+  Rotation uses age's native multi-recipient support: add the new recipient to the encryptor's set,
+  deploy, then lazily re-encrypt the remote to drop the old — the recipient set in each file *is* the
+  key epoch, so no metadata tracks it.
 - **Envelope format: [age](https://age-encryption.org/v1).** Rather than design a custom AEAD framing,
   hypha uses the reviewed age v1 format — Filippo's modern streaming AEAD — which has the exact
   properties hypha needs (per-chunk authentication, seekable decryption for range GET, splice/truncation
@@ -162,9 +167,10 @@ random — so:
 
 - **Range GET** maps a plaintext byte range to a contiguous ciphertext byte range (`chunk_index =
   floor(plaintext_byte / 65536)`, ciphertext offset = `chunk_index * 65552` plus the per-file
-  header + payload-nonce offset, derived from the object's plaintext and ciphertext lengths), one
-  byte-range GET on the remote, no prefix read. age's `StreamReader` implements `std::io::Seek` directly when given a seekable
-  underlying reader (which `aws-sdk-s3` byte-range GET provides), so hypha does not reimplement chunk
+  header + payload-nonce offset, derived from the object's plaintext and ciphertext lengths).
+  age's `StreamReader` implements `std::io::Seek` when its underlying reader does; an S3 GET body
+  is a one-shot stream, so hypha supplies a small adapter that satisfies `Seek` by issuing a fresh
+  byte-range GET per seek (one per request in practice). Hypha does not reimplement chunk
   decryption.
 - **Per-part independence** is achieved by giving each multipart part its own age file (and therefore
   its own fresh file key and its own nonce space starting at chunk 0). No cross-part coordination; a
@@ -180,54 +186,58 @@ random — so:
 Multipart uploads **route parts around the cache** — parts are not readable individually until
 `CompleteMultipartUpload` commits the composite, the cache's latency win doesn't help throughput-bound
 multipart traffic, and routing parts through the cache would impose S3 multipart plumbing on the
-cache with no upside. Multipart takes the cacheless data path of § *Write-through durability*
-regardless of whether the deployment is cached; only `CompleteMultipartUpload` touches the cache,
-atomically writing a tombstone at the composite's key to replace any stale cached body and keep the
-cache namespace complete for LIST. A completed composite becomes cachable on first read: a GET
-fetches and decrypts from the remote, then asynchronously populates the cache from the decrypted
-plaintext, so subsequent reads are hot — the same rehydrate path used for tombstoned bodies.
+cache with no upside. Multipart takes the durable data path regardless of the deployment's mode:
+hypha proxies the multipart ops onto the **remote's own native multipart upload** at the same key,
+just with streaming encryption per part. Only `CompleteMultipartUpload` touches the cache, atomically
+writing a tombstone at the composite's key to replace any stale cached body and keep the cache
+namespace complete for LIST. In a cached deployment a completed composite becomes cachable on first
+read: a GET fetches and decrypts from the remote, then asynchronously populates the cache from the
+decrypted plaintext — the same rehydrate path used for tombstoned bodies.
 
-Multipart is supported by encrypting **each part directly as its own age file**, using the format
-above — there is no completion-time re-encryption pass.
+Each part is encrypted **directly as its own age file**, using the format above — there is no
+completion-time re-encryption pass.
 
-- Each `UploadPart` is encrypted into an age file (fresh random file key per part) and streamed
-  straight to the remote. Because each part has its own file key and its own nonce space starting at
-  chunk 0, a part is encrypted with no knowledge of the other parts. That part's **plaintext length
-  and plaintext MD5** are stamped onto the remote part object's own S3 user-metadata — there is no
-  separate manifest artifact.
-- Parts may arrive out of order, in parallel, or be re-uploaded. A re-upload simply creates a new age
-  file with a fresh file key, replacing that part's bytes on the remote — nothing to coordinate.
-- `CompleteMultipartUpload` `ListParts`s the remote upload, composes the S3-correct composite ETag from
-  the per-part MD5s, and writes a small **part table** (per-part plaintext lengths) into the composite
-  object's metadata when it fits. The table lets hypha:
-  - serve **ranged GETs** by mapping a plaintext range across part boundaries and fetching only the
-    covering age chunks from the remote (byte-range GET), and
-  - detect truncation or cross-object splicing when reassembling (per-part file-key separation plus
-    age's chunk-index-in-nonce derivation plus finalizer chunk do the binding).
-  A half-finished upload simply shows a missing part via `ListParts` — detectable as incomplete, never
-  as corrupt — because the per-part facts live on the per-part objects the remote already stores
-  atomically, with no second "manifest" write to order against the body.
+- Each `UploadPart` is encrypted into an age file (fresh random file key per part) and streamed to
+  the remote as that upload's native part. Because each part has its own file key and its own nonce
+  space starting at chunk 0, a part is encrypted with no knowledge of the other parts. Hypha computes
+  the part's **plaintext MD5** inline while encrypting and accumulates the per-part facts in the
+  upload's state (persisted under a reserved cache prefix, so a restart mid-upload doesn't lose them).
+- Parts may arrive out of order, in parallel, or be re-uploaded; concurrent uploads to one key are
+  the remote's native multipart semantics. A re-upload is just a new age file with a fresh file key.
+- `CompleteMultipartUpload` composes the S3-correct composite ETag from the accumulated per-part
+  MD5s and completes the upload on the remote, which concatenates the ciphertext parts into a single
+  object at the key — the durability commit. The completed object's metadata marks it a composite;
+  the composite ETag and plaintext size are stamped onto it as object tags after completion (so a
+  discarded cache can be rebuilt) and live on the cache tombstone (and its facts twin). A small
+  completion record written to the remote just before the commit bridges the complete→tag crash
+  window, so a committed composite is never without recoverable facts. There is
+  no stored part table: a ranged GET recovers ciphertext part boundaries from the remote's own part
+  index and derives each part's plaintext length from its ciphertext length after a small
+  header read. Truncation and cross-object splicing are detected by per-part file-key separation
+  plus age's chunk-index-in-nonce derivation plus the finalizer chunk.
 - Each part's plaintext size is capped at **4 GiB** (one line below the S3 `UploadPart` 5 GiB max) so
   the age envelope (~1.3 MiB overhead per GiB plus a ~200 B header) never pushes the framed part over
   the remote's part-size cap. Homelab parts are 5–128 MiB in practice; transparent re-splitting of a
   larger client part at the 4 GiB boundary is a later refinement, not launch scope.
-- An aborted multipart upload leaves orphaned age files on the remote keyed under the upload id; these
-  are reclaimed by the same GC pass that manages eviction.
+- `AbortMultipartUpload` maps to the remote's native abort; abandoned uploads are reclaimed by the
+  same GC pass that manages eviction.
 
 ## Data path
 
 - **PUT** (single-object) → in a cached deployment, write plaintext to the cache, write a pending
   marker, and ack; a background reconcile pass frame-encrypts and uploads to the remote (write-through
-  async). In a cacheless deployment, frame-encrypt and upload straight to the remote, acking once it
-  is durable.
+  async). In a durable deployment, frame-encrypt and upload straight to the remote — the commit —
+  with the key marked in-transition so readers resolve it from the remote and never see torn
+  state; then settle the cache tombstone and ack.
 - **UploadPart** → routed around the cache in both deployments: frame-encrypt and stream straight to
-  the remote (the cacheless path), ack each part once the remote confirms. The composite is not
+  the remote as a native multipart part, ack once the remote confirms. The composite is not
   readable until `CompleteMultipartUpload` commits it, and a multipart's size is throughput-bound, so
   the cache's latency win doesn't apply.
 - **GET** → if the body is local, serve from the cache. If tombstoned (or the local body was lost to a
-  node failure), consult the manifest, fetch the covering age chunks from the remote, authenticate and
-  decrypt, and stream to the client; **rehydrate the body locally and bump its LRU position** — this
-  is also how a completed multipart composite first enters the cache.
+  node failure), fetch the covering age chunks from the remote, authenticate and decrypt, and stream
+  to the client; in a cached deployment, **rehydrate the body locally and bump its LRU position** —
+  this is also how a completed multipart composite first enters the cache. A durable deployment never
+  rehydrates: the body would immediately be tombstoned again.
 - **HEAD / LIST** → served from the cache while its **sync marker** is present — a reserved cache
   object recording that reconciliation has made the namespace complete (every remote key has a
   local body or tombstone, so an absent key is authoritatively a 404). While the marker is absent,
@@ -240,13 +250,13 @@ above — there is no completion-time re-encryption pass.
   Buckets map one-to-one across cache and remote; bucket create/delete is synchronous
   write-through (acked only once both sides confirm), and nothing else touches the remote, so
   `ListBuckets` follows the same rule.
-- **DELETE** → overwrite the local body at K with a delete-tombstone (so GET answers 404 and LIST
-  omits K) and write a pending marker; a background reconcile propagates `DeleteObject` to the
-  remote, then clears the marker and the tombstone. The tombstone-and-marker path keeps the local
-  namespace authoritative for HEAD/LIST and a crash after a local-only delete cannot resurrect the
-  object from the remote.
-- **Cacheless deployment** → single-object PUT takes the same inline-to-remote path that multipart
-  always takes; a GET fetches and decrypts from the remote, with no rehydrate target.
+- **DELETE** → in a cached deployment, overwrite the local body at K with a delete-tombstone (so
+  GET answers 404 and LIST omits K) and write a pending marker; the background reconcile propagates
+  `DeleteObject` to the remote, then clears marker and tombstone — the mask keeps the local
+  namespace authoritative and a crash mid-delete cannot resurrect the object. In a durable
+  deployment the remote delete is the commit: K is marked in-transition (readers keep seeing the
+  object from the remote until the delete lands, so an unacked delete stays invisible), then the
+  cache entry is cleared before the ack.
 
 ## Write-through durability
 
@@ -254,8 +264,8 @@ Every write is mirrored to the remote as it happens, so the encrypted remote is 
 a periodic snapshot — always current to within the async upload lag, which is what lets the cache run
 with no local redundancy and supersedes the old nightly `rclone crypt` sync.
 
-Clients that cannot tolerate the async-lag window use a **cacheless deployment** (see *Caching is
-optional*), whose writes ack only after the remote confirms.
+Clients that cannot tolerate the async-lag window use a **durable deployment** (see *Two modes*),
+whose writes ack only after the remote confirms.
 
 This is **replication, not a backup**: it protects against node/disk loss but faithfully propagates
 destructive operations. A client `DELETE` or overwrite is written through to the remote, so the live
@@ -316,7 +326,7 @@ data stays on NVMe.
   metadata backup. The only unrecoverable loss is the **bounded** set of operations still within the
   async write-through lag — written (or deleted) but not yet propagated to the remote — which is
   accepted under the no-redundancy design. This applies only to a cached deployment;
-  a cacheless one writes synchronously to its remote, so it has no such window.
+  a durable one writes synchronously to its remote, so it has no such window.
 - **Remote unavailable.** Reads of hot (local) objects are unaffected; reads of tombstoned objects fail
   cleanly until the remote returns. Write-through uploads queue and retry.
 - **Clean swap from Ceph.** Because Ceph was never deployed, standing up hypha is a greenfield install
@@ -330,11 +340,13 @@ each in its own namespace, mirroring the `cilium` / `cert-manager` / `monitoring
 
 - `topolvm/` — the CSI driver and the `topolvm-provisioner` StorageClass.
 - `seaweedfs/` — SeaweedFS (master / volume / filer / S3), redundancy off.
-- `hypha/` — the Rust gateway `Deployment` + `Service` + `HTTPRoute`, plus references to the master-key
-  Secret and the remote S3 credentials Secret. Caching and the remote prefix are chart values: install it
-  once with a cache (`s3.internal.haustorium.net`) as the default tier, and again cacheless
-  (`s3-direct.internal.haustorium.net`) for zero-loss clients — each scoped to its own remote account or,
-  on a shared remote, its own key prefix.
+- `hypha/` — the Rust gateway: a two-pod **StatefulSet** (active + pre-warmed passive; pod-name
+  labels give each pod the static Cilium identity the fencing controller selects on) + `Service` +
+  `HTTPRoute`, the `hypha-fence` failover controller, plus references to the master-key Secret and
+  the remote S3 credentials Secret. Mode and the remote prefix are chart values: install it once in
+  cached mode (`s3.internal.haustorium.net`) as the default tier, and again in durable mode
+  (`s3-direct.internal.haustorium.net`) for zero-loss clients — each scoped to its own remote account
+  or, on a shared remote, its own key prefix.
 
 ### Access to the cache surfaces
 
@@ -348,7 +360,3 @@ are single-tenant and pod labels are self-applied (see the design doc, §11.4). 
 cache" means "workloads in hypha's namespace may."
 
 Hypha will reach seaweedFs by its cluster ip. 
-
-## Open questions
-
-- Remote key rotation / re-encryption strategy for the single master key.

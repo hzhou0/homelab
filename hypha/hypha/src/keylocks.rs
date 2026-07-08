@@ -1,8 +1,8 @@
-//! Per-key async lock table — the shared serialization primitive (§7, generalized). Every path
-//! that writes a key's remote body or tombstone (inline durable finalize now; background cached
-//! reconcile and GC later) takes this lock, so same-key operations never overlap or reorder while
-//! distinct keys run fully in parallel. This is the N-worker generalization of the doc's "single
-//! reconcile task".
+//! Per-key async lock table — the shared serialization primitive (§4). Same-key holders never
+//! overlap or reorder while distinct keys run fully in parallel. Instantiated twice: the *write*
+//! lock (conditional writes, the durable finalize, GC tombstone transitions) and — in phase 4 —
+//! the reconcile-only *upload* lock, kept separate so a replication upload only ever blocks other
+//! reconciles of its key, never a client's conditional PUT.
 //!
 //! The table stores **weak** references, so it never keeps a mutex alive: the returned
 //! `OwnedMutexGuard` is the only strong owner, and when the last guard for a key drops, the mutex

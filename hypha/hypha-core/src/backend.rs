@@ -2,7 +2,7 @@
 //! independently-configured instances of this same type (§2); Phase 2 uses only the remote.
 //!
 //! The wrapper owns two concerns the op handlers should not repeat: the per-deployment key
-//! `prefix` (architecture § *Caching is optional*) and the SDK-error → `hypha_core::Error`
+//! `prefix` (architecture § *Two modes*) and the SDK-error → `hypha_core::Error`
 //! mapping. Everything else — encryption, ETag math, DTO translation — stays in the handlers so
 //! this layer is a mechanical passthrough.
 
@@ -201,7 +201,7 @@ impl Backend {
 
     // ── Multipart-to-remote primitives (Phase 3) ────────────────────────────────────────────
     // hypha maps a client multipart upload onto a remote multipart upload at the composite key;
-    // each part it uploads is an independent age file (§9), concatenated by the remote's own
+    // each part it uploads is an independent age file (§6), concatenated by the remote's own
     // CompleteMultipartUpload.
 
     pub async fn create_multipart(

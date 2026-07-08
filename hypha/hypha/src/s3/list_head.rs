@@ -1,4 +1,4 @@
-//! HEAD and LIST, both cache-served and reporting **plaintext** facts (§9). HEAD reads them off
+//! HEAD and LIST, both cache-served and reporting **plaintext** facts (§7). HEAD reads them off
 //! the object (native for a live body, metadata for a tombstone). LIST classifies each entry from
 //! its (size, ETag) sentinel pair and pairs it with its adjacent facts twin in one pass — no
 //! per-key HEAD except the rare unbound-twin fallback.
@@ -94,7 +94,7 @@ impl Hypha {
                         e_tag: Some(ETag::Strong(f.client_etag)),
                         ..Default::default()
                     }),
-                    // Unbound / missing twin: fall back to the object's own metadata (§9).
+                    // Unbound / missing twin: fall back to the object's own metadata (§6).
                     None => {
                         if let Some(o) = self.head_facts(key).await? {
                             entries.push(o);
@@ -137,7 +137,7 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// HEAD-fallback facts for an unbound-twin tombstone (§9). `None` if it turned out absent.
+    /// HEAD-fallback facts for an unbound-twin tombstone (§6). `None` if it turned out absent.
     async fn head_facts(&self, key: &str) -> S3Result<Option<Object>> {
         match self.cache().head(key).await {
             Ok(head) => {

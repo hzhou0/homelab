@@ -4,7 +4,7 @@
 //!
 //! Two shapes, because single-part routes *through* the cache and multipart routes *around* it:
 //! - **Single-part body** (through the cache, which computed the ETag): [`PLEN`] + [`CETAG`],
-//!   read only by the §10 restore sweep — steady-state HEAD/LIST/GET come from the cache.
+//!   read only by the §7 restore sweep — steady-state HEAD/LIST/GET come from the cache.
 //! - **Multipart part object** (around the cache — one age file per part, §7): [`PLEN`] (the
 //!   part's plaintext length) + [`PMD5`] (the part's plaintext MD5). No single cache PutObject
 //!   reproduces the composite ETag `md5(concat part md5s)-N`, so hypha composes it from these at
@@ -15,7 +15,7 @@
 /// User-metadata key names. The SDK adds the `x-amz-meta-` prefix on the wire.
 pub const PLEN: &str = "plen";
 pub const CETAG: &str = "cetag";
-/// Per-part plaintext MD5 on a multipart part object; input to the composite ETag (§9).
+/// Per-part plaintext MD5 on a multipart part object; input to the composite ETag (§6).
 pub const PMD5: &str = "pmd5";
 /// Marks a cache object as a tombstone — body is remote-only (§8). Value is the tombstone kind.
 pub const TOMB: &str = "tomb";
@@ -25,10 +25,10 @@ pub const TOMB_EVICT: &str = "evict";
 pub const TOMB_DELETE: &str = "delete";
 
 /// Fixed 16-byte sentinel body an eviction tombstone carries, so a LIST classifies it from its
-/// (size, ETag) pair without a metadata read (§4). 16 bytes saturate an MD5 ETag's entropy, so a
+/// (size, ETag) pair without a metadata read (§6). 16 bytes saturate an MD5 ETag's entropy, so a
 /// collision with a real client body needs both a length and a 2^-128 byte match.
 pub const EVICT_SENTINEL: [u8; 16] = *b"hypha:evicted!!\x00";
-/// Distinct sentinel for delete tombstones (client-visibly absent, §9).
+/// Distinct sentinel for delete tombstones (client-visibly absent, §6).
 pub const DELETE_SENTINEL: [u8; 16] = *b"hypha:deleted!!\x00";
 
 /// Whether an object's user-metadata marks it a tombstone of any kind.
@@ -38,20 +38,20 @@ pub fn is_tombstone(metadata: &std::collections::HashMap<String, String>) -> boo
 
 /// Hex MD5 of the eviction sentinel body — the cache ETag every eviction tombstone carries.
 /// Constant, so it's the `bound_etag` a facts twin binds to and the `If-Match` token a
-/// conditional tombstone/rehydrate uses (§4, §8).
+/// conditional tombstone/rehydrate uses (§6, §8).
 pub fn evict_sentinel_etag() -> String {
     use md5::{Digest, Md5};
     hex::encode(Md5::digest(EVICT_SENTINEL))
 }
 
 /// Hex MD5 of the delete sentinel body — lets a LIST classify a delete-tombstone (which it omits)
-/// from the (size, ETag) pair alone, no metadata read (§9).
+/// from the (size, ETag) pair alone, no metadata read (§6).
 pub fn delete_sentinel_etag() -> String {
     use md5::{Digest, Md5};
     hex::encode(Md5::digest(DELETE_SENTINEL))
 }
 
-// ── LIST facts twins (§9) ───────────────────────────────────────────────────────────────────
+// ── LIST facts twins (§6) ───────────────────────────────────────────────────────────────────
 //
 // A twin is a zero-byte cache object at `base_key ‖ 0x01 ‖ facts`. Because `0x01` sorts below
 // every admissible client-key byte (see [`validate_client_key`]), a twin sorts immediately after
@@ -111,7 +111,7 @@ pub fn parse_twin(full_key: &str) -> Option<(&str, Facts)> {
 }
 
 /// The S3-correct composite ETag from the ordered per-part plaintext MD5s: `md5(md5₀‖…‖md5ₙ)-N`
-/// (§9). hypha composes this at `CompleteMultipartUpload` — parts route around the cache, so
+/// (§6). hypha composes this at `CompleteMultipartUpload` — parts route around the cache, so
 /// nothing else can produce it.
 pub fn composite_etag(part_md5s_hex: &[String]) -> Option<String> {
     use md5::{Digest, Md5};

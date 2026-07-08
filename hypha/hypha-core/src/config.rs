@@ -26,7 +26,7 @@ pub struct S3Endpoint {
     pub access_key: String,
     pub secret_key: String,
     /// Prepended to every key this deployment stores, so deployments sharing one remote land in
-    /// disjoint keyspaces (architecture § *Caching is optional*). Empty for a dedicated bucket.
+    /// disjoint keyspaces (architecture § *Two modes*). Empty for a dedicated bucket.
     #[serde(default)]
     pub prefix: String,
 }
