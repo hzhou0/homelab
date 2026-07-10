@@ -32,8 +32,10 @@ Surface used:
 - Firewall DNAT (port-forward): `FirewallDNatControllerAdd/Set/Del/Get/Search/ToggleRuleAction`.
   Apply with `FirewallDNatControllerApplyAction(ctx, rollbackRevision)` (pass `""`).
   Add/Set body = `{ rule: { Interface ("wan"), Protocol (tcp/udp), Port (external),
-  Target (LB IP), LocalPort (internal), Description, Disabled, Pass } }`. `Pass` is set so the
-  auto-associated filter rule lets traffic through (WAN is default-deny otherwise).
+  Target (LB IP), LocalPort (internal), Description, Disabled, Pass, Sequence } }`. `Pass` is set so
+  the auto-associated filter rule lets traffic through (WAN is default-deny otherwise). `Sequence`
+  is a required, non-omitempty field (empty is rejected); it only hints display order, so the
+  operator sends a constant.
 - **All client methods return raw `(*http.Response, error)`; only request bodies are typed.**
   Responses are JSON-decoded by the wrapper. OPNsense conventions: Search → `{"rows":[...]}`;
   Add → `{"result":"saved","uuid":"..."}`; errors → `{"result":"failed","validations":{...}}`.

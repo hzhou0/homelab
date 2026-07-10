@@ -164,6 +164,23 @@ func TestSyncCreatesDNSAndNAT(t *testing.T) {
 	if !strings.Contains(dnsBody.Host.Description, "owner=Service/app-grafana/grafana") {
 		t.Errorf("dns description missing owner tag: %q", dnsBody.Host.Description)
 	}
+
+	// The NAT add body must carry a non-empty sequence — OPNsense rejects it as required, and it is
+	// a non-omitempty field, so a zero value serializes and fails.
+	var natBody struct {
+		Rule struct {
+			Interface, Protocol, Port, Target, LocalPort, Sequence string `json:",omitempty"`
+		}
+	}
+	if err := json.Unmarshal(f.addBody["nat"], &natBody); err != nil {
+		t.Fatalf("decode nat add body: %v", err)
+	}
+	if natBody.Rule.Sequence == "" {
+		t.Errorf("nat add body missing required sequence: %s", f.addBody["nat"])
+	}
+	if natBody.Rule.Port != "443" || natBody.Rule.Target != "10.0.0.100" || natBody.Rule.Protocol != "tcp" {
+		t.Errorf("unexpected nat add body: %+v", natBody.Rule)
+	}
 }
 
 func TestSyncIdempotentNoChange(t *testing.T) {

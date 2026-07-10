@@ -7,6 +7,10 @@ import (
 	"github.com/hzhou0/opnsense-sdk/go-sdk/generated"
 )
 
+// OPNsense requires a non-empty rule sequence but only uses it for display ordering; the operator
+// keeps one rule per owner, so a constant is sufficient.
+const natSequence = "1"
+
 // syncPortForward converges the single WAN DNAT rule owned by `owner` to
 // `desired`. A nil desired removes the owner's rule(s). Returns whether a
 // mutation occurred (so the caller knows whether to apply the firewall).
@@ -81,6 +85,9 @@ func addNATBody(p PortForward, desc string) generated.FirewallDNatControllerAddR
 	body.Rule.LocalPort = strptr(p.LocalPort)
 	body.Rule.Pass = &pass
 	body.Rule.Description = strptr(desc)
+	// Required, non-omitempty field: OPNsense rejects an empty sequence. It is only a display-order
+	// hint, so a constant is fine — rule identity/dedup is by description, not sequence.
+	body.Rule.Sequence = natSequence
 	return body
 }
 
@@ -98,5 +105,6 @@ func setNATBody(p PortForward, desc string) generated.FirewallDNatControllerSetR
 	body.Rule.LocalPort = strptr(p.LocalPort)
 	body.Rule.Pass = &pass
 	body.Rule.Description = strptr(desc)
+	body.Rule.Sequence = natSequence
 	return body
 }
