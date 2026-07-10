@@ -26,7 +26,7 @@ func (c *Client) syncPortForward(ctx context.Context, owner Owner, desired *Port
 
 	var owned []row
 	for _, r := range rows {
-		if describesOwner(r.Description, owner) {
+		if describesOwner(r.desc(), owner) {
 			owned = append(owned, r)
 		}
 	}
@@ -48,7 +48,7 @@ func (c *Client) syncPortForward(ctx context.Context, owner Owner, desired *Port
 	// Keep the first owned rule, update it if drifted; delete any extras.
 	if len(owned) > 0 {
 		keep := owned[0]
-		if keep.Description != wantDesc {
+		if keep.desc() != wantDesc {
 			if _, err := c.decodeWrite(c.gen.FirewallDNatControllerSetRuleAction(
 				ctx, keep.UUID, setNATBody(*desired, wantDesc))); err != nil {
 				return changed, fmt.Errorf("opnsense: set dnat rule: %w", err)
@@ -84,7 +84,9 @@ func addNATBody(p PortForward, desc string) generated.FirewallDNatControllerAddR
 	body.Rule.Target = strptr(p.TargetIP)
 	body.Rule.LocalPort = strptr(p.LocalPort)
 	body.Rule.Pass = &pass
-	body.Rule.Description = strptr(desc)
+	// OPNsense persists the DNAT description in `descr`; the model's separate `description` field is
+	// ignored, so writing it leaves the stored rule blank and breaks description-based ownership.
+	body.Rule.Descr = strptr(desc)
 	// Required, non-omitempty field: OPNsense rejects an empty sequence. It is only a display-order
 	// hint, so a constant is fine — rule identity/dedup is by description, not sequence.
 	body.Rule.Sequence = natSequence
@@ -104,7 +106,9 @@ func setNATBody(p PortForward, desc string) generated.FirewallDNatControllerSetR
 	body.Rule.Target = strptr(p.TargetIP)
 	body.Rule.LocalPort = strptr(p.LocalPort)
 	body.Rule.Pass = &pass
-	body.Rule.Description = strptr(desc)
+	// OPNsense persists the DNAT description in `descr`; the model's separate `description` field is
+	// ignored, so writing it leaves the stored rule blank and breaks description-based ownership.
+	body.Rule.Descr = strptr(desc)
 	body.Rule.Sequence = natSequence
 	return body
 }

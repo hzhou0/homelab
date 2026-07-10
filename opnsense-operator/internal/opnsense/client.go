@@ -114,8 +114,19 @@ type searchResponse struct {
 // authored by this operator, so it is the source of truth for ownership and
 // change detection; uuid is needed to address the row for Set/Del.
 type row struct {
-	UUID        string `json:"uuid"`
+	UUID string `json:"uuid"`
+	// DNS host overrides carry the operator description in `description`; DNAT rules use `descr`
+	// (a distinct legacy field on that model). Read both and coalesce via desc().
 	Description string `json:"description"`
+	Descr       string `json:"descr"`
+}
+
+// desc returns the operator-authored description regardless of which field the endpoint uses.
+func (r row) desc() string {
+	if r.Description != "" {
+		return r.Description
+	}
+	return r.Descr
 }
 
 // writeResult is the shape OPNsense returns from Add/Set actions.

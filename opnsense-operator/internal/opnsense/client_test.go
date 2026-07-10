@@ -165,11 +165,18 @@ func TestSyncCreatesDNSAndNAT(t *testing.T) {
 		t.Errorf("dns description missing owner tag: %q", dnsBody.Host.Description)
 	}
 
-	// The NAT add body must carry a non-empty sequence — OPNsense rejects it as required, and it is
-	// a non-omitempty field, so a zero value serializes and fails.
+	// The NAT add body must (1) carry a non-empty sequence — OPNsense rejects it as required and it
+	// is non-omitempty, so a zero value serializes and fails — and (2) put the operator description
+	// in `descr`, the field OPNsense persists; writing `description` leaves the stored rule blank,
+	// which breaks ownership matching and causes a duplicate rule every reconcile.
 	var natBody struct {
 		Rule struct {
-			Interface, Protocol, Port, Target, LocalPort, Sequence string `json:",omitempty"`
+			Protocol    string `json:"protocol"`
+			Port        string `json:"port"`
+			Target      string `json:"target"`
+			Sequence    string `json:"sequence"`
+			Descr       string `json:"descr"`
+			Description string `json:"description"`
 		}
 	}
 	if err := json.Unmarshal(f.addBody["nat"], &natBody); err != nil {
@@ -177,6 +184,9 @@ func TestSyncCreatesDNSAndNAT(t *testing.T) {
 	}
 	if natBody.Rule.Sequence == "" {
 		t.Errorf("nat add body missing required sequence: %s", f.addBody["nat"])
+	}
+	if !strings.Contains(natBody.Rule.Descr, "owner=Service/app-grafana/grafana") {
+		t.Errorf("nat descr must carry the owner tag (got descr=%q description=%q)", natBody.Rule.Descr, natBody.Rule.Description)
 	}
 	if natBody.Rule.Port != "443" || natBody.Rule.Target != "10.0.0.100" || natBody.Rule.Protocol != "tcp" {
 		t.Errorf("unexpected nat add body: %+v", natBody.Rule)
@@ -239,8 +249,10 @@ func TestDeleteRemovesOwnedObjects(t *testing.T) {
 		{"uuid": "foo-dns", "description": dnsDescription(owner, ho)},
 		{"uuid": "bar-dns", "description": dnsDescription(otherOwner, HostOverride{Host: "bar", Domain: "lab", Address: "10.0.0.101"})},
 	}
+	// DNAT search rows carry the description under `descr` (not `description`); the ownership match
+	// must read it back through that key or an owned rule looks unowned and is never cleaned up.
 	f.natRows = []map[string]string{
-		{"uuid": "foo-nat", "description": natDescription(owner, pf)},
+		{"uuid": "foo-nat", "descr": natDescription(owner, pf)},
 	}
 	c := newTestClient(t, f)
 
