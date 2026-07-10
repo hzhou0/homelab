@@ -33,6 +33,7 @@ them via a finalizer on deletion.
 helm install opnsense-operator ./chart \
   --namespace opnsense-operator --create-namespace \
   --set opnsense.existingSecret=opnsense-operator-creds
+helm upgrade opnsense-operator opnsense-operator/chart --namespace opnsense-operator
 ```
 
 Credentials go in a pre-created Secret (`OPNSENSE_API_KEY` / `OPNSENSE_API_SECRET`), or set

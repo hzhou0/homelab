@@ -172,11 +172,14 @@ func TestSyncCreatesDNSAndNAT(t *testing.T) {
 	var natBody struct {
 		Rule struct {
 			Protocol    string `json:"protocol"`
-			Port        string `json:"port"`
 			Target      string `json:"target"`
 			Sequence    string `json:"sequence"`
 			Descr       string `json:"descr"`
 			Description string `json:"description"`
+			// The match port is destination.port, not a flat rule-level port.
+			Destination struct {
+				Port string `json:"port"`
+			} `json:"destination"`
 		}
 	}
 	if err := json.Unmarshal(f.addBody["nat"], &natBody); err != nil {
@@ -188,7 +191,7 @@ func TestSyncCreatesDNSAndNAT(t *testing.T) {
 	if !strings.Contains(natBody.Rule.Descr, "owner=Service/app-grafana/grafana") {
 		t.Errorf("nat descr must carry the owner tag (got descr=%q description=%q)", natBody.Rule.Descr, natBody.Rule.Description)
 	}
-	if natBody.Rule.Port != "443" || natBody.Rule.Target != "10.0.0.100" || natBody.Rule.Protocol != "tcp" {
+	if natBody.Rule.Destination.Port != "443" || natBody.Rule.Target != "10.0.0.100" || natBody.Rule.Protocol != "tcp" {
 		t.Errorf("unexpected nat add body: %+v", natBody.Rule)
 	}
 }

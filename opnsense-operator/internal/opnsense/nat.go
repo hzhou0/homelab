@@ -80,7 +80,9 @@ func addNATBody(p PortForward, desc string) generated.FirewallDNatControllerAddR
 	body.Rule.Interface = strptr(p.Interface)
 	body.Rule.Ipprotocol = &ipproto
 	body.Rule.Protocol = &proto
-	body.Rule.Port = strptr(p.ExternalPort)
+	// The match port is destination.port, NOT a flat rule-level port; leaving source/destination
+	// address nil matches any (correct for a public WAN forward). local-port/target are the redirect.
+	body.Rule.Destination = &generated.FirewallDNatDestinationRequest{Port: strptr(p.ExternalPort)}
 	body.Rule.Target = strptr(p.TargetIP)
 	body.Rule.LocalPort = strptr(p.LocalPort)
 	body.Rule.Pass = &pass
@@ -102,7 +104,7 @@ func setNATBody(p PortForward, desc string) generated.FirewallDNatControllerSetR
 	body.Rule.Interface = strptr(p.Interface)
 	body.Rule.Ipprotocol = &ipproto
 	body.Rule.Protocol = &proto
-	body.Rule.Port = strptr(p.ExternalPort)
+	body.Rule.Destination = &generated.FirewallDNatDestinationRequest{Port: strptr(p.ExternalPort)}
 	body.Rule.Target = strptr(p.TargetIP)
 	body.Rule.LocalPort = strptr(p.LocalPort)
 	body.Rule.Pass = &pass

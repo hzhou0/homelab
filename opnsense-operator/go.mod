@@ -3,7 +3,7 @@ module github.com/hzhou0/homelab/opnsense-operator
 go 1.22.0
 
 require (
-	github.com/hzhou0/opnsense-sdk/go-sdk v0.1.0
+	github.com/hzhou0/opnsense-sdk/go-sdk v0.2.0
 	k8s.io/api v0.30.3
 	k8s.io/apimachinery v0.30.3
 	k8s.io/client-go v0.30.3
