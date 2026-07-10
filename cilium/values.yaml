@@ -17,6 +17,24 @@ cilium:
   kubeProxyReplacement: true
   operator:
     replicas: 1
+    # Keep cilium-operator (LB IPAM/L2, CRD reconcile) off the reclaimable spot node
+    # (node.kubernetes.io/capacity-type=spot). The agent DaemonSet is the CNI and must stay on every
+    # node, spot included, so it is deliberately not constrained. Preserves the chart's default
+    # host-spread podAntiAffinity.
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node.kubernetes.io/capacity-type
+                  operator: NotIn
+                  values: [spot]
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                io.cilium/app: operator
   routingMode: tunnel
   tunnelProtocol: vxlan
 

@@ -12,6 +12,16 @@ kube-prometheus-stack:
   prometheus:
     enabled: true
     prometheusSpec:
+      # Keep the TSDB and the rest of the stack off the reclaimable spot node
+      # (node.kubernetes.io/capacity-type=spot); node-exporter (a DaemonSet) still runs there.
+      affinity: &avoidSpot
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/capacity-type
+                    operator: NotIn
+                    values: [spot]
       replicas: 1
       retention: 15d
       # Discover ServiceMonitors/PodMonitors/PrometheusRules in ALL namespaces, not just those
@@ -44,10 +54,20 @@ kube-prometheus-stack:
 
   alertmanager:
     alertmanagerSpec:
+      affinity: *avoidSpot
       replicas: 1
+
+  # kube-state-metrics and the Prometheus operator are Deployments with no node pinning of their
+  # own; keep them off spot too (the node-exporter DaemonSet is intentionally left to run there).
+  kube-state-metrics:
+    affinity: *avoidSpot
+
+  prometheusOperator:
+    affinity: *avoidSpot
 
   grafana:
     enabled: true
+    affinity: *avoidSpot
     # See GOGC note on prometheusSpec above: collect earlier for a smaller heap, no hard limit. Only
     # the grafana container is Go; the two k8s-sidecar (Python) containers ignore this.
     env:

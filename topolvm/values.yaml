@@ -19,6 +19,16 @@ topolvm:
 
   controller:
     replicaCount: 1
+    # Keep the CSI controller off the reclaimable spot node (node.kubernetes.io/capacity-type=spot);
+    # the lvmd/node DaemonSets already skip it (no `vg: nvme` label). This value is a tpl'd string.
+    affinity: |
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node.kubernetes.io/capacity-type
+                  operator: NotIn
+                  values: [spot]
 
 
   storageClasses:

@@ -5,10 +5,21 @@ cert-manager:
   crds:
     enabled: true
   replicaCount: 1
+  # Keep cert issuance off the reclaimable spot node (node.kubernetes.io/capacity-type=spot).
+  affinity: &avoidSpot
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node.kubernetes.io/capacity-type
+                operator: NotIn
+                values: [spot]
   webhook:
     replicaCount: 1
+    affinity: *avoidSpot
   cainjector:
     replicaCount: 1
+    affinity: *avoidSpot
 
 # DNS-01 (not HTTP-01) so no inbound reachability is needed — only DNS zone access.
 acme:

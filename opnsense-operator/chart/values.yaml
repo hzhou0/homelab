@@ -40,4 +40,12 @@ securityContext:
 
 nodeSelector: {}
 tolerations: []
-affinity: {}
+# Keep the singleton operator off the reclaimable spot node (node.kubernetes.io/capacity-type=spot).
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node.kubernetes.io/capacity-type
+              operator: NotIn
+              values: [spot]
