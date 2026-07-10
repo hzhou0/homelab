@@ -66,6 +66,47 @@ so a node on wifi is not subject to the lockdown.
 `hubble.internal.haustorium.net` (see `hubble-ui-route.yaml` + `gateway.hubbleUI` in
 `values.yaml`), gated by the gateway's `allowedCIDRs`.
 
+## WireGuard remote-access tunnel
+
+`wireguard.yaml` runs a cluster-hosted WireGuard server (`wireguard` namespace) so an admin can
+tunnel in from off-LAN. It is reachable at `wireguard.loadBalancerIP` (a pinned `lab-pool` IP).
+With `wireguard.expose: true` the Service carries `homelab.lab/expose` + `protocol: udp`, so
+**opnsense-operator reconciles the `WAN:51820/udp` DNAT** — no manual forward (set `expose: false`
+to wire it by hand). UDP from world already passes the host firewall. No `homelab.lab/hostname`:
+that Unbound record resolves to the internal LB IP, useless to an off-LAN peer.
+
+The tunnel is confined to **the ingress Gateway and the LAN DNS only**:
+
+- The server masquerades decrypted peer traffic to the pod IP, so Cilium sees the whole tunnel
+  as one endpoint. `wireguard-egress-fence` then default-denies that endpoint's egress and
+  re-allows only `reserved:ingress` (the Gateway) and `lanDNS:53`.
+- `allow-wireguard-to-gateway-ingress` grants the tunnel the Gateway front door **by identity**
+  rather than via `gateway.allowedCIDRs` — masquerade hides the peer CIDR from a `fromCIDR`
+  match, so this is the "similar access" that a CIDR entry would give an on-LAN host.
+- `allow-world-to-wireguard` re-opens the inbound handshake (the namespace is otherwise fenced by
+  east-west-default-deny). Peer→server replies flow statefully, so peers must set
+  `PersistentKeepalive`.
+
+The server private key is **not** a chart value — it is injected at runtime (`wg set private-key`)
+from a Secret you precreate, so it never enters Helm state. The chart owns the `wireguard`
+namespace, so create the Secret **after** the first `helm upgrade` (don't `kubectl create` the
+namespace yourself — Helm can't adopt an untagged one; the pod waits in `ContainerCreating` until
+the Secret lands):
+
+```sh
+wg genkey | kubectl -n wireguard create secret generic wireguard-privatekey \
+  --from-file=privatekey=/dev/stdin
+```
+
+Everything else is `values.yaml → wireguard` (non-secret): `peers` (public keys + tunnel `/32`s),
+ports, `lanDNS`. A peer's client config points `DNS` at `lanDNS` and sets
+`AllowedIPs = 10.0.0.100/32, 10.0.0.1/32` so only the Gateway VIP and resolver route through the
+tunnel.
+
+`gen-wireguard-client.sh` mints a peer: it generates the client keypair, writes the client `.conf`
+(defaulting to those fence-matching `AllowedIPs`/`DNS`), and prints the `[Peer]` block to paste
+under `wireguard.peers`. Run `./gen-wireguard-client.sh -h` for flags.
+
 ## Install / upgrade
 
 ```sh

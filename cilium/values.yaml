@@ -88,7 +88,8 @@ loadBalancer:
     ip: "10.0.0.100"
   l2:
     name: lab-l2
-    # Pin to the LAN node — only k3s-server is on 10.0.0.x; the spot node (10.0.1.x) can't ARP.
+    # Pin the announcer to the control-plane node: it must already be up for the cluster to function,
+    # so hosting the LB IPs there means ephemeral worker failover never disturbs LB reachability.
     nodeSelector:
       matchLabels:
         kubernetes.io/hostname: k3s-server
@@ -127,3 +128,48 @@ gateway:
   hubbleUI:
     enabled: true
     hostname: hubble.internal.haustorium.net
+
+# ---------------------------------------------------------------------------
+# WireGuard remote-access tunnel
+# ---------------------------------------------------------------------------
+# A cluster-hosted WireGuard server so admins can tunnel in from off-LAN. Decrypted client
+# traffic is masqueraded to the pod IP, so Cilium sees the whole tunnel as this one endpoint;
+# an egress fence (templates/wireguard.yaml) then confines that endpoint to the ingress Gateway
+# and the LAN DNS only. See README "WireGuard remote-access tunnel".
+wireguard:
+  enabled: true
+  namespace: wireguard
+  image: lscr.io/linuxserver/wireguard:1.0.20260223
+  # One-shot privileged init that enables net.ipv4.ip_forward in the pod netns (see wireguard.yaml).
+  sysctlInitImage: busybox:1.37
+  # UDP listen port; also the WAN port OPNsense must DNAT to loadBalancerIP.
+  listenPort: 51820
+  # Pinned from lab-pool so the OPNsense WAN forward has a stable target. Keep out of any other
+  # Service's use.
+  loadBalancerIP: "10.0.0.101"
+  # Must be the loadBalancer.l2 announcer host: that node alone answers loadBalancerIP, and the
+  # Service uses externalTrafficPolicy:Local (no off-node forward, real peer IP preserved).
+  nodeName: k3s-server
+  # Let opnsense-operator create the WAN UDP DNAT (homelab.lab/expose). Needs opnsense-operator
+  # installed. Off => wire the WAN:listenPort/udp forward by hand.
+  expose: true
+  # Peer subnet; the server interface takes .1.
+  serverAddress: "10.9.0.1/24"
+  # LAN resolver (OPNsense Unbound) the tunnel may reach — it answers *.internal.haustorium.net.
+  lanDNS: "10.0.0.1"
+
+  # Server private key, injected at runtime from a Secret you precreate (never in Helm values or
+  # release state). The chart owns the `wireguard` namespace — do NOT `kubectl create` it yourself
+  # (Helm can't adopt an untagged namespace). Create the Secret AFTER the first `helm upgrade`; the
+  # pod stays in ContainerCreating until it exists, then starts:
+  #   wg genkey | kubectl -n wireguard create secret generic wireguard-privatekey \
+  #     --from-file=privatekey=/dev/stdin
+  privateKeySecret:
+    name: wireguard-privatekey
+    key: privatekey
+
+  # Tunnel peers. publicKey/address are not secret. address is the peer's /32 in serverAddress's subnet.
+  peers:
+    - name: laptop
+      publicKey: "IfvIa2dLZYVQ+DP/WMYW5Xg2BiVvhvdKLSR1WKk2Y1c="
+      address: "10.9.0.2/32"

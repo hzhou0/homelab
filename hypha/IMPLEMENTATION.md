@@ -551,13 +551,34 @@ catch: eviction there would see a markerless key whose remote HEAD still finds t
 version present, and tombstone an acked-but-never-uploaded body. The count gates only eviction;
 PUTs never block on it.
 
-**Windowed CLOCK.** The read path stays write-free: recency is a **Bloom-ring sketch** (one
-filter per time slice, fed by GET/HEAD; sealed slices persisted per §6, reloaded on promotion,
-retained k deep). Advisory only — a lost or cold ring degrades to LastModified ordering for one
-churnier cycle, never to incorrectness. Each pass the scavenger advances a rotating cursor over a
-keyspace window, orders candidates by LastModified, skips ring hits, and evicts the oldest within
-the window. Rehydration refreshes mtime — the second-chance bit. Eviction of candidate K with
-version-token ETag `E_v`:
+**The recency ring.** The read path stays write-free: recency is a **Bloom-ring sketch** — one
+filter per **fill window**, fed by GET/HEAD; sealed slices persisted per §6, reloaded on
+promotion, retained k deep. A slice rotates when its distinct-key fill reaches the design point —
+the insert path counts 0→1 bit flips, so fill is exact and duplicate touches of a hot key don't
+advance it. Rotating on fill bounds each slice's false-positive rate by construction (no read
+rate can silently degrade the ring into protect-everything) and keeps wall time out of the
+mechanism entirely: the ring is denominated in distinct keys touched, so recency is relative to
+competing traffic and an idle cache holds its working set indefinitely — nothing ages out except
+by displacement. A probe returns the index of the **newest** slice containing
+the key: a quantized last-access age, k+1 buckets from current-window down to *miss* — colder
+than everything the ring remembers. Advisory only — a lost or cold ring (first boot, failover
+without a persisted ring) collapses every key into one bucket and ordering degrades to
+LastModified for one churnier cycle, never to incorrectness.
+
+**Target-driven eviction — the threshold ratchet.** A pressure-triggered pass owes a byte
+target: reclaim from current usage down to the low-water mark. The scavenger walks the keyspace
+by rotating cursor, window by window, evicting only candidates at or above the current **age
+threshold**, which starts at *miss* — the keys the ring affirmatively vouches nothing has
+touched. If the target is unmet when the cursor completes a full loop, the threshold ratchets
+one bucket younger and the walk continues — globally coldest-first without buffering the
+keyspace, paying extra loops only under the pressure that justifies them, and converging on the
+target whenever evictable bytes exist instead of stalling because too much looks recent.
+LastModified is the tie-break within a bucket (rehydration lands a fresh mtime, so a
+just-restored body sorts young). A pass that meets its target never ratchets younger, but may
+keep taking *misses* the walk still encounters, bounded per pass — over-evicting an
+affirmatively cold key is nearly free in rehydration risk, yet each eviction still costs a
+remote HEAD, a twin write, and a CAS, hence the bound. Recency is priority only: it never
+overrides the correctness gates below. Eviction of candidate K with version-token ETag `E_v`:
 
 1. **Skip if ref count > 0.**
 2. **Skip if the marker exists** (`HEAD <marker-prefix>/<K>`) — also catches markers from a prior
@@ -593,7 +614,8 @@ accurate, sees dead bytes), scavenges from high- to low-water mark, and can driv
 for disjoint namespaces on a shared remote), `mode` (`durable` | `cached`), `auth` (hypha's own
 client credentials for `S3Auth`), `master_identity` (the age X25519 identity string, from a
 Secret), `serving.listen` + `serving.offload_threshold` (§5). Later phases add: reconcile pass
-interval/concurrency, GC water marks / walk window / recency-ring shape, restore fan-out + hint
+interval/concurrency, GC water marks / walk window / recency-ring shape (slice size, depth k,
+rotation fill target) / opportunistic-eviction bound, restore fan-out + hint
 interval, and the §4 fencing block (identity selectors, lease timings, fence-confirm timeout,
 settle delay).
 
@@ -707,7 +729,8 @@ delete; composite into the shadow body). Deployed with one replica and no fencin
 default `s3.internal` deployment with correctness intact, only failover seamlessness missing.
 *Exit*: §11 concurrency, marker/reconcile, and eviction-vs-writer suites against real SeaweedFS.
 
-**Phase 5 — GC + restore.** Walk cursor, windowed CLOCK, Bloom ring + slice persistence, usage
+**Phase 5 — GC + restore.** Walk cursor, threshold-ratchet eviction, Bloom ring (fill rotation)
++ slice persistence, usage
 source + vacuum, prefix-hint writer, sync marker + parallel restore sweep, debris sweeps (orphan
 twins, orphan shadow bodies, leftover transition marks, orphan completion records, abandoned mpu
 state). *Exit*:

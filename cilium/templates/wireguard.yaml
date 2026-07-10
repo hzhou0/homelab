@@ -1,0 +1,221 @@
+{{- if .Values.wireguard.enabled }}
+{{- $wg := .Values.wireguard }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  # A foundational (non-tier) namespace so Kyverno pod governance does not apply — the WireGuard
+  # container needs NET_ADMIN. It is deliberately NOT in eastWestDefaultDeny.excludeNamespaces:
+  # the pod stays default-denied and gets only the explicit grants below.
+  name: {{ $wg.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # No secret material: peer public keys are not sensitive, and the server private key is injected
+  # at runtime from the precreated privateKeySecret (see PostUp) so it never lands in Helm state.
+  name: wireguard-config
+  namespace: {{ $wg.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+data:
+  wg0.conf: |
+    [Interface]
+    Address = {{ $wg.serverAddress }}
+    ListenPort = {{ $wg.listenPort }}
+    # `wg set private-key` loads the key from the mounted Secret file (wg-quick brings the interface
+    # up keyless first, then this sets it). Key is mounted under /run — NOT /etc/wireguard, which in
+    # this image is a symlink to /config/wg_confs (the read-only conf mount). Masquerade pins decrypted
+    # peer traffic to the pod IP (eth0 = pod veth) so Cilium sees the whole tunnel as one endpoint for
+    # the egress fence below. ip_forward is enabled by the enable-forwarding initContainer.
+    PostUp = wg set %i private-key /run/wireguard-keys/{{ $wg.privateKeySecret.key }}; iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+    {{- range $wg.peers }}
+
+    [Peer]
+    # {{ .name }}
+    PublicKey = {{ .publicKey }}
+    AllowedIPs = {{ .address }}
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wireguard
+  namespace: {{ $wg.namespace }}
+  labels:
+    app.kubernetes.io/name: wireguard
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  # WireGuard peer state is a single UDP socket; a second replica would answer handshakes
+  # inconsistently behind one VIP.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wireguard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wireguard
+    spec:
+      # Co-locate with the L2 announcer (loadBalancer.l2.nodeSelector): the LB IP is answered only
+      # by that node, and externalTrafficPolicy:Local won't forward off-node — so the pod must live
+      # there to receive tunnel traffic (and it keeps the real peer IP, no SNAT).
+      nodeSelector:
+        kubernetes.io/hostname: {{ $wg.nodeName }}
+      initContainers:
+        # Enable IP forwarding in the pod netns (the main container relays wg0<->eth0). Confined to
+        # this one-shot: the runtime mounts /proc/sys read-only, so writing net.ipv4.ip_forward needs
+        # an unmasked /proc (privileged); the sysctl persists in the shared netns for the main
+        # container, which then stays at NET_ADMIN.
+        - name: enable-forwarding
+          image: {{ $wg.sysctlInitImage | quote }}
+          command: ["sysctl", "-w", "net.ipv4.ip_forward=1"]
+          securityContext:
+            privileged: true
+      containers:
+        - name: wireguard
+          image: {{ $wg.image | quote }}
+          securityContext:
+            capabilities:
+              # No kernel module mount: linuxserver/wireguard falls back to userspace wireguard-go
+              # when the module is unavailable, so NET_ADMIN + /dev/net/tun is enough.
+              add:
+                - NET_ADMIN
+          ports:
+            - name: wireguard
+              containerPort: {{ $wg.listenPort }}
+              protocol: UDP
+          volumeMounts:
+            - name: config
+              mountPath: /config/wg_confs
+              readOnly: true
+            - name: privatekey
+              # NOT /etc/wireguard/* — that path is a symlink into the read-only conf mount here.
+              mountPath: /run/wireguard-keys
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: wireguard-config
+        - name: privatekey
+          secret:
+            secretName: {{ $wg.privateKeySecret.name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wireguard
+  namespace: {{ $wg.namespace }}
+  labels:
+    app.kubernetes.io/name: wireguard
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+  annotations:
+    lbipam.cilium.io/ips: {{ $wg.loadBalancerIP | quote }}
+    {{- if $wg.expose }}
+    # opnsense-operator reconciles the WAN UDP DNAT from these. No homelab.lab/hostname: its Unbound
+    # record would point at the internal LB IP, useless to an off-LAN peer (peers dial the WAN).
+    homelab.lab/expose: "true"
+    homelab.lab/protocol: "udp"
+    homelab.lab/external-port: {{ $wg.listenPort | quote }}
+    homelab.lab/internal-port: {{ $wg.listenPort | quote }}
+    {{- end }}
+spec:
+  type: LoadBalancer
+  # Preserve the external client IP (harmless here, but keeps peer endpoints stable for logging).
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: wireguard
+  ports:
+    - name: wireguard
+      protocol: UDP
+      port: {{ $wg.listenPort }}
+      targetPort: {{ $wg.listenPort }}
+---
+# The tunnel's inbound handshake. wireguard's namespace is fenced by east-west-default-deny, so
+# re-open UDP/listenPort from world (additive: enableDefaultDeny.ingress:false leaves the deny intact).
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: allow-world-to-wireguard
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  endpointSelector:
+    matchLabels:
+      k8s:io.kubernetes.pod.namespace: {{ $wg.namespace }}
+      app.kubernetes.io/name: wireguard
+  enableDefaultDeny:
+    ingress: false
+  ingress:
+    - fromEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: {{ $wg.listenPort | quote }}
+              protocol: UDP
+---
+# Egress fence: the whole tunnel appears as this pod (see masquerade above), so this is where "the
+# tunnel may reach the ingress and LAN DNS only" is enforced. Default-deny egress, re-allowing just:
+#   - the ingress Gateway (reserved:ingress) — resolves *.internal.haustorium.net traffic
+#   - the LAN resolver on :53 — so peers can resolve those names
+# Peer->server reply packets (the encrypted return path) are permitted statefully by conntrack, so
+# no world egress is needed as long as peers use PersistentKeepalive.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: wireguard-egress-fence
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  endpointSelector:
+    matchLabels:
+      k8s:io.kubernetes.pod.namespace: {{ $wg.namespace }}
+      app.kubernetes.io/name: wireguard
+  enableDefaultDeny:
+    egress: true
+    ingress: false
+  egress:
+    # KPR translates the gateway VIP before policy, so the match is the backend identity, not a CIDR.
+    - toEntities:
+        - ingress
+    - toCIDR:
+        - {{ printf "%s/32" $wg.lanDNS | quote }}
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+---
+# The gateway front door, granted to the tunnel by identity instead of allowedCIDRs (masquerade
+# hides the peer CIDR from a fromCIDR match). Additive re-open of reserved:ingress, mirroring
+# allow-clients-to-gateway-ingress.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: allow-wireguard-to-gateway-ingress
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  endpointSelector:
+    matchLabels:
+      reserved:ingress: ""
+  enableDefaultDeny:
+    ingress: false
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $wg.namespace }}
+            app.kubernetes.io/name: wireguard
+{{- end }}

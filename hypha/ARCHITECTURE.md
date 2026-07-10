@@ -284,15 +284,17 @@ are simple to switch between:
 The cache is bounded storage over an unbounded remote. Hypha watches cache usage — reported by a
 pluggable *usage source* (below) — against a high-water and low-water mark:
 
-- Crossing the **high-water mark** starts GC: evict least-recently-used object *bodies*. Eviction
-  confirms the remote copy is durable, deletes the local body from the cache, and leaves a **tombstone** —
-  the metadata stays, marking the body as remote-only. GC continues until the
-  **low-water mark** is reached.
-- Recency is tracked by an in-memory **Bloom-ring sketch** (one filter per time slice, fed by
-  GET/HEAD, sealed slices persisted to the cache), consulted to skip recently-read candidates;
-  eviction otherwise orders by LastModified, and a rehydrated body's fresh mtime is the
-  second-chance bit (CLOCK). If the sketch is lost or absent (first boot), eviction falls back to
-  LastModified alone — churnier for one cycle, never incorrect.
+- Crossing the **high-water mark** starts GC with a byte target: reclaim down to the
+  **low-water mark**, evicting the coldest object *bodies* first. Eviction confirms the remote
+  copy is durable, deletes the local body from the cache, and leaves a **tombstone** — the
+  metadata stays, marking the body as remote-only.
+- Recency is tracked by an in-memory **Bloom-ring sketch** (one filter per fill window — a slice
+  rotates when enough distinct keys have been touched — fed by GET/HEAD,
+  sealed slices persisted to the cache). The newest slice containing a key quantizes its
+  last-access age, so eviction works coldest-first: keys the ring has no memory of, then
+  progressively younger age buckets until the target is met, LastModified breaking ties within a
+  bucket. If the sketch is lost or absent (first boot), every key falls into one bucket and
+  eviction degrades to LastModified alone — churnier for one cycle, never incorrect.
 - Reading a tombstoned object rehydrates it (optionally) and refreshes its LRU position, so working sets
   stay hot and cold data drifts out to the remote.
 - The same pass reclaims orphaned age files from aborted multipart uploads.
