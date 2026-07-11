@@ -37,9 +37,11 @@ hypha validates its *own* clients' credentials.
 **Clients (cache + remote) — `aws-sdk-s3`** with `aws-config`. Both backends are the same SDK type
 pointed at different endpoints; the architecture's loose coupling falls out naturally.
 
-**Encryption — `age` 0.11.** A reviewed streaming AEAD format: per-chunk authentication, seekable
-decryption, a finalizer chunk for truncation detection, and per-file random file keys — which give
-parallel part encryption without key/nonce coordination, with per-file key isolation. The crate is
+**Encryption — `age` 0.11, native scrypt recipient.** A reviewed streaming AEAD format: per-chunk
+authentication, seekable decryption, a finalizer chunk for truncation detection, and per-file
+random file keys — which give parallel part encryption without key/nonce coordination, with
+per-file key isolation. File keys are wrapped by age's own scrypt recipient with the work factor
+pinned to the minimum (§6) — no custom recipients, no plugins, nothing to maintain. The crate is
 sync; hypha drives it over adapters bridged via `spawn_blocking` (§5).
 
 | Concern              | Crate(s)                                                            |
@@ -56,12 +58,12 @@ sync; hypha drives it over adapters bridged via `spawn_blocking` (§5).
 
 ```
 hypha-format/src/
-  envelope.rs            Encryptor/Decryptor against hypha's static X25519 identity
+  envelope.rs            Encryptor/Decryptor over age's scrypt recipient, work factor pinned (§6)
   offset.rs              plaintext ⇄ ciphertext arithmetic; hlen derivation + header parse (§6)
   stream.rs              RangeReader: sync Read+Seek over ranged GETs (seek ⇒ new byte-range req)
 
 hypha-core/src/
-  config.rs              typed config: mode, both endpoints, auth, identity
+  config.rs              typed config: mode, both endpoints, auth, master passphrase
   backend.rs             Backend over an aws-sdk-s3 client (prefix mapping, typed errors)
   meta.rs                tombstones, sentinels, facts twins, composite ETag, key admission
   error.rs               error → s3s::S3Error mapping
@@ -184,8 +186,10 @@ in-flight concurrency.
 ChaCha20-Poly1305 runs at multi-GB/s/core, so 64 KiB chunks encrypt in microseconds — inline on
 the async worker is fine; hypha offloads to `spawn_blocking` only when a single contiguous
 encrypt/decrypt exceeds a threshold (default 1 MiB). Measured (criterion, `hypha-format`):
-~1.5 GiB/s/core encrypt, ~1.3 GiB/s decrypt, ~60–90 µs per-file X25519 wrap/unwrap — per-file key
-isolation costs noise, one core outruns 10 GbE.
+~1.5 GiB/s/core encrypt, ~1.3 GiB/s decrypt (measured on the phase-1 X25519 build; the
+pinned-work-factor scrypt wrap is the same order of magnitude — re-bench at swap, and assert the
+emitted stanza's work factor, since age's *default* auto-tunes toward ~1 s per file) — per-file
+key isolation costs noise, one core outruns 10 GbE.
 
 ## 6. Data structures
 
@@ -212,10 +216,18 @@ age v1 properties hypha relies on (`offset.rs` implements the math):
   practice). A cold ranged GET is two remote reads — header (to unwrap the file key) + chunk
   range — coalesced when the range abuts the head. age's `Seek` lives on the sync path; §5 bridges
   it.
-- **Per-file random file keys**, wrapped to hypha's static X25519 recipient in each file's own
-  header. Parallel parts and concurrent PUTs need no key/nonce coordination, and the key
-  separation, chunk-index-derived nonces, and finalizer chunk make cross-object splices, reorders,
-  and truncation fail authentication.
+- **Per-file random file keys**, wrapped by age's **native scrypt recipient**
+  (`age::scrypt::Recipient` over the 256-bit random master passphrase; fresh 16-byte salt per
+  file): ~75 B stanza, post-quantum where X25519 is harvest-now-decrypt-later-exposed and ~20×
+  smaller than age's native `mlkem768x25519` (ARCHITECTURE.md has the rationale). **The work
+  factor is pinned via `set_work_factor(1)`** — load-bearing, not an optimization: security lives
+  in the passphrase's 256 bits, stretching adds nothing, and the crate's default auto-tunes
+  toward ~1 s and ~256 MiB *per file* — fatal for a small-object namespace. Wholly stock age, so
+  DR is any age binary + the passphrase. The scrypt stanza is spec-required to be a file's sole
+  stanza — no multi-recipient; rotation is an accepted flag-day re-encrypt (ARCHITECTURE.md).
+  Parallel parts and concurrent PUTs need no key/nonce coordination, and the key separation,
+  chunk-index-derived nonces, and finalizer chunk make cross-object splices, reorders, and
+  truncation fail authentication.
 
 These lengths are the complete read-side state: a single-part object is decodable from `plen` +
 Content-Length + the fixed chunk size; a composite is a concatenation of per-part age files whose
@@ -612,8 +624,8 @@ accurate, sees dead bytes), scavenges from high- to low-water mark, and can driv
 `figment` (TOML + `HYPHA_`-prefixed env, `__` nesting), validated at boot. Current surface
 (`config.rs`): `remote` and `cache` endpoints (endpoint/region/bucket/credentials/**key prefix**
 for disjoint namespaces on a shared remote), `mode` (`durable` | `cached`), `auth` (hypha's own
-client credentials for `S3Auth`), `master_identity` (the age X25519 identity string, from a
-Secret), `serving.listen` + `serving.offload_threshold` (§5). Later phases add: reconcile pass
+client credentials for `S3Auth`), `master_passphrase` (the 256-bit random age passphrase, from a Secret; supersedes phase 1's
+`master_identity`), `serving.listen` + `serving.offload_threshold` (§5). Later phases add: reconcile pass
 interval/concurrency, GC water marks / walk window / recency-ring shape (slice size, depth k,
 rotation fill target) / opportunistic-eviction bound, restore fan-out + hint
 interval, and the §4 fencing block (identity selectors, lease timings, fence-confirm timeout,
@@ -648,7 +660,10 @@ condition, not a readiness gate.
 ## 11. Testing strategy
 
 - **`hypha-format`**: proptest round-trips (encrypt→decrypt identity; corrupt/truncate/reorder/
-  splice ⇒ auth failure); offset-arithmetic proptests against the fixed chunk size; the
+  splice ⇒ auth failure); scrypt-wrap round-trips (emitted stanza carries the pinned work factor —
+  guards a silent fallback to the ~1 s default; wrong passphrase ⇒ clean failure; interop: stock
+  rage decrypts hypha output);
+  offset-arithmetic proptests against the fixed chunk size; the
   `streaming_ctlen` guard (header-before-body, exact capture-and-measure lengths); a fuzz target
   for `RangeReader` seeks; criterion benches for the §5 threshold. (Largely built.)
 - **Concurrency**: hammer conditional writes against one active over real SeaweedFS; assert
@@ -713,8 +728,10 @@ bracket — add the transition sentinel to `meta.rs`, rework `put.rs` (no mark t
 only `plen`; the §7 restore sweep needs `cetag` too) and `delete.rs` (currently a cache-first hard
 delete) to the mark → commit → settle sequences, and add the repair rule to the read and
 conditional paths; slim the twin to `{cetag, plen, mtime}` with the classification gate
-(`meta::Facts` drops kind/bound-ETag; `list_head.rs`/`tier.rs` follow); integration conformance
-vs. MinIO + SeaweedFS.
+(`meta::Facts` drops kind/bound-ETag; `list_head.rs`/`tier.rs` follow); swap `envelope.rs` from
+the phase-1 X25519 identity to the §6 pinned-work-factor scrypt recipient + `master_passphrase` —
+before anything writes a real remote, so quantum-exposed headers never accumulate; integration
+conformance vs. MinIO + SeaweedFS.
 *Exit*: conformance pass; ZeroFS works against the durable endpoint.
 
 **Phase 3 — multipart.** Native-remote-multipart proxy (§7): per-part encryption + inline `pmd5`,

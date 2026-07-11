@@ -110,9 +110,9 @@ node-local PVC from TopoLVM.
   sentinel body (so its size and ETag identify it straight off a LIST) whose S3 user-metadata
   records that the body now lives only on the remote (plus the client-visible ETag), paired with a
   zero-byte *facts twin* at a suffixed key that carries the LIST-visible facts. There is no
-  per-object key material to track on the cache side: hypha encrypts each remote object with age to a
-  static X25519 recipient, age wraps a fresh random file key into the age header stored on the remote
-  object itself, and the cache stores only plaintext. Because the remote keeps the real key name and
+  per-object key material to track on the cache side: hypha encrypts each remote object as an age file
+  whose fresh random file key is wrapped under the master secret in the age header stored on the
+  remote object itself, and the cache stores only plaintext. Because the remote keeps the real key name and
   metadata in plaintext (standard S3 client-side encryption), the filer is only a cache index — discard
   it and hypha's startup reconciliation rebuilds the namespace from the remote as tombstones, with
   bodies rehydrating on read.
@@ -135,23 +135,32 @@ create/update semantics, regardless of what the underlying backends guarantee on
 
 ## Encryption
 
-- **One asymmetric master identity**, an X25519 keypair delivered to hypha through a Kubernetes Secret
-  kept out of git; the authoritative copy lives outside the cluster (password manager / safe). Losing it
-  renders the remote copies unrecoverable — the same key-custody rule as the rest of the homelab's backups.
-  Rotation uses age's native multi-recipient support: add the new recipient to the encryptor's set,
-  deploy, then lazily re-encrypt the remote to drop the old — the recipient set in each file *is* the
-  key epoch, so no metadata tracks it.
-- **Envelope format: [age](https://age-encryption.org/v1).** Rather than design a custom AEAD framing,
-  hypha uses the reviewed age v1 format — Filippo's modern streaming AEAD — which has the exact
-  properties hypha needs (per-chunk authentication, seekable decryption for range GET, splice/truncation
-  detection via a finalizer chunk). Each remote object (single-part body, or one age file per multipart
-  part) is an independent age file encrypted to hypha's static X25519 recipient; age generates a fresh
-  random **file key** per invocation, so parallel `UploadPart` workers and concurrent PUTs need no nonce
-  or key coordination — the per-file file key *is* the coordination-free property. Each file key is
-  wrapped to hypha's recipient key in the age header stored alongside the ciphertext on the remote object.
-  This is cryptographically cleaner than a single master key encrypting every frame with random nonces:
-  per-file key isolation removes any cross-object nonce-reuse budget, and a hypothetical compromise of one
-  file's ciphertext does not leak information about another's.
+- **One symmetric master secret** — a 256-bit random string used as an age passphrase — delivered to
+  hypha through a Kubernetes Secret kept out of git; the authoritative copy lives outside the cluster
+  (password manager / safe). Losing it renders the remote copies unrecoverable — the same key-custody
+  rule as the rest of the homelab's backups. Symmetric rather than age's native X25519 because the
+  remote provider keeps the ciphertext forever: a harvest-now-decrypt-later adversary defeats any later
+  migration off a quantum-vulnerable KEM, so the key wrap is post-quantum from the first byte or never.
+  (age's native PQ stanza, `mlkem768x25519`, buys the same property at ~1.6 KiB of KEM encapsulation in
+  every file header — the wrong trade for a namespace heavy in small objects.)
+- **Envelope format: [age](https://age-encryption.org/v1), native scrypt recipient.** Rather than
+  design a custom AEAD framing — or even a custom stanza — hypha uses the reviewed age v1 format,
+  Filippo's modern streaming AEAD, entirely stock: it has the exact properties hypha needs (per-chunk
+  authentication, seekable decryption for range GET, splice/truncation detection via a finalizer
+  chunk), and disaster recovery is any age binary plus the passphrase. Each remote object (single-part
+  body, or one age file per multipart part) is an independent age file; age generates a fresh random
+  **file key** and scrypt salt per invocation, so parallel `UploadPart` workers and concurrent PUTs
+  need no nonce or key coordination — the per-file file key *is* the coordination-free property,
+  per-file key isolation removes any cross-object nonce-reuse budget, and one file's ciphertext leaks
+  nothing about another's. The **scrypt work factor is pinned to the minimum**: the KDF's stretching
+  exists to protect low-entropy human passphrases, and hypha's passphrase is full-entropy — security
+  lives in its 256 bits, not the work factor. (Left at age's default — auto-tuned to ~1 s and ~256 MiB
+  *per file* — the wrap would dominate every small-object operation.)
+- **Rotation is a flag day, accepted deliberately.** The age spec requires an scrypt stanza to be the
+  only stanza in a file, so there is no multi-recipient lazy re-wrap. That forfeits little:
+  harvest-now-decrypt-later already means rotation cannot retroactively protect harvested ciphertext —
+  the true response to a compromised key is a full re-encrypt sweep under a new secret, and that
+  remains available under any scheme.
 - **Only bodies are encrypted — standard S3 client-side encryption.** The key name and object metadata
   are stored in plaintext on the remote, exactly as an S3 client-side-encryption client does; only the
   body is ciphertext. The provider can see names and sizes, never contents.

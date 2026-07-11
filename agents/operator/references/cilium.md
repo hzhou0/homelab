@@ -75,11 +75,14 @@ With `wireguard.expose: true` the Service carries `homelab.lab/expose` + `protoc
 to wire it by hand). UDP from world already passes the host firewall. No `homelab.lab/hostname`:
 that Unbound record resolves to the internal LB IP, useless to an off-LAN peer.
 
-The tunnel is confined to **the ingress Gateway and the LAN DNS only**:
+The tunnel is confined to **the Gateway's backend services and the LAN DNS only**:
 
 - The server masquerades decrypted peer traffic to the pod IP, so Cilium sees the whole tunnel
-  as one endpoint. `wireguard-egress-fence` then default-denies that endpoint's egress and
-  re-allows only `reserved:ingress` (the Gateway) and `lanDNS:53`.
+  as one endpoint. `wireguard-egress-fence` then default-denies that endpoint's egress. Because the
+  Gateway is an **L7 LoadBalancer**, Cilium enforces this pod's egress against the backend Envoy
+  routes to — *not* `reserved:ingress` — so the fence re-allows the Gateway's backend namespaces
+  (mirroring `allow-gateway-ingress-to-backends`) plus the hubble-ui pods, and `lanDNS:53`. A
+  `toEntities:ingress` rule would be a no-op: it never matches that enforcement point.
 - `allow-wireguard-to-gateway-ingress` grants the tunnel the Gateway front door **by identity**
   rather than via `gateway.allowedCIDRs` — masquerade hides the peer CIDR from a `fromCIDR`
   match, so this is the "similar access" that a CIDR entry would give an on-LAN host.

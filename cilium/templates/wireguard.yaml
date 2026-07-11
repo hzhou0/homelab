@@ -163,12 +163,14 @@ spec:
             - port: {{ $wg.listenPort | quote }}
               protocol: UDP
 ---
-# Egress fence: the whole tunnel appears as this pod (see masquerade above), so this is where "the
-# tunnel may reach the ingress and LAN DNS only" is enforced. Default-deny egress, re-allowing just:
-#   - the ingress Gateway (reserved:ingress) — resolves *.internal.haustorium.net traffic
-#   - the LAN resolver on :53 — so peers can resolve those names
-# Peer->server reply packets (the encrypted return path) are permitted statefully by conntrack, so
-# no world egress is needed as long as peers use PersistentKeepalive.
+# Egress fence: peer traffic is masqueraded to this pod (above), so the tunnel is confined here by
+# default-deny egress. The gateway is an L7 LoadBalancer (Cilium Envoy): for an L7LB service Cilium
+# enforces THIS pod's egress against the backend Envoy ultimately routes to, NOT the reserved:ingress
+# proxy — so the allow-list is the gateway's own backend namespaces (mirrors
+# allow-gateway-ingress-to-backends) plus the hubble-ui pods that back hubble.internal. A
+# toEntities:ingress rule is a no-op here: it never matches that enforcement point. The LAN resolver
+# on :53 lets peers resolve *.internal; peer->server reply packets return statefully via conntrack,
+# so no world egress is needed as long as peers use PersistentKeepalive.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
@@ -185,9 +187,20 @@ spec:
     egress: true
     ingress: false
   egress:
-    # KPR translates the gateway VIP before policy, so the match is the backend identity, not a CIDR.
-    - toEntities:
-        - ingress
+    {{- if .Values.gateway.backendNamespaces }}
+    - toEndpoints:
+        {{- range $ns := .Values.gateway.backendNamespaces }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns | quote }}
+        {{- end }}
+    {{- end }}
+    {{- if .Values.gateway.hubbleUI.enabled }}
+    # hubble-ui backs hubble.internal from kube-system; scope to its pods, not all of kube-system.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: hubble-ui
+    {{- end }}
     - toCIDR:
         - {{ printf "%s/32" $wg.lanDNS | quote }}
       toPorts:
