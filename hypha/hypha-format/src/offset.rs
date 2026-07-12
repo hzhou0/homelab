@@ -43,6 +43,21 @@ pub fn header_len_from(plaintext_len: u64, total_ciphertext_len: u64) -> Option<
     total_ciphertext_len.checked_sub(payload)
 }
 
+/// Plaintext length derived from a file's total ciphertext length and its header length — the
+/// inverse of [`ciphertext_len`], for composite parts whose `plen` is stored nowhere (parts are
+/// pure age files; the one object footer carries only the total, §6). Each full ciphertext
+/// chunk is `CHUNK_CIPHERTEXT` bytes and a trailing partial chunk still carries a whole tag, so
+/// the chunk count falls out of the payload length alone. Returns `None` if the pair is
+/// inconsistent (truncated object, or a wrong `header_len`).
+pub fn plaintext_len_from(total_ciphertext_len: u64, header_len: u64) -> Option<u64> {
+    let payload = total_ciphertext_len.checked_sub(header_len + PAYLOAD_NONCE)?;
+    let chunks = payload.div_ceil(CHUNK_CIPHERTEXT).max(1);
+    let plen = payload.checked_sub(chunks * TAG)?;
+    // Reject payloads that don't correspond to any plaintext length (e.g. a partial chunk of
+    // fewer than TAG+1 bytes).
+    (ciphertext_len(plen, header_len) == total_ciphertext_len).then_some(plen)
+}
+
 /// Header length parsed from a ciphertext prefix, or `None` if the prefix is too short.
 /// Validation / fallback for [`header_len_from`] when lengths aren't at hand.
 ///
@@ -86,6 +101,28 @@ mod tests {
         assert_eq!(chunk_count(CHUNK_PLAINTEXT), 1);
         assert_eq!(chunk_count(CHUNK_PLAINTEXT + 1), 2);
         assert_eq!(chunk_count(3 * CHUNK_PLAINTEXT), 3);
+    }
+
+    #[test]
+    fn plaintext_len_inverts_ciphertext_len() {
+        let h = 200;
+        for plen in [
+            0u64,
+            1,
+            CHUNK_PLAINTEXT - 1,
+            CHUNK_PLAINTEXT,
+            CHUNK_PLAINTEXT + 1,
+            3 * CHUNK_PLAINTEXT + 10,
+        ] {
+            assert_eq!(plaintext_len_from(ciphertext_len(plen, h), h), Some(plen));
+        }
+        // Impossible payloads are rejected: a trailing partial chunk can't be tag-only-or-less
+        // (byte-shaving truncation is *not* detectable here — that's the AEAD finalizer's job).
+        assert_eq!(
+            plaintext_len_from(h + PAYLOAD_NONCE + CHUNK_CIPHERTEXT + TAG, h),
+            None
+        );
+        assert_eq!(plaintext_len_from(h, h), None);
     }
 
     #[test]

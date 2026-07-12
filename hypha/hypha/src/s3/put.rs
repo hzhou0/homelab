@@ -1,7 +1,12 @@
-//! Single-object PUT. Routes **through** the cache: the client's plaintext is written to the
-//! cache (which computes the S3 ETag natively), then — in `sync` mode — encrypted and uploaded to
-//! the remote and tombstoned inline before the ack (§4/§7, unified tiering design). The whole
-//! finalize holds the key lock so concurrent same-key PUTs can't interleave or reorder.
+//! Single-object PUT. Durable mode is the §7 transition bracket — precondition → mark →
+//! commit → settle, all under K's write lock — with the remote op as the commit point.
+//!
+//! The commit must land the body *and* its facts at K atomically (a committed object without
+//! facts would be indistinguishable from a foreign write and unrecoverable without decrypting).
+//! `cetag = MD5(plaintext)` is only known after the body has streamed, so the facts travel as
+//! the **footer behind the ciphertext** (§6) — computed inline and framed into the same single
+//! streaming `PutObject`. K is marked for the transfer's duration; readers of K meanwhile
+//! resolve from the remote, which atomically holds the old object until the PUT completes.
 
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
@@ -12,8 +17,9 @@ use hypha_core::config::Mode;
 use hypha_core::error::Error;
 use hypha_core::meta;
 
-use super::Hypha;
+use super::{Hypha, MAX_INLINE_PLAINTEXT};
 use crate::codec;
+use crate::tier;
 
 impl Hypha {
     pub(super) async fn op_put_object(
@@ -34,17 +40,38 @@ impl Hypha {
             .filter(|&n| n >= 0)
             .ok_or_else(|| Error::Invalid("PutObject requires Content-Length".into()))?
             as u64;
+        if plen > MAX_INLINE_PLAINTEXT {
+            return Err(s3_error!(
+                EntityTooLarge,
+                "PutObject bodies over 4 GiB must use multipart upload"
+            ));
+        }
         let body = input
             .body
             .ok_or_else(|| Error::Invalid("PutObject requires a body".into()))?;
 
-        // One lock for the whole sequence: precondition → cache write → upload → tombstone.
+        // One lock for the whole bracket: precondition → mark → commit → settle (§4).
         let _guard = self.tier.locks.lock(&key).await;
 
         // Resolve the key's *current* client-visible ETag for the conditional-write check: a live
-        // body reports it natively; a tombstone carries it in metadata; an absent key has none.
+        // body reports it natively, a tombstone carries it in metadata, an absent key has none,
+        // and a leftover transition mark is repaired first (§7 — the marking writer held this
+        // lock, so a mark seen here is always a crash leftover).
         let current_etag = match self.cache().head(&key).await {
-            Ok(head) => current_client_etag(&head.metadata, head.e_tag.as_deref()),
+            Ok(head) => {
+                let md = head.metadata.clone().unwrap_or_default();
+                match meta::tomb_kind(&md) {
+                    Some(meta::TombKind::Transit) => {
+                        self.tier.repair_locked(&key).await?.map(|f| f.cetag)
+                    }
+                    Some(meta::TombKind::Evict) => md.get(meta::CETAG).cloned(),
+                    Some(meta::TombKind::Delete) => None,
+                    None => head
+                        .e_tag
+                        .as_deref()
+                        .map(|e| e.trim_matches('"').to_string()),
+                }
+            }
             Err(Error::NotFound) => None,
             Err(e) => return Err(e.into()),
         };
@@ -54,50 +81,47 @@ impl Hypha {
             current_etag.as_deref(),
         )?;
 
-        // Encrypt the request body directly — durable mode never writes plaintext to cache. The
-        // client ETag (MD5 of the plaintext) is computed inline alongside the encryption.
-        let (ct_len, enc, etag_rx) = codec::encrypt_blob_with_etag(self.env(), body, plen)
+        // Mark → commit → settle. The commit is one streaming PutObject at K: ciphertext framed
+        // with the facts footer (client MD5 computed inline, §6) — durable mode never writes
+        // plaintext to the cache. On failure or indeterminacy, settle K to whichever way the
+        // remote actually landed — the same repair that handles a crash here (§7).
+        let mtime_ms = tier::now_ms();
+        self.tier.mark_transit_locked(&key).await?;
+        let (framed_len, enc, etag_rx) =
+            match codec::encrypt_blob_with_etag(self.env(), body, plen, Some(mtime_ms)).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = self.tier.repair_locked(&key).await;
+                    return Err(Error::Io(e).into());
+                }
+            };
+        if let Err(e) = self
+            .remote()
+            .put(&key, enc, Some(framed_len as i64), HashMap::new(), None, None)
             .await
-            .map_err(Error::Io)?;
-        let mut remote_md = HashMap::new();
-        remote_md.insert(meta::PLEN.to_string(), plen.to_string());
-        self.remote()
-            .put(&key, enc, Some(ct_len as i64), remote_md, None, None)
+        {
+            let _ = self.tier.repair_locked(&key).await;
+            return Err(e.into());
+        }
+        // The PUT consumed the whole framed body, footer included — the etag is ready. Its loss
+        // means the encrypt task died mid-commit; repair settles K from the remote either way.
+        let etag = match etag_rx.await {
+            Ok(e) => e,
+            Err(_) => {
+                let _ = self.tier.repair_locked(&key).await;
+                return Err(Error::Backend("MD5 task dropped before completing".into()).into());
+            }
+        };
+        self.tier
+            .settle_evict_locked(&key, plen, &etag, mtime_ms)
             .await?;
-        // Remote PUT consumed the body; the MD5 task has finished — etag is ready.
-        let etag = etag_rx
-            .await
-            .map_err(|_| Error::Backend("MD5 task dropped before completing".into()))?;
-
-        self.tier.tombstone_with_facts_locked(&key, plen, &etag).await?;
 
         let resp = PutObjectOutput {
-            e_tag: client_etag_from_raw(&etag),
+            e_tag: Some(ETag::Strong(etag)),
             ..Default::default()
         };
         Ok(S3Response::new(resp))
     }
-}
-
-/// The current object's client-visible ETag, whether it is a live body (native cache ETag) or a
-/// tombstone (client ETag in metadata) (§4). `None` ⇒ absent.
-fn current_client_etag(
-    metadata: &Option<HashMap<String, String>>,
-    native_etag: Option<&str>,
-) -> Option<String> {
-    if let Some(md) = metadata {
-        match md.get(meta::TOMB).map(String::as_str) {
-            Some(meta::TOMB_EVICT) => return md.get(meta::CETAG).cloned(),
-            // Delete-tombstone is client-visibly absent.
-            Some(meta::TOMB_DELETE) => return None,
-            _ => {}
-        }
-    }
-    native_etag.map(|e| e.trim_matches('"').to_string())
-}
-
-fn client_etag_from_raw(raw: &str) -> Option<ETag> {
-    Some(ETag::Strong(raw.trim_matches('"').to_string()))
 }
 
 /// Decide whether a conditional PUT may proceed against the key's current state (§4).

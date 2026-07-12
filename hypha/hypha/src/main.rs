@@ -36,18 +36,20 @@ async fn main() -> Result<(), BoxError> {
 
     let config = Config::load().map_err(ctx("loading config"))?;
 
-    // age zeroizes the parsed key material itself — the identity's `StaticSecret` is
-    // `ZeroizeOnDrop` and `from_str` wipes its decode intermediates — so there's nothing useful
-    // to wipe here. The secret's real residency is the config String (a k8s Secret → env var),
-    // which would need age's `SecretString` end-to-end to protect, not a one-off zeroize.
-    let env = hypha_format::Envelope::from_identity_str(&config.master_identity)
-        .map_err(ctx("parsing master identity"))?;
+    let env = hypha_format::Envelope::from_passphrase(&config.master_passphrase)
+        .map_err(ctx("parsing master passphrase"))?;
 
     let remote = Backend::connect(&config.remote);
     let cache = Backend::connect(&config.cache);
     tracing::info!(mode = ?config.mode, "hypha starting");
 
-    let app = s3::Hypha::new(remote, cache, env, config.mode, config.serving.offload_threshold);
+    let app = s3::Hypha::new(
+        remote,
+        cache,
+        env,
+        config.mode,
+        config.serving.offload_threshold,
+    );
 
     let service = {
         let mut b = S3ServiceBuilder::new(app);

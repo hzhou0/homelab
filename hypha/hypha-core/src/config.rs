@@ -68,10 +68,10 @@ pub struct Config {
     pub cache: S3Endpoint,
     pub mode: Mode,
     pub auth: ClientAuth,
-    /// The age X25519 identity string (`AGE-SECRET-KEY-1…`) hypha wraps every file key to,
-    /// delivered via a Secret. One identity for the whole remote. age zeroizes the parsed key
-    /// material on drop; the string form here lives for the process lifetime.
-    pub master_identity: String,
+    /// The 256-bit random passphrase age's scrypt recipient wraps every file key to (§6),
+    /// delivered via a Secret. One passphrase for the whole remote; the string form here lives
+    /// for the process lifetime.
+    pub master_passphrase: String,
     #[serde(default)]
     pub serving: Serving,
 }

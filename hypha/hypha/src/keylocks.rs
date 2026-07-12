@@ -35,25 +35,33 @@ impl KeyLocks {
     /// Acquire the lock for `key`, awaiting any current holder. Hold the returned guard for the
     /// critical section; dropping it releases the lock.
     pub async fn lock(&self, key: &str) -> OwnedMutexGuard<()> {
-        let mutex = {
-            let mut inner = self.inner.lock().unwrap();
+        self.mutex_for(key).lock_owned().await
+    }
 
-            inner.since_sweep += 1;
-            if inner.since_sweep >= SWEEP_INTERVAL {
-                inner.table.retain(|_, w| w.strong_count() > 0);
-                inner.since_sweep = 0;
-            }
+    /// Acquire the lock only if free. Lock-free read paths use this to repair a leftover
+    /// transition mark opportunistically (§7): a *held* lock means the marking writer is alive
+    /// mid-bracket — nothing to repair, and a read must not queue behind it.
+    pub fn try_lock(&self, key: &str) -> Option<OwnedMutexGuard<()>> {
+        self.mutex_for(key).try_lock_owned().ok()
+    }
 
-            // Reuse the live mutex if another holder/waiter exists, else install a fresh one.
-            match inner.table.get(key).and_then(Weak::upgrade) {
-                Some(m) => m,
-                None => {
-                    let m = Arc::new(AsyncMutex::new(()));
-                    inner.table.insert(key.to_string(), Arc::downgrade(&m));
-                    m
-                }
+    fn mutex_for(&self, key: &str) -> Arc<AsyncMutex<()>> {
+        let mut inner = self.inner.lock().unwrap();
+
+        inner.since_sweep += 1;
+        if inner.since_sweep >= SWEEP_INTERVAL {
+            inner.table.retain(|_, w| w.strong_count() > 0);
+            inner.since_sweep = 0;
+        }
+
+        // Reuse the live mutex if another holder/waiter exists, else install a fresh one.
+        match inner.table.get(key).and_then(Weak::upgrade) {
+            Some(m) => m,
+            None => {
+                let m = Arc::new(AsyncMutex::new(()));
+                inner.table.insert(key.to_string(), Arc::downgrade(&m));
+                m
             }
-        };
-        mutex.lock_owned().await
+        }
     }
 }

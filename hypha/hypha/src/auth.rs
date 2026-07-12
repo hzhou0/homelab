@@ -2,7 +2,7 @@
 //! distinct from the backend credentials in [`hypha_core::config::S3Endpoint`] (§2).
 
 use s3s::auth::{S3Auth, SecretKey};
-use s3s::{S3Result, S3ErrorCode, S3Error};
+use s3s::{S3Error, S3ErrorCode, S3Result};
 
 pub struct SingleKeyAuth {
     access_key: String,

@@ -1,7 +1,7 @@
 //! Guards the invariant hypha's streaming remote upload depends on: `age`'s `wrap_output` emits
 //! the whole header **and** the 16-byte payload nonce before the first body byte, so the total
 //! ciphertext length is `prefix + plen + chunks·TAG` — knowable without spilling, once the
-//! (grease-randomized, hence unpredictable) header prefix has been length-measured.
+//! header prefix (treated as unpredictable — see the trailing assertion) is length-measured.
 //!
 //! If a future `age` version writes the nonce lazily (on first body write instead of at
 //! `wrap_output`), this fails and hypha's `ct_len` computation must change.
@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
 
-use hypha_format::offset::{chunk_count, TAG};
+use hypha_format::offset::{chunk_count, parse_header_len, PAYLOAD_NONCE, TAG};
 use hypha_format::Envelope;
 
 #[derive(Clone)]
@@ -47,14 +47,26 @@ fn wrap_output_prefix_plus_payload_is_total_ciphertext() {
                 prefix + plen + chunk_count(plen) * TAG,
                 "wrap_output must emit header+nonce before body (plen={plen})"
             );
-            distinct_header_lens.insert(prefix - plen.min(0)); // prefix is plen-independent here
+            // The measured prefix must agree with the ciphertext-prefix parse — the read-side
+            // fallback for recovering `hlen` (§6).
+            let parsed = parse_header_len(&buf.borrow()).expect("header MAC line present");
+            assert_eq!(
+                prefix,
+                parsed + PAYLOAD_NONCE,
+                "measured prefix ≠ parsed header + nonce"
+            );
+            distinct_header_lens.insert(prefix);
         }
     }
 
-    // Grease makes the header length vary run to run; if it were ever constant we could predict
-    // ct_len in closed form, but it isn't — this documents why capture-and-measure is required.
-    assert!(
-        distinct_header_lens.len() > 1,
-        "expected grease to vary the header length across runs"
+    // With the scrypt recipient the header carries a single fixed-shape stanza (the age spec
+    // forbids companions, so the crate does not grease it) — the length is deterministic today.
+    // Capture-and-measure stays load-bearing anyway: nothing here may *depend* on a constant
+    // hlen, because a future age could legally vary the header again (as X25519 grease did).
+    assert_eq!(
+        distinct_header_lens.len(),
+        1,
+        "scrypt headers were expected deterministic; if age started varying them, \
+         confirm capture-and-measure paths still hold and update this assertion"
     );
 }

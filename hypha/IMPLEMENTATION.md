@@ -59,6 +59,7 @@ sync; hypha drives it over adapters bridged via `spawn_blocking` (§5).
 ```
 hypha-format/src/
   envelope.rs            Encryptor/Decryptor over age's scrypt recipient, work factor pinned (§6)
+  footer.rs              the fixed 48-byte plaintext facts footer at every remote object's tail (§6)
   offset.rs              plaintext ⇄ ciphertext arithmetic; hlen derivation + header parse (§6)
   stream.rs              RangeReader: sync Read+Seek over ranged GETs (seek ⇒ new byte-range req)
 
@@ -91,8 +92,8 @@ The `s3/` modules are thin: parse intent, take the key lock where required, orch
 
 A deployment runs in one of two modes; **both require the cache and the remote**. The cache is
 always the namespace and ETag source of truth — HEAD/LIST and conditional-write evaluation are
-cache-served in both modes — and the remote always holds age ciphertext with plaintext facts
-stamped alongside (§6) so the restore sweep (§7) can rebuild the cache namespace from it.
+cache-served in both modes — and the remote always holds age ciphertext framed with a plaintext
+facts footer (§6) so the restore sweep (§7) can rebuild the cache namespace from it.
 
 - **`durable`** — writes are synchronous: the remote op is the **commit point**, bracketed by a
   transition mark so readers never see torn state (§7). PUT encrypts and uploads inline, settles
@@ -204,8 +205,9 @@ age v1 properties hypha relies on (`offset.rs` implements the math):
 - **Fixed 64 KiB chunks** (65552 ciphertext bytes each), so offset math is closed-form. The header
   length varies per file — rage greases headers with a random stanza — and is derived, both ways:
   - **Read side**: `hlen = ct_len − 16 − plen − 16·⌈plen/64 KiB⌉` from lengths hypha already has
-    (`ct_len` = the remote object's Content-Length, `plen` stamped in metadata). A
-    ciphertext-prefix parse (`--- <mac>` ends the header unambiguously) is the validation fallback.
+    (`ct_len` = the remote object's Content-Length minus the 48-byte footer, §6; `plen` from the
+    tombstone facts or the footer itself). A ciphertext-prefix parse (`--- <mac>` ends the header
+    unambiguously) is the validation fallback.
   - **Write side, capture-and-measure**: age emits the whole header + 16-byte payload nonce
     *before the first body byte* (guarded by `hypha-format/tests/streaming_ctlen.rs`). A split
     sink buffers that prefix, measures it, and computes
@@ -230,8 +232,33 @@ age v1 properties hypha relies on (`offset.rs` implements the math):
   truncation fail authentication.
 
 These lengths are the complete read-side state: a single-part object is decodable from `plen` +
-Content-Length + the fixed chunk size; a composite is a concatenation of per-part age files whose
-boundaries come from the remote's part index plus per-part header parses (§7).
+Content-Length + the fixed chunk size; a composite is a concatenation of pure per-part age
+files whose boundaries come from the remote's part index, per-part `plen`s from the closed form
+(§7).
+
+### The facts footer
+
+Every remote object ends in **one** fixed **48-byte plaintext facts trailer** (`footer.rs`):
+magic + version, a kind byte (*single* | *composite*), the client part count (the composite
+ETag's `-N`), total `plen`, the client-write mtime, and the raw MD5 whose hex form (plus `-N`
+for composites) is the client ETag. It exists because S3 offers no slot that lands facts
+atomically with a streamed body: user-metadata travels ahead of the body, while
+`cetag = MD5(plaintext)` exists only once the body has streamed; tags are post-hoc. A trailer
+*behind* the ciphertext is both atomic and at a knowable offset (`len − 48`), so every commit
+carries its own complete facts and every cold read, repair, or restore recovers them with **one
+exact tail read** — the object is self-describing, with no second carrier to crash between. A
+single-part PUT appends it in the same streaming `PutObject`; a composite's footer is a 48-byte
+**terminating part** uploaded just before the native complete (part number above every client
+part — hence the 9999 client part cap), so `CompleteMultipartUpload` stays the single atomic
+commit of body + facts.
+
+The footer sits **outside** the envelope, and decrypt paths stop at `len − 48`: age's reader is
+delimited by EOF, not by anything in-band, so trailing bytes get pulled into the final chunk
+read and fail authentication (`hypha-format`'s `trailing_bytes_break_decryption` documents
+this). The footer is unauthenticated, but the facts it carries are checked by what they gate (a
+wrong `plen` fails the closed-form tiling, a wrong MD5 fails the client's ETag, and body
+integrity is the AEAD's). DR with a stock age binary is `head -c -48 file | age -d` (composites:
+concatenation decrypts part by part).
 
 ### Cache objects
 
@@ -297,22 +324,18 @@ the §8 recency ring.
 
 ### Remote objects
 
-Every remote body is age ciphertext; key names, metadata, and tags are plaintext.
+Every remote object is age ciphertext ending in its one facts footer (§6 above); key names and
+the footer are plaintext. No user-metadata, no tags: the footer is the sole facts carrier.
 
-**Single-part object**: one age file at `K`, user-metadata `{plen, cetag}` stamped atomically in
-the same `PutObject` as the body.
+**Single-part object**: one age file at `K` with the footer appended in the same `PutObject`.
 
-**Composite**: the remote's own native-multipart object at `K` — a concatenation of per-part age
-files. Create-time user-metadata `{composite flag, nonce}` (S3 takes object metadata only at
-create, before the composite ETag exists); post-completion **object tags** `{cetag, plen}`
-(`PutObjectTagging` — the one post-hoc-mutable slot S3 offers). Ciphertext part boundaries come
-from the remote's own part index (`GetObjectAttributes` ObjectParts / `HEAD partNumber=n`).
-
-**Completion record**: `{K, nonce, cetag, plen}` at `<marker-prefix>/complete/<nonce>`, written
-just before a composite's commit and deleted once its tags are on (§7) — it keeps a committed
-composite's facts remote-recoverable through the complete→tag window. The per-part plaintext MD5s
-that compose the ETag are not derivable from ciphertext, so unstamped facts would be recoverable
-only by full decrypt.
+**Composite**: the remote's own native-multipart object at `K` — a concatenation of pure
+per-part age files plus the 48-byte terminating footer part. Ciphertext part boundaries come
+from the remote's own part index (`GetObjectAttributes` ObjectParts / `HEAD partNumber=n`);
+per-part plaintext lengths fall out of the closed form, since the scrypt header length is
+shared across parts (deterministic today; one header-prefix read supplies it, the tiling check
+against the footer's total `plen` guards it, and per-part header parses are the degraded path
+if age ever varies headers again).
 
 **Prefix-distribution hint**: approximate per-prefix key counts at a reserved key, refreshed for
 free by the §8 walk cursor — advisory sharding input for the restore sweep (§7).
@@ -352,13 +375,18 @@ request/response system — never a hybrid read, never a wrongly-absent key.
    delete-tombstone or absent ⇒ none; leftover mark ⇒ repair first) and evaluate
    `If-Match` / `If-None-Match`.
 2. **Mark**: transition tombstone at K.
-3. **Commit**: encrypt the request body (capture-and-measure, §6; client MD5 computed inline),
-   `PutObject` ciphertext to the remote at K, stamping `plen` + `cetag` in metadata.
+3. **Commit**: one streaming `PutObject` at K — the request body encrypted
+   (capture-and-measure, §6; client MD5 computed inline) with the facts footer framed in behind
+   the ciphertext, so body and facts land atomically. K stays marked for the transfer; readers
+   of K meanwhile resolve from the remote, which atomically holds the old object until the PUT
+   completes. Plaintext is capped at 4 GiB — the same envelope-vs-5-GiB-ceiling math as a part;
+   larger bodies belong to multipart anyway.
 4. **Settle**: eviction tombstone + twin with the same facts. Ack.
 
-Crash before 3: the remote still holds the old object — marked readers serve it, repair restores
-its projection; the op never happened. Crash after 3: committed — marked readers serve the new
-object from the remote, repair completes the projection; lost-ack.
+Crash before the commit lands: the remote still holds the old object — marked readers serve it,
+repair restores its projection; the op never happened. Crash after: committed — marked readers
+serve the new object from the remote, repair completes the projection (facts off the footer);
+lost-ack.
 
 **Cached** — the write lock covers steps 1–4 for conditional PUTs; unconditional PUTs take no
 lock:
@@ -399,18 +427,20 @@ apply).
 
 **CreateMultipartUpload**:
 
-1. Validate the key; mint a random **upload nonce**.
-2. Create the native upload on the remote with create-time metadata `{composite flag, nonce}` —
-   the nonce is how everything else finds this upload's records later.
+1. Validate the key; create the native upload on the remote; record the upload (its client key)
+   in the mpu state (§6).
 
 **UploadPart**:
 
-1. Reject plaintext > **4 GiB** (so the age envelope never pushes a framed part past the remote's
-   5 GiB part cap; transparent re-splitting is a later refinement).
-2. Encrypt the part as **its own age file** (fresh file key; capture-and-measure Content-Length),
-   streaming to the remote as the native part; compute the part's plaintext MD5 inline.
-3. Persist the part's `{pmd5, plen}` into the mpu state (§6); its loss with the cache volume
-   merely fails the eventual complete (never-acked, client retries).
+1. Reject part numbers above **9999** (the number above every client part is reserved for the
+   terminating footer part) and plaintext > **4 GiB** (so the envelope never pushes a part past
+   the remote's 5 GiB part cap; transparent re-splitting is a later refinement).
+2. Encrypt the part as **its own pure age file** (fresh file key; capture-and-measure
+   Content-Length), streaming to the remote as the native part; the plaintext MD5 is computed
+   inline.
+3. Persist the part's `{pmd5, plen}` into the mpu state (§6) — an in-progress upload's parts
+   aren't readable, so complete needs its own copy; its loss with the cache volume merely fails
+   the eventual complete (never-acked, client retries).
 4. Ack on the remote's part ack. Out-of-order / parallel / re-uploaded parts and concurrent
    uploads to one key are the remote's native semantics; per-part file keys make them
    cryptographically independent.
@@ -419,20 +449,17 @@ apply).
 
 1. Load the per-part facts for exactly the client's part list; compose the client ETag
    `md5(concat pmd5s)-N` (`meta::composite_etag`) and `plen = Σ part plens`.
-2. Write the **completion record** (§6) to the remote — before the commit, so a committed
-   composite is never without remote-recoverable facts.
+2. Upload the **terminating footer part** (§6) — 48 bytes, part number = highest client part
+   + 1 — carrying the composed facts.
 3. **Mark** K.
-4. **Commit**: native complete on the remote — it concatenates the ciphertext parts into one
-   object at K.
-5. Stamp the `{cetag, plen}` **object tags** — the steady-state facts carrier for restore.
-6. **Settle**: delete the completion record, write the eviction tombstone + twin, drop the mpu
-   state. Ack.
+4. **Commit**: native complete on the remote (client parts + footer part) — one atomic op lands
+   the concatenated body *and* its facts at K.
+5. **Settle**: eviction tombstone + twin, drop the mpu state. Ack.
 
-Crash before 4: K untouched; the record and the dangling native upload are orphans (swept,
-aborted). Crash between 4 and 5: committed but untagged — marked readers serve it from the remote
-(facts recomposable from the surviving mpu state), and even after a simultaneous cache loss the
-restore sweep recovers the facts from the completion record by nonce match. Crash after 5: a
-stale record, swept. In cached mode the composite enters the cache lazily on first GET via
+Crash before 4: K untouched; the dangling native upload (footer part included) is an orphan
+(swept, aborted). Crash after 4: committed — marked readers serve it from the remote, and
+repair (or, after a simultaneous cache loss, the restore sweep) reads the facts off the tail
+footer; lost-ack. In cached mode the composite enters the cache lazily on first GET via
 rehydrate (§8); in durable mode it stays tombstoned like everything else.
 
 **AbortMultipartUpload**: native abort on the remote; drop the mpu state. The §8 sweep reclaims
@@ -447,9 +474,9 @@ leftovers of abandoned uploads.
      single-part into K, composite into the shadow. Durable mode always reads the remote. A
      single-part range maps to a closed-form chunk range + header read (§6), driven through
      `RangeReader` + age seek and trimmed to the exact `[a,b)`. A composite range first fetches
-     the remote's part index, then derives each needed part's `plen` from its `ct_len` after a
-     small header-prefix read (grease makes `hlen` per-part random), walking parts to the range —
-     uniform-part-size fast path first, since clients almost always use fixed part sizes.
+     the remote's part index, derives every part's `plen` in closed form (one header-prefix
+     read for the shared `hlen`, tiling-checked against the total — §6), then walks parts to
+     the range.
    - **Delete-tombstone**: 404.
    - **Transition tombstone**: remote-as-truth — HEAD the remote, serve (or 404) per its actual
      state, and opportunistically repair.
@@ -487,8 +514,8 @@ The upload path for acked cache writes — a continual duty of the active (phase
    **upload branch**.
 3. **Upload branch**, under K's *upload* lock (§4 — reconcile-only, so client PUTs never queue
    behind it): GET the cache at K — `plen`, ETag `E_n`, and the body come from the *same
-   response*, so the stamped facts can never disagree with the uploaded bytes — encrypt
-   (capture-and-measure) and PUT to the remote, stamping `plen` + `cetag`. Then delete the marker
+   response*, so the framed facts can never disagree with the uploaded bytes — encrypt
+   (capture-and-measure, footer framed in) and PUT to the remote. Then delete the marker
    with `If-Match: M_etag`. A PUT that landed `E_{n+1}` mid-upload rewrote the marker, so the CAS
    412s and the next pass uploads it — the remote is transiently one version behind, never left
    stale with an empty pending set. **The body stays in the cache**: reconcile marks durability
@@ -520,15 +547,10 @@ LIST on promotion) so read-after-write holds while the cache is untrusted. The s
 
 1. LIST remote and cache; recreate any bucket missing from the cache.
 2. For each remote key with no cache entry (a surviving delete-tombstone counts as present, so
-   pending deletes aren't resurrected), write an eviction tombstone + twin. Single-part facts
-   come from the object's metadata (the per-key HEAD); composite facts from its tags — one
-   `GetObjectTagging` per composite, since HEAD doesn't return tags.
-3. An **untagged composite** is a complete→tag crash orphan: recover its facts from the
-   completion record matched by the nonce in its create-time metadata, tag it, and tombstone it
-   normally — the op committed, only its ack was lost. An object with no facts *and* no record
-   was never committed through hypha and is deleted, as are orphan completion records whose
-   upload never committed.
-4. Write the sync marker; flip reads back to the cache.
+   pending deletes aren't resurrected), write an eviction tombstone + twin. Facts come from the
+   object's tail footer — one exact suffix read per key, single-part and composite alike (§6).
+   An object with no valid footer was never written through hypha and is deleted.
+3. Write the sync marker; flip reads back to the cache.
 
 Throughput comes from sharding the keyspace — LIST chains are serial per shard — with shard
 boundaries from the prefix-distribution hint (§6); a stale or missing hint degrades to
@@ -553,7 +575,7 @@ cache, then runs the normal §4 path.
 
 A single background task of the active (the passive never scavenges), phase 5. In durable mode
 there are no bodies to evict — the task only sweeps debris: orphan twins, leftover transition
-marks (repaired per §7), orphan completion records, abandoned mpu state and native uploads. In
+marks (repaired per §7), abandoned mpu state and native uploads. In
 cached mode it additionally evicts under pressure:
 
 **Write-awareness: the in-flight ref count.** The PUT path's only in-process state is a per-key
@@ -637,10 +659,10 @@ which linearizes on the §4 lock. SeaweedFS has them as of **4.07**, broken only
 versioning/object-lock, which the cache bucket enables neither of — pin ≥ 4.07; the §11 suite
 re-verifies. Everything else the cache does is plain S3 objects, so it stays swappable; the only
 SeaweedFS-specific surface is usage/vacuum (§8), already pluggable. The **remote** must support
-native multipart with a post-completion part index (`GetObjectAttributes` ObjectParts /
-`partNumber` reads) and **object tagging** — not universal among S3-compatibles (Backblaze B2's
-S3 layer lacks tagging); a remote without tagging keeps each completion record permanently
-instead of transiently.
+native multipart with a post-completion part index (`GetObjectAttributes` ObjectParts, with
+`HEAD partNumber=n` as the universal fallback) — the footer (§6) removed the former
+object-tagging requirement, so tagging-less remotes (e.g. Backblaze B2's S3 layer) work
+unrestricted.
 
 Delivered as the `hypha/` chart (cluster-admin installed): the serving **StatefulSet** (2 pods,
 active + passive — a StatefulSet so pod-name labels give the static Cilium identities the fence
@@ -662,7 +684,9 @@ condition, not a readiness gate.
 - **`hypha-format`**: proptest round-trips (encrypt→decrypt identity; corrupt/truncate/reorder/
   splice ⇒ auth failure); scrypt-wrap round-trips (emitted stanza carries the pinned work factor —
   guards a silent fallback to the ~1 s default; wrong passphrase ⇒ clean failure; interop: stock
-  rage decrypts hypha output);
+  rage decrypts hypha output after the 48-byte footer strip);
+  footer encode/decode round-trips + foreign-byte rejection + the trailing-bytes guard (age's
+  EOF-delimited reader is why decrypt paths bound at `len − 48`);
   offset-arithmetic proptests against the fixed chunk size; the
   `streaming_ctlen` guard (header-before-body, exact capture-and-measure lengths); a fuzz target
   for `RangeReader` seeks; criterion benches for the §5 threshold. (Largely built.)
@@ -689,8 +713,8 @@ condition, not a readiness gate.
   idempotently from the remote regardless of where the writer died.
 - **Multipart**: out-of-order / parallel / re-uploaded parts; process restart mid-upload (facts
   recovered from mpu state); composite ETag correctness; ranged GET across part boundaries
-  (uniform and ragged part sizes); abort cleanup; crash between complete and tag *plus* cache
-  wipe ⇒ restore recovers the facts from the completion record by nonce match.
+  (uniform and ragged part sizes); abort cleanup; crash at complete *plus* cache wipe ⇒ restore
+  reads the facts off the terminating footer part.
 - **Failover/fencing**: two replicas, partition the active, assert fence→confirm→drain→promote —
   old active's writes refused at the backend before the new active writes; graceful path too.
 - **Integration**: `testcontainers` with real SeaweedFS (cache) + MinIO (remote); S3 conformance
@@ -720,25 +744,28 @@ deployable — with the hardest machinery (cache coherence, fencing) landing las
 forced derived-`hlen` + capture-and-measure), `RangeReader`, round-trip + `streaming_ctlen` tests,
 criterion benches (§5 numbers).
 
-**Phase 2 — durable serving. Mostly landed.** `hypha-core` (config/backend/meta/error, twins, key
-admission) and the s3s surface over durable mode: PUT (preconditions, inline encrypt + ETag,
-tombstone + twin), GET (cache-first, remote decrypt, ranges), HEAD/LIST (single-pass twin
-pairing), buckets, auth, `Reconciler` + `KeyLocks`. **Remaining**: implement the §7 transition
-bracket — add the transition sentinel to `meta.rs`, rework `put.rs` (no mark today, and it stamps
-only `plen`; the §7 restore sweep needs `cetag` too) and `delete.rs` (currently a cache-first hard
-delete) to the mark → commit → settle sequences, and add the repair rule to the read and
-conditional paths; slim the twin to `{cetag, plen, mtime}` with the classification gate
-(`meta::Facts` drops kind/bound-ETag; `list_head.rs`/`tier.rs` follow); swap `envelope.rs` from
-the phase-1 X25519 identity to the §6 pinned-work-factor scrypt recipient + `master_passphrase` —
-before anything writes a real remote, so quantum-exposed headers never accumulate; integration
-conformance vs. MinIO + SeaweedFS.
-*Exit*: conformance pass; ZeroFS works against the durable endpoint.
+**Phase 2 — durable serving. Code complete; exit criteria pending.** `hypha-core`
+(config/backend/meta/error, twins, key admission) and the s3s surface over durable mode: PUT
+(preconditions, inline encrypt + ETag with the §6 facts footer framed in, the §7 mark → commit →
+settle bracket), DELETE
+(same bracket), GET (cache-first, remote decrypt, ranges), HEAD/LIST (single-pass twin pairing
+under the classification gate; transition marks resolve from the remote), the repair rule on the
+read and conditional paths, buckets, auth, `Reconciler` + `KeyLocks`; the slim
+`{cetag, plen, mtime}` twin; the §6 pinned-work-factor scrypt envelope + `master_passphrase`
+(landed before anything writes a real remote, so quantum-exposed headers never accumulate). Note:
+the sole-stanza scrypt header is deterministic today — capture-and-measure still treats `hlen` as
+per-file unpredictable, and `streaming_ctlen.rs` flags if age varies it again.
+*Exit (deferred to the single test pass)*: integration conformance vs. MinIO + SeaweedFS; ZeroFS
+works against the durable endpoint.
 
-**Phase 3 — multipart.** Native-remote-multipart proxy (§7): per-part encryption + inline `pmd5`,
-mpu facts state under the reserved prefix, upload nonce + completion record, composite ETag +
-facts tags at complete (the full six-step bracket), abort, the 4 GiB cap, composite ranged GET
-(part-index walk + fast path). Verify the remote's tagging/part-index support (§9) up front.
-*Exit*: §11 multipart scenarios including restart-mid-upload and record-based restore recovery.
+**Phase 3 — multipart. Code complete; exit criteria pending.** Native-remote-multipart proxy
+(§7): per-part encryption + inline `pmd5`, mpu facts state under the reserved prefix, composite
+ETag composed at complete with the terminating footer part in the same atomic native complete
+(the five-step bracket — the footer makes the committed composite self-describing, no records
+or tags), abort, the 4 GiB / 9999-part caps, composite full + ranged GET (part-index walk +
+closed-form plens, `HEAD partNumber=n` fallback for remotes whose `GetObjectAttributes` omits
+parts). Still to verify up front on the live remotes: part-index support (§9).
+*Exit*: §11 multipart scenarios including restart-mid-upload and footer-based restore recovery.
 
 **Phase 4 — cached mode, single replica.** Marker writes + the in-flight ref count on the PUT
 path, the reconcile sweep, cached DELETE propagation, rehydrate (single-part into K + twin
@@ -749,7 +776,7 @@ default `s3.internal` deployment with correctness intact, only failover seamless
 **Phase 5 — GC + restore.** Walk cursor, threshold-ratchet eviction, Bloom ring (fill rotation)
 + slice persistence, usage
 source + vacuum, prefix-hint writer, sync marker + parallel restore sweep, debris sweeps (orphan
-twins, orphan shadow bodies, leftover transition marks, orphan completion records, abandoned mpu
+twins, orphan shadow bodies, leftover transition marks, abandoned mpu
 state). *Exit*:
 scavenge/rehydrate and cache-wipe → restore-sweep → rehydrate scenarios.
 

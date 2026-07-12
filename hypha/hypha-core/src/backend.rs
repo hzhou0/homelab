@@ -12,12 +12,13 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use aws_sdk_s3::operation::get_object_attributes::GetObjectAttributesOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::CompletedMultipartUpload;
+use aws_sdk_s3::types::{CompletedMultipartUpload, ObjectAttributes};
 use aws_sdk_s3::Client;
 
 use crate::config::S3Endpoint;
@@ -91,6 +92,40 @@ impl Backend {
             .map_err(Error::from_sdk)
     }
 
+    /// HEAD one part of a committed native-multipart object: its ciphertext Content-Length plus
+    /// `x-amz-mp-parts-count` — the universal part-index primitive (§9; `GetObjectAttributes`
+    /// below is the one-shot variant not every remote implements).
+    pub async fn head_part(&self, key: &str, part_number: i32) -> Result<HeadObjectOutput> {
+        self.client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.k(key))
+            .part_number(part_number)
+            .send()
+            .await
+            .map_err(Error::from_sdk)
+    }
+
+    /// The remote's own part index for a committed composite (§6). One page; the caller
+    /// paginates on `object_parts.next_part_number_marker`.
+    pub async fn object_parts(
+        &self,
+        key: &str,
+        part_number_marker: Option<String>,
+        max_parts: i32,
+    ) -> Result<GetObjectAttributesOutput> {
+        self.client
+            .get_object_attributes()
+            .bucket(&self.bucket)
+            .key(self.k(key))
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .max_parts(max_parts)
+            .set_part_number_marker(part_number_marker)
+            .send()
+            .await
+            .map_err(Error::from_sdk)
+    }
+
     /// PUT a body already in its final on-remote form (ciphertext, for hypha's objects).
     /// `content_length` must be `Some` for a non-seekable `ByteStream` — S3 needs it up front.
     #[allow(clippy::too_many_arguments)]
@@ -141,7 +176,11 @@ impl Backend {
             .send()
             .await
             .map_err(Error::from_sdk)?;
-        Ok(out.e_tag().unwrap_or_default().trim_matches('"').to_string())
+        Ok(out
+            .e_tag()
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string())
     }
 
     pub async fn delete(&self, key: &str) -> Result<()> {

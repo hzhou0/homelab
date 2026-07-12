@@ -70,7 +70,9 @@ impl Error {
         R: std::fmt::Debug,
     {
         match err.code() {
-            Some("NoSuchKey") | Some("404") | Some("NotFound") => Error::NotFound,
+            Some("NoSuchKey") | Some("404") | Some("NotFound") | Some("NoSuchUpload") => {
+                Error::NotFound
+            }
             Some("NoSuchBucket") => Error::NoSuchBucket,
             Some("PreconditionFailed") | Some("412") => Error::PreconditionFailed,
             _ => Error::Backend(format!("{err:?}")),

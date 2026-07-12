@@ -6,7 +6,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use hypha_format::Envelope;
 
 fn bench_codec(c: &mut Criterion) {
-    let env = Envelope::generate();
+    let envelope = Envelope::generate();
     let mut g = c.benchmark_group("codec");
     for size in [64 * 1024, 1024 * 1024, 8 * 1024 * 1024] {
         let pt = vec![0xA5u8; size];
@@ -15,14 +15,14 @@ fn bench_codec(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("encrypt", size), &pt, |b, pt| {
             b.iter(|| {
                 ct_buf.clear();
-                let mut w = env.encrypt(&mut ct_buf).unwrap();
+                let mut w = envelope.encrypt(&mut ct_buf).unwrap();
                 w.write_all(pt).unwrap();
                 w.finish().unwrap();
             })
         });
         let ct = {
             let mut buf = Vec::new();
-            let mut w = env.encrypt(&mut buf).unwrap();
+            let mut w = envelope.encrypt(&mut buf).unwrap();
             w.write_all(&pt).unwrap();
             w.finish().unwrap();
             buf
@@ -31,7 +31,7 @@ fn bench_codec(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("decrypt", size), &ct, |b, ct| {
             b.iter(|| {
                 pt_buf.clear();
-                env.decrypt(&ct[..])
+                envelope.decrypt(&ct[..])
                     .unwrap()
                     .read_to_end(&mut pt_buf)
                     .unwrap();
