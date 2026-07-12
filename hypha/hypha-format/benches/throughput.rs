@@ -31,7 +31,8 @@ fn bench_codec(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("decrypt", size), &ct, |b, ct| {
             b.iter(|| {
                 pt_buf.clear();
-                envelope.decrypt(&ct[..])
+                envelope
+                    .decrypt(&ct[..])
                     .unwrap()
                     .read_to_end(&mut pt_buf)
                     .unwrap();

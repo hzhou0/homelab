@@ -13,7 +13,7 @@ mod put;
 
 use std::sync::Arc;
 
-use hypha_format::Envelope;
+use hypha_format::{Envelope, TrailerKey};
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
@@ -40,6 +40,7 @@ impl Hypha {
         remote: Backend,
         cache: Backend,
         env: Envelope,
+        trailer_key: TrailerKey,
         mode: Mode,
         offload_threshold: usize,
     ) -> Self {
@@ -48,6 +49,7 @@ impl Hypha {
                 cache,
                 remote,
                 env: Arc::new(env),
+                trailer_key,
                 locks: KeyLocks::default(),
             },
             mode,

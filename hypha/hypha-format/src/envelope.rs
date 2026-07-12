@@ -49,9 +49,8 @@ impl Envelope {
     /// scrypt stanza with a fresh salt and the pinned work factor.
     /// Callers must call `finish()` on the result to write the final (possibly short) chunk.
     ///
-    /// The header length varies per file (random salt, and the scrypt label mechanism), so
-    /// callers that need offset math later must record it — tee the ciphertext prefix through
-    /// [`crate::offset::parse_header_len`] while uploading.
+    /// The scrypt sole-stanza header is a fixed length ([`crate::offset::HLEN`]), so offset math
+    /// needs no per-file measurement.
     pub fn encrypt<W: Write>(&self, writer: W) -> Result<StreamWriter<W>, Error> {
         let mut recipient = age::scrypt::Recipient::new(self.passphrase.clone());
         recipient.set_work_factor(PINNED_WORK_FACTOR);
@@ -67,5 +66,27 @@ impl Envelope {
         identity.set_max_work_factor(self.max_work_factor);
         let decryptor = age::Decryptor::new(reader)?;
         Ok(decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity))?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::offset::{HLEN, PAYLOAD_NONCE, TAG};
+
+    /// Pins `HLEN`. age can't grease a scrypt sole-stanza header and the stanza is fixed-shape, so
+    /// the header length is constant; if a future age changes it, this trips ⇒ bump the trailer
+    /// version. An empty plaintext encrypts to `header ‖ payload_nonce(16) ‖ one empty chunk (tag)`.
+    #[test]
+    fn hlen_is_constant() {
+        let env = Envelope::generate();
+        let mut ct = Vec::new();
+        let w = env.encrypt(&mut ct).unwrap();
+        w.finish().unwrap();
+        let hlen = ct.len() as u64 - PAYLOAD_NONCE - TAG;
+        assert_eq!(
+            hlen, HLEN,
+            "age scrypt header length changed to {hlen}; bump the trailer version"
+        );
     }
 }

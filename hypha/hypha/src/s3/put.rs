@@ -18,7 +18,7 @@ use hypha_core::error::Error;
 use hypha_core::meta;
 
 use super::{Hypha, MAX_INLINE_PLAINTEXT};
-use crate::codec;
+use crate::codec::{self, SingleTrailer};
 use crate::tier;
 
 impl Hypha {
@@ -87,8 +87,13 @@ impl Hypha {
         // remote actually landed — the same repair that handles a crash here (§7).
         let mtime_ms = tier::now_ms();
         self.tier.mark_transit_locked(&key).await?;
+        let trailer = SingleTrailer {
+            trailer_key: self.tier.trailer_key.clone(),
+            object_key: key.clone(),
+            mtime_ms,
+        };
         let (framed_len, enc, etag_rx) =
-            match codec::encrypt_blob_with_etag(self.env(), body, plen, Some(mtime_ms)).await {
+            match codec::encrypt_blob_with_etag(self.env(), body, plen, Some(trailer)).await {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = self.tier.repair_locked(&key).await;
@@ -97,7 +102,14 @@ impl Hypha {
             };
         if let Err(e) = self
             .remote()
-            .put(&key, enc, Some(framed_len as i64), HashMap::new(), None, None)
+            .put(
+                &key,
+                enc,
+                Some(framed_len as i64),
+                HashMap::new(),
+                None,
+                None,
+            )
             .await
         {
             let _ = self.tier.repair_locked(&key).await;

@@ -7,6 +7,10 @@ repository.workspace = true
 
 [dependencies]
 age = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+bytemuck = { workspace = true }
 criterion = "0.8.2"
 
 [dev-dependencies]

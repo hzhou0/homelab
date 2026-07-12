@@ -7,8 +7,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use hypha_format::offset::{
-    chunk_ciphertext_offset, ciphertext_len, ciphertext_range, header_len_from, parse_header_len,
-    CHUNK_CIPHERTEXT, CHUNK_PLAINTEXT,
+    chunk_ciphertext_offset, ciphertext_len, ciphertext_range, CHUNK_CIPHERTEXT, CHUNK_PLAINTEXT,
+    HLEN,
 };
 use hypha_format::{Envelope, RangeReader, RangeSource};
 use proptest::prelude::*;
@@ -25,8 +25,8 @@ fn encrypt(env: &Envelope, plaintext: &[u8]) -> Vec<u8> {
     ct
 }
 
-fn hlen(ct: &[u8]) -> u64 {
-    parse_header_len(ct).expect("ciphertext prefix must contain a full header")
+fn hlen(_ct: &[u8]) -> u64 {
+    HLEN
 }
 
 fn decrypt(env: &Envelope, ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -54,12 +54,6 @@ fn ciphertext_length_matches_closed_form() {
             ct.len() as u64,
             ciphertext_len(len as u64, hlen(&ct)),
             "closed-form ciphertext_len wrong for plaintext len {len}"
-        );
-        // hlen derived from (plen, ct_len) must agree with hlen parsed from the header
-        assert_eq!(
-            header_len_from(len as u64, ct.len() as u64),
-            Some(hlen(&ct)),
-            "derived header length wrong for plaintext len {len}"
         );
     }
 }
@@ -108,7 +102,7 @@ fn cross_file_chunk_splice_fails() {
     let pt = pattern(2 * CHUNK_PLAINTEXT as usize);
     let a = encrypt(&env, &pt);
     let b = encrypt(&env, &pt);
-    // headers differ per file (grease), so locate each file's chunk 0 independently
+    // headers are the fixed HLEN; locate each file's chunk 0
     let (ha, hb) = (hlen(&a) as usize, hlen(&b) as usize);
 
     let mut spliced = a.clone();
@@ -149,6 +143,47 @@ fn chunk_reorder_fails() {
 fn wrong_identity_fails() {
     let ct = encrypt(&Envelope::generate(), &pattern(100));
     assert!(decrypt(&Envelope::generate(), &ct).is_err());
+}
+
+/// The invariant hypha's single-stream composite read rests on: a concatenation of independent
+/// age files decrypts correctly by feeding each part's exact ciphertext window to a fresh
+/// decryptor off *one* shared reader, via `by_ref().take(len)`. age's reader is EOF-delimited, so
+/// a `Take` bounded to a part's window makes age stop at that part's final chunk and consume
+/// precisely `len` bytes — leaving the shared stream aligned on the next part. Ragged part sizes
+/// (empty, sub-chunk, multi-chunk, chunk-aligned) exercise the boundary cases.
+#[test]
+fn concatenated_parts_decrypt_in_one_stream() {
+    let env = Envelope::generate();
+    let plens = [
+        0u64,
+        1,
+        CHUNK_PLAINTEXT - 1,
+        CHUNK_PLAINTEXT,
+        CHUNK_PLAINTEXT + 7,
+        2 * CHUNK_PLAINTEXT,
+    ];
+
+    let mut blob = Vec::new();
+    let mut ct_lens = Vec::new();
+    let mut expected = Vec::new();
+    for (i, &plen) in plens.iter().enumerate() {
+        let pt: Vec<u8> = (0..plen).map(|b| (b as usize + i) as u8).collect();
+        let part = encrypt(&env, &pt);
+        assert_eq!(part.len() as u64, ciphertext_len(plen, HLEN));
+        ct_lens.push(part.len() as u64);
+        blob.extend_from_slice(&part);
+        expected.extend_from_slice(&pt);
+    }
+
+    let mut cursor = std::io::Cursor::new(blob);
+    let mut got = Vec::new();
+    for &len in &ct_lens {
+        let mut dec = env.decrypt(Read::by_ref(&mut cursor).take(len)).unwrap();
+        dec.read_to_end(&mut got).unwrap();
+    }
+    assert_eq!(got, expected);
+    // Every byte consumed, stream landed exactly at the end — no drift across parts.
+    assert_eq!(cursor.position(), cursor.get_ref().len() as u64);
 }
 
 // --- ranged read via RangeReader + StreamReader::seek --------------------------------------

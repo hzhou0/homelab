@@ -12,14 +12,14 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
-use aws_sdk_s3::operation::get_object_attributes::GetObjectAttributesOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, ObjectAttributes};
+use aws_sdk_s3::types::{CompletedMultipartUpload, Delete, EncodingType, ObjectIdentifier};
 use aws_sdk_s3::Client;
+use percent_encoding::percent_decode_str;
 
 use crate::config::S3Endpoint;
 use crate::error::{Error, Result};
@@ -87,40 +87,6 @@ impl Backend {
             .head_object()
             .bucket(&self.bucket)
             .key(self.k(key))
-            .send()
-            .await
-            .map_err(Error::from_sdk)
-    }
-
-    /// HEAD one part of a committed native-multipart object: its ciphertext Content-Length plus
-    /// `x-amz-mp-parts-count` — the universal part-index primitive (§9; `GetObjectAttributes`
-    /// below is the one-shot variant not every remote implements).
-    pub async fn head_part(&self, key: &str, part_number: i32) -> Result<HeadObjectOutput> {
-        self.client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(self.k(key))
-            .part_number(part_number)
-            .send()
-            .await
-            .map_err(Error::from_sdk)
-    }
-
-    /// The remote's own part index for a committed composite (§6). One page; the caller
-    /// paginates on `object_parts.next_part_number_marker`.
-    pub async fn object_parts(
-        &self,
-        key: &str,
-        part_number_marker: Option<String>,
-        max_parts: i32,
-    ) -> Result<GetObjectAttributesOutput> {
-        self.client
-            .get_object_attributes()
-            .bucket(&self.bucket)
-            .key(self.k(key))
-            .object_attributes(ObjectAttributes::ObjectParts)
-            .max_parts(max_parts)
-            .set_part_number_marker(part_number_marker)
             .send()
             .await
             .map_err(Error::from_sdk)
@@ -194,6 +160,36 @@ impl Backend {
         Ok(())
     }
 
+    /// Batch-delete up to 1000 keys in one round trip (S3 `DeleteObjects`). Used to reclaim a
+    /// key's twins and an upload's per-part records without a request per object. `quiet` so the
+    /// response omits per-key success entries; a partial failure surfaces via `from_sdk`.
+    pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let build_err = |e: aws_sdk_s3::error::BuildError| {
+            Error::Backend(format!("building DeleteObjects request: {e}"))
+        };
+        let objects = keys
+            .iter()
+            .map(|k| ObjectIdentifier::builder().key(self.k(k)).build())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(build_err)?;
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(true)
+            .build()
+            .map_err(build_err)?;
+        self.client
+            .delete_objects()
+            .bucket(&self.bucket)
+            .delete(delete)
+            .send()
+            .await
+            .map_err(Error::from_sdk)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn list(
         &self,
@@ -205,7 +201,11 @@ impl Backend {
     ) -> Result<ListObjectsV2Output> {
         // Fold the deployment prefix into the client-supplied one so listings stay scoped.
         let scoped_prefix = Some(self.k(prefix.as_deref().unwrap_or("")));
-        self.client
+        // `encoding-type=url` so keys carrying bytes XML can't represent — the twin separator
+        // `0x01`, and any control byte a client used — survive the LIST response (§6). Keys come
+        // back percent-encoded; decode them before returning so callers see raw bytes.
+        let mut out = self
+            .client
             .list_objects_v2()
             .bucket(&self.bucket)
             .set_prefix(scoped_prefix)
@@ -213,9 +213,17 @@ impl Backend {
             .set_continuation_token(continuation_token)
             .set_start_after(start_after.map(|s| self.k(&s)))
             .set_max_keys(max_keys)
+            .encoding_type(EncodingType::Url)
             .send()
             .await
-            .map_err(Error::from_sdk)
+            .map_err(Error::from_sdk)?;
+        for obj in out.contents.iter_mut().flatten() {
+            obj.key = obj.key.take().map(|k| url_decode(&k));
+        }
+        for cp in out.common_prefixes.iter_mut().flatten() {
+            cp.prefix = cp.prefix.take().map(|p| url_decode(&p));
+        }
+        Ok(out)
     }
 
     pub async fn create_bucket(&self) -> Result<()> {
@@ -296,6 +304,42 @@ impl Backend {
             .map_err(Error::from_sdk)
     }
 
+    /// Every part currently held by an in-progress native upload, as `(part_number, etag, size)` —
+    /// the remote's own last-write-wins-resolved view. Complete uses it to pick the winning parts
+    /// and their ciphertext sizes (§7), so a re-uploaded part's stale hypha record never wins.
+    /// Paginated; ETags are unquoted.
+    pub async fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<(i32, String, u64)>> {
+        let mut out = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let page = self
+                .client
+                .list_parts()
+                .bucket(&self.bucket)
+                .key(self.k(key))
+                .upload_id(upload_id)
+                .max_parts(1000)
+                .set_part_number_marker(marker)
+                .send()
+                .await
+                .map_err(Error::from_sdk)?;
+            for p in page.parts() {
+                if let (Some(n), Some(sz)) = (p.part_number(), p.size()) {
+                    let etag = p.e_tag().unwrap_or_default().trim_matches('"').to_string();
+                    out.push((n, etag, sz.max(0) as u64));
+                }
+            }
+            if page.is_truncated() != Some(true) {
+                break;
+            }
+            marker = page.next_part_number_marker().map(str::to_string);
+            if marker.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
         self.client
             .abort_multipart_upload()
@@ -307,4 +351,10 @@ impl Backend {
             .map_err(Error::from_sdk)?;
         Ok(())
     }
+}
+
+/// Reverse `encoding-type=url` on a LIST-returned key. Keys are UTF-8; a stray non-UTF-8 sequence
+/// (which hypha never writes) degrades lossily rather than erroring a whole page.
+fn url_decode(s: &str) -> String {
+    percent_decode_str(s).decode_utf8_lossy().into_owned()
 }

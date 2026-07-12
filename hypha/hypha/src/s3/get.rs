@@ -10,10 +10,11 @@
 //!   read serves the remote's current state without queuing.
 //!
 //! A composite (client ETag `hash-N`) is a concatenation of pure per-part age files followed by
-//! the terminating footer part; its part boundaries are **derived at read time** from the
-//! remote's own part index (`GetObjectAttributes` ObjectParts, falling back to
-//! `HEAD partNumber=n`), and per-part plaintext lengths fall out of the closed form once one
-//! header-prefix read supplies `hlen` (§6) — hypha stores no part table.
+//! the terminating trailer part. Its part boundaries and per-part plaintext lengths come from the
+//! **parts table in the object's own trailer** (§6), recovered in the one speculative tail read
+//! that also yields the facts — no remote part-index calls, no per-part header probes. A whole-
+//! object read then decrypts every part from a single `[0, body_ct_len)` GET; a range read fetches
+//! only the parts it touches.
 
 use std::ops::Range as ByteRange;
 
@@ -22,8 +23,7 @@ use s3s::{S3Request, S3Response, S3Result};
 
 use hypha_core::error::Error;
 use hypha_core::meta;
-use hypha_format::offset::{parse_header_len, plaintext_len_from};
-use hypha_format::FOOTER_LEN;
+use hypha_format::SINGLE_TRAILER_LEN;
 
 use super::{ts_ms, Hypha};
 use crate::codec::{self, PartSegment};
@@ -124,12 +124,32 @@ impl Hypha {
         };
 
         let body = if meta::is_composite_etag(&facts.cetag) {
-            let windows = self.part_windows(key).await?;
-            let segments = match &pt {
-                None => windows.into_iter().map(PartSegment::Whole).collect(),
-                Some(pt) => self.composite_segments(key, &windows, plen, pt).await?,
-            };
-            codec::decrypt_composite(self.env(), self.remote().clone(), key.to_string(), segments)
+            // The trailer's parts table (recovered in one tail read) gives every part's ciphertext
+            // window and plaintext length — no remote part-index calls.
+            let tail = self.tier.read_tail(key).await?.ok_or_else(|| {
+                Error::Backend(format!("composite {key:?} carries no hypha trailer"))
+            })?;
+            match &pt {
+                // Whole object: one GET of the concatenated parts, decrypted part-by-part in-stream.
+                None => {
+                    let out = self
+                        .remote()
+                        .get(key, Some(format!("bytes=0-{}", tail.body_ct_len - 1)))
+                        .await?;
+                    let part_lens = tail.windows.iter().map(|w| w.end - w.start).collect();
+                    codec::decrypt_composite_full(self.env(), out.body, part_lens)
+                }
+                // Range: fetch only the parts it touches.
+                Some(pt) => {
+                    let segments = composite_segments(&tail.windows, &tail.plens, pt);
+                    codec::decrypt_composite(
+                        self.env(),
+                        self.remote().clone(),
+                        key.to_string(),
+                        segments,
+                    )
+                }
+            }
         } else {
             match &pt {
                 None => {
@@ -179,168 +199,37 @@ impl Hypha {
             Ok(S3Response::new(resp))
         }
     }
-
-    /// Absolute ciphertext windows of a committed composite's **age-file parts** (the trailing
-    /// 48-byte footer part is stripped — it is facts, not ciphertext), from the remote's own
-    /// part index. `GetObjectAttributes` yields the whole index in one call; remotes that omit
-    /// `Part` elements (§9) degrade to one `HEAD partNumber=n` per part. Derived per read —
-    /// hypha stores no part table (§6).
-    async fn part_windows(&self, key: &str) -> Result<Vec<ByteRange<u64>>, Error> {
-        let mut sizes: Vec<(i32, u64)> = Vec::new();
-        let mut marker: Option<String> = None;
-        loop {
-            let out = match self.remote().object_parts(key, marker.clone(), 1000).await {
-                Ok(out) => out,
-                // The object being gone is real; anything else (NotImplemented, access shape)
-                // means the remote lacks the op — degrade to the HEAD walk below.
-                Err(Error::NotFound) => return Err(Error::NotFound),
-                Err(e) => {
-                    tracing::debug!(key, error = %e, "GetObjectAttributes unavailable; using HEAD partNumber walk");
-                    sizes.clear();
-                    break;
-                }
-            };
-            let Some(op) = out.object_parts() else { break };
-            for p in op.parts() {
-                if let (Some(n), Some(sz)) = (p.part_number(), p.size()) {
-                    sizes.push((n, sz.max(0) as u64));
-                }
-            }
-            if op.is_truncated() != Some(true) {
-                break;
-            }
-            marker = op.next_part_number_marker().map(str::to_string);
-            if marker.is_none() {
-                break;
-            }
-        }
-
-        if sizes.is_empty() {
-            // Part-index-less remote: walk `HEAD partNumber=n`, count from the first response.
-            let first = self.remote().head_part(key, 1).await?;
-            let count = first.parts_count().unwrap_or(1).max(1);
-            sizes.push((1, first.content_length().unwrap_or(0).max(0) as u64));
-            for n in 2..=count {
-                let h = self.remote().head_part(key, n).await?;
-                sizes.push((n, h.content_length().unwrap_or(0).max(0) as u64));
-            }
-        }
-
-        sizes.sort_unstable_by_key(|(n, _)| *n);
-        // The last part is the terminating footer (§6) — always present on a hypha composite.
-        match sizes.pop() {
-            Some((_, sz)) if sz == FOOTER_LEN && !sizes.is_empty() => {}
-            _ => {
-                return Err(Error::Backend(format!(
-                    "composite {key:?} lacks a terminating footer part"
-                )))
-            }
-        }
-        let mut windows = Vec::with_capacity(sizes.len());
-        let mut off = 0u64;
-        for (_, sz) in sizes {
-            windows.push(off..off + sz);
-            off += sz;
-        }
-        Ok(windows)
-    }
-
-    /// Per-part plaintext lengths, in closed form (§6): the scrypt header length is shared
-    /// across a composite's parts (deterministic today — `streaming_ctlen.rs` guards it), so
-    /// one header-prefix read of part 1 gives `hlen` and every part's `plen` falls out of its
-    /// ciphertext length, validated by tiling to the stamped total. If age ever varies headers
-    /// again the tiling check fails and the walk degrades to one header parse per part.
-    async fn part_plens(
-        &self,
-        key: &str,
-        windows: &[ByteRange<u64>],
-        total_plen: u64,
-    ) -> Result<Vec<u64>, Error> {
-        let hlen = self.part_hlen(key, &windows[0]).await?;
-        let shared: Option<Vec<u64>> = windows
-            .iter()
-            .map(|w| plaintext_len_from(len(w), hlen))
-            .collect();
-        if let Some(plens) = shared {
-            if plens.iter().sum::<u64>() == total_plen {
-                return Ok(plens);
-            }
-        }
-
-        let mut plens = Vec::with_capacity(windows.len());
-        for w in windows {
-            let hlen = self.part_hlen(key, w).await?;
-            plens.push(plaintext_len_from(len(w), hlen).ok_or_else(|| {
-                Error::Backend(format!("part of {key:?} inconsistent with its header"))
-            })?);
-        }
-        if plens.iter().sum::<u64>() != total_plen {
-            return Err(Error::Backend(format!(
-                "parts of {key:?} do not tile to the stamped plaintext length"
-            )));
-        }
-        Ok(plens)
-    }
-
-    /// One part's header length, parsed from a small prefix read (`--- <mac>` ends the header
-    /// unambiguously).
-    async fn part_hlen(&self, key: &str, w: &ByteRange<u64>) -> Result<u64, Error> {
-        let end = (w.start + HEADER_PROBE).min(w.end);
-        let out = self
-            .remote()
-            .get(key, Some(format!("bytes={}-{}", w.start, end - 1)))
-            .await?;
-        let prefix = out
-            .body
-            .collect()
-            .await
-            .map_err(|e| Error::Backend(format!("part header read: {e}")))?
-            .into_bytes();
-        parse_header_len(&prefix)
-            .ok_or_else(|| Error::Backend("part header MAC line not in probe window".into()))
-    }
-
-    /// Resolve a plaintext range against a composite's parts (§7): derive every part's `plen`
-    /// (closed form, one small read), then clip the parts covering `pt`.
-    async fn composite_segments(
-        &self,
-        key: &str,
-        windows: &[ByteRange<u64>],
-        total_plen: u64,
-        pt: &ByteRange<u64>,
-    ) -> Result<Vec<PartSegment>, Error> {
-        let plens = self.part_plens(key, windows, total_plen).await?;
-        let mut segs = Vec::new();
-        let mut acc = 0u64;
-        for (w, &p) in windows.iter().zip(&plens) {
-            if acc >= pt.end {
-                break;
-            }
-            segs.extend(clip(w, acc, p, pt));
-            acc += p;
-        }
-        Ok(segs)
-    }
 }
 
-/// Bytes fetched to find a part's header end. Scrypt headers are ~120 B; the probe leaves
-/// generous room for future stanza growth while staying one small ranged GET.
-const HEADER_PROBE: u64 = 8 * 1024;
-
-fn len(r: &ByteRange<u64>) -> u64 {
-    r.end - r.start
+/// Resolve a plaintext range against a composite's parts (§7): with per-part windows and plaintext
+/// lengths already in hand (from the trailer's parts table), clip the parts that cover `pt`.
+fn composite_segments(
+    windows: &[ByteRange<u64>],
+    plens: &[u64],
+    pt: &ByteRange<u64>,
+) -> Vec<PartSegment> {
+    let mut segs = Vec::new();
+    let mut acc = 0u64;
+    for (w, &p) in windows.iter().zip(plens) {
+        if acc >= pt.end {
+            break;
+        }
+        segs.extend(clip(w, acc, p, pt));
+        acc += p;
+    }
+    segs
 }
 
-/// The age-envelope length of a single-part remote object: its Content-Length minus the inline
-/// tail footer, which must never reach the decryptor (§6).
+/// The age-envelope length of a single-part remote object: its Content-Length minus the tail
+/// trailer, which must never reach the decryptor (§6).
 fn envelope_len(key: &str, content_length: Option<i64>) -> Result<u64, Error> {
     let framed = content_length
         .filter(|&n| n >= 0)
         .ok_or_else(|| Error::Backend("remote response missing content-length".into()))?
         as u64;
     framed
-        .checked_sub(FOOTER_LEN)
-        .ok_or_else(|| Error::Backend(format!("remote object {key:?} shorter than a footer")))
+        .checked_sub(SINGLE_TRAILER_LEN as u64)
+        .ok_or_else(|| Error::Backend(format!("remote object {key:?} shorter than a trailer")))
 }
 
 /// The segment (if any) part `w` contributes to plaintext range `pt`, given the part's plaintext

@@ -1,13 +1,16 @@
 //! The hypha encryption envelope: a thin wrapper around the `age` crate plus the
 //! offset arithmetic and seekable-reader adapter that ranged GETs need.
 pub mod envelope;
-pub mod footer;
 pub mod offset;
 pub mod stream;
+pub mod trailer;
 
 pub use envelope::Envelope;
-pub use footer::{Footer, FooterKind, FOOTER_LEN};
 pub use stream::{RangeReader, RangeSource};
+pub use trailer::{
+    decode_tail, encode_trailer, Footer, FooterKind, Tail, TrailerKey, FACTS_LEN, MAX_PARTS,
+    MAX_TAIL_LEN, SINGLE_TRAILER_LEN, TAG_LEN, VERSION_LEN,
+};
 
 #[derive(Debug)]
 pub enum Error {

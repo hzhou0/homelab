@@ -1,11 +1,11 @@
 //! Multipart (§7) — one path, both modes. Parts route **around the cache** onto the remote's own
 //! native multipart upload at K: each part is an independent, pure age file (fresh file key ⇒
-//! parallel and re-uploaded parts need no coordination), the remote concatenates them at
-//! complete, and reads derive part boundaries from the remote's part index — no stored part
-//! table (§6). The object's facts travel as its **one terminating footer part** (48 bytes,
-//! part number above every client part — hence the 9999 client cap), uploaded just before the
-//! native complete so the commit lands body and facts in one atomic op; no side records, no
-//! tags.
+//! parallel and re-uploaded parts need no coordination), and the remote concatenates them at
+//! complete. The object's facts **and its parts table** travel as its one terminating trailer
+//! part (part number above every client part — hence the 9999 client cap), uploaded just before
+//! the native complete so the commit lands body and facts in one atomic op. The table is the
+//! per-part cumulative ciphertext end-offsets, so reads recover every part boundary from the
+//! trailer alone — no remote part-index calls (§6).
 //!
 //! hypha's own state per upload is minimal and cache-resident under the reserved prefix:
 //! per-part `{pmd5, plen, retag}` facts, needed at complete because an in-progress upload's
@@ -19,7 +19,8 @@ use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use hypha_core::error::Error;
 use hypha_core::meta;
-use hypha_format::{Footer, FooterKind, FOOTER_LEN};
+use hypha_format::offset::{plaintext_len_from, HLEN};
+use hypha_format::{encode_trailer, Footer, FooterKind};
 
 use super::{Hypha, MAX_INLINE_PLAINTEXT};
 use crate::codec;
@@ -127,17 +128,16 @@ impl Hypha {
             .await
             .map_err(|_| Error::Backend("MD5 task dropped before completing".into()))?;
 
-        // Persist the part's facts; last write wins on re-upload, mirroring the remote's own
-        // part semantics. Survives process restarts across a multi-hour upload (§6).
-        let mut pmd = HashMap::new();
-        pmd.insert(meta::PMD5.to_string(), pmd5.clone());
-        pmd.insert(meta::PLEN.to_string(), plen.to_string());
-        pmd.insert(meta::RETAG.to_string(), retag);
+        // Persist the part's facts in the record KEY (§6): `pmd5` (the plaintext MD5, unknowable to
+        // the remote) plus `retag` (its last-write-wins token). A re-upload writes a new key; the
+        // stale one is resolved away at complete by the remote's `ListParts`. Survives process
+        // restarts across a multi-hour upload; `plen` isn't stored — it's `plaintext_len_from` the
+        // remote's part size at complete.
         self.cache()
             .put_small(
-                &meta::mpu_part_key(&input.upload_id, part_number),
+                &meta::mpu_part_key(&input.upload_id, part_number, &retag, &pmd5),
                 Vec::new(),
-                pmd,
+                HashMap::new(),
                 None,
                 None,
             )
@@ -188,29 +188,40 @@ impl Hypha {
             Err(e) => return Err(e.into()),
         }
 
-        // 1. Load the per-part facts for exactly the client's part list; compose the client ETag
-        //    and total plaintext length.
+        // 1. Recover per-part facts and geometry, then compose the client ETag, total plaintext
+        //    length, and offset table. Two reads, no per-part HEAD (§6/§7):
+        //    · one LIST of the upload's records → `(part, retag) → pmd5` (facts live in the keys);
+        //    · one `ListParts` of the remote upload → the winning `(part → retag, size)`, with
+        //      last-write-wins on re-uploaded parts already resolved by the remote.
+        //    Matching a winner's `retag` to its record yields the surviving upload's `pmd5`; stale
+        //    re-upload records simply never match and are swept at settle.
+        let pmd5_by_part = self.load_part_pmd5s(&upload_id).await?;
+        let winners: HashMap<i32, (String, u64)> = self
+            .remote()
+            .list_parts(&key, &upload_id)
+            .await?
+            .into_iter()
+            .map(|(n, retag, size)| (n, (retag, size)))
+            .collect();
+
         let mut pmd5s = Vec::with_capacity(requested.len());
         let mut remote_parts = Vec::with_capacity(requested.len());
         let mut total_plen: u64 = 0;
+        // Parts table (§6): cumulative ciphertext end-offset after each part, taken from the
+        // remote's own part sizes — the exact bytes the native complete will concatenate.
+        let mut table = Vec::with_capacity(requested.len());
+        let mut ct_acc: u64 = 0;
         for cp in &requested {
             let n = cp
                 .part_number
                 .ok_or_else(|| s3_error!(InvalidPart, "part entry missing part number"))?;
-            let rec = match self.cache().head(&meta::mpu_part_key(&upload_id, n)).await {
-                Ok(h) => h,
-                Err(Error::NotFound) => {
-                    return Err(s3_error!(InvalidPart, "no such uploaded part"))
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let md = rec.metadata().cloned().unwrap_or_default();
-            let (pmd5, plen, retag) = md
-                .get(meta::PMD5)
-                .zip(md.get(meta::PLEN).and_then(|s| s.parse::<u64>().ok()))
-                .zip(md.get(meta::RETAG))
-                .map(|((a, b), c)| (a.clone(), b, c.clone()))
-                .ok_or_else(|| Error::Backend("part record missing facts".into()))?;
+            let (retag, size) = winners
+                .get(&n)
+                .ok_or_else(|| s3_error!(InvalidPart, "no such uploaded part"))?;
+            let pmd5 = pmd5_by_part
+                .get(&(n, retag.clone()))
+                .cloned()
+                .ok_or_else(|| Error::Backend(format!("no local pmd5 for winning part {n}")))?;
             // S3 verifies the caller's part ETags against what the uploads returned — for hypha
             // those are the plaintext part MD5s.
             if let Some(e) = &cp.e_tag {
@@ -218,7 +229,12 @@ impl Hypha {
                     return Err(s3_error!(InvalidPart, "part etag mismatch"));
                 }
             }
+            let plen = plaintext_len_from(*size, HLEN).ok_or_else(|| {
+                Error::Backend(format!("part {n} size {size} inconsistent with HLEN"))
+            })?;
             total_plen += plen;
+            ct_acc += *size;
+            table.push(ct_acc);
             pmd5s.push(pmd5);
             remote_parts.push(
                 aws_sdk_s3::types::CompletedPart::builder()
@@ -233,10 +249,10 @@ impl Hypha {
             .ok_or_else(|| Error::Backend("empty part md5 set".into()))?;
         let mtime_ms = tier::now_ms();
 
-        // 2. Upload the terminating **footer part** (§6) — the object's one facts carrier, its
-        //    part number above every client part (the 9999 cap guarantees room) — so the native
-        //    complete below commits body and facts in one atomic op. A crash from here on leaves
-        //    only the dangling native upload, swept like any abandoned one.
+        // 2. Upload the terminating **trailer part** (§6) — the object's one facts + parts-table
+        //    carrier, its part number above every client part (the 9999 cap guarantees room) — so
+        //    the native complete below commits body and facts in one atomic op. A crash from here
+        //    on leaves only the dangling native upload, swept like any abandoned one.
         let footer = Footer {
             kind: FooterKind::Composite,
             count: requested.len() as u32,
@@ -244,20 +260,21 @@ impl Hypha {
             mtime_ms,
             md5,
         };
-        let footer_pn = requested.last().and_then(|p| p.part_number).unwrap_or(0) + 1;
+        let trailer = encode_trailer(&self.tier.trailer_key, &key, ct_acc, &footer, &table);
+        let trailer_pn = requested.last().and_then(|p| p.part_number).unwrap_or(0) + 1;
         let fout = self
             .remote()
             .upload_part(
                 &key,
                 &upload_id,
-                footer_pn,
-                aws_sdk_s3::primitives::ByteStream::from(footer.encode().to_vec()),
-                Some(FOOTER_LEN as i64),
+                trailer_pn,
+                aws_sdk_s3::primitives::ByteStream::from(trailer.clone()),
+                Some(trailer.len() as i64),
             )
             .await?;
         remote_parts.push(
             aws_sdk_s3::types::CompletedPart::builder()
-                .part_number(footer_pn)
+                .part_number(trailer_pn)
                 .e_tag(fout.e_tag().unwrap_or_default().to_string())
                 .build(),
         );
@@ -311,6 +328,40 @@ impl Hypha {
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
+    /// One LIST of an upload's part records → `(part_number, retag) → pmd5` (facts in the keys,
+    /// §6). Both surviving and stale (re-uploaded-over) records appear; complete matches by the
+    /// remote's winning `retag`, so the stale ones never resolve. The upload's own `/u` record and
+    /// any malformed key don't parse and are skipped.
+    async fn load_part_pmd5s(
+        &self,
+        upload_id: &str,
+    ) -> Result<HashMap<(i32, String), String>, Error> {
+        let prefix = meta::mpu_prefix(upload_id);
+        let mut out = HashMap::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .cache()
+                .list(Some(prefix.clone()), None, token.clone(), None, None)
+                .await?;
+            for obj in page.contents.unwrap_or_default() {
+                if let Some(full) = obj.key {
+                    let ck = self.cache().strip(&full);
+                    if let Some((n, retag, pmd5)) = meta::parse_mpu_part(ck) {
+                        out.insert((n, retag.to_string()), pmd5.to_string());
+                    }
+                }
+            }
+            if page.is_truncated != Some(true) {
+                return Ok(out);
+            }
+            token = page.next_continuation_token;
+            if token.is_none() {
+                return Ok(out);
+            }
+        }
+    }
+
     /// Drop everything recorded for one upload (the `mpu/<id>/` range); complete/abort both end
     /// here. The §8 sweep reclaims records of uploads abandoned without either.
     async fn drop_mpu_state(&self, upload_id: &str) -> Result<(), Error> {
@@ -324,12 +375,13 @@ impl Hypha {
             if objs.is_empty() {
                 return Ok(());
             }
-            for obj in &objs {
-                if let Some(full) = obj.key() {
-                    let k = self.cache().strip(full).to_string();
-                    self.cache().delete(&k).await?;
-                }
-            }
+            // One LIST page is ≤1000 keys — exactly one batch DeleteObjects.
+            let keys: Vec<String> = objs
+                .iter()
+                .filter_map(|o| o.key())
+                .map(|full| self.cache().strip(full).to_string())
+                .collect();
+            self.cache().delete_objects(&keys).await?;
             if page.is_truncated != Some(true) {
                 return Ok(());
             }

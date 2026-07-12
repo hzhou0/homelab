@@ -9,12 +9,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
-use hypha_format::{Envelope, Footer, FooterKind, FOOTER_LEN};
+use hypha_format::{decode_tail, Tail, TrailerKey};
+use hypha_format::{Envelope, MAX_TAIL_LEN};
 
 use hypha_core::error::{Error, Result};
 use hypha_core::{meta, Backend};
 
-use crate::codec;
+use crate::codec::{self, SingleTrailer};
 use crate::keylocks::KeyLocks;
 
 #[derive(Clone)]
@@ -22,6 +23,8 @@ pub struct Reconciler {
     pub cache: Backend,
     pub remote: Backend,
     pub env: Arc<Envelope>,
+    /// Keys the tail trailer's authentication tag (§6); derived once from the master passphrase.
+    pub trailer_key: TrailerKey,
     pub locks: KeyLocks,
 }
 
@@ -101,9 +104,9 @@ impl Reconciler {
         Ok(Some(facts))
     }
 
-    /// Resolve a remote object's plaintext facts from its footer (§6): **one exact tail read**,
-    /// single-part and composite alike — the footer carries the complete facts either way, and
-    /// its kind/count distinguish the two. Mid-bracket reads, repair, and the restore sweep all
+    /// Resolve a remote object's plaintext facts from its tail trailer (§6): **one speculative tail
+    /// read**, single-part and composite alike — the trailer carries the complete facts either way,
+    /// and its kind/count distinguish the two. Mid-bracket reads, repair, and the restore sweep all
     /// resolve through here. The HEAD supplies the mtime fallback only.
     pub(crate) async fn remote_facts(
         &self,
@@ -115,32 +118,40 @@ impl Reconciler {
             .map(|t| t.to_millis().unwrap_or_default())
             .unwrap_or_else(now_ms);
 
-        let tail = self.read_footer(key).await?.ok_or_else(|| bad_facts(key))?;
+        let tail = self.read_tail(key).await?.ok_or_else(|| bad_facts(key))?;
+        let f = &tail.footer;
         Ok(RemoteFacts {
-            plen: tail.plen,
-            cetag: tail.client_etag(),
-            mtime_ms: if tail.mtime_ms > 0 {
-                tail.mtime_ms
+            plen: f.plen,
+            cetag: f.client_etag(),
+            mtime_ms: if f.mtime_ms > 0 {
+                f.mtime_ms
             } else {
                 remote_mtime
             },
         })
     }
 
-    /// One exact ranged GET of the trailing [`FOOTER_LEN`] bytes of the object at `key`.
-    /// `None` ⇒ the bytes aren't a hypha footer — the object was never written through hypha.
-    pub(crate) async fn read_footer(&self, key: &str) -> Result<Option<Footer>> {
+    /// One speculative suffix GET of the trailing [`MAX_TAIL_LEN`] bytes, then authenticate and
+    /// parse the trailer (§6): this captures `table ‖ facts ‖ tag ‖ version` for any object in a
+    /// single round trip, so composite reads recover their parts table without a second fetch. The
+    /// object's total length — needed to place the body/trailer boundary — comes from the suffix
+    /// GET's own `Content-Range` (`bytes X-Y/TOTAL`), else the whole object was returned and its
+    /// byte count is the length. `None` ⇒ the bytes don't authenticate as a hypha trailer: the
+    /// object was never written through hypha, or is foreign/tampered.
+    pub(crate) async fn read_tail(&self, key: &str) -> Result<Option<Tail>> {
         let out = self
             .remote
-            .get(key, Some(format!("bytes=-{FOOTER_LEN}")))
+            .get(key, Some(format!("bytes=-{MAX_TAIL_LEN}")))
             .await?;
+        let total = out.content_range().and_then(parse_content_range_total);
         let bytes = out
             .body
             .collect()
             .await
-            .map_err(|e| Error::Backend(format!("footer read: {e}")))?
+            .map_err(|e| Error::Backend(format!("tail read: {e}")))?
             .into_bytes();
-        Ok(Footer::decode(&bytes))
+        let object_len = total.unwrap_or(bytes.len() as u64);
+        Ok(decode_tail(&self.trailer_key, key, object_len, &bytes))
     }
 
     // ── Upload / GC primitives ──────────────────────────────────────────────────────────────
@@ -159,33 +170,37 @@ impl Reconciler {
     pub(crate) async fn upload_locked(&self, key: &str) -> Result<()> {
         let out = self.cache.get(key, None).await?;
         let plen = out.content_length().unwrap_or(0).max(0) as u64;
-        // Single-part client ETag == the cache's own MD5 (composites route around this path, §7).
-        let cetag = out
-            .e_tag()
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        let mut md5 = [0u8; 16];
-        hex::decode_to_slice(&cetag, &mut md5)
-            .map_err(|_| Error::Backend(format!("cache ETag for {key:?} is not an MD5")))?;
+        // Single-part client ETag == the cache's own MD5 (composites route around this path, §7);
+        // the trailer recomputes it from the streamed body, so validating the shape here suffices.
+        let cetag = out.e_tag().unwrap_or_default().trim_matches('"');
+        if hex::decode(cetag).map(|b| b.len()) != Ok(16) {
+            return Err(Error::Backend(format!(
+                "cache ETag for {key:?} is not an MD5"
+            )));
+        }
         let mtime_ms = out
             .last_modified()
             .map(|t| t.to_millis().unwrap_or_default())
             .unwrap_or_else(now_ms);
         let body = out.body;
 
-        let footer = Footer {
-            kind: FooterKind::Single,
-            count: 1,
-            plen,
+        let trailer = SingleTrailer {
+            trailer_key: self.trailer_key.clone(),
+            object_key: key.to_string(),
             mtime_ms,
-            md5,
         };
-        let (framed_len, enc) = codec::encrypt_stream(self.env.clone(), body, plen, footer)
+        let (framed_len, enc) = codec::encrypt_stream(self.env.clone(), body, plen, trailer)
             .await
             .map_err(Error::Io)?;
         self.remote
-            .put(key, enc, Some(framed_len as i64), HashMap::new(), None, None)
+            .put(
+                key,
+                enc,
+                Some(framed_len as i64),
+                HashMap::new(),
+                None,
+                None,
+            )
             .await?;
         Ok(())
     }
@@ -256,18 +271,26 @@ impl Reconciler {
     pub(crate) async fn delete_twins(&self, key: &str) -> Result<()> {
         let sep = format!("{}{}", key, meta::TWIN_SEP as char);
         let existing = self.cache.list(Some(sep), None, None, None, None).await?;
-        for obj in existing.contents.unwrap_or_default() {
-            if let Some(full) = obj.key {
-                let client_key = self.cache.strip(&full).to_string();
-                self.cache.delete(&client_key).await?;
-            }
-        }
+        let keys: Vec<String> = existing
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|obj| obj.key)
+            .map(|full| self.cache.strip(&full).to_string())
+            .collect();
+        self.cache.delete_objects(&keys).await?;
         Ok(())
     }
 }
 
 fn bad_facts(key: &str) -> Error {
     Error::Backend(format!("remote object {key:?} carries no hypha facts"))
+}
+
+/// Total object length from a `Content-Range: bytes <start>-<end>/<total>` header (the response to
+/// a suffix-range GET). `None` if the header is malformed or the size is unknown (`*`).
+fn parse_content_range_total(cr: &str) -> Option<u64> {
+    cr.rsplit_once('/')?.1.trim().parse().ok()
 }
 
 pub(crate) fn now_ms() -> i64 {

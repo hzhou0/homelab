@@ -13,3 +13,4 @@ serde = { workspace = true }
 figment = { workspace = true }
 md-5 = { workspace = true }
 hex = { workspace = true }
+percent-encoding = { workspace = true }

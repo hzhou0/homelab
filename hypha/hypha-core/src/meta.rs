@@ -1,19 +1,14 @@
 //! The cache-side structures plaintext facts travel through (§6): tombstones, facts twins, and
 //! the reserved-prefix records — plus the composite-ETag arithmetic and key admission.
 //!
-//! The *remote* carrier of an object's facts is the framed footer behind its age ciphertext
-//! (`hypha_format::footer`), landed atomically with every commit; nothing here is stamped onto
-//! remote objects. The cache copies below (tombstone metadata, twins) are projections serving
-//! steady-state HEAD/LIST without touching the remote.
+//! The *remote* carrier of an object's facts is the authenticated trailer behind its age
+//! ciphertext (`hypha_format::trailer`), landed atomically with every commit; nothing here is
+//! stamped onto remote objects. The cache copies below (tombstone metadata, twins) are
+//! projections serving steady-state HEAD/LIST without touching the remote.
 
 /// User-metadata key names on cache objects. The SDK adds the `x-amz-meta-` prefix on the wire.
 pub const PLEN: &str = "plen";
 pub const CETAG: &str = "cetag";
-/// Per-part plaintext MD5 on an mpu part record; input to the composite ETag (§6).
-pub const PMD5: &str = "pmd5";
-/// The *remote's* part ETag (ciphertext MD5) on an mpu part record — what the native
-/// CompleteMultipartUpload needs back.
-pub const RETAG: &str = "retag";
 /// Marks a cache object as a tombstone — body is remote-only (§8). Value is the tombstone kind.
 pub const TOMB: &str = "tomb";
 /// Original client-write mtime (unix ms) on a tombstone — eviction must not move a key's
@@ -26,13 +21,20 @@ pub const TOMB_DELETE: &str = "delete";
 pub const TOMB_TRANSIT: &str = "transit";
 
 /// Fixed 16-byte sentinel bodies, compiled in, one per tombstone kind, so a LIST classifies every
-/// key from its (size, ETag) pair without a metadata read (§6). 16 bytes saturate an MD5 ETag's
-/// entropy: a collision with a real client body needs a length match *and* a 2^-128 byte match.
-pub const EVICT_SENTINEL: [u8; 16] = *b"hypha:evicted!!\x00";
+/// key from its (size, ETag) pair without a metadata read (§6). Random 16-byte values so no client
+/// body collides with the classification token by accident; stable by contract (they are the
+/// on-disk classification).
+pub const EVICT_SENTINEL: [u8; 16] = [
+    0xe4, 0x80, 0xae, 0x85, 0xd6, 0xe7, 0x58, 0x9c, 0x7e, 0x07, 0xb5, 0xa5, 0xac, 0x39, 0x37, 0xaa,
+];
 /// Client-visibly absent (§6).
-pub const DELETE_SENTINEL: [u8; 16] = *b"hypha:deleted!!\x00";
+pub const DELETE_SENTINEL: [u8; 16] = [
+    0x64, 0x58, 0x6a, 0xf5, 0x7f, 0xc3, 0xf6, 0x22, 0xf3, 0x00, 0xd3, 0xbb, 0x42, 0xb8, 0x72, 0x6d,
+];
 /// K is mid-bracket (§7): cache facts are distrusted and readers resolve K from the remote.
-pub const TRANSIT_SENTINEL: [u8; 16] = *b"hypha:intransit\x00";
+pub const TRANSIT_SENTINEL: [u8; 16] = [
+    0xd9, 0xa5, 0xc8, 0x7a, 0x7c, 0x7e, 0x03, 0xc8, 0x04, 0x6c, 0x1a, 0xbf, 0x7c, 0x49, 0x0c, 0x65,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TombKind {
@@ -112,11 +114,17 @@ pub fn is_composite_etag(cetag: &str) -> bool {
 // ── The reserved prefix (§6) ────────────────────────────────────────────────────────────────
 //
 // Everything hypha stores *about* objects — mpu state, and later the phase-4 pending markers —
-// lives under one fixed 16-byte key prefix, excluded from client namespaces by key admission
-// (below) rather than by an unrepresentable byte: reserved keys must survive XML LIST
-// responses, which control bytes would not.
+// lives under one fixed reserved key prefix. It leads with U+10FFFD — the **highest
+// interchange-safe** codepoint (the last plane-16 private-use char, just below the U+10FFFE/F
+// noncharacters that XML serializers may reject) — so the reserved keyspace sorts above every
+// client key except one starting with exactly U+10FFFD, clustering at the **end** of a LIST
+// instead of interleaving a client's scan. This is efficiency, not correctness: LIST filters
+// reserved keys per-entry (`is_reserved_key`), so a client that does use such keys just scans less
+// efficiently there. The base64url tail (~128 random bits) is what actually prevents collision —
+// a client can't land on the reserved keyspace without guessing it. Stable by contract (existing
+// reserved keys carry it).
 
-pub const RESERVED_PREFIX: &str = ".hypha-reserved/";
+pub const RESERVED_PREFIX: &str = "\u{10FFFD}3uYGNMVZsD97OWTV3oBHrd/";
 
 pub fn is_reserved_key(key: &str) -> bool {
     key.starts_with(RESERVED_PREFIX)
@@ -128,10 +136,30 @@ pub fn mpu_upload_key(upload_id: &str) -> String {
     format!("{RESERVED_PREFIX}mpu/{upload_id}/u")
 }
 
-/// Cache: per-part facts `{pmd5, plen, retag}`, written as each part completes (§7). Zero-padded
-/// so a LIST of [`mpu_prefix`] yields parts in order.
-pub fn mpu_part_key(upload_id: &str, part_number: i32) -> String {
-    format!("{RESERVED_PREFIX}mpu/{upload_id}/p{part_number:05}")
+/// Cache: per-part record for a multipart upload, its facts encoded **in the key** so complete
+/// recovers them with one LIST and no per-part HEAD (§7). `pmd5` (the part's *plaintext* MD5) is
+/// the one datum the remote can't reproduce; `retag` (the remote's ciphertext part ETag) is the
+/// last-write-wins token complete matches against the remote's `ListParts` — a re-uploaded part
+/// writes a *new* key, and the stale one is resolved away at complete. Both are hex MD5s (no `;`,
+/// no control byte), so the `;`-delimited form is unambiguous; the zero-padded number keeps LIST
+/// order and lets [`parse_mpu_part`] reject the `/u` upload record.
+pub fn mpu_part_key(upload_id: &str, part_number: i32, retag: &str, pmd5: &str) -> String {
+    format!(
+        "{RESERVED_PREFIX}mpu/{upload_id}/p{part_number:05};{};{}",
+        retag.trim_matches('"'),
+        pmd5
+    )
+}
+
+/// Parse an mpu part record key into `(part_number, retag, pmd5)`; `None` for the upload's own
+/// `/u` record or a malformed key. Reads only the final path segment, so a full or
+/// deployment-stripped key both work.
+pub fn parse_mpu_part(key: &str) -> Option<(i32, &str, &str)> {
+    let mut it = key.rsplit('/').next()?.strip_prefix('p')?.splitn(3, ';');
+    let n: i32 = it.next()?.parse().ok()?;
+    let retag = it.next()?;
+    let pmd5 = it.next()?;
+    (!pmd5.is_empty()).then_some((n, retag, pmd5))
 }
 
 /// Cache: everything recorded for one upload — dropped at complete/abort.
@@ -153,8 +181,10 @@ pub fn mpu_prefix(upload_id: &str) -> String {
 // that replaces an eviction tombstone passes through a live body or a transition mark first, so
 // an eviction tombstone is never adjacent to another epoch's twin (§6).
 
-/// Separator between a key and its twin's facts. Below `0x20`, so it can never appear in an
-/// admissible client key and always sorts a twin right after its base key.
+/// Separator between a key and its twin's facts. Forbidden in client keys (along with `0x00`), so
+/// it can never appear in one and always sorts a twin right after its base key. `0x01` (not `0x00`)
+/// because NUL is a string-terminator hazard across backends; the LIST round-trip carries it via
+/// `encoding-type=url` (`Backend::list`), since `0x01` is not a valid XML character.
 pub const TWIN_SEP: u8 = 0x01;
 
 /// The facts a twin projects for LIST: exactly what LIST must emit for an evicted key.
@@ -215,16 +245,17 @@ pub fn composite_etag(part_md5s_hex: &[String]) -> Option<String> {
     ))
 }
 
-/// hypha constrains client keys beyond stock S3 so the twin scheme sorts correctly and fits
-/// (architecture § *S3 surface*): no bytes below `0x20` (so [`TWIN_SEP`] sorts below every key
-/// byte), a length cap short of 1024 leaving suffix headroom for a twin, and no
-/// [`RESERVED_PREFIX`] collisions.
+/// hypha constrains client keys beyond stock S3 only where the twin scheme needs it (architecture
+/// § *S3 surface*): no `0x00` or `0x01` — `0x01` is [`TWIN_SEP`], and both sort at or below it, so
+/// allowing them could place a client key between a base key and its twin — a length cap short of
+/// 1024 leaving twin-suffix headroom, and no [`RESERVED_PREFIX`] collisions. Other control bytes
+/// are fine: LIST rides `encoding-type=url` (see `Backend::list`), so any byte round-trips.
 pub fn validate_client_key(key: &str) -> Result<(), &'static str> {
     if key.len() > 900 {
         return Err("key too long (max 900 bytes, leaving twin-suffix headroom)");
     }
-    if key.bytes().any(|b| b < 0x20) {
-        return Err("key contains a control byte (< 0x20), disallowed by hypha");
+    if key.bytes().any(|b| b <= TWIN_SEP) {
+        return Err("key contains a 0x00 or 0x01 byte, reserved by hypha for the twin separator");
     }
     if is_reserved_key(key) {
         return Err("key prefix is reserved by hypha");
@@ -275,14 +306,59 @@ mod tests {
     #[test]
     fn key_admission() {
         assert!(validate_client_key("normal/key.txt").is_ok());
+        // Only 0x00 and 0x01 are reserved; other control bytes ride encoding-type=url.
+        assert!(validate_client_key("tab\tand\x1fctrl").is_ok());
+        assert!(validate_client_key("bad\x00key").is_err());
         assert!(validate_client_key("bad\x01key").is_err());
         assert!(validate_client_key(&"x".repeat(1000)).is_err());
         assert!(validate_client_key(&mpu_upload_key("id")).is_err());
-        assert!(validate_client_key(".hypha-reserved/anything").is_err());
+        assert!(validate_client_key(&format!("{RESERVED_PREFIX}anything")).is_err());
     }
 
     #[test]
-    fn reserved_prefix_is_16_bytes() {
-        assert_eq!(RESERVED_PREFIX.len(), 16);
+    fn reserved_prefix_sorts_after_practical_keys() {
+        // Leads with U+10FFFD (highest interchange-safe codepoint), above every practical client
+        // key, so the reserved keyspace clusters at the end of a LIST rather than interleaving.
+        assert!(RESERVED_PREFIX.starts_with('\u{10FFFD}'));
+        assert!(RESERVED_PREFIX.ends_with('/'));
+        for k in [
+            "",
+            "zzz",
+            "~~~",
+            "\u{FFFF}tail",
+            "\u{FFFFF}",
+            "\u{FFFFF}zzzz",
+        ] {
+            assert!(
+                k < RESERVED_PREFIX,
+                "{k:?} must sort before the reserved prefix"
+            );
+            assert!(format!("{RESERVED_PREFIX}mpu/x").as_str() > k);
+        }
+        // Not an admission rule — a client *may* use plane-16 keys, just scanning less efficiently
+        // there; only the reserved keyspace itself is off-limits, by prefix.
+        assert!(validate_client_key("\u{100000}anything").is_ok());
+        assert!(validate_client_key(&format!("{RESERVED_PREFIX}x")).is_err());
+    }
+
+    #[test]
+    fn mpu_part_key_roundtrips_and_rejects_upload_record() {
+        let (retag, pmd5) = ("ab".repeat(16), "cd".repeat(16));
+        let k = mpu_part_key("up-1", 7, &retag, &pmd5);
+        assert_eq!(parse_mpu_part(&k), Some((7, retag.as_str(), pmd5.as_str())));
+        // Quoted remote ETags are normalized on the way in.
+        let kq = mpu_part_key("up-1", 42, &format!("\"{retag}\""), &pmd5);
+        assert_eq!(
+            parse_mpu_part(&kq),
+            Some((42, retag.as_str(), pmd5.as_str()))
+        );
+        // The upload's own record and malformed keys don't parse as parts.
+        assert_eq!(parse_mpu_part(&mpu_upload_key("up-1")), None);
+        assert_eq!(
+            parse_mpu_part(&format!("{RESERVED_PREFIX}mpu/up-1/p00007")),
+            None
+        );
+        // Records sort by part number under one LIST.
+        assert!(mpu_part_key("up-1", 2, &retag, &pmd5) < mpu_part_key("up-1", 10, &retag, &pmd5));
     }
 }

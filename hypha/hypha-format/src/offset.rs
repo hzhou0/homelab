@@ -2,11 +2,9 @@
 //!
 //! Layout of an age file: `header ‖ payload_nonce(16) ‖ chunk₀ ‖ chunk₁ ‖ …` where every chunk
 //! is 64 KiB of plaintext + a 16-byte Poly1305 tag, except the last (shorter, never empty —
-//! unless the whole plaintext is empty, which still produces one empty chunk). The header
-//! length is constant per *file* but not across files (rage greases headers with a random
-//! stanza), so it is a per-object fact: recorded in object metadata at upload, or recovered
-//! from the ciphertext prefix via [`parse_header_len`]. With it, all mappings below are pure
-//! arithmetic — no per-chunk lookup table.
+//! unless the whole plaintext is empty, which still produces one empty chunk). age's v1 spec
+//! makes the scrypt stanza a file's sole stanza, so age never greases a hypha header and its
+//! length is the compile-time constant [`HLEN`] — every mapping below is pure arithmetic.
 
 use std::ops::Range;
 
@@ -14,6 +12,12 @@ pub const CHUNK_PLAINTEXT: u64 = 64 * 1024;
 pub const TAG: u64 = 16;
 pub const CHUNK_CIPHERTEXT: u64 = CHUNK_PLAINTEXT + TAG;
 pub const PAYLOAD_NONCE: u64 = 16;
+
+/// The age v1 header length for hypha's pinned scrypt recipient. Constant because a scrypt stanza
+/// is spec-required to be a file's sole stanza, so age emits no grease and the stanza is
+/// fixed-shape (16-byte salt → 22 b64 chars, pinned work factor). Pinned by the `hlen_is_constant`
+/// test in `envelope.rs`; a future age that changes it trips that test ⇒ bump the trailer version.
+pub const HLEN: u64 = 149;
 
 pub fn chunk_count(plaintext_len: u64) -> u64 {
     if plaintext_len == 0 {
@@ -32,23 +36,11 @@ pub fn chunk_of(offset: u64) -> u64 {
     offset / CHUNK_PLAINTEXT
 }
 
-/// Header length derived from the plaintext length and the total ciphertext length —
-/// no stored metadata and no prefix read: `ct_len − nonce − plen − tag·chunks`.
-///
-/// This is what makes the varying header (rage greases it with a random stanza) costless:
-/// hypha already knows `plen` (it must serve plaintext sizes on HEAD) and `ct_len` is the
-/// object's Content-Length. Returns `None` if the pair is inconsistent (truncated object).
-pub fn header_len_from(plaintext_len: u64, total_ciphertext_len: u64) -> Option<u64> {
-    let payload = PAYLOAD_NONCE + plaintext_len + chunk_count(plaintext_len) * TAG;
-    total_ciphertext_len.checked_sub(payload)
-}
-
-/// Plaintext length derived from a file's total ciphertext length and its header length — the
-/// inverse of [`ciphertext_len`], for composite parts whose `plen` is stored nowhere (parts are
-/// pure age files; the one object footer carries only the total, §6). Each full ciphertext
-/// chunk is `CHUNK_CIPHERTEXT` bytes and a trailing partial chunk still carries a whole tag, so
-/// the chunk count falls out of the payload length alone. Returns `None` if the pair is
-/// inconsistent (truncated object, or a wrong `header_len`).
+/// Plaintext length from a file's total ciphertext length and its header length — the inverse of
+/// [`ciphertext_len`], used to recover a composite part's `plen` from its ciphertext window and
+/// [`HLEN`] (§6). Each full ciphertext chunk is `CHUNK_CIPHERTEXT` bytes and a trailing partial
+/// chunk still carries a whole tag, so the chunk count falls out of the payload length alone.
+/// Returns `None` if the pair is inconsistent (truncated object, or a wrong `header_len`).
 pub fn plaintext_len_from(total_ciphertext_len: u64, header_len: u64) -> Option<u64> {
     let payload = total_ciphertext_len.checked_sub(header_len + PAYLOAD_NONCE)?;
     let chunks = payload.div_ceil(CHUNK_CIPHERTEXT).max(1);
@@ -56,17 +48,6 @@ pub fn plaintext_len_from(total_ciphertext_len: u64, header_len: u64) -> Option<
     // Reject payloads that don't correspond to any plaintext length (e.g. a partial chunk of
     // fewer than TAG+1 bytes).
     (ciphertext_len(plen, header_len) == total_ciphertext_len).then_some(plen)
-}
-
-/// Header length parsed from a ciphertext prefix, or `None` if the prefix is too short.
-/// Validation / fallback for [`header_len_from`] when lengths aren't at hand.
-///
-/// The header is ASCII lines terminated by the MAC line `--- <mac>`; stanza bodies are base64
-/// (no `-`), and stanza openers start with `-> `, so `\n--- ` matches only the MAC line.
-pub fn parse_header_len(prefix: &[u8]) -> Option<u64> {
-    let mac = prefix.windows(5).position(|w| w == b"\n--- ")? + 1;
-    let end = mac + prefix[mac..].iter().position(|&b| b == b'\n')? + 1;
-    Some(end as u64)
 }
 
 pub fn chunk_ciphertext_offset(chunk: u64, header_len: u64) -> u64 {

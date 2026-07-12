@@ -13,6 +13,10 @@ hypha-core = { path = "hypha-core" }
 
 # Encryption
 age = "0.11"
+hmac = "0.12"          # trailer MAC (also an age dep — its own header MAC)
+sha2 = "0.10"
+subtle = "2"           # constant-time tag compare
+bytemuck = { version = "1", features = ["derive"] }  # zero-copy facts struct
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
@@ -22,6 +26,7 @@ tokio-util = { version = "0.7", features = ["io", "io-util", "codec"] }
 async-trait = "0.1"
 md-5 = "0.10"
 hex = "0.4"
+percent-encoding = "2"  # decode encoding-type=url LIST keys (§6)
 s3s = "0.14"
 s3s-aws = "0.14"
 aws-sdk-s3 = "1"
