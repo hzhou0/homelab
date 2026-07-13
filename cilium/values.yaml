@@ -176,6 +176,18 @@ wireguard:
   # LAN resolver (OPNsense Unbound) the tunnel may reach — it answers *.internal.haustorium.net.
   lanDNS: "10.0.0.1"
 
+  # Off by default: the tunnel is otherwise confined to the Gateway backends + LAN DNS. When on,
+  # the egress fence also permits the k3s API server (Cilium's kube-apiserver entity, which matches
+  # the host-network apiserver a plain toCIDR would miss) so an admin can run kubectl over the
+  # tunnel. You must ALSO add `address` to the peer's client AllowedIPs (gen-wireguard-client.sh -s),
+  # or the request never enters the tunnel.
+  apiServer:
+    enabled: true
+    # Client-side routing only (peer AllowedIPs). The server-side policy uses the kube-apiserver
+    # entity, so this CIDR is not consulted there.
+    address: "10.0.0.22/32"
+    port: 6443
+
   # Server private key, injected at runtime from a Secret you precreate (never in Helm values or
   # release state). The chart owns the `wireguard` namespace — do NOT `kubectl create` it yourself
   # (Helm can't adopt an untagged namespace). Create the Secret AFTER the first `helm upgrade`; the

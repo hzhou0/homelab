@@ -87,6 +87,11 @@ The tunnel is confined to **the Gateway's backend services and the LAN DNS only*
 - `allow-world-to-wireguard` re-opens the inbound handshake (the namespace is otherwise fenced by
   east-west-default-deny). Peer→server replies flow statefully, so peers must set
   `PersistentKeepalive`.
+- `wireguard.apiServer.enabled` (off by default) additionally opens the fence to the k3s API server
+  for admin `kubectl` over the tunnel. The rule targets Cilium's `kube-apiserver` entity, not a
+  `toCIDR` to the node IP — the host-network apiserver carries the `host`/`remote-node` identity, not
+  `world`, so a CIDR match would miss it. Enabling it server-side is not enough: the peer must also
+  route the apiserver in its `AllowedIPs` (`gen-wireguard-client.sh -s`).
 
 The server private key is **not** a chart value — it is injected at runtime (`wg set private-key`)
 from a Secret you precreate, so it never enters Helm state. The chart owns the `wireguard`
@@ -106,7 +111,8 @@ tunnel.
 
 `gen-wireguard-client.sh` mints a peer: it generates the client keypair, writes the client `.conf`
 (defaulting to those fence-matching `AllowedIPs`/`DNS`), and prints the `[Peer]` block to paste
-under `wireguard.peers`. Run `./gen-wireguard-client.sh -h` for flags.
+under `wireguard.peers`. `-s` appends the API server to `AllowedIPs` (pair with
+`wireguard.apiServer.enabled`). Run `./gen-wireguard-client.sh -h` for flags.
 
 ## Install / upgrade
 

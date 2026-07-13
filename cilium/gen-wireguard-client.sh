@@ -12,6 +12,8 @@ command -v wg >/dev/null || die "wireguard-tools (wg) not found"
 # Defaults mirror cilium/values.yaml.
 dns="10.0.0.1"
 allowed_ips="10.0.0.100/32, 10.0.0.1/32"
+# Appended to allowed_ips with -s; must match wireguard.apiServer.address (and .enabled server-side).
+apiserver="10.0.0.22/32"
 keepalive="25"
 port="51820"
 outdir="."
@@ -33,20 +35,25 @@ options:
   -e ENDPOINT      public WAN host the OPNsense forward lands on (default: $endpoint)
   -d DNS           DNS server pushed to the client         (default: $dns)
   -A ALLOWED_IPS   AllowedIPs routed through the tunnel    (default: $allowed_ips)
+  -s               also route the k3s API server ($apiserver) for kubectl over the tunnel
+                   (requires wireguard.apiServer.enabled server-side)
   -p PORT          endpoint UDP port                       (default: $port)
   -o DIR           output directory                        (default: $outdir)
 EOF
   exit 2
 }
 
-while getopts "n:a:e:k:K:d:A:p:o:h" o; do
+want_apiserver=""
+while getopts "n:a:e:k:K:d:A:p:o:sh" o; do
   case "$o" in
     n) name=$OPTARG ;;  a) address=$OPTARG ;;  e) endpoint=$OPTARG ;;
     k) server_pubkey=$OPTARG ;;  K) server_privkey=$OPTARG ;;
     d) dns=$OPTARG ;;  A) allowed_ips=$OPTARG ;;  p) port=$OPTARG ;;  o) outdir=$OPTARG ;;
+    s) want_apiserver=1 ;;
     *) usage ;;
   esac
 done
+[[ -n $want_apiserver ]] && allowed_ips="$allowed_ips, $apiserver"
 
 [[ -n $name && -n $address ]] || usage
 if [[ -z $server_pubkey ]]; then

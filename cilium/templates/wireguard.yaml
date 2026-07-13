@@ -209,6 +209,16 @@ spec:
               protocol: UDP
             - port: "53"
               protocol: TCP
+    {{- if $wg.apiServer.enabled }}
+    # Admin kubectl over the tunnel. The kube-apiserver entity matches the host-network apiserver
+    # (a toCIDR to the node IP would land on the host/remote-node identity, not world, and miss).
+    - toEntities:
+        - kube-apiserver
+      toPorts:
+        - ports:
+            - port: {{ $wg.apiServer.port | quote }}
+              protocol: TCP
+    {{- end }}
 ---
 # The gateway front door, granted to the tunnel by identity instead of allowedCIDRs (masquerade
 # hides the peer CIDR from a fromCIDR match). Additive re-open of reserved:ingress, mirroring
