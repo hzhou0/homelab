@@ -392,7 +392,7 @@ mod tests {
     fn trailing_bytes_break_decryption() {
         use std::io::{Read, Write};
 
-        let env = crate::Envelope::generate();
+        let env = crate::Envelope::new("trailing-bytes test passphrase").unwrap();
         for plen in [100usize, 64 * 1024] {
             let plaintext = vec![7u8; plen];
             let mut ct = Vec::new();

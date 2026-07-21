@@ -16,7 +16,7 @@ Cargo workspace:
   `StreamWriter<W: Write>` / `StreamReader<R: Read>`), closed-form offset arithmetic, and the
   `RangeReader` seek adapter; the serving binary bridges it to async bodies. Standalone so it
   carries the proptest/fuzz/bench suite without a server.
-- **`hypha-core`** — shared library: `Backend` (an `aws-sdk-s3` wrapper with key-prefix mapping),
+- **`hypha-core`** — shared library: `Backend` (an `aws-sdk-s3` wrapper with bucket-prefix mapping),
   `meta` (tombstones, sentinels, facts twins, composite ETag, key admission), typed config
   (including the mode), error → `s3s::S3Error` mapping.
 - **`hypha`** — the serving binary: the `s3s::S3` surface, the sync↔async codec bridges, and the
@@ -65,7 +65,7 @@ hypha-format/src/
 
 hypha-core/src/
   config.rs              typed config: mode, both endpoints, auth, master passphrase
-  backend.rs             Backend over an aws-sdk-s3 client (prefix mapping, typed errors)
+  backend.rs             Backend over an aws-sdk-s3 client (bucket-prefix mapping, typed errors)
   meta.rs                tombstones, sentinels, facts twins, composite ETag, key admission
   error.rs               error → s3s::S3Error mapping
 
@@ -537,12 +537,21 @@ leftovers of abandoned uploads.
 
 ### Buckets
 
-Buckets map one-to-one across client ⇄ cache ⇄ remote; bucket ops are rare control-plane events.
+Buckets map one-to-one across client ⇄ cache ⇄ remote; the client bucket passes through, mapped to
+`<bucket_prefix><bucket>` by each `Backend` (§2). Like multipart, the **remote is the source of
+truth** and bucket ops are **always durable** (synchronous to the remote regardless of mode). The
+cache bucket exists only to host object-side state (bodies, tombstones, twins, mpu records), so it
+is created/deleted alongside but is never the authority. Rare control-plane events — no markers.
 
-- **CreateBucket**: create on the cache, then the remote; ack after both.
-- **DeleteBucket**: delete on the remote, then the cache — a crash between leaves a retryable,
-  still-visible bucket.
-- **ListBuckets**: cache-served, like all namespace reads.
+- **CreateBucket**: create the cache projection, then the remote — the remote create is the durable
+  commit; a crash before it leaves a harmless orphan cache bucket (not yet "created" per the remote).
+- **DeleteBucket**: delete the remote first (the durable commit that makes the bucket cease to
+  exist), then the cache — a crash between leaves a retryable cache orphan, never a remote bucket the
+  client believes is gone.
+- **ListBuckets**: remote-served, filtered to this deployment's prefix and stripped back to
+  client-visible names.
+- **HeadBucket / GetBucketLocation**: remote existence check; the latter reports the deployment's
+  configured backend region.
 
 ### Background: the reconcile sweep (cached mode)
 
@@ -687,8 +696,9 @@ accurate, sees dead bytes), scavenges from high- to low-water mark, and can driv
 ## 9. Configuration & deployment
 
 `figment` (TOML + `HYPHA_`-prefixed env, `__` nesting), validated at boot. Current surface
-(`config.rs`): `remote` and `cache` endpoints (endpoint/region/bucket/credentials/**key prefix**
-for disjoint namespaces on a shared remote), `mode` (`durable` | `cached`), `auth` (hypha's own
+(`config.rs`): `remote` and `cache` endpoints (endpoint/region/credentials/**bucket prefix** —
+client buckets pass through prefixed, so deployments share a remote account in disjoint bucket
+namespaces), `mode` (`durable` | `cached`), `auth` (hypha's own
 client credentials for `S3Auth`), `master_passphrase` (the 256-bit random age passphrase, from a Secret; supersedes phase 1's
 `master_identity`), `serving.listen` + `serving.offload_threshold` (§5). Later phases add: reconcile pass
 interval/concurrency, GC water marks / walk window / recency-ring shape (slice size, depth k,

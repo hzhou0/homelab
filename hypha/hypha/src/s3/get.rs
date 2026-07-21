@@ -35,36 +35,41 @@ impl Hypha {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
+        let bucket = input.bucket.clone();
         let key = input.key.clone();
         if meta::validate_client_key(&key).is_err() {
             return Err(Error::NotFound.into());
         }
 
-        let head = self.cache().head(&key).await?;
+        let head = self.cache().head(&bucket, &key).await?;
         let md = head.metadata.clone().unwrap_or_default();
 
         match meta::tomb_kind(&md) {
             Some(meta::TombKind::Delete) => Err(Error::NotFound.into()),
             Some(meta::TombKind::Evict) => {
                 let facts = facts_from_tombstone(&key, &md)?;
-                self.serve_remote(&key, &input, &facts).await
+                self.serve_remote(&bucket, &key, &input, &facts).await
             }
-            Some(meta::TombKind::Transit) => match self.resolve_transit(&key).await? {
+            Some(meta::TombKind::Transit) => match self.resolve_transit(&bucket, &key).await? {
                 None => Err(Error::NotFound.into()),
-                Some(facts) => self.serve_remote(&key, &input, &facts).await,
+                Some(facts) => self.serve_remote(&bucket, &key, &input, &facts).await,
             },
-            None => self.serve_cache_body(&key, &input).await,
+            None => self.serve_cache_body(&bucket, &key, &input).await,
         }
     }
 
     /// Resolve a transition-marked K from the remote (§7): repair it if its lock is free (crash
     /// leftover), else read through to the remote's current state. `None` ⇒ K is absent there.
-    pub(super) async fn resolve_transit(&self, key: &str) -> Result<Option<RemoteFacts>, Error> {
+    pub(super) async fn resolve_transit(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<RemoteFacts>, Error> {
         if let Some(_guard) = self.tier.locks.try_lock(key) {
-            return self.tier.repair_locked(key).await;
+            return self.tier.repair_locked(bucket, key).await;
         }
-        match self.remote().head(key).await {
-            Ok(h) => Ok(Some(self.tier.remote_facts(key, &h).await?)),
+        match self.remote().head(bucket, key).await {
+            Ok(h) => Ok(Some(self.tier.remote_facts(bucket, key, &h).await?)),
             Err(Error::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
@@ -73,12 +78,13 @@ impl Hypha {
     /// Live plaintext body in the cache.
     async fn serve_cache_body(
         &self,
+        bucket: &str,
         key: &str,
         input: &GetObjectInput,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let out = self
             .cache()
-            .get(key, input.range.as_ref().map(range_header))
+            .get(bucket, key, input.range.as_ref().map(range_header))
             .await?;
         let status = if input.range.is_some() {
             Some(hyper::StatusCode::PARTIAL_CONTENT)
@@ -111,6 +117,7 @@ impl Hypha {
     /// No cache repopulation — durable mode never restores.
     async fn serve_remote(
         &self,
+        bucket: &str,
         key: &str,
         input: &GetObjectInput,
         facts: &RemoteFacts,
@@ -126,7 +133,7 @@ impl Hypha {
         let body = if meta::is_composite_etag(&facts.cetag) {
             // The trailer's parts table (recovered in one tail read) gives every part's ciphertext
             // window and plaintext length — no remote part-index calls.
-            let tail = self.tier.read_tail(key).await?.ok_or_else(|| {
+            let tail = self.tier.read_tail(bucket, key).await?.ok_or_else(|| {
                 Error::Backend(format!("composite {key:?} carries no hypha trailer"))
             })?;
             match &pt {
@@ -134,7 +141,11 @@ impl Hypha {
                 None => {
                     let out = self
                         .remote()
-                        .get(key, Some(format!("bytes=0-{}", tail.body_ct_len - 1)))
+                        .get(
+                            bucket,
+                            key,
+                            Some(format!("bytes=0-{}", tail.body_ct_len - 1)),
+                        )
                         .await?;
                     let part_lens = tail.windows.iter().map(|w| w.end - w.start).collect();
                     codec::decrypt_composite_full(self.env(), out.body, part_lens)
@@ -145,6 +156,7 @@ impl Hypha {
                     codec::decrypt_composite(
                         self.env(),
                         self.remote().clone(),
+                        bucket.to_string(),
                         key.to_string(),
                         segments,
                     )
@@ -153,16 +165,17 @@ impl Hypha {
         } else {
             match &pt {
                 None => {
-                    let out = self.remote().get(key, None).await?;
+                    let out = self.remote().get(bucket, key, None).await?;
                     let ct_len = envelope_len(key, out.content_length)?;
                     codec::decrypt_full(self.env(), out.body, ct_len)
                 }
                 Some(pt) => {
-                    let rhead = self.remote().head(key).await?;
+                    let rhead = self.remote().head(bucket, key).await?;
                     let ct_len = envelope_len(key, rhead.content_length)?;
                     codec::decrypt_range(
                         self.env(),
                         self.remote().clone(),
+                        bucket.to_string(),
                         key.to_string(),
                         ct_len,
                         pt.clone(),
@@ -268,10 +281,12 @@ pub(super) fn facts_from_tombstone(
         .get(meta::CETAG)
         .cloned()
         .ok_or_else(|| Error::Backend(format!("tombstone for {key:?} missing cetag")))?;
+    // hypha writes MTIME on every eviction tombstone (§6), so — like plen/cetag above — a missing
+    // or unparseable value is a corrupt tombstone, not a defaultable optional.
     let mtime_ms = md
         .get(meta::MTIME)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .ok_or_else(|| Error::Backend(format!("tombstone for {key:?} missing mtime")))?;
     Ok(RemoteFacts {
         plen,
         cetag,

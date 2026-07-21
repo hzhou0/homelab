@@ -18,6 +18,7 @@ impl Hypha {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
         if self.mode != Mode::Durable {
@@ -31,11 +32,11 @@ impl Hypha {
 
         // A leftover mark is repaired before this op takes its own (§7) — the bracket below must
         // start from a settled projection or a mark could hide an object the delete should 404.
-        match self.cache().head(&key).await {
+        match self.cache().head(&bucket, &key).await {
             Ok(head) => {
                 let md = head.metadata.clone().unwrap_or_default();
                 if meta::tomb_kind(&md) == Some(meta::TombKind::Transit) {
-                    self.tier.repair_locked(&key).await?;
+                    self.tier.repair_locked(&bucket, &key).await?;
                 }
             }
             Err(Error::NotFound) => {}
@@ -44,16 +45,18 @@ impl Hypha {
 
         // Mark → commit → settle. Crash before the remote delete: the object survives and repair
         // restores its projection. Crash after: 404 everywhere, repair removes the entry.
-        self.tier.mark_transit_locked(&key).await?;
-        match self.remote().delete(&key).await {
+        self.tier.mark_transit_locked(&bucket, &key).await?;
+        match self.remote().delete(&bucket, &key).await {
             Ok(()) | Err(Error::NotFound) => {}
             Err(e) => {
                 // Failed or indeterminate commit — settle K to what the remote actually holds.
-                let _ = self.tier.repair_locked(&key).await;
+                if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
+                    tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
+                }
                 return Err(e.into());
             }
         }
-        self.tier.settle_absent_locked(&key).await?;
+        self.tier.settle_absent_locked(&bucket, &key).await?;
 
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }

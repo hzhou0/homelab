@@ -6,7 +6,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use hypha_format::Envelope;
 
 fn bench_codec(c: &mut Criterion) {
-    let envelope = Envelope::generate();
+    let envelope = Envelope::new("throughput bench passphrase").unwrap();
     let mut g = c.benchmark_group("codec");
     for size in [64 * 1024, 1024 * 1024, 8 * 1024 * 1024] {
         let pt = vec![0xA5u8; size];

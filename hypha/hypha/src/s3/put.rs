@@ -27,6 +27,7 @@ impl Hypha {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let input = req.input;
+        let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
@@ -57,13 +58,15 @@ impl Hypha {
         // body reports it natively, a tombstone carries it in metadata, an absent key has none,
         // and a leftover transition mark is repaired first (§7 — the marking writer held this
         // lock, so a mark seen here is always a crash leftover).
-        let current_etag = match self.cache().head(&key).await {
+        let current_etag = match self.cache().head(&bucket, &key).await {
             Ok(head) => {
                 let md = head.metadata.clone().unwrap_or_default();
                 match meta::tomb_kind(&md) {
-                    Some(meta::TombKind::Transit) => {
-                        self.tier.repair_locked(&key).await?.map(|f| f.cetag)
-                    }
+                    Some(meta::TombKind::Transit) => self
+                        .tier
+                        .repair_locked(&bucket, &key)
+                        .await?
+                        .map(|f| f.cetag),
                     Some(meta::TombKind::Evict) => md.get(meta::CETAG).cloned(),
                     Some(meta::TombKind::Delete) => None,
                     None => head
@@ -86,23 +89,32 @@ impl Hypha {
         // plaintext to the cache. On failure or indeterminacy, settle K to whichever way the
         // remote actually landed — the same repair that handles a crash here (§7).
         let mtime_ms = tier::now_ms();
-        self.tier.mark_transit_locked(&key).await?;
+        self.tier.mark_transit_locked(&bucket, &key).await?;
         let trailer = SingleTrailer {
             trailer_key: self.tier.trailer_key.clone(),
             object_key: key.clone(),
             mtime_ms,
         };
-        let (framed_len, enc, etag_rx) =
-            match codec::encrypt_blob_with_etag(self.env(), body, plen, Some(trailer)).await {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = self.tier.repair_locked(&key).await;
-                    return Err(Error::Io(e).into());
+        let (framed_len, enc, etag_rx) = match codec::encrypt_blob_with_etag(
+            self.env(),
+            body,
+            plen,
+            Some(trailer),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
+                    tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
                 }
-            };
+                return Err(Error::Io(e).into());
+            }
+        };
         if let Err(e) = self
             .remote()
             .put(
+                &bucket,
                 &key,
                 enc,
                 Some(framed_len as i64),
@@ -112,7 +124,9 @@ impl Hypha {
             )
             .await
         {
-            let _ = self.tier.repair_locked(&key).await;
+            if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
+                tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
+            }
             return Err(e.into());
         }
         // The PUT consumed the whole framed body, footer included — the etag is ready. Its loss
@@ -120,12 +134,14 @@ impl Hypha {
         let etag = match etag_rx.await {
             Ok(e) => e,
             Err(_) => {
-                let _ = self.tier.repair_locked(&key).await;
+                if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
+                    tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
+                }
                 return Err(Error::Backend("MD5 task dropped before completing".into()).into());
             }
         };
         self.tier
-            .settle_evict_locked(&key, plen, &etag, mtime_ms)
+            .settle_evict_locked(&bucket, &key, plen, &etag, mtime_ms)
             .await?;
 
         let resp = PutObjectOutput {

@@ -122,6 +122,13 @@ impl s3s::S3 for Hypha {
         self.op_delete_object(req).await
     }
 
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        self.op_get_bucket_location(req).await
+    }
+
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,
@@ -129,11 +136,25 @@ impl s3s::S3 for Hypha {
         self.op_get_object(req).await
     }
 
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        self.op_head_bucket(req).await
+    }
+
     async fn head_object(
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         self.op_head_object(req).await
+    }
+
+    async fn list_buckets(
+        &self,
+        req: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
+        self.op_list_buckets(req).await
     }
 
     async fn list_objects_v2(

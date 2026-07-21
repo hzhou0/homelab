@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 
-use age::secrecy::{ExposeSecret, SecretString};
+use age::secrecy::SecretString;
 use age::stream::{StreamReader, StreamWriter};
 
 use crate::Error;
@@ -24,24 +24,14 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    pub fn from_passphrase(s: &str) -> Result<Self, Error> {
-        if s.is_empty() {
+    pub fn new(passphrase: &str) -> Result<Self, Error> {
+        if passphrase.is_empty() {
             return Err(Error::Identity("empty passphrase".into()));
         }
         Ok(Self {
-            passphrase: SecretString::from(s.to_owned()),
+            passphrase: SecretString::from(passphrase.to_owned()),
             max_work_factor: PINNED_WORK_FACTOR,
         })
-    }
-
-    /// Random-passphrase envelope for tests/benches. Reuses age's own RNG (an x25519 secret's
-    /// bech32 form) so the crate needs no direct `rand` dependency.
-    pub fn generate() -> Self {
-        let secret = age::x25519::Identity::generate();
-        Self {
-            passphrase: SecretString::from(secret.to_string().expose_secret().to_owned()),
-            max_work_factor: PINNED_WORK_FACTOR,
-        }
     }
 
     /// Wrap `writer` in an encrypting writer. Each call generates a fresh random file key —
@@ -79,7 +69,7 @@ mod tests {
     /// version. An empty plaintext encrypts to `header ‖ payload_nonce(16) ‖ one empty chunk (tag)`.
     #[test]
     fn hlen_is_constant() {
-        let env = Envelope::generate();
+        let env = Envelope::new("hlen pinning test passphrase").unwrap();
         let mut ct = Vec::new();
         let w = env.encrypt(&mut ct).unwrap();
         w.finish().unwrap();

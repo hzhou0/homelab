@@ -42,11 +42,11 @@ impl Reconciler {
     /// **Mark**: overwrite K's cache entry with the transition tombstone. Readers resolve K from
     /// the remote until settle. Caller holds K's write lock — a mark is only ever *observed* by
     /// lock-free readers mid-bracket or by anyone after a crash.
-    pub(crate) async fn mark_transit_locked(&self, key: &str) -> Result<()> {
+    pub(crate) async fn mark_transit_locked(&self, bucket: &str, key: &str) -> Result<()> {
         let mut md = HashMap::new();
         md.insert(meta::TOMB.to_string(), meta::TOMB_TRANSIT.to_string());
         self.cache
-            .put_small(key, meta::TRANSIT_SENTINEL.to_vec(), md, None, None)
+            .put_small(bucket, key, meta::TRANSIT_SENTINEL.to_vec(), md, None, None)
             .await?;
         Ok(())
     }
@@ -56,6 +56,7 @@ impl Reconciler {
     /// user-metadata — the authoritative copy; the twin is its LIST projection (§6).
     pub(crate) async fn settle_evict_locked(
         &self,
+        bucket: &str,
         key: &str,
         plen: u64,
         cetag: &str,
@@ -66,7 +67,7 @@ impl Reconciler {
             plen,
             mtime_ms,
         };
-        self.refresh_twin(key, &facts).await?;
+        self.refresh_twin(bucket, key, &facts).await?;
 
         let mut md = HashMap::new();
         md.insert(meta::TOMB.to_string(), meta::TOMB_EVICT.to_string());
@@ -74,32 +75,36 @@ impl Reconciler {
         md.insert(meta::CETAG.to_string(), cetag.to_string());
         md.insert(meta::MTIME.to_string(), mtime_ms.to_string());
         self.cache
-            .put_small(key, meta::EVICT_SENTINEL.to_vec(), md, None, None)
+            .put_small(bucket, key, meta::EVICT_SENTINEL.to_vec(), md, None, None)
             .await?;
         Ok(())
     }
 
     /// **Settle** after a commit that removed K from the remote: absent is the authoritative 404.
-    pub(crate) async fn settle_absent_locked(&self, key: &str) -> Result<()> {
-        self.delete_twins(key).await?;
-        self.cache.delete(key).await?;
+    pub(crate) async fn settle_absent_locked(&self, bucket: &str, key: &str) -> Result<()> {
+        self.delete_twins(bucket, key).await?;
+        self.cache.delete(bucket, key).await?;
         Ok(())
     }
 
     /// **Repair rule** (§7): settle K to whatever the remote actually holds. Idempotent; needs no
     /// knowledge of what the dead (or failed) writer was doing. Caller holds K's write lock.
     /// Returns the facts K settled to, `None` if it settled absent.
-    pub(crate) async fn repair_locked(&self, key: &str) -> Result<Option<RemoteFacts>> {
-        let head = match self.remote.head(key).await {
+    pub(crate) async fn repair_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<RemoteFacts>> {
+        let head = match self.remote.head(bucket, key).await {
             Ok(h) => h,
             Err(Error::NotFound) => {
-                self.settle_absent_locked(key).await?;
+                self.settle_absent_locked(bucket, key).await?;
                 return Ok(None);
             }
             Err(e) => return Err(e),
         };
-        let facts = self.remote_facts(key, &head).await?;
-        self.settle_evict_locked(key, facts.plen, &facts.cetag, facts.mtime_ms)
+        let facts = self.remote_facts(bucket, key, &head).await?;
+        self.settle_evict_locked(bucket, key, facts.plen, &facts.cetag, facts.mtime_ms)
             .await?;
         Ok(Some(facts))
     }
@@ -110,6 +115,7 @@ impl Reconciler {
     /// resolve through here. The HEAD supplies the mtime fallback only.
     pub(crate) async fn remote_facts(
         &self,
+        bucket: &str,
         key: &str,
         head: &HeadObjectOutput,
     ) -> Result<RemoteFacts> {
@@ -118,7 +124,10 @@ impl Reconciler {
             .map(|t| t.to_millis().unwrap_or_default())
             .unwrap_or_else(now_ms);
 
-        let tail = self.read_tail(key).await?.ok_or_else(|| bad_facts(key))?;
+        let tail = self
+            .read_tail(bucket, key)
+            .await?
+            .ok_or_else(|| bad_facts(key))?;
         let f = &tail.footer;
         Ok(RemoteFacts {
             plen: f.plen,
@@ -138,10 +147,10 @@ impl Reconciler {
     /// GET's own `Content-Range` (`bytes X-Y/TOTAL`), else the whole object was returned and its
     /// byte count is the length. `None` ⇒ the bytes don't authenticate as a hypha trailer: the
     /// object was never written through hypha, or is foreign/tampered.
-    pub(crate) async fn read_tail(&self, key: &str) -> Result<Option<Tail>> {
+    pub(crate) async fn read_tail(&self, bucket: &str, key: &str) -> Result<Option<Tail>> {
         let out = self
             .remote
-            .get(key, Some(format!("bytes=-{MAX_TAIL_LEN}")))
+            .get(bucket, key, Some(format!("bytes=-{MAX_TAIL_LEN}")))
             .await?;
         let total = out.content_range().and_then(parse_content_range_total);
         let bytes = out
@@ -167,8 +176,8 @@ impl Reconciler {
     /// remote stale with an empty pending set (IMPLEMENTATION §7); the separate instance keeps a
     /// conditional PUT from ever queuing behind a multi-second transfer.
     #[allow(dead_code)] // phase 4: the cached-mode reconcile sweep
-    pub(crate) async fn upload_locked(&self, key: &str) -> Result<()> {
-        let out = self.cache.get(key, None).await?;
+    pub(crate) async fn upload_locked(&self, bucket: &str, key: &str) -> Result<()> {
+        let out = self.cache.get(bucket, key, None).await?;
         let plen = out.content_length().unwrap_or(0).max(0) as u64;
         // Single-part client ETag == the cache's own MD5 (composites route around this path, §7);
         // the trailer recomputes it from the streamed body, so validating the shape here suffices.
@@ -194,6 +203,7 @@ impl Reconciler {
             .map_err(Error::Io)?;
         self.remote
             .put(
+                bucket,
                 key,
                 enc,
                 Some(framed_len as i64),
@@ -214,8 +224,13 @@ impl Reconciler {
     /// `remote_confirmed`: the caller already knows the remote copy is present. Pass `false`
     /// from the cached-mode GC, which must gate tombstoning on a successful remote HEAD (§7).
     #[allow(dead_code)] // phase 5: the GC scavenger's eviction transition
-    pub(crate) async fn tombstone_locked(&self, key: &str, remote_confirmed: bool) -> Result<()> {
-        let head = self.cache.head(key).await?;
+    pub(crate) async fn tombstone_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        remote_confirmed: bool,
+    ) -> Result<()> {
+        let head = self.cache.head(bucket, key).await?;
         let body_etag = head
             .e_tag()
             .unwrap_or_default()
@@ -229,7 +244,7 @@ impl Reconciler {
             .unwrap_or_else(now_ms);
         if !remote_confirmed {
             // Durability-gates-GC (§7): never tombstone a body whose ciphertext isn't on the remote.
-            self.remote.head(key).await?;
+            self.remote.head(bucket, key).await?;
         }
 
         let facts = meta::Facts {
@@ -237,7 +252,7 @@ impl Reconciler {
             plen,
             mtime_ms,
         };
-        self.refresh_twin(key, &facts).await?;
+        self.refresh_twin(bucket, key, &facts).await?;
 
         let mut md = HashMap::new();
         md.insert(meta::TOMB.to_string(), meta::TOMB_EVICT.to_string());
@@ -246,6 +261,7 @@ impl Reconciler {
         md.insert(meta::MTIME.to_string(), mtime_ms.to_string());
         self.cache
             .put_small(
+                bucket,
                 key,
                 meta::EVICT_SENTINEL.to_vec(),
                 md,
@@ -259,26 +275,35 @@ impl Reconciler {
     /// Delete any stale twins of `key`, then write the fresh zero-byte twin. A crash between
     /// leaves only a twin next to a non-evict entry — ignored by the classification gate (§6)
     /// and swept later.
-    async fn refresh_twin(&self, key: &str, facts: &meta::Facts) -> Result<()> {
-        self.delete_twins(key).await?;
+    async fn refresh_twin(&self, bucket: &str, key: &str, facts: &meta::Facts) -> Result<()> {
+        self.delete_twins(bucket, key).await?;
         self.cache
-            .put_small(&facts.twin_key(key), Vec::new(), HashMap::new(), None, None)
+            .put_small(
+                bucket,
+                &facts.twin_key(key),
+                Vec::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
             .await?;
         Ok(())
     }
 
     /// Delete every twin of `key` (the `key ‖ 0x01 …` suffix range).
-    pub(crate) async fn delete_twins(&self, key: &str) -> Result<()> {
+    pub(crate) async fn delete_twins(&self, bucket: &str, key: &str) -> Result<()> {
         let sep = format!("{}{}", key, meta::TWIN_SEP as char);
-        let existing = self.cache.list(Some(sep), None, None, None, None).await?;
+        let existing = self
+            .cache
+            .list(bucket, Some(sep), None, None, None, None)
+            .await?;
         let keys: Vec<String> = existing
             .contents
             .unwrap_or_default()
             .into_iter()
             .filter_map(|obj| obj.key)
-            .map(|full| self.cache.strip(&full).to_string())
             .collect();
-        self.cache.delete_objects(&keys).await?;
+        self.cache.delete_objects(bucket, &keys).await?;
         Ok(())
     }
 }

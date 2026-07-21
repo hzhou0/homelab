@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(command -v cargo rustc)",
+      "Read(//home/henry/.cargo/bin/**)",
+      "Read(//home/henry/.rustup/toolchains/**)"
+    ]
+  }
+}

@@ -19,11 +19,12 @@ impl Hypha {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         if meta::validate_client_key(&key).is_err() {
             return Err(Error::NotFound.into());
         }
-        let head = self.cache().head(&key).await?;
+        let head = self.cache().head(&bucket, &key).await?;
         let md = head.metadata.clone().unwrap_or_default();
 
         let (content_length, e_tag, last_modified) = match meta::tomb_kind(&md) {
@@ -36,7 +37,7 @@ impl Hypha {
                     Some(ts_ms(f.mtime_ms)),
                 )
             }
-            Some(meta::TombKind::Transit) => match self.resolve_transit(&key).await? {
+            Some(meta::TombKind::Transit) => match self.resolve_transit(&bucket, &key).await? {
                 None => return Err(Error::NotFound.into()),
                 Some(f) => (
                     Some(f.plen as i64),
@@ -70,9 +71,11 @@ impl Hypha {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
+        let bucket = input.bucket.clone();
         let raw = self
             .cache()
             .list(
+                &bucket,
                 input.prefix.clone(),
                 input.delimiter.clone(),
                 input.continuation_token.clone(),
@@ -83,12 +86,15 @@ impl Hypha {
 
         let objs = raw.contents.unwrap_or_default();
 
-        // Walk the raw page, stripping the deployment prefix on the fly, filtering the reserved
-        // keyspace, and pairing each base key with the twin that sorts immediately after it.
+        // Walk the raw page, filtering the reserved keyspace and pairing each base key with the
+        // twin that sorts immediately after it.
         let mut entries: Vec<Object> = Vec::new();
         let mut i = 0;
         while i < objs.len() {
-            let key = self.cache().strip(objs[i].key().unwrap_or_default());
+            // Every S3 object has a key; a keyless LIST entry is a broken backend response.
+            let key = objs[i]
+                .key()
+                .ok_or_else(|| Error::Backend("LIST returned an entry with no key".into()))?;
             // Reserved-prefix records and orphan twins are hypha-internal, never listed.
             if meta::is_reserved_key(key) || meta::parse_twin(key).is_some() {
                 i += 1;
@@ -96,7 +102,7 @@ impl Hypha {
             }
             // The twin, if the next entry is this key's twin.
             let twin = objs.get(i + 1).and_then(|o| {
-                let k = self.cache().strip(o.key().unwrap_or_default());
+                let k = o.key().unwrap_or_default();
                 meta::parse_twin(k)
                     .filter(|(base, _)| *base == key)
                     .map(|(_, f)| f)
@@ -131,15 +137,15 @@ impl Hypha {
                     }),
                     // Missing/unparseable twin: the tombstone's metadata is authoritative (§6).
                     None => {
-                        if let Some(o) = self.head_facts(key).await? {
+                        if let Some(o) = self.head_facts(&bucket, key).await? {
                             entries.push(o);
                         }
                     }
                 },
                 // Mid-bracket: the one classification that leaves the cache — remote HEAD (§7).
-                Some(meta::TombKind::Transit) => match self.remote().head(key).await {
+                Some(meta::TombKind::Transit) => match self.remote().head(&bucket, key).await {
                     Ok(h) => {
-                        let f = self.tier.remote_facts(key, &h).await?;
+                        let f = self.tier.remote_facts(&bucket, key, &h).await?;
                         entries.push(Object {
                             key: Some(key.to_string()),
                             size: Some(f.plen as i64),
@@ -157,15 +163,13 @@ impl Hypha {
 
         let common_prefixes = raw.common_prefixes.map(|cps| {
             cps.into_iter()
-                .map(|cp| CommonPrefix {
-                    prefix: cp.prefix.map(|p| self.cache().strip(&p).to_string()),
-                })
+                .map(|cp| CommonPrefix { prefix: cp.prefix })
                 .filter(|cp| !cp.prefix.as_deref().is_some_and(meta::is_reserved_key))
                 .collect()
         });
 
         let resp = ListObjectsV2Output {
-            name: Some(self.cache().bucket().to_string()),
+            name: Some(bucket),
             prefix: input.prefix,
             delimiter: input.delimiter,
             key_count: Some(entries.len() as i32),
@@ -182,8 +186,8 @@ impl Hypha {
 
     /// HEAD-fallback facts for an eviction tombstone missing its twin (§6). `None` if the key
     /// moved on (deleted / absent) since the LIST page was cut.
-    async fn head_facts(&self, key: &str) -> S3Result<Option<Object>> {
-        match self.cache().head(key).await {
+    async fn head_facts(&self, bucket: &str, key: &str) -> S3Result<Option<Object>> {
+        match self.cache().head(bucket, key).await {
             Ok(head) => {
                 let md = head.metadata.clone().unwrap_or_default();
                 match meta::tomb_kind(&md) {

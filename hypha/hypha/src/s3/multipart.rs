@@ -32,10 +32,14 @@ impl Hypha {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
+        let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        let created = self.remote().create_multipart(&key, HashMap::new()).await?;
+        let created = self
+            .remote()
+            .create_multipart(&bucket, &key, HashMap::new())
+            .await?;
         let upload_id = created
             .upload_id()
             .ok_or_else(|| Error::Backend("remote returned no upload id".into()))?
@@ -45,6 +49,7 @@ impl Hypha {
         // metadata header can't).
         self.cache()
             .put_small(
+                &bucket,
                 &meta::mpu_upload_key(&upload_id),
                 key.clone().into_bytes(),
                 HashMap::new(),
@@ -67,6 +72,7 @@ impl Hypha {
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let input = req.input;
+        let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
         let part_number = input.part_number;
@@ -96,7 +102,7 @@ impl Hypha {
         // Fail fast if the upload is unknown to us — the eventual complete needs these records.
         match self
             .cache()
-            .head(&meta::mpu_upload_key(&input.upload_id))
+            .head(&bucket, &meta::mpu_upload_key(&input.upload_id))
             .await
         {
             Ok(_) => {}
@@ -112,6 +118,7 @@ impl Hypha {
         let out = self
             .remote()
             .upload_part(
+                &bucket,
                 &key,
                 &input.upload_id,
                 part_number,
@@ -119,9 +126,11 @@ impl Hypha {
                 Some(ct_len as i64),
             )
             .await?;
+        // The remote accepted the part, so it must echo the ETag that identifies it — an empty
+        // `retag` would silently fail to match this part at complete (§6).
         let retag = out
             .e_tag()
-            .unwrap_or_default()
+            .ok_or_else(|| Error::Backend("part upload returned no ETag".into()))?
             .trim_matches('"')
             .to_string();
         let pmd5 = etag_rx
@@ -135,6 +144,7 @@ impl Hypha {
         // remote's part size at complete.
         self.cache()
             .put_small(
+                &bucket,
                 &meta::mpu_part_key(&input.upload_id, part_number, &retag, &pmd5),
                 Vec::new(),
                 HashMap::new(),
@@ -155,6 +165,7 @@ impl Hypha {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let input = req.input;
+        let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
         let upload_id = input.upload_id.clone();
@@ -182,7 +193,11 @@ impl Hypha {
         // The whole bracket runs under K's write lock (§7).
         let _guard = self.tier.locks.lock(&key).await;
 
-        match self.cache().head(&meta::mpu_upload_key(&upload_id)).await {
+        match self
+            .cache()
+            .head(&bucket, &meta::mpu_upload_key(&upload_id))
+            .await
+        {
             Ok(_) => {}
             Err(Error::NotFound) => return Err(s3_error!(NoSuchUpload, "unknown upload id")),
             Err(e) => return Err(e.into()),
@@ -195,10 +210,10 @@ impl Hypha {
         //      last-write-wins on re-uploaded parts already resolved by the remote.
         //    Matching a winner's `retag` to its record yields the surviving upload's `pmd5`; stale
         //    re-upload records simply never match and are swept at settle.
-        let pmd5_by_part = self.load_part_pmd5s(&upload_id).await?;
+        let pmd5_by_part = self.load_part_pmd5s(&bucket, &upload_id).await?;
         let winners: HashMap<i32, (String, u64)> = self
             .remote()
-            .list_parts(&key, &upload_id)
+            .list_parts(&bucket, &key, &upload_id)
             .await?
             .into_iter()
             .map(|(n, retag, size)| (n, (retag, size)))
@@ -265,6 +280,7 @@ impl Hypha {
         let fout = self
             .remote()
             .upload_part(
+                &bucket,
                 &key,
                 &upload_id,
                 trailer_pn,
@@ -272,34 +288,41 @@ impl Hypha {
                 Some(trailer.len() as i64),
             )
             .await?;
+        // The remote just accepted this part, so it must echo its ETag; an empty one would silently
+        // build a mismatched CompletedPart and fail (or corrupt) the native complete.
+        let trailer_etag = fout
+            .e_tag()
+            .ok_or_else(|| Error::Backend("trailer part upload returned no ETag".into()))?;
         remote_parts.push(
             aws_sdk_s3::types::CompletedPart::builder()
                 .part_number(trailer_pn)
-                .e_tag(fout.e_tag().unwrap_or_default().to_string())
+                .e_tag(trailer_etag)
                 .build(),
         );
 
         // 3. Mark → 4. commit (the native complete concatenates the parts at K).
-        self.tier.mark_transit_locked(&key).await?;
+        self.tier.mark_transit_locked(&bucket, &key).await?;
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
             .set_parts(Some(remote_parts))
             .build();
         if let Err(e) = self
             .remote()
-            .complete_multipart(&key, &upload_id, completed)
+            .complete_multipart(&bucket, &key, &upload_id, completed)
             .await
         {
             // Failed or indeterminate commit: settle K to whatever the remote holds (§7) and
             // leave the native upload as a sweepable orphan.
-            let _ = self.tier.repair_locked(&key).await;
+            if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
+                tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
+            }
             return Err(e.into());
         }
 
         // 5. Settle: project the tombstone + twin, drop the mpu state.
         self.tier
-            .settle_evict_locked(&key, total_plen, &cetag, mtime_ms)
+            .settle_evict_locked(&bucket, &key, total_plen, &cetag, mtime_ms)
             .await?;
-        self.drop_mpu_state(&upload_id).await?;
+        self.drop_mpu_state(&bucket, &upload_id).await?;
 
         let resp = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),
@@ -317,14 +340,14 @@ impl Hypha {
         let input = req.input;
         match self
             .remote()
-            .abort_multipart(&input.key, &input.upload_id)
+            .abort_multipart(&input.bucket, &input.key, &input.upload_id)
             .await
         {
             // Already gone remotely: still drop our records — abort is idempotent.
             Ok(()) | Err(Error::NotFound) => {}
             Err(e) => return Err(e.into()),
         }
-        self.drop_mpu_state(&input.upload_id).await?;
+        self.drop_mpu_state(&input.bucket, &input.upload_id).await?;
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
@@ -334,6 +357,7 @@ impl Hypha {
     /// any malformed key don't parse and are skipped.
     async fn load_part_pmd5s(
         &self,
+        bucket: &str,
         upload_id: &str,
     ) -> Result<HashMap<(i32, String), String>, Error> {
         let prefix = meta::mpu_prefix(upload_id);
@@ -342,12 +366,18 @@ impl Hypha {
         loop {
             let page = self
                 .cache()
-                .list(Some(prefix.clone()), None, token.clone(), None, None)
+                .list(
+                    bucket,
+                    Some(prefix.clone()),
+                    None,
+                    token.clone(),
+                    None,
+                    None,
+                )
                 .await?;
             for obj in page.contents.unwrap_or_default() {
                 if let Some(full) = obj.key {
-                    let ck = self.cache().strip(&full);
-                    if let Some((n, retag, pmd5)) = meta::parse_mpu_part(ck) {
+                    if let Some((n, retag, pmd5)) = meta::parse_mpu_part(&full) {
                         out.insert((n, retag.to_string()), pmd5.to_string());
                     }
                 }
@@ -364,12 +394,12 @@ impl Hypha {
 
     /// Drop everything recorded for one upload (the `mpu/<id>/` range); complete/abort both end
     /// here. The §8 sweep reclaims records of uploads abandoned without either.
-    async fn drop_mpu_state(&self, upload_id: &str) -> Result<(), Error> {
+    async fn drop_mpu_state(&self, bucket: &str, upload_id: &str) -> Result<(), Error> {
         let prefix = meta::mpu_prefix(upload_id);
         loop {
             let page = self
                 .cache()
-                .list(Some(prefix.clone()), None, None, None, None)
+                .list(bucket, Some(prefix.clone()), None, None, None, None)
                 .await?;
             let objs = page.contents.unwrap_or_default();
             if objs.is_empty() {
@@ -379,9 +409,9 @@ impl Hypha {
             let keys: Vec<String> = objs
                 .iter()
                 .filter_map(|o| o.key())
-                .map(|full| self.cache().strip(full).to_string())
+                .map(str::to_string)
                 .collect();
-            self.cache().delete_objects(&keys).await?;
+            self.cache().delete_objects(bucket, &keys).await?;
             if page.is_truncated != Some(true) {
                 return Ok(());
             }

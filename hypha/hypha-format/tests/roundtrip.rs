@@ -17,6 +17,12 @@ fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
+/// A fixed passphrase for the round-trip tests: encrypt and decrypt through the same one, so any
+/// static string works. Cross-key tests (`wrong_identity_fails`) use distinct literals instead.
+fn env() -> Envelope {
+    Envelope::new("hypha-format roundtrip test passphrase").unwrap()
+}
+
 fn encrypt(env: &Envelope, plaintext: &[u8]) -> Vec<u8> {
     let mut ct = Vec::new();
     let mut w = env.encrypt(&mut ct).unwrap();
@@ -38,7 +44,7 @@ fn decrypt(env: &Envelope, ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
 
 #[test]
 fn ciphertext_length_matches_closed_form() {
-    let env = Envelope::generate();
+    let env = env();
     // sizes straddling every interesting boundary
     for len in [
         0usize,
@@ -60,7 +66,7 @@ fn ciphertext_length_matches_closed_form() {
 
 #[test]
 fn corruption_fails_authentication() {
-    let env = Envelope::generate();
+    let env = env();
     let pt = pattern(3 * CHUNK_PLAINTEXT as usize / 2);
     let ct = encrypt(&env, &pt);
     let h = hlen(&ct) as usize;
@@ -82,7 +88,7 @@ fn corruption_fails_authentication() {
 
 #[test]
 fn truncation_fails() {
-    let env = Envelope::generate();
+    let env = env();
     let ct = encrypt(&env, &pattern(CHUNK_PLAINTEXT as usize + 100));
     // drop the final short chunk entirely, and separately drop one byte
     for cut in [ct.len() - 1, ct.len() - 100 - 16] {
@@ -98,7 +104,7 @@ fn truncation_fails() {
 fn cross_file_chunk_splice_fails() {
     // Same recipient, two files ⇒ two random file keys. Transplant file B's first payload
     // chunk into file A: authentication must fail (key separation is the binding).
-    let env = Envelope::generate();
+    let env = env();
     let pt = pattern(2 * CHUNK_PLAINTEXT as usize);
     let a = encrypt(&env, &pt);
     let b = encrypt(&env, &pt);
@@ -116,7 +122,7 @@ fn cross_file_chunk_splice_fails() {
 
 #[test]
 fn chunk_reorder_fails() {
-    let env = Envelope::generate();
+    let env = env();
     let pt = pattern(3 * CHUNK_PLAINTEXT as usize);
     let ct = encrypt(&env, &pt);
     let h = hlen(&ct) as usize;
@@ -141,8 +147,8 @@ fn chunk_reorder_fails() {
 
 #[test]
 fn wrong_identity_fails() {
-    let ct = encrypt(&Envelope::generate(), &pattern(100));
-    assert!(decrypt(&Envelope::generate(), &ct).is_err());
+    let ct = encrypt(&Envelope::new("identity one").unwrap(), &pattern(100));
+    assert!(decrypt(&Envelope::new("a different identity").unwrap(), &ct).is_err());
 }
 
 /// The invariant hypha's single-stream composite read rests on: a concatenation of independent
@@ -153,7 +159,7 @@ fn wrong_identity_fails() {
 /// (empty, sub-chunk, multi-chunk, chunk-aligned) exercise the boundary cases.
 #[test]
 fn concatenated_parts_decrypt_in_one_stream() {
-    let env = Envelope::generate();
+    let env = env();
     let plens = [
         0u64,
         1,
@@ -203,7 +209,7 @@ impl RangeSource for MemSource {
 
 #[test]
 fn ranged_read_via_seek() {
-    let env = Envelope::generate();
+    let env = env();
     let pt = pattern(3 * CHUNK_PLAINTEXT as usize + 12345);
     let ct = Arc::new(encrypt(&env, &pt));
 
@@ -253,7 +259,7 @@ fn ciphertext_range_covers_decryption_needs() {
         }
     }
 
-    let env = Envelope::generate();
+    let env = env();
     let pt = pattern(2 * CHUNK_PLAINTEXT as usize + 999);
     let ct = Arc::new(encrypt(&env, &pt));
     let h = hlen(&ct);
@@ -282,7 +288,7 @@ proptest! {
 
     #[test]
     fn prop_roundtrip(pt in proptest::collection::vec(any::<u8>(), 0..200_000)) {
-        let env = Envelope::generate();
+        let env = env();
         let ct = encrypt(&env, &pt);
         prop_assert_eq!(decrypt(&env, &ct).unwrap(), pt.clone());
         prop_assert_eq!(ct.len() as u64, ciphertext_len(pt.len() as u64, hlen(&ct)));
@@ -294,7 +300,7 @@ proptest! {
         a_frac in 0.0f64..1.0,
         b_frac in 0.0f64..1.0,
     ) {
-        let env = Envelope::generate();
+        let env = env();
         let pt = pattern(len);
         let ct = Arc::new(encrypt(&env, &pt));
         let (mut a, mut b) = (

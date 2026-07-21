@@ -1,10 +1,12 @@
 //! Thin `ObjectStore` wrapper over an `aws-sdk-s3` client. The cache and the remote are two
 //! independently-configured instances of this same type (§2); Phase 2 uses only the remote.
 //!
-//! The wrapper owns two concerns the op handlers should not repeat: the per-deployment key
-//! `prefix` (architecture § *Two modes*) and the SDK-error → `hypha_core::Error`
-//! mapping. Everything else — encryption, ETag math, DTO translation — stays in the handlers so
-//! this layer is a mechanical passthrough.
+//! Buckets map one-to-one client ⇄ cache ⇄ remote (§7): the client's bucket rides every call, and
+//! the wrapper prepends the deployment's **bucket prefix** so deployments sharing one remote
+//! account land in disjoint bucket namespaces (and strips it back off on `ListBuckets`). The other
+//! cross-cutting concern is the SDK-error → `hypha_core::Error` mapping. Everything else —
+//! encryption, ETag math, DTO translation — stays in the handlers so this layer is a mechanical
+//! passthrough.
 
 use std::collections::HashMap;
 
@@ -27,8 +29,8 @@ use crate::error::{Error, Result};
 #[derive(Clone)]
 pub struct Backend {
     client: Client,
-    bucket: String,
-    prefix: String,
+    region: String,
+    bucket_prefix: String,
 }
 
 impl Backend {
@@ -44,49 +46,53 @@ impl Backend {
             .build();
         Self {
             client: Client::from_conf(conf),
-            bucket: cfg.bucket.clone(),
-            prefix: cfg.prefix.clone(),
+            region: cfg.region.clone(),
+            bucket_prefix: cfg.bucket_prefix.clone(),
         }
-    }
-
-    /// Full backend key for a client-visible key: the deployment prefix keeps deployments that
-    /// share one remote in disjoint keyspaces.
-    pub fn k(&self, key: &str) -> String {
-        format!("{}{}", self.prefix, key)
     }
 
     pub fn client(&self) -> &Client {
         &self.client
     }
-    pub fn bucket(&self) -> &str {
-        &self.bucket
-    }
-    pub fn prefix(&self) -> &str {
-        &self.prefix
+
+    /// The backend's SigV4 signing region (a dummy for SeaweedFS); surfaced for `GetBucketLocation`.
+    pub fn region(&self) -> &str {
+        &self.region
     }
 
-    /// Strip the deployment prefix off a full backend key for the client-visible form.
-    /// Falls back to the full key if it somehow lacks the prefix.
-    pub fn strip<'a>(&self, full: &'a str) -> &'a str {
-        full.strip_prefix(&self.prefix).unwrap_or(full)
+    /// Backend bucket name for a client bucket: the deployment's bucket prefix keeps deployments
+    /// sharing one remote account in disjoint bucket namespaces.
+    fn bkt(&self, bucket: &str) -> String {
+        format!("{}{}", self.bucket_prefix, bucket)
     }
 
-    pub async fn get(&self, key: &str, range: Option<String>) -> Result<GetObjectOutput> {
+    /// The client-visible name for a backend bucket, or `None` if it isn't under this deployment's
+    /// prefix — a sibling deployment's bucket on a shared account, not ours to list.
+    fn strip_bkt<'a>(&self, full: &'a str) -> Option<&'a str> {
+        full.strip_prefix(&self.bucket_prefix)
+    }
+
+    pub async fn get(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<String>,
+    ) -> Result<GetObjectOutput> {
         self.client
             .get_object()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .set_range(range)
             .send()
             .await
             .map_err(Error::from_sdk)
     }
 
-    pub async fn head(&self, key: &str) -> Result<HeadObjectOutput> {
+    pub async fn head(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput> {
         self.client
             .head_object()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .send()
             .await
             .map_err(Error::from_sdk)
@@ -97,6 +103,7 @@ impl Backend {
     #[allow(clippy::too_many_arguments)]
     pub async fn put(
         &self,
+        bucket: &str,
         key: &str,
         body: ByteStream,
         content_length: Option<i64>,
@@ -106,8 +113,8 @@ impl Backend {
     ) -> Result<PutObjectOutput> {
         self.client
             .put_object()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .body(body)
             .set_content_length(content_length)
             .set_metadata(Some(metadata))
@@ -120,8 +127,10 @@ impl Backend {
 
     /// PUT a small in-memory body (tombstone sentinel, zero-byte twin) with optional conditions.
     /// Returns the object's new cache ETag (unquoted).
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_small(
         &self,
+        bucket: &str,
         key: &str,
         bytes: Vec<u8>,
         metadata: HashMap<String, String>,
@@ -132,8 +141,8 @@ impl Backend {
         let out = self
             .client
             .put_object()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .body(ByteStream::from(bytes))
             .content_length(len)
             .set_metadata(Some(metadata))
@@ -149,11 +158,11 @@ impl Backend {
             .to_string())
     }
 
-    pub async fn delete(&self, key: &str) -> Result<()> {
+    pub async fn delete(&self, bucket: &str, key: &str) -> Result<()> {
         self.client
             .delete_object()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .send()
             .await
             .map_err(Error::from_sdk)?;
@@ -163,7 +172,7 @@ impl Backend {
     /// Batch-delete up to 1000 keys in one round trip (S3 `DeleteObjects`). Used to reclaim a
     /// key's twins and an upload's per-part records without a request per object. `quiet` so the
     /// response omits per-key success entries; a partial failure surfaces via `from_sdk`.
-    pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+    pub async fn delete_objects(&self, bucket: &str, keys: &[String]) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -172,7 +181,7 @@ impl Backend {
         };
         let objects = keys
             .iter()
-            .map(|k| ObjectIdentifier::builder().key(self.k(k)).build())
+            .map(|k| ObjectIdentifier::builder().key(k.as_str()).build())
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(build_err)?;
         let delete = Delete::builder()
@@ -182,7 +191,7 @@ impl Backend {
             .map_err(build_err)?;
         self.client
             .delete_objects()
-            .bucket(&self.bucket)
+            .bucket(self.bkt(bucket))
             .delete(delete)
             .send()
             .await
@@ -193,25 +202,24 @@ impl Backend {
     #[allow(clippy::too_many_arguments)]
     pub async fn list(
         &self,
+        bucket: &str,
         prefix: Option<String>,
         delimiter: Option<String>,
         continuation_token: Option<String>,
         start_after: Option<String>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsV2Output> {
-        // Fold the deployment prefix into the client-supplied one so listings stay scoped.
-        let scoped_prefix = Some(self.k(prefix.as_deref().unwrap_or("")));
         // `encoding-type=url` so keys carrying bytes XML can't represent — the twin separator
         // `0x01`, and any control byte a client used — survive the LIST response (§6). Keys come
         // back percent-encoded; decode them before returning so callers see raw bytes.
         let mut out = self
             .client
             .list_objects_v2()
-            .bucket(&self.bucket)
-            .set_prefix(scoped_prefix)
+            .bucket(self.bkt(bucket))
+            .set_prefix(prefix)
             .set_delimiter(delimiter)
             .set_continuation_token(continuation_token)
-            .set_start_after(start_after.map(|s| self.k(&s)))
+            .set_start_after(start_after)
             .set_max_keys(max_keys)
             .encoding_type(EncodingType::Url)
             .send()
@@ -226,24 +234,58 @@ impl Backend {
         Ok(out)
     }
 
-    pub async fn create_bucket(&self) -> Result<()> {
+    // ── Bucket ops ──────────────────────────────────────────────────────────────────────────
+
+    pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
         self.client
             .create_bucket()
-            .bucket(&self.bucket)
+            .bucket(self.bkt(bucket))
             .send()
             .await
             .map_err(Error::from_sdk)?;
         Ok(())
     }
 
-    pub async fn delete_bucket(&self) -> Result<()> {
+    pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         self.client
             .delete_bucket()
-            .bucket(&self.bucket)
+            .bucket(self.bkt(bucket))
             .send()
             .await
             .map_err(Error::from_sdk)?;
         Ok(())
+    }
+
+    pub async fn head_bucket(&self, bucket: &str) -> Result<()> {
+        self.client
+            .head_bucket()
+            .bucket(self.bkt(bucket))
+            .send()
+            .await
+            .map_err(Error::from_sdk)?;
+        Ok(())
+    }
+
+    /// This deployment's buckets, as `(client_name, creation_ms)` — the backend's `ListBuckets`
+    /// filtered to those under our prefix, with the prefix stripped so clients see their own names.
+    pub async fn list_buckets(&self) -> Result<Vec<(String, Option<i64>)>> {
+        let out = self
+            .client
+            .list_buckets()
+            .send()
+            .await
+            .map_err(Error::from_sdk)?;
+        Ok(out
+            .buckets()
+            .iter()
+            .filter_map(|b| {
+                let name = self.strip_bkt(b.name()?)?;
+                Some((
+                    name.to_string(),
+                    b.creation_date().and_then(|d| d.to_millis().ok()),
+                ))
+            })
+            .collect())
     }
 
     // ── Multipart-to-remote primitives (Phase 3) ────────────────────────────────────────────
@@ -253,21 +295,24 @@ impl Backend {
 
     pub async fn create_multipart(
         &self,
+        bucket: &str,
         key: &str,
         metadata: HashMap<String, String>,
     ) -> Result<CreateMultipartUploadOutput> {
         self.client
             .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .set_metadata(Some(metadata))
             .send()
             .await
             .map_err(Error::from_sdk)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upload_part(
         &self,
+        bucket: &str,
         key: &str,
         upload_id: &str,
         part_number: i32,
@@ -276,8 +321,8 @@ impl Backend {
     ) -> Result<UploadPartOutput> {
         self.client
             .upload_part()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
             .body(body)
@@ -289,14 +334,15 @@ impl Backend {
 
     pub async fn complete_multipart(
         &self,
+        bucket: &str,
         key: &str,
         upload_id: &str,
         parts: CompletedMultipartUpload,
     ) -> Result<CompleteMultipartUploadOutput> {
         self.client
             .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .upload_id(upload_id)
             .multipart_upload(parts)
             .send()
@@ -308,15 +354,20 @@ impl Backend {
     /// the remote's own last-write-wins-resolved view. Complete uses it to pick the winning parts
     /// and their ciphertext sizes (§7), so a re-uploaded part's stale hypha record never wins.
     /// Paginated; ETags are unquoted.
-    pub async fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<(i32, String, u64)>> {
+    pub async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<(i32, String, u64)>> {
         let mut out = Vec::new();
         let mut marker: Option<String> = None;
         loop {
             let page = self
                 .client
                 .list_parts()
-                .bucket(&self.bucket)
-                .key(self.k(key))
+                .bucket(self.bkt(bucket))
+                .key(key)
                 .upload_id(upload_id)
                 .max_parts(1000)
                 .set_part_number_marker(marker)
@@ -340,11 +391,11 @@ impl Backend {
         Ok(out)
     }
 
-    pub async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
+    pub async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
         self.client
             .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(self.k(key))
+            .bucket(self.bkt(bucket))
+            .key(key)
             .upload_id(upload_id)
             .send()
             .await

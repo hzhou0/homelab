@@ -18,17 +18,20 @@ pub enum Mode {
 
 /// One S3 endpoint hypha talks to (remote, or the optional cache — same shape, §2).
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct S3Endpoint {
     pub endpoint: String,
+    /// Backend SigV4 signing region — a dummy for SeaweedFS/MinIO, which ignore it. Not a
+    /// client-facing concern: client buckets pass through, so this is purely how hypha's SDK
+    /// client signs against the backend.
     #[serde(default = "default_region")]
     pub region: String,
-    pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
-    /// Prepended to every key this deployment stores, so deployments sharing one remote land in
-    /// disjoint keyspaces (architecture § *Two modes*). Empty for a dedicated bucket.
+    /// Prepended to every client bucket name (architecture § *Two modes*), so deployments sharing
+    /// one remote account land in disjoint bucket namespaces. Empty for a dedicated account.
     #[serde(default)]
-    pub prefix: String,
+    pub bucket_prefix: String,
 }
 
 fn default_region() -> String {
@@ -38,12 +41,14 @@ fn default_region() -> String {
 /// The access-key/secret hypha's own clients authenticate with — distinct from the backend
 /// credentials above (§2, `S3Auth`).
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientAuth {
     pub access_key: String,
     pub secret_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Serving {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -61,6 +66,7 @@ fn default_offload() -> usize {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub remote: S3Endpoint,
     /// Required in both modes: the cache is the ETag/namespace source of truth even for the

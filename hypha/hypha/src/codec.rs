@@ -86,6 +86,7 @@ fn pump_decrypt_full<R: Read>(
 pub fn decrypt_range(
     env: Arc<Envelope>,
     backend: Backend,
+    bucket: String,
     key: String,
     ct_len: u64,
     pt: Range<u64>,
@@ -96,6 +97,7 @@ pub fn decrypt_range(
     tokio::task::spawn_blocking(move || {
         let source = RemoteRangeSource {
             backend,
+            bucket,
             key,
             base: 0,
             len: ct_len,
@@ -265,6 +267,7 @@ impl<R: Read> Read for Md5Reader<R> {
 /// off a `spawn_blocking` thread, which is not a runtime worker).
 struct RemoteRangeSource {
     backend: Backend,
+    bucket: String,
     key: String,
     base: u64,
     len: u64,
@@ -295,7 +298,7 @@ impl RangeSource for RemoteRangeSource {
         let range = format!("bytes={}-{}", self.base + offset, self.base + self.len - 1);
         let out = self
             .handle
-            .block_on(self.backend.get(&self.key, Some(range)))
+            .block_on(self.backend.get(&self.bucket, &self.key, Some(range)))
             .map_err(io::Error::other)?;
         let reader = SyncIoBridge::new_with_handle(out.body.into_async_read(), self.handle.clone());
         Ok(Box::new(reader))
@@ -358,6 +361,7 @@ pub enum PartSegment {
 pub fn decrypt_composite(
     env: Arc<Envelope>,
     backend: Backend,
+    bucket: String,
     key: String,
     segments: Vec<PartSegment>,
 ) -> StreamingBlob {
@@ -366,7 +370,9 @@ pub fn decrypt_composite(
     let h = handle.clone();
     tokio::task::spawn_blocking(move || {
         let mut dst = SyncIoBridge::new_with_handle(writer, h.clone());
-        if let Err(e) = pump_decrypt_composite(&env, &backend, &key, segments, &h, &mut dst) {
+        if let Err(e) =
+            pump_decrypt_composite(&env, &backend, &bucket, &key, segments, &h, &mut dst)
+        {
             tracing::error!(error = %e, "decrypt (composite) failed mid-stream");
         }
         let _ = dst.shutdown();
@@ -377,6 +383,7 @@ pub fn decrypt_composite(
 fn pump_decrypt_composite(
     env: &Envelope,
     backend: &Backend,
+    bucket: &str,
     key: &str,
     segments: Vec<PartSegment>,
     handle: &Handle,
@@ -389,6 +396,7 @@ fn pump_decrypt_composite(
         };
         let source = RemoteRangeSource {
             backend: backend.clone(),
+            bucket: bucket.to_string(),
             key: key.to_string(),
             base: ct.start,
             len: ct.end - ct.start,

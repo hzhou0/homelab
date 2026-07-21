@@ -65,7 +65,8 @@ that moves nutrients between a store and the outside.
 Hypha always has a **remote** and a **cache**; a deployment runs in one of two modes that differ only
 in *when* a write becomes durable on the remote and whether the cache retains bodies. Rather than
 build durability tiers into one service, run hypha more than once, each deployment scoped to its own
-remote namespace — a distinct account/bucket, or a shared remote under a forced key prefix:
+**bucket namespace** — client buckets pass through, prefixed per deployment (below), so several can
+share one remote account:
 
 - **Cached deployment (default)** — `s3.internal.haustorium.net`. Reads and writes go through the
   cache; writes are acked locally and replicated to the remote asynchronously (write-through). Low
@@ -77,10 +78,11 @@ remote namespace — a distinct account/bucket, or a shared remote under a force
   per-op write latency, and it still depends on the SeaweedFS cache; the only guarantee it trades
   away from the cached mode is exposure to the bounded loss window.
 
-Each deployment prepends a configured **remote prefix** to every object key it stores (and strips it on
-read), so deployments that share one remote account or bucket still land in disjoint key-spaces. Because
-their namespaces don't overlap — whether by separate account or by prefix — there is no shared-key
-cache-coherence concern. Both apply the same client-side body encryption.
+Clients address arbitrary buckets, mapped one-to-one client ⇄ cache ⇄ remote. A deployment prepends a
+configured **bucket prefix** to every client bucket name (and strips it back off on `ListBuckets`), so
+deployments sharing one remote account land in disjoint bucket namespaces; keys within a bucket pass
+through verbatim. Because their namespaces don't overlap, there is no shared-key cache-coherence
+concern. Both apply the same client-side body encryption.
 
 ## Storage substrate — TopoLVM
 
@@ -257,9 +259,10 @@ completion-time re-encryption pass.
   object's key plus a low-sorting suffix encoding the facts, so they arrive adjacent to their key
   inside the same LIST page. Listing the remote (the resync window) instead requires a bounded
   per-entry HEAD fan-out.
-  Buckets map one-to-one across cache and remote; bucket create/delete is synchronous
-  write-through (acked only once both sides confirm), and nothing else touches the remote, so
-  `ListBuckets` follows the same rule.
+  Buckets map one-to-one across cache and remote, but — like multipart — the **remote is their
+  source of truth** and they are **always durable**: create/delete are synchronous to both sides
+  (acked only once both confirm) regardless of mode, and `HeadBucket`/`ListBuckets` are answered
+  from the remote, not the cache.
 - **DELETE** → in a cached deployment, overwrite the local body at K with a delete-tombstone (so
   GET answers 404 and LIST omits K) and write a pending marker; the background reconcile propagates
   `DeleteObject` to the remote, then clears marker and tombstone — the mask keeps the local
@@ -355,10 +358,10 @@ each in its own namespace, mirroring the `cilium` / `cert-manager` / `monitoring
 - `hypha/` — the Rust gateway: a two-pod **StatefulSet** (active + pre-warmed passive; pod-name
   labels give each pod the static Cilium identity the fencing controller selects on) + `Service` +
   `HTTPRoute`, the `hypha-fence` failover controller, plus references to the master-key Secret and
-  the remote S3 credentials Secret. Mode and the remote prefix are chart values: install it once in
+  the remote S3 credentials Secret. Mode and the bucket prefix are chart values: install it once in
   cached mode (`s3.internal.haustorium.net`) as the default tier, and again in durable mode
-  (`s3-direct.internal.haustorium.net`) for zero-loss clients — each scoped to its own remote account
-  or, on a shared remote, its own key prefix.
+  (`s3-direct.internal.haustorium.net`) for zero-loss clients — each scoped to its own bucket prefix
+  (or its own remote account).
 
 ### Access to the cache surfaces
 

@@ -36,7 +36,7 @@ async fn main() -> Result<(), BoxError> {
 
     let config = Config::load().map_err(ctx("loading config"))?;
 
-    let env = hypha_format::Envelope::from_passphrase(&config.master_passphrase)
+    let env = hypha_format::Envelope::new(&config.master_passphrase)
         .map_err(ctx("parsing master passphrase"))?;
     // Trailer authentication key: derived from the same master passphrase, distinct domain (§6).
     let trailer_key = hypha_format::TrailerKey::derive(&config.master_passphrase);
