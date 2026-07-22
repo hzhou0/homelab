@@ -290,20 +290,25 @@ impl Reconciler {
         Ok(())
     }
 
-    /// Delete every twin of `key` (the `key ‖ 0x01 …` suffix range).
+    /// Delete every twin of `key` (the `key ‖ 0x01 …` suffix range). Twins carry the `0x01`
+    /// separator, which XML 1.0 cannot represent at all — so they must go through single-object
+    /// `DeleteObject` (key in the percent-encoded URL path), never the batch `DeleteObjects` whose
+    /// XML body would be rejected as malformed. There is ≤ 1 twin per key in steady state (refresh
+    /// deletes the stale one before writing the new); the rare multi-twin cleanup fires the
+    /// per-key deletes concurrently.
     pub(crate) async fn delete_twins(&self, bucket: &str, key: &str) -> Result<()> {
         let sep = format!("{}{}", key, meta::TWIN_SEP as char);
         let existing = self
             .cache
             .list(bucket, Some(sep), None, None, None, None)
             .await?;
-        let keys: Vec<String> = existing
+        let deletes = existing
             .contents
             .unwrap_or_default()
             .into_iter()
             .filter_map(|obj| obj.key)
-            .collect();
-        self.cache.delete_objects(bucket, &keys).await?;
+            .map(|twin| async move { self.cache.delete(bucket, &twin).await });
+        futures::future::try_join_all(deletes).await?;
         Ok(())
     }
 }

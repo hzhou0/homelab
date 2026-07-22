@@ -473,7 +473,11 @@ apply).
    terminating trailer part) and plaintext > **4 GiB** (so the envelope never pushes a part past
    the remote's 5 GiB part cap; transparent re-splitting is a later refinement).
 2. Encrypt the part as **its own pure age file** (fresh file key; Content-Length computed from
-   `HLEN`), streaming to the remote as the native part; the plaintext MD5 is computed inline.
+   `HLEN`), streaming to the remote as the native part; the plaintext MD5 is computed inline. A part
+   whose framed ciphertext is **below the backend's 5 MiB part minimum** — which any S3 backend
+   permits only as the upload's *final* part — is additionally retained in the cache mpu state
+   (keyed by its `retag`, ≤ 5 MiB) so complete can fold the trailer into it rather than append a
+   separate trailer part that would demote it to an illegal sub-minimum non-final part (see below).
 3. Persist the part's `pmd5` (with `retag`) as a key-encoded mpu record (§6) — an in-progress
    upload's parts aren't readable, so complete needs its own copy of `pmd5`; its loss with the
    cache volume merely fails the eventual complete (never-acked, client retries).
@@ -491,11 +495,20 @@ apply).
    Compose the client ETag `md5(concat pmd5s)-N` (`meta::composite_etag`), each `plen` from the
    remote's part `size` + `HLEN`, and the cumulative-offset **parts table**. Reject if a requested
    part is absent from `ListParts`, or its client-supplied ETag doesn't match the matched `pmd5`.
-2. Upload the **terminating trailer part** (§6) — `table ‖ facts ‖ tag ‖ version`, part number =
-   highest client part + 1 — carrying the facts and offset table under its MAC.
+2. Build the **terminating trailer** (§6) — `table ‖ facts ‖ tag ‖ version` — and place it as the
+   object's final bytes. Normally it rides its **own part** above every client part (highest + 1);
+   the trailer's content is identical either way. **But** S3 exempts only the *last* part from the
+   5 MiB minimum, so when the highest client part is itself below that minimum — necessarily the
+   client's last part, as any backend rejects a smaller non-final part — a separate trailer part
+   would leave that part a sub-minimum non-final part the native complete rejects. In that case
+   **fold** the trailer into the highest part: re-upload it (from its retained ciphertext, keyed by
+   the remote's `ListParts` winning `retag` so the fold takes exactly that winner) as `part ‖
+   trailer`, keeping it the final part. The committed object K is **byte-identical** either way —
+   the same `age₁…ageₙ ‖ trailer` concatenation — so the read path is unaffected.
 3. **Mark** K.
-4. **Commit**: native complete on the remote (client parts + trailer part) — one atomic op lands
-   the concatenated body *and* its facts at K.
+4. **Commit**: native complete on the remote — one atomic op lands the concatenated body *and* its
+   facts at K. Its part set is either the client parts plus the separate trailer part, or (folded
+   case) the client parts with the trailer riding the last one.
 5. **Settle**: eviction tombstone + twin, drop the mpu state (batched multi-object delete). Ack.
 
 Crash before 4: K untouched; the dangling native upload (trailer part included) is an orphan
@@ -527,13 +540,29 @@ leftovers of abandoned uploads.
 
 ### ListObjectsV2
 
-1. One cache LIST page; strip the deployment prefix; filter the reserved prefix.
-2. Classify each entry from its (size, ETag) sentinel pair (§6): **live body** → native facts
+1. Classify each cache entry from its (size, ETag) sentinel pair (§6): **live body** → native facts
    (any adjacent twin is stale — ignored); **eviction tombstone** → the adjacent twin's
    `{cetag, plen, mtime}`, per-key cache HEAD fallback when the twin is missing;
    **delete-tombstone** →
    omitted; **transition tombstone** → per-key *remote* HEAD (the one classification that leaves
-   the cache).
+   the cache). Strip the deployment prefix; filter the reserved prefix.
+2. **Single page, forwarded pagination.** A facts twin sits beside every eviction tombstone and
+   delete-tombstones/reserved records are dropped, so a page can return **fewer** than `MaxKeys`
+   client entries even when more exist — a short page. That is valid S3 as long as `IsTruncated` and
+   the continuation token are honest, so hypha forwards the **backend's own** (key-position) token
+   and truncation flag verbatim; `KeyCount` reports the entries actually emitted. LIST deliberately
+   does **not** coalesce cache pages to fill `MaxKeys`: any such backfill would resume either by
+   reusing a backend cursor across requests or by a client-entry count, and both weaken S3's
+   key-position guarantee — a concurrent insert/delete in the re-listed range could dup or drop an
+   untouched key. Short pages are the accepted cost; a client follows the token until `IsTruncated`
+   is false.
+
+   *Deferred optimization (revisit post-phase-4):* twin pairing is per cache page, so an eviction
+   tombstone that is the **last** raw entry of a page has its twin on the next page → the
+   missing-twin **HEAD fallback** fires (correct, but one extra HEAD per cache-page boundary that
+   splits a pair). Avoidance is a cross-page carry-over — defer the unpaired trailing base and peek
+   the next page's head before falling back to a HEAD; left for later, as the bounded HEAD fallback
+   (which must exist anyway for genuinely-missing twins, §6) covers correctness meanwhile.
 
 ### Buckets
 
@@ -767,7 +796,11 @@ condition, not a readiness gate.
   tombstone; rehydrate's body-then-twin-delete); LIST never reports wrong facts — a twin next to
   a non-evict entry is ignored and swept, an evict tombstone with a missing twin HEAD-falls-back,
   ≤ 1 twin per key; shadow-body probe/evict races; lexicographic order holds with prefix-key
-  populations (`a`, `a!b`, `a/b`). Keys with control bytes (`0x02`–`0x1f`, tab) and the `0x01`
+  populations (`a`, `a!b`, `a/b`).
+- **LIST pagination**: a twin-diluted population paginated at several `MaxKeys` — pages may be
+  short (dilution), but following the forwarded continuation token covers every key exactly once in
+  order, never over `MaxKeys`, with `IsTruncated`/`NextContinuationToken` consistent. (Built —
+  `conformance.rs`.) Keys with control bytes (`0x02`–`0x1f`, tab) and the `0x01`
   twin separator round-trip through the `encoding-type=url` LIST and decode back byte-exact.
 - **Transition bracket**: crash-inject at every step of the §7 durable PUT / DELETE / complete
   brackets and assert the contract — readers never see hybrid facts/bytes, an unacked op leaves
@@ -782,8 +815,16 @@ condition, not a readiness gate.
   cache wipe ⇒ restore decrypts the facts + table off the terminating trailer part.
 - **Failover/fencing**: two replicas, partition the active, assert fence→confirm→drain→promote —
   old active's writes refused at the backend before the new active writes; graceful path too.
-- **Integration**: `testcontainers` with real SeaweedFS (cache) + MinIO (remote); S3 conformance
-  pass + the scenarios above end-to-end; a real zero-loss client (ZeroFS) against durable mode.
+- **Integration** (`hypha/tests/`, built): an in-process harness drives hypha over an ephemeral
+  port with a real `aws-sdk-s3` client against a throwaway **MinIO** serving as *both* cache and
+  remote (kept disjoint by each backend's `bucket_prefix`); every fixture is stateless and tears
+  down its MinIO + data dir on drop. Covers the durable S3 conformance surface incl. twin-diluted
+  **LIST pagination** (`conformance.rs`),
+  the multipart scenarios above including the small-final-part **trailer fold** (`multipart.rs`),
+  model-based **proptest fuzzing** of random op sequences against a `BTreeMap` oracle (`fuzz.rs`),
+  and an `#[ignore]`d **load/concurrency** suite — throughput, no-double-create-under-contention,
+  parallel multipart (`load.rs`). Still to add: SeaweedFS as the cache backend, and a real zero-loss
+  client (ZeroFS) against the durable endpoint.
 
 ## 12. Risks
 
@@ -810,7 +851,7 @@ criterion benches (§5 numbers). (The phase-1 grease scare that motivated derive
 capture-and-measure was later resolved: age can't grease a scrypt sole-stanza, so `HLEN` is a
 constant and that machinery is removed — §6.)
 
-**Phase 2 — durable serving. Code complete; exit criteria pending.** `hypha-core`
+**Phase 2 — durable serving. Done (vs. MinIO).** `hypha-core`
 (config/backend/meta/error, twins, key admission) and the s3s surface over durable mode: PUT
 (preconditions, inline encrypt + ETag with the §6 facts trailer appended, the §7 mark → commit →
 settle bracket), DELETE
@@ -821,22 +862,29 @@ read and conditional paths, buckets, auth, `Reconciler` + `KeyLocks`; the slim
 (landed before anything writes a real remote, so quantum-exposed headers never accumulate). Note:
 age 0.11.x cannot grease a scrypt sole-stanza header, so `HLEN` is a hardcoded constant (the
 `HLEN` pin test guards it) — capture-and-measure and all dynamic-`hlen` code are removed.
-*Exit (deferred to the single test pass)*: integration conformance vs. MinIO + SeaweedFS; ZeroFS
-works against the durable endpoint.
+*Exit*: integration conformance vs. MinIO — **done** (`hypha/tests/conformance.rs` + `fuzz.rs`;
+this pass also caught and fixed a real bug: twin keys carry `0x01`, which XML 1.0 can't represent,
+so `delete_twins` must use single-object `DeleteObject`, never the batch `DeleteObjects` whose body
+would be rejected — it had broken every durable overwrite/delete of an already-written key).
+Remaining: conformance vs. SeaweedFS as the cache backend, and ZeroFS against the durable endpoint.
 
-**Phase 3 — multipart. Code complete; §11 exit pending.** Trailer + embedded parts table
+**Phase 3 — multipart. Done (vs. MinIO).** Trailer + embedded parts table
 (single-stream composite read, MAC'd trailer) and the mpu-record retag-match via `ListParts`
 (§6/§7) both landed, superseding the original metadata records + completed-object part-index
 approach.
 Native-remote-multipart proxy (§7): per-part encryption + inline `pmd5`, listable mpu records
 (`p{n:05};<retag>;<pmd5>` key-encoded, `pmd5` the sole stored datum) under the reserved prefix;
 complete resolves the winning part set via the remote's `ListParts` (retag-matched, geometry from
-the remote's sizes), composes the composite ETag, and lands the terminating **trailer part** —
+the remote's sizes), composes the composite ETag, and lands the terminating trailer —
 `table ‖ facts ‖ tag ‖ version` — in the same atomic native complete (self-describing, no records
-or tags, no *completed-object* part index); abort; the 4 GiB / 9999-part caps; single-stream
-composite full + ranged GET off the table; cleanup via batched multi-object delete.
-*Exit*: §11 multipart scenarios including restart-mid-upload, re-upload/concurrent-part resolution,
-and trailer-based restore recovery.
+or tags, no *completed-object* part index): as its own part above every client part, or **folded
+into the last client part** when that part is under the backend's 5 MiB minimum (this pass added the
+fold — a separate trailer part would demote the small final part to an illegal non-final one on any
+real S3 backend); abort; the 4 GiB / 9999-part caps; single-stream composite full + ranged GET off
+the table; cleanup via batched multi-object delete.
+*Exit*: §11 multipart scenarios — restart-mid-upload, re-upload/concurrent-part resolution
+(including a small final part), the trailer fold, and trailer-based restore recovery — all covered
+in `hypha/tests/multipart.rs` against MinIO.
 
 **Phase 4 — cached mode, single replica.** Marker writes + the in-flight ref count on the PUT
 path, the reconcile sweep, cached DELETE propagation, rehydrate (single-part into K + twin

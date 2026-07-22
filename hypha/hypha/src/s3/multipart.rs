@@ -1,11 +1,13 @@
 //! Multipart (§7) — one path, both modes. Parts route **around the cache** onto the remote's own
 //! native multipart upload at K: each part is an independent, pure age file (fresh file key ⇒
 //! parallel and re-uploaded parts need no coordination), and the remote concatenates them at
-//! complete. The object's facts **and its parts table** travel as its one terminating trailer
-//! part (part number above every client part — hence the 9999 client cap), uploaded just before
-//! the native complete so the commit lands body and facts in one atomic op. The table is the
-//! per-part cumulative ciphertext end-offsets, so reads recover every part boundary from the
-//! trailer alone — no remote part-index calls (§6).
+//! complete. The object's facts **and its parts table** travel as a terminating trailer that is the
+//! object's final bytes — normally its own part above every client part (hence the 9999 client
+//! cap), but folded into the last client part when that part is below the backend's 5 MiB minimum
+//! (only the final part is exempt, and hypha's trailer would otherwise steal that exemption). Either
+//! way it lands in the same native complete, so the commit lands body and facts in one atomic op.
+//! The table is the per-part cumulative ciphertext end-offsets, so reads recover every part boundary
+//! from the trailer alone — no remote part-index calls (§6).
 //!
 //! hypha's own state per upload is minimal and cache-resident under the reserved prefix:
 //! per-part `{pmd5, plen, retag}` facts, needed at complete because an in-progress upload's
@@ -25,6 +27,12 @@ use hypha_format::{encode_trailer, Footer, FooterKind};
 use super::{Hypha, MAX_INLINE_PLAINTEXT};
 use crate::codec;
 use crate::tier;
+
+/// S3/MinIO reject any multipart part below 5 MiB except the upload's final part. hypha's trailer
+/// normally occupies that final-part slot, so a client's last data part this small must instead
+/// *carry* the trailer (the fold in `op_complete_multipart_upload`, §7); `op_upload_part` retains
+/// such a part's ciphertext up front so complete can re-upload it as `part ‖ trailer`.
+const MIN_REMOTE_PART: u64 = 5 * 1024 * 1024;
 
 impl Hypha {
     pub(super) async fn op_create_multipart_upload(
@@ -115,6 +123,25 @@ impl Hypha {
         let (ct_len, enc, etag_rx) = codec::encrypt_blob_with_etag(self.env(), body, plen, None)
             .await
             .map_err(Error::Io)?;
+
+        // A part whose framed ciphertext is under the remote's 5 MiB minimum can only ever be the
+        // upload's last part; retain its ciphertext (bounded, < 5 MiB) so complete can fold the
+        // trailer into it rather than append a separate trailer part (§7).
+        let (upload_body, stash) = if ct_len < MIN_REMOTE_PART {
+            let bytes = enc
+                .collect()
+                .await
+                .map_err(|e| Error::Backend(format!("buffering small part: {e}")))?
+                .into_bytes()
+                .to_vec();
+            (
+                aws_sdk_s3::primitives::ByteStream::from(bytes.clone()),
+                Some(bytes),
+            )
+        } else {
+            (enc, None)
+        };
+
         let out = self
             .remote()
             .upload_part(
@@ -122,7 +149,7 @@ impl Hypha {
                 &key,
                 &input.upload_id,
                 part_number,
-                enc,
+                upload_body,
                 Some(ct_len as i64),
             )
             .await?;
@@ -136,6 +163,21 @@ impl Hypha {
         let pmd5 = etag_rx
             .await
             .map_err(|_| Error::Backend("MD5 task dropped before completing".into()))?;
+
+        // Retained small-part ciphertext (for the complete-time trailer fold, §7). Written before
+        // the part record so a crash never leaves a record whose fold ciphertext is missing.
+        if let Some(bytes) = stash {
+            self.cache()
+                .put_small(
+                    &bucket,
+                    &meta::mpu_stash_key(&input.upload_id, part_number, &retag),
+                    bytes,
+                    HashMap::new(),
+                    None,
+                    None,
+                )
+                .await?;
+        }
 
         // Persist the part's facts in the record KEY (§6): `pmd5` (the plaintext MD5, unknowable to
         // the remote) plus `retag` (its last-write-wins token). A re-upload writes a new key; the
@@ -264,10 +306,10 @@ impl Hypha {
             .ok_or_else(|| Error::Backend("empty part md5 set".into()))?;
         let mtime_ms = tier::now_ms();
 
-        // 2. Upload the terminating **trailer part** (§6) — the object's one facts + parts-table
-        //    carrier, its part number above every client part (the 9999 cap guarantees room) — so
-        //    the native complete below commits body and facts in one atomic op. A crash from here
-        //    on leaves only the dangling native upload, swept like any abandoned one.
+        // 2. Build the terminating trailer (§6) — the object's one facts + parts-table carrier —
+        //    and place it as the object's final bytes so the native complete below commits body and
+        //    facts in one atomic op. A crash from here on leaves only the dangling native upload,
+        //    swept like any abandoned one.
         let footer = Footer {
             kind: FooterKind::Composite,
             count: requested.len() as u32,
@@ -276,29 +318,86 @@ impl Hypha {
             md5,
         };
         let trailer = encode_trailer(&self.tier.trailer_key, &key, ct_acc, &footer, &table);
-        let trailer_pn = requested.last().and_then(|p| p.part_number).unwrap_or(0) + 1;
-        let fout = self
-            .remote()
-            .upload_part(
-                &bucket,
-                &key,
-                &upload_id,
-                trailer_pn,
-                aws_sdk_s3::primitives::ByteStream::from(trailer.clone()),
-                Some(trailer.len() as i64),
-            )
-            .await?;
-        // The remote just accepted this part, so it must echo its ETag; an empty one would silently
-        // build a mismatched CompletedPart and fail (or corrupt) the native complete.
-        let trailer_etag = fout
-            .e_tag()
-            .ok_or_else(|| Error::Backend("trailer part upload returned no ETag".into()))?;
-        remote_parts.push(
-            aws_sdk_s3::types::CompletedPart::builder()
-                .part_number(trailer_pn)
-                .e_tag(trailer_etag)
-                .build(),
-        );
+
+        // Placement: the trailer normally rides its own part above every client part (the 9999 cap
+        // guarantees room). But S3 exempts only the *last* part from the 5 MiB minimum, so when the
+        // highest client part is itself under that minimum — necessarily the client's last part, as
+        // any backend rejects a smaller non-final part — a separate trailer part would demote it to
+        // an illegal sub-minimum non-final part. In that case fold the trailer into the highest part
+        // instead: re-upload it as `part ‖ trailer`, keeping it the final part. The committed object
+        // K is byte-identical either way (same concatenation), so reads are unaffected (§7).
+        let last_n = requested.last().and_then(|p| p.part_number).unwrap_or(0);
+        let (last_retag, last_size) = winners
+            .get(&last_n)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), 0));
+        if last_size < MIN_REMOTE_PART {
+            // Fold the trailer into exactly the remote's winning part (§6) — its retag keys the stash.
+            let stash_key = meta::mpu_stash_key(&upload_id, last_n, &last_retag);
+            let stashed = match self.cache().get(&bucket, &stash_key, None).await {
+                Ok(o) => o
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| Error::Backend(format!("reading retained final part: {e}")))?
+                    .into_bytes(),
+                Err(Error::NotFound) => {
+                    return Err(Error::Backend(format!(
+                        "final part {last_n} ciphertext not retained; cannot fold trailer"
+                    ))
+                    .into())
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let mut folded = stashed.to_vec();
+            folded.extend_from_slice(&trailer);
+            let fout = self
+                .remote()
+                .upload_part(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    last_n,
+                    aws_sdk_s3::primitives::ByteStream::from(folded.clone()),
+                    Some(folded.len() as i64),
+                )
+                .await?;
+            let fold_etag = fout.e_tag().ok_or_else(|| {
+                Error::Backend("folded final part upload returned no ETag".into())
+            })?;
+            // The last client part now carries the trailer; point its CompletedPart at the re-upload.
+            *remote_parts
+                .last_mut()
+                .expect("requested is non-empty, so remote_parts is too") =
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .part_number(last_n)
+                    .e_tag(fold_etag)
+                    .build();
+        } else {
+            let trailer_pn = last_n + 1;
+            let fout = self
+                .remote()
+                .upload_part(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    trailer_pn,
+                    aws_sdk_s3::primitives::ByteStream::from(trailer.clone()),
+                    Some(trailer.len() as i64),
+                )
+                .await?;
+            // The remote just accepted this part, so it must echo its ETag; an empty one would
+            // silently build a mismatched CompletedPart and fail (or corrupt) the native complete.
+            let trailer_etag = fout
+                .e_tag()
+                .ok_or_else(|| Error::Backend("trailer part upload returned no ETag".into()))?;
+            remote_parts.push(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .part_number(trailer_pn)
+                    .e_tag(trailer_etag)
+                    .build(),
+            );
+        }
 
         // 3. Mark → 4. commit (the native complete concatenates the parts at K).
         self.tier.mark_transit_locked(&bucket, &key).await?;

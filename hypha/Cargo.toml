@@ -42,3 +42,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Testing
 proptest = "1"
 criterion = "0.5"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"

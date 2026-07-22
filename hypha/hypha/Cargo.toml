@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "hypha"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hypha"
 path = "src/main.rs"
@@ -25,3 +29,12 @@ tracing-subscriber = { workspace = true }
 age = { workspace = true }
 md-5 = { workspace = true }
 hex = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+# Integration harness (tests/): spawn MinIO as both the cache and the remote backend, drive hypha
+# in-process over an ephemeral port with a real S3 client. Stateless — every fixture cleans up on
+# drop.
+proptest = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }

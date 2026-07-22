@@ -4,6 +4,17 @@
 //! with its adjacent facts twin in one pass — the twin applies **iff the entry classifies as an
 //! eviction tombstone**; per-key HEADs happen only for the rare missing-twin fallback and for
 //! transition marks (the one classification that leaves the cache).
+//!
+//! LIST is a **single cache page**, forwarded pagination. A facts twin sits beside every eviction
+//! tombstone, and delete-tombstones and reserved records are dropped, so a page can yield fewer
+//! than `MaxKeys` client entries even when more exist — a short page, which is valid S3 as long as
+//! `IsTruncated` and the continuation token are honest. hypha forwards the backend's own
+//! (key-position) continuation token and truncation flag verbatim, so a client pages correctly with
+//! no gaps or repeats even under concurrent mutation. It deliberately does **not** backfill to fill
+//! a page: coalescing multiple cache pages would require either reusing a backend cursor across
+//! requests or resuming by a client-entry count, and both weaken S3's key-position guarantee (a
+//! concurrent insert/delete in the re-listed range could dup or drop an untouched key). Short pages
+//! are the cost; a client simply follows the token until `IsTruncated` is false.
 
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
@@ -136,6 +147,8 @@ impl Hypha {
                         ..Default::default()
                     }),
                     // Missing/unparseable twin: the tombstone's metadata is authoritative (§6).
+                    // Also fires when a pair straddles the page boundary (base last on this page,
+                    // twin first on the next) — a per-key HEAD, correct but an extra round trip.
                     None => {
                         if let Some(o) = self.head_facts(&bucket, key).await? {
                             entries.push(o);
@@ -161,23 +174,29 @@ impl Hypha {
             i += if consumed_twin { 2 } else { 1 };
         }
 
-        let common_prefixes = raw.common_prefixes.map(|cps| {
-            cps.into_iter()
-                .map(|cp| CommonPrefix { prefix: cp.prefix })
-                .filter(|cp| !cp.prefix.as_deref().is_some_and(meta::is_reserved_key))
-                .collect()
-        });
+        let common_prefixes: Vec<CommonPrefix> = raw
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| CommonPrefix { prefix: cp.prefix })
+            .filter(|cp| !cp.prefix.as_deref().is_some_and(meta::is_reserved_key))
+            .collect();
 
+        // KeyCount counts keys and common prefixes alike (S3). It is ≤ MaxKeys but may be strictly
+        // less: filtered twins/records leave a short — but honestly truncated — page.
+        let key_count = (entries.len() + common_prefixes.len()) as i32;
         let resp = ListObjectsV2Output {
             name: Some(bucket),
             prefix: input.prefix,
             delimiter: input.delimiter,
-            key_count: Some(entries.len() as i32),
+            key_count: Some(key_count),
             max_keys: raw.max_keys,
+            // The backend's key-position token and flag, forwarded verbatim: a short page still
+            // paginates correctly, and a client follows the token until IsTruncated is false.
             is_truncated: raw.is_truncated,
             continuation_token: input.continuation_token,
             next_continuation_token: raw.next_continuation_token,
-            common_prefixes,
+            common_prefixes: Some(common_prefixes),
             contents: Some(entries),
             ..Default::default()
         };

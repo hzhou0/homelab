@@ -216,17 +216,20 @@ completion-time re-encryption pass.
 - Parts may arrive out of order, in parallel, or be re-uploaded; concurrent uploads to one key are
   the remote's native multipart semantics. A re-upload is just a new age file with a fresh file key.
 - `CompleteMultipartUpload` composes the S3-correct composite ETag from the accumulated per-part
-  MD5s, uploads it with the total plaintext size as a small fixed-size **terminating footer
-  part**, and completes the upload on the remote, which concatenates the parts into a single
-  object at the key — one atomic op that is both the durability commit and the facts carrier.
-  The committed object is self-describing: a discarded cache is rebuilt by reading the ETag and
-  size off the object's tail, with no side records or tags to crash between. The facts also
-  live on the cache tombstone (and its facts twin). There is no stored part table: a ranged GET
-  recovers ciphertext part boundaries from the remote's own part index and derives each part's
-  plaintext length from its ciphertext length in closed form (the header length is shared
-  across parts and checked by tiling to the recorded total). Truncation and cross-object
-  splicing are detected by per-part file-key separation plus age's chunk-index-in-nonce
-  derivation plus the finalizer chunk.
+  MD5s and lands a **terminating trailer** — the facts *and* a per-part offset table, MAC'd — as
+  the object's final bytes, then completes the upload on the remote, which concatenates the parts
+  into a single object at the key — one atomic op that is both the durability commit and the facts
+  carrier. The trailer normally rides its own part above every client part; but S3 exempts only the
+  last part from its 5 MiB minimum, so when the client's last part is itself smaller than that, the
+  trailer is **folded into that part** (re-uploaded as `part ‖ trailer`) rather than appended as a
+  separate part that would demote the small part to an illegal non-final one — the committed object
+  is byte-identical either way. The committed object is self-describing: a discarded cache is
+  rebuilt by reading the ETag, size, and part boundaries off the object's tail trailer, with no side
+  records or tags to crash between. The facts also live on the cache tombstone (and its facts twin).
+  Ranged GETs recover ciphertext part boundaries from the trailer's offset table; each part's
+  plaintext length follows from its ciphertext length in closed form. Truncation and cross-object
+  splicing are detected by per-part file-key separation plus age's chunk-index-in-nonce derivation
+  plus the finalizer chunk.
 - Each part's plaintext size is capped at **4 GiB** (one line below the S3 `UploadPart` 5 GiB max) so
   the age envelope (~1.3 MiB overhead per GiB plus a ~200 B header) never pushes the framed part over
   the remote's part-size cap. Homelab parts are 5–128 MiB in practice; transparent re-splitting of a

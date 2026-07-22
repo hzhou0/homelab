@@ -162,6 +162,22 @@ pub fn parse_mpu_part(key: &str) -> Option<(i32, &str, &str)> {
     (!pmd5.is_empty()).then_some((n, retag, pmd5))
 }
 
+/// Cache: retained ciphertext of a **small** part — one whose framed size is below the backend's
+/// 5 MiB part minimum, which any S3 backend permits only as the upload's *final* part. hypha's
+/// terminating trailer normally occupies that final-part slot, so such a part must instead *carry*
+/// the trailer; complete re-uploads it as `part ‖ trailer` (§7), and needs the ciphertext back to
+/// do so (an in-progress part isn't readable). Keyed by `retag` like [`mpu_part_key`] — so
+/// concurrent/re-uploaded writes to the one small part each stash under their own token and complete
+/// folds *exactly* the remote's `ListParts` winner, never a divergent cache last-writer. Prefix `c`
+/// — distinct from `p` records and the `/u` upload record — so [`parse_mpu_part`] skips it and it's
+/// swept with the rest of the `mpu/<id>/` range at complete/abort.
+pub fn mpu_stash_key(upload_id: &str, part_number: i32, retag: &str) -> String {
+    format!(
+        "{RESERVED_PREFIX}mpu/{upload_id}/c{part_number:05};{}",
+        retag.trim_matches('"')
+    )
+}
+
 /// Cache: everything recorded for one upload — dropped at complete/abort.
 pub fn mpu_prefix(upload_id: &str) -> String {
     format!("{RESERVED_PREFIX}mpu/{upload_id}/")
