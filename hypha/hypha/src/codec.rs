@@ -74,7 +74,7 @@ fn pump_decrypt_full<R: Read>(
     env: &Envelope,
     src: R,
     dst: &mut impl Write,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> hypha_core::error::Result<()> {
     let mut dec = env.decrypt(src)?;
     io::copy(&mut dec, dst)?;
     Ok(())
@@ -117,7 +117,7 @@ fn pump_decrypt_range(
     source: RemoteRangeSource,
     pt: Range<u64>,
     dst: &mut impl Write,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> hypha_core::error::Result<()> {
     // Decryptor::new reads the age header from ciphertext offset 0 (RangeReader opens there),
     // then the seek maps the plaintext offset to a fresh ranged GET of the covering chunks.
     let mut dec = env.decrypt(RangeReader::new(source))?;
@@ -336,7 +336,7 @@ fn pump_decrypt_composite_full<R: Read>(
     mut src: R,
     part_ct_lens: &[u64],
     dst: &mut impl Write,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> hypha_core::error::Result<()> {
     for &len in part_ct_lens {
         // by_ref so the shared stream survives the Take; age reads exactly `len` (its EOF).
         let mut dec = env.decrypt(src.by_ref().take(len))?;
@@ -388,7 +388,7 @@ fn pump_decrypt_composite(
     segments: Vec<PartSegment>,
     handle: &Handle,
     dst: &mut impl Write,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> hypha_core::error::Result<()> {
     for seg in segments {
         let (ct, pt) = match seg {
             PartSegment::Whole(ct) => (ct, None),

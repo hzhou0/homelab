@@ -36,6 +36,8 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "server-gra
 # Config / errors / observability
 serde = { version = "1", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
+thiserror = "1"      # derive Display/Error/From on the layered error enums
+anyhow = "1"         # bootstrap-path error context in the serving binary
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 

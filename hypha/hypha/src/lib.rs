@@ -75,6 +75,11 @@ where
             () = shutdown.as_mut() => { tracing::info!("shutdown signalled: draining"); break; }
         };
 
+        // Disable Nagle: streamed-body responses (GET) write headers then body chunks, and with
+        // Nagle on the second small segment waits for the client's delayed ACK — a ~40 ms stall on
+        // every read (writes/HEAD have single-segment responses and don't hit it). Latency over
+        // throughput is the right trade for a request/response S3 surface.
+        stream.set_nodelay(true)?;
         let conn = http.serve_connection(TokioIo::new(stream), service.clone());
         let conn = graceful.watch(conn.into_owned());
         tokio::spawn(async move {

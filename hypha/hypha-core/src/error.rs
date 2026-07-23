@@ -7,56 +7,28 @@ use s3s::{S3Error, S3ErrorCode};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Object (or the ciphertext body behind a tombstone) is absent on the backend.
+    #[error("no such key")]
     NotFound,
     /// Target bucket does not exist.
+    #[error("no such bucket")]
     NoSuchBucket,
     /// An `If-Match` / `If-None-Match` precondition did not hold.
+    #[error("precondition failed")]
     PreconditionFailed,
     /// Client sent something hypha rejects at admission (bad key byte, oversized part, …).
+    #[error("invalid request: {0}")]
     Invalid(String),
     /// age envelope failure — decrypt authentication, truncation, or a malformed header.
-    Crypto(hypha_format::Error),
+    #[error("crypto: {0}")]
+    Crypto(#[from] hypha_format::Error),
     /// Anything the backend SDK reported that isn't one of the modelled cases above.
+    #[error("backend: {0}")]
     Backend(String),
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::NotFound => f.write_str("no such key"),
-            Error::NoSuchBucket => f.write_str("no such bucket"),
-            Error::PreconditionFailed => f.write_str("precondition failed"),
-            Error::Invalid(s) => write!(f, "invalid request: {s}"),
-            Error::Crypto(e) => write!(f, "crypto: {e}"),
-            Error::Backend(s) => write!(f, "backend: {s}"),
-            Error::Io(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Crypto(e) => Some(e),
-            Error::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<hypha_format::Error> for Error {
-    fn from(e: hypha_format::Error) -> Self {
-        Error::Crypto(e)
-    }
-}
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
-    }
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 impl Error {

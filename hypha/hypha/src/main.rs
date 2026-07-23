@@ -3,18 +3,14 @@
 //! SIGTERM/Ctrl-C. The service construction and accept loop live in the library ([`hypha`]) so the
 //! integration tests can build and drive the same service in-process.
 
+use anyhow::Context as _;
 use tokio::net::TcpListener;
 
-use hypha::{build_service, serve, BoxError};
+use hypha::{build_service, serve};
 use hypha_core::Config;
 
-/// Wrap an error with a bootstrap-context message (stands in for `anyhow::Context`).
-fn ctx<E: std::fmt::Display>(msg: &str) -> impl FnOnce(E) -> BoxError + '_ {
-    move |e| format!("{msg}: {e}").into()
-}
-
 #[tokio::main]
-async fn main() -> Result<(), BoxError> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -23,14 +19,14 @@ async fn main() -> Result<(), BoxError> {
         )
         .init();
 
-    let config = Config::load().map_err(ctx("loading config"))?;
+    let config = Config::load().context("loading config")?;
     tracing::info!(mode = ?config.mode, "hypha starting");
 
-    let service = build_service(&config)?;
+    let service = build_service(&config).context("building service")?;
 
     let listener = TcpListener::bind(&config.serving.listen)
         .await
-        .map_err(ctx(&format!("binding {}", config.serving.listen)))?;
+        .with_context(|| format!("binding {}", config.serving.listen))?;
     tracing::info!(addr = %config.serving.listen, "hypha listening");
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -42,5 +38,5 @@ async fn main() -> Result<(), BoxError> {
         }
     };
 
-    serve(listener, service, shutdown).await
+    serve(listener, service, shutdown).await.context("serving")
 }
