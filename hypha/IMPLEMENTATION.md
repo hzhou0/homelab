@@ -278,8 +278,41 @@ tail parses directly for facts and boundaries.
 
 ### Cache objects
 
-Body, tombstone, and marker share one keyspace: a client body lives at `K` and a tombstone
-overwrites `K` in place, so a racing GET sees one or the other, never a 404.
+**Two cache buckets, and the client keyspace is clean.** Every deployment maps one client bucket
+onto **four** backend buckets (§2): `<data><b>` and `<meta><b>` on the cache, `<remote><b>` on the
+remote — the fourth being the client bucket name itself, which never leaves hypha.
+
+- **`<data><b>`** holds *only* client objects: a body at `K`, or a tombstone overwriting `K` in
+  place, so a racing GET sees one or the other and never a 404. Nothing hypha-internal lives here.
+- **`<meta><b>`** holds everything hypha keeps *about* objects, in three contiguous,
+  prefix-separable ranges (below) — the two lowest byte values are inadmissible in client keys,
+  which is what makes the split structural rather than probabilistic.
+
+| Range                     | Contents                                              | How it is scanned                                    |
+|---------------------------|-------------------------------------------------------|------------------------------------------------------|
+| `0x01 0x01 ‖ tag ‖ …`     | mpu state, sync marker, recency slices, shadow bodies | prefix scan per tag                                  |
+| `0x01 ‖ K ‖ 0x01 ‖ facts` | facts twins                                           | prefix `0x01 ‖ <client prefix>`, delimiter mirrored  |
+| `K`                       | pending markers, **bare**                             | `start_after` past the `0x01` block                  |
+
+A twin is `0x01 ‖ K ‖ …` where `K`'s first byte is ≥ `0x02`, so the doubled `0x01` lead cannot
+collide with one; the three ranges sort in the order above and never interleave.
+
+This split is what the whole of §7's LIST rests on. Because `<data><b>` contains only client keys,
+a LIST page needs no reserved-key filter, carries no twin dilution, and its **last raw key is
+always a client key** — which is what makes v1's `NextMarker` expressible at all (§7,
+*ListObjectsV2*). It also gives the pending marker a zero-overhead home, so the marker — the one
+structure that is a durability signal rather than an optimization and therefore cannot degrade —
+supports the full 1024-byte key. Markers stay bare and *twins* carry the prefix, deliberately: a
+marker that cannot be written is data loss, where a twin that cannot be written is one HEAD.
+
+Splitting markers into a bucket of their own would cost a third: markers and twins are
+non-colliding but **interleave**, and the reconcile sweep's `O(pending)` flat LIST (§7) would
+become `O(pending + evicted)`, which a pressured cache makes arbitrarily bad. A `delimiter=0x01`
+rollup does not rescue it — each twin is its own group, so the response still carries one entry per
+evicted key. Prefixing the twins keeps both scans contiguous in one bucket.
+
+Both cache buckets live on the **same volume**: markers and bodies must survive a process crash
+together and die together on volume loss, which is what bounds the cached-mode loss window (§7).
 
 **Tombstones** carry fixed 16-byte sentinel bodies, compiled in, one per kind — **eviction** (body
 is remote-only, facts in metadata/twin), **delete** (client-visibly absent), and **transition** (K
@@ -289,52 +322,91 @@ deterministic (size==16, ETag) pair, so a plain LIST classifies every key with n
 sentinel's constant ETag doubles as a CAS token. Random 16-byte values so no client body collides
 with the classification token by accident.
 
-**Facts twins** — a zero-byte object at `K ‖ 0x01 ‖ cetag ; plen ; mtime`, carrying in its key
-name (the one field LIST returns per entry) exactly the facts LIST needs for an evicted key: the
-client ETag, the plaintext size, and the original client-write mtime. The separator sorts below every admissible key byte, so the twin
-arrives adjacent to K in the same LIST page. A twin **applies if K's own entry classifies as an
-eviction tombstone**; next to anything else it is a crash-window leftover, ignored and swept — a
-live body's facts are native, so a stale twin can never override them. An eviction tombstone
-whose twin is missing or unparseable falls back to a per-key HEAD (the tombstone's metadata is
-the authoritative copy; the twin is its LIST projection). Twins are written in the same locked
-sequence as their tombstone (twin-before-tombstone), and every path that replaces an eviction
-tombstone passes through a live body or a transition mark first — so an eviction tombstone is
-never adjacent to another epoch's twin, and the classification gate is the entire validity
-check.
+**Facts twins** — a zero-byte object in `<meta><b>` at `0x01 ‖ K ‖ 0x01 ‖ facts`, carrying in its
+key name (the one field LIST returns per entry) exactly the facts LIST needs for an evicted key:
+the client ETag, the plaintext size, and the original client-write mtime. Both separators sort
+below every admissible key byte, which is what makes the twin range **order-isomorphic to the
+client keyspace**: for `A < B`, if `A` is a proper prefix of `B` the two diverge where the twin
+holds `0x01` and `B` holds a byte ≥ `0x02`, so `twin(A) < twin(B)`; otherwise they diverge on a
+byte both keys share. LIST therefore pairs twins to keys by a **merge join** over two cursors
+(§7), not by adjacency.
 
-**Key admission** is what makes the twin scheme sound, and is now as narrow as the scheme allows:
-client keys may not contain `0x00` or `0x01` — `0x01` is the separator, and both sort at or below
-it, so either would let a client key fall between a base key and its twin — and are capped at 900
-bytes for twin-suffix headroom (`meta::validate_client_key`). Every other byte, control chars
-included, is permitted: hypha lists with **`encoding-type=url`** and percent-decodes (`Backend::list`),
-so keys XML can't represent (the `0x01` separator, or a client's own control bytes) round-trip
-safely. Enforced at every op that takes a key.
+A twin **applies if K's own entry classifies as an eviction tombstone**; against anything else it
+is a crash-window leftover, ignored and swept — a live body's facts are native, so a stale twin
+can never override them. Pairing is by key equality, so the gate is a direct check rather than a
+positional argument. Twins are written in the same locked sequence as their tombstone
+(twin-before-tombstone), and every path that replaces an eviction tombstone passes through a live
+body or a transition mark first.
+
+**Facts encoding.** `{md5(128) ‖ plen(46) ‖ mtime_ms(42) ‖ part-count(14)}` = 230 bits, bit-packed
+and rendered in a 92-symbol printable-ASCII alphabet (6.52 bits/char) → **36 chars**, fixed width.
+The alphabet excludes `/` — a `/` in the facts would make a twin roll up under a delimiter listing
+and vanish from the twin cursor (§7) — and `+`, which form-style decoders turn into a space. It
+also excludes `;`, though only by construction: one packed field needs no separator.
+
+**Twins are optional per key.** Twin overhead is `2 + 36 = 38` bytes, so a key longer than **986**
+bytes gets no twin, and its eviction tombstone resolves through the per-key HEAD fallback that
+already exists for genuinely-missing twins. This is deliberate: the tombstone's metadata is the
+authoritative copy and the twin is only its LIST projection, so a missing twin costs a round trip
+and never correctness. Keys containing `0x01` are impossible by admission, so length is the only
+condition. The threshold is a **format constant**, not a tunable — changing the facts encoding
+moves previously-written twins across it.
+
+> **Why the cap can shrink but never vanish.** Any twin that sorts adjacent to its base must
+> *embed* that base, so `|twin| ≥ |K| + |facts|` and some suffix of the key range is always
+> untwinnable. Hashing `K` to a fixed width does not escape it: strict order preservation forces
+> injectivity, injectivity forces `|output| ≥ log₂|domain|`, and for 1024-byte keys that is
+> ~875 bytes of output — order preservation and compression are directly opposed. Order-preserving
+> *minimal perfect* hashing reaches `log₂(n)` bits per key but requires a static key set, so one
+> PUT would rewrite every twin. The escape hatches are splitting facts across two adjacent twins
+> (threshold → ~1004 each, band → 17) or amortizing facts over a run of keys in one object (removes
+> the cap, buys write amplification and CAS on shared blocks). Neither is worth it while the
+> fallback is correct.
+
+**Key admission** is now S3's own rule plus one structural restriction (`meta::validate_client_key`):
+at most **1024 bytes**, and no `0x00` or `0x01` — those two byte values are what the `<meta><b>`
+ranges above are built from, and both sort at or below the twin separator, so either would let a
+client key fall inside the twin range. Every other byte, control chars included, is permitted:
+hypha lists with **`encoding-type=url`** and percent-decodes (`Backend::list`), so keys XML cannot
+represent round-trip safely. Enforced at every op that takes a key.
 
 **Tombstone metadata**: every tombstone carries the full facts — kind, `cetag`, `plen`, original
 mtime — in its user-metadata, the authoritative copy; HEAD and GET serve from it, and the twin is
 its LIST projection. Eviction never changes a key's client-visible `LastModified`: LIST reads it
 from the twin, HEAD from the metadata.
 
-**Shadow body** (cached mode): a rehydrated composite's plaintext at `<marker-prefix>/body/<K>`.
-The tombstone and twin at K stay untouched — K never changes classification, so composite
-rehydration is invisible to LIST/HEAD and rewrites no twin. A tombstoned GET probes the shadow
-before the remote; evicting a shadow is a single delete.
+**Shadow body** (cached mode): a rehydrated composite's plaintext at
+`0x01 0x01 b ‖ sha256(K)[..160 bits]`. The access pattern is a **point lookup** — "is there a
+rehydrated plaintext for K" — so the key can be a hash, which removes any length condition; the
+eviction path is likewise a point delete driven from K's side. SHA-256 rather than the MD5 already
+in the tree: a shadow collision would serve *another key's plaintext*, the worst failure the system
+has, so the digest must resist deliberate collision, and a second independent digest of K rides the
+shadow's user-metadata to be verified on read (a mismatch is a miss that falls through to the
+remote, turning a corruption risk into a cache miss). K itself cannot ride there — a 1024-byte key
+percent-encodes past S3's 2 KB metadata ceiling. The tombstone and twin at K stay untouched, so
+composite rehydration is invisible to LIST/HEAD and rewrites no twin.
 
-**The pending marker** (cached mode) lives at `<marker-prefix>/<K>` — **one per key**, body = the
-body ETag of the most recently acked PUT. Concurrent PUTs overwrite it; last writer wins — the
-write-coalescing point: however many PUTs raced, the pending set holds one entry for K and
-reconcile uploads the latest cache body. The marker's own S3 ETag (`M_etag`) changes on each
-overwrite and is the reconciler's CAS handle. The marker prefix leads with U+10FFFD — the highest
-interchange-safe codepoint (last plane-16 PUA char, just below the U+10FFFE/F noncharacters XML
-serializers may reject) — above every practical client key, so the reserved keyspace clusters at
-the **end** of a LIST rather than interleaving a client's scan. Efficiency, not correctness: LIST
-filters reserved keys per-entry, so a client that does use such keys merely scans less efficiently
-there. A ~128-bit base64url tail is what prevents collision. Marker and body live on the same cache
-volume: both survive a process crash, both die together on volume loss. **The marker set is the
-durability signal**, enumerable as one flat LIST.
+**The pending marker** (cached mode) lives in `<meta><b>` at **bare `K`** — **one per key**,
+body = the body ETag of the most recently acked PUT. Concurrent PUTs overwrite it; last writer
+wins — the write-coalescing point: however many PUTs raced, the pending set holds one entry for K
+and reconcile uploads the latest cache body. The marker's own S3 ETag (`M_etag`) changes on each
+overwrite and is the reconciler's CAS handle.
+
+The marker gets the bare keyspace because it is the one structure here that is a **durability
+signal rather than an optimization**: a twin or a shadow that cannot be written costs a round trip,
+a marker that cannot be written is data loss. Bare means zero overhead, so every admissible key has
+one — no threshold, no degraded case. Marker and body live on the same cache volume: both survive a
+process crash, both die together on volume loss. **The marker set is the durability signal**,
+enumerable as one flat LIST — `start_after` past the `0x01` block, which is what keeps the sweep
+`O(pending)` rather than `O(pending + evicted)`.
+
+Hashing the marker key would be a regression, not an alternative: the sweep's whole efficiency
+argument is that one flat LIST yields both K and `M_etag` per pending key, and a hash makes K
+unrecoverable from the listing — parking it in the marker body costs a GET per marker per pass, on
+a continual duty.
 
 **Multipart upload state**: one record per uploaded part, key
-`<marker-prefix>/mpu/<upload-id>/p{n:05};<retag>;<pmd5>;<nonce>`
+`0x01 0x01 m ‖ <upload-id> ‖ 0x01 ‖ p{n:05};<retag>;<pmd5>;<nonce>`
 (empty body) — the part's facts **encoded into the key** so `CompleteMultipartUpload` recovers
 them with **one LIST**, no per-part HEAD. The only irreducible datum is `pmd5`, the part's
 *plaintext* MD5: hypha hashes it inline during the streaming encrypt and it is never re-derivable,
@@ -343,7 +415,7 @@ MD5). Everything else the remote can re-tell us — so `ct_len`/`plen` are **not
 plaintext length is `plaintext_len_from(ct_size, HLEN)` over the size the remote reports.
 
 `nonce` is present only for a part that **admits no successor** (§7, *UploadPart*), and names its
-retained ciphertext at `<marker-prefix>/mpu/<upload-id>/c{n:05};<nonce>` — the copy complete folds
+retained ciphertext at `0x01 0x01 m ‖ <upload-id> ‖ 0x01 ‖ c{n:05};<nonce>` — the copy complete folds
 the trailer into. It is a nonce rather than the `retag` because the retained bytes must be written
 *while* the part streams, before the remote has returned an ETag to key them by; carrying it here
 costs one field on a record that already exists to disambiguate re-uploads.
@@ -354,18 +426,20 @@ disambiguated at complete by the one authority that already resolved the race �
 `ListParts`**, which returns the winning `(n → retag, size)` for the in-progress upload. hypha
 matches each winning `retag` to the record carrying it (a ciphertext MD5 ⇒ the match is exact),
 takes that record's `pmd5` (and its `nonce`, where a fold needs the retained bytes), and ignores
-the losing orphans (swept by the batched delete below).
+the losing orphans (swept by the batched delete below). All of an upload's records share the
+prefix `0x01 0x01 m ‖ <upload-id> ‖ 0x01`, so that one LIST is a prefix scan and the sweep at
+complete/abort is a prefix range.
 This is why no hypha-minted version counter is needed: `UploadPart` returns no ordering token, and
 a durable monotonic counter across the active/passive pods would be its own distributed problem —
 the remote's retag *is* the version. Survives process restarts across a multi-hour upload; dropped
 at complete/abort via a batched multi-object delete.
 
-**The sync marker**: a reserved object under the marker prefix, present iff a namespace
+**The sync marker**: an object at `0x01 0x01 s`, present iff a namespace
 reconciliation has completed — namespace trust recorded in the cache itself, dying with the
 volume by construction. Present ⇒ reads are cache-authoritative and an absent key is a definitive
 404. Absent ⇒ the remote is the read source of truth until the restore sweep rewrites it (§7).
 
-**Recency slices**: sealed Bloom filters under `<marker-prefix>/recency/`, the persisted form of
+**Recency slices**: sealed Bloom filters under `0x01 0x01 r ‖ …`, the persisted form of
 the §8 recency ring.
 
 ### Remote objects
@@ -440,7 +514,7 @@ lock:
 1. *(conditional only)* resolve + evaluate as above.
 2. `inc` K's in-flight ref count (§8).
 3. **Commit**: `PutObject` plaintext at K — the cache computes the ETag natively.
-4. Overwrite the single marker at `<marker-prefix>/<K>` with the body ETag (last writer wins —
+4. Overwrite the single marker at `<meta><b>`'s bare `K` with the body ETag (last writer wins —
    the coalescing point, §6).
 5. `dec`. Ack. The remote trails via the reconcile sweep below.
 
@@ -475,6 +549,11 @@ exempt). The invariant is per-key, so batching is a transport question, not a co
 **Durable** — the transition bracket widened from one key to the batch, so the *remote* leg
 collapses to one native call while the cache leg stays per-key:
 
+0. **Admit**: a key hypha rejects (forbidden byte, over-long) fails *per key* —
+   an `InvalidArgument` entry in the reply — and never reaches the bracket; the rest of the batch
+   still commits. Keys are **deduplicated** for the bracket: a key repeated in one request would
+   otherwise wait on the lock it already holds. The reply is still built per *requested* entry, so
+   a repeat gets the same verdict twice.
 1. Acquire the batch's write locks in **sorted key order** (two overlapping batch deletes can't
    deadlock; single-key ops take one lock and queue); repair any leftover marks.
 2. **Mark** each K — per-key transition tombstones.
@@ -619,7 +698,7 @@ integration harness runs MinIO.
 upload today, so the proxy needs no filter. `CopyObject`'s large-body path (§7) creates a transient
 native upload at `K_dst`, which would otherwise surface here while the copy runs; from that point the
 page is filtered against the client uploads hypha knows about — **one** cache LIST of
-`<marker-prefix>/mpu/` with `delimiter=/`, whose common prefixes carry the upload ids in the key
+`0x01 0x01 m` with `delimiter=0x01`, whose common prefixes carry the upload ids in the key
 names, so membership is a set test with no per-entry fetch.
 
 **ListParts** (both modes): proxy the remote's `ListParts` (the winning `(n → retag, size)`),
@@ -685,7 +764,7 @@ special handling. Under `K_dst`'s write lock for the conditional case:
      plaintext, same volume, ETag preserved natively, zero bytes through hypha.
    - **Source cold** (evicted / shadow): rehydrate from the remote (§8), then the cache→cache copy;
      equivalently source GET → decrypt → cache `PutObject` at `K_dst`.
-3. Overwrite the marker at `<marker-prefix>/K_dst` (last-writer-wins coalescing, §6). `dec`. Ack; the
+3. Overwrite the marker at `<meta><b>`'s bare `K_dst` (last-writer-wins coalescing, §6). `dec`. Ack; the
    remote trails via reconcile.
 
 An unconditional cached copy takes no lock, racing on the cache like an unconditional PUT (§4).
@@ -721,56 +800,114 @@ supplies it from the trailer. `Checksum` is omitted (deferred).
 
 ### ListObjectsV2
 
-1. Classify each cache entry from its (size, ETag) sentinel pair (§6): **live body** → native facts
-   (any adjacent twin is stale — ignored); **eviction tombstone** → the adjacent twin's
-   `{cetag, plen, mtime}`, per-key cache HEAD fallback when the twin is missing;
-   **delete-tombstone** →
-   omitted; **transition tombstone** → per-key *remote* HEAD (the one classification that leaves
-   the cache). Strip the deployment prefix; filter the reserved prefix.
-2. **Single page, forwarded pagination.** A facts twin sits beside every eviction tombstone and
-   delete-tombstones/reserved records are dropped, so a page can return **fewer** than `MaxKeys`
-   client entries even when more exist — a short page. That is valid S3 as long as `IsTruncated` and
-   the continuation token are honest, so hypha forwards the **backend's own** (key-position) token
-   and truncation flag verbatim; `KeyCount` reports the entries actually emitted. LIST deliberately
-   does **not** coalesce cache pages to fill `MaxKeys`: any such backfill would resume either by
-   reusing a backend cursor across requests or by a client-entry count, and both weaken S3's
-   key-position guarantee — a concurrent insert/delete in the re-listed range could dup or drop an
-   untouched key. Short pages are the accepted cost; a client follows the token until `IsTruncated`
-   is false.
+**Two cursors, merged.** Facts twins live in `<meta><b>` (§6), not beside their keys, so a page is
+assembled from two listings issued **concurrently** against the same cache backend:
 
-   *Deferred optimization (revisit post-phase-4):* twin pairing is per cache page, so an eviction
-   tombstone that is the **last** raw entry of a page has its twin on the next page → the
-   missing-twin **HEAD fallback** fires (correct, but one extra HEAD per cache-page boundary that
-   splits a pair). Avoidance is a cross-page carry-over — defer the unpaired trailing base and peek
-   the next page's head before falling back to a HEAD; left for later, as the bounded HEAD fallback
-   (which must exist anyway for genuinely-missing twins, §6) covers correctness meanwhile.
+- the **client cursor** over `<data><b>` — `prefix`, `delimiter`, `max_keys`, and the client's
+  position, all forwarded unchanged;
+- the **twin cursor** over `<meta><b>` at `prefix = 0x01 ‖ <client prefix>`, **the same delimiter**,
+  and the client's position likewise prefixed.
 
-**ListObjects (v1)** reuses this classifier verbatim (twin pairing, reserved filter, single-page /
-forwarded-token discipline — s3s does not translate v1→v2, so it is its own method): only the
-pagination shell differs — request `marker`, response `NextMarker` = the last returned key when
-`IsTruncated`. Short pages are as valid under v1 as v2. Cache-served, both modes identical.
+The delimiter mirrors exactly because the twin range is order-isomorphic to the client keyspace
+(§6) and the facts alphabet excludes `/`: `twin("a/1")` rolls up into common prefix `0x01 ‖ a/`
+just as `a/1` rolls into `a/`, while `twin("top")` stays a content entry just as `top` does. So the
+twin cursor's shape tracks the client cursor's, and no scan runs past a rolled-up group.
+
+1. Classify each client-cursor entry from its (size, ETag) sentinel pair (§6): **live body** →
+   native facts (any twin is stale — ignored); **eviction tombstone** → its twin's
+   `{cetag, plen, mtime}`, matched from the twin cursor **by key equality**, with a per-key cache
+   HEAD fallback when the twin is missing (crash window, page straddle, or a key over the §6
+   twin threshold); **delete-tombstone** → omitted; **transition tombstone** → per-key *remote*
+   HEAD (the one classification that leaves the cache).
+2. **Single page, forwarded pagination.** Delete-tombstones are dropped, so a page can still return
+   **fewer** than `MaxKeys` client entries — a short page, valid S3 as long as `IsTruncated` and the
+   resume position are honest. hypha forwards the client cursor's **own** truncation flag, and
+   `KeyCount` reports the entries actually emitted. LIST deliberately does **not** coalesce pages to
+   fill `MaxKeys`: any such backfill would resume either by reusing a backend cursor across requests
+   or by a client-entry count, and both weaken S3's key-position guarantee — a concurrent
+   insert/delete in the re-listed range could dup or drop an untouched key. Short pages are the
+   accepted cost; a client follows the position until `IsTruncated` is false.
+
+   Dilution is gone with the twins: pages are short only where keys were *deleted*, not for every
+   evicted key, so the effect is now the exception rather than the norm.
+
+**ListObjects (v1)** reuses the classifier and the two-cursor merge verbatim (s3s does not translate
+v1→v2, so it is its own method); only the pagination shell differs — request `marker`, response
+`NextMarker` = **the last raw key of the client-cursor page**. Cache-served, both modes identical.
+
+That expression is only available because `<data><b>` holds nothing but client objects: the last
+raw key is always a client key, so it is XML-representable, strictly increasing, and skips nothing.
+It is worth recording why the pre-split layout could not express it at all, since the failure is
+not obvious and both halves were observed:
+
+> **Why v1 needs the split.** v2 forwards an **opaque** continuation token; v1's `NextMarker` is a
+> **key**. With twins interleaved at `K ‖ 0x01 ‖ …`, neither candidate worked. *The raw page end*
+> can be a twin, whose `0x01` is not a legal XML character — the client's parser rejects the whole
+> response. *The last returned client key* (or a trailing twin mapped back to its base) makes a page
+> of purely filtered records reproduce the previous marker and loop forever: at `MaxKeys=1`, page 1
+> returns `K` and marker `K`; page 2 is `K`'s twin alone, emits nothing, and yields marker `K`
+> again. And no third choice existed — a valid marker must satisfy `all twins ≤ S < all client
+> keys`, but twins occupy `K ‖ 0x01 ‖ …`, so every candidate begins `K ‖ 0x01` or `K ‖ 0x02`, none
+> XML-representable. The same argument rules out a sentinel *below* the client keyspace generally:
+> the smallest possible client key is the single byte `0x02`, so any `S < "\x02"` must begin `0x00`
+> or `0x01`. This is why the reserved ranges sort at the bottom of `<meta><b>` and are skipped with
+> an internal `start_after` constant — a *request* parameter, which carries arbitrary bytes freely —
+> rather than being filtered and patched over in a response.
 
 ### Buckets
 
-Buckets map one-to-one across client ⇄ cache ⇄ remote; the client bucket passes through, mapped to
-`<bucket_prefix><bucket>` by each `Backend` (§2). Like multipart, the **remote is the source of
-truth** and bucket ops are **always durable** (synchronous to the remote regardless of mode). The
-cache bucket exists only to host object-side state (bodies, tombstones, twins, mpu records), so it
-is created/deleted alongside but is never the authority. Rare control-plane events — no markers.
+One client bucket maps to **three** backend buckets: `<data><b>` and `<meta><b>` on the cache,
+`<remote><b>` on the remote, each `Backend` prepending its own configured prefix (§2, §6). Like
+multipart, the **remote is the source of truth** and bucket ops are **always durable** (synchronous
+to the remote regardless of mode). The two cache buckets exist only to host object-side state
+(bodies and tombstones; twins, markers, and mpu records), so they are created/deleted alongside but
+are never the authority. Rare control-plane events — no markers.
 
-- **CreateBucket**: create the cache projection, then the remote — the remote create is the durable
-  commit; a crash before it leaves a harmless orphan cache bucket (not yet "created" per the remote).
+**Bucket-name budget.** S3 caps a bucket name at **63 characters** and the prefix is charged
+against it, so the client-visible cap is `63 − max(prefix length)`. Prefixes should therefore be
+short (`d-`, `m-`, `r-` ⇒ 61) and the effective cap validated up front with `InvalidBucketName`,
+rather than surfacing as an opaque backend error. Two configuration invariants, checked at startup
+(§9): no prefix may be **empty** when backends share an endpoint — three buckets cannot occupy one
+name — and no prefix may be a **prefix of another**, or `ListBuckets`' strip-and-filter
+mis-classifies and client buckets leak or vanish.
+
+- **CreateBucket**: create both cache projections, then the remote — the remote create is the
+  durable commit; a crash before it leaves harmless orphan cache buckets (not yet "created" per the
+  remote). Idempotent, so a partial create is repaired by retry.
 - **DeleteBucket**: delete the remote first (the durable commit that makes the bucket cease to
-  exist), then the cache — a crash between leaves a retryable cache orphan, never a remote bucket the
-  client believes is gone.
-- **ListBuckets**: remote-served, filtered to this deployment's prefix and stripped back to
-  client-visible names.
+  exist), then both cache buckets — a crash between leaves a retryable cache orphan, never a remote
+  bucket the client believes is gone. **Emptiness is judged on `<data><b>` alone**: leftover twins
+  or markers in `<meta><b>` are hypha's own state and must be swept rather than block the delete.
+- **ListBuckets**: remote-served, filtered to this deployment's remote prefix and stripped back to
+  client-visible names — the cache prefixes never match, so cache buckets cannot leak into the
+  listing even when both backends share one account.
 - **HeadBucket / GetBucketLocation**: remote existence check; the latter reports the deployment's
   configured backend region.
 - **GetBucketVersioning**: a benign stub — an empty `VersioningConfiguration` (no `Status`,
   `MFADelete: Disabled`), no backend call, hypha buckets never carry versioning. Load-bearing for
   compatibility: `aws s3 sync` / boto / `mc` probe it up front and a 501 aborts them where
   "not enabled" passes. Enabling it (`PutBucketVersioning`) stays exempt — rejected.
+
+### User metadata (passthrough, both modes)
+
+Client `x-amz-meta-*` rides the cache object's user-metadata alongside hypha's own facts, so the
+two are namespaced apart: hypha's keys stay bare and the client's take a `u-` prefix, which is not
+a prefix of any hypha key. The *client* wire leg is RFC 2047 for non-ASCII — s3s encodes and
+decodes it, so hypha only ever handles decoded values; MinIO does the same on its own client leg,
+while `aws-sdk-s3` neither encodes nor decodes, which is why a round-trip through the SDK shows the
+encoded-word form.
+
+**The carrier is capped at S3's 2 KB for all user metadata, and hypha shares it with the client**,
+so the at-rest escaping is deliberately narrow: controls and `DEL` (illegal in a header value),
+space (SigV4 canonicalization collapses runs of whitespace, so `a  b` would sign as `a b`, and edge
+whitespace is trimmed), and `%` (what keeps the encoding self-delimiting). Non-ASCII always escapes.
+Ordinary ASCII therefore passes through **unchanged**. The earlier set — everything outside
+`[A-Za-z0-9]` — inflated typical values up to 3× and put hypha's effective client budget at roughly
+a third of S3's: an invisible conformance shortfall of exactly the kind the key-length cap was.
+
+The remote's sole facts carrier is the trailer (§6), which holds facts and nothing else, so a
+repair or restore that rebuilds K from the remote settles user metadata and storage class back to
+their defaults — the accepted durability limit of this carrier.
 
 ### Storage class (passthrough, both modes)
 
@@ -779,8 +916,8 @@ CreateMultipartUpload: read `x-amz-storage-class`, **reject the archive family**
 (`GLACIER`/`DEEP_ARCHIVE`/`GLACIER_IR`/`SNOW`/`OUTPOSTS`) with `InvalidStorageClass` (they imply
 `RestoreObject`), accept the rest, default `STANDARD`; persist it on the **same user-metadata
 carrier** as `x-amz-meta-*` and echo on HEAD / GET / GetObjectAttributes. Two accepted cosmetic
-corners: **LIST reports `STANDARD`** for every key (the twin carries only `{cetag, plen, mtime}`;
-per-object class would mean a twin-format change), and a cache-loss restore falls the class back to
+corners: **LIST reports `STANDARD`** for every key (the twin's packed facts carry only
+`{cetag, plen, mtime, count}`; per-object class would mean a twin-format change), and a cache-loss restore falls the class back to
 `STANDARD` (the user-metadata carrier's durability limit).
 
 ### Background: the reconcile sweep (cached mode)
@@ -788,9 +925,10 @@ per-object class would mean a twin-format change), and a cache-loss restore fall
 The upload path for acked cache writes — a continual duty of the active (phase 4,
 `replication.rs`). Each pass:
 
-1. `ListObjectsV2` the cache at `prefix=<marker-prefix>/` — one entry per pending key,
-   `O(pending)` over local NVMe; each yields K and the marker's own ETag `M_etag` (the CAS
-   handle).
+1. `ListObjectsV2` `<meta><b>` with `start_after` past the `0x01` block (§6) — the markers are the
+   bare-`K` range above it, so this is one entry per pending key, `O(pending)` over local NVMe and
+   never `O(evicted)`; each yields K directly from the key name and the marker's own ETag `M_etag`
+   (the CAS handle).
 2. Dispatch on the cache body at K: delete-sentinel ⇒ **delete branch**, anything else ⇒
    **upload branch**.
 3. **Upload branch**, under K's *upload* lock (§4 — reconcile-only, so client PUTs never queue
@@ -897,7 +1035,7 @@ remote HEAD, a twin write, and a CAS, hence the bound. Recency is priority only:
 overrides the correctness gates below. Eviction of candidate K with version-token ETag `E_v`:
 
 1. **Skip if ref count > 0.**
-2. **Skip if the marker exists** (`HEAD <marker-prefix>/<K>`) — also catches markers from a prior
+2. **Skip if the marker exists** (`HEAD <meta><b>` at bare `K`) — also catches markers from a prior
    process generation whose ref count died with it.
 3. **Confirm the remote** (`HEAD` remote K); absent ⇒ not durable ⇒ skip.
 4. Under K's lock: delete stale twins, write the fresh twin, then overwrite K with the eviction
@@ -1119,7 +1257,8 @@ age 0.11.x cannot grease a scrypt sole-stanza header, so `HLEN` is a hardcoded c
 *Exit*: integration conformance vs. MinIO — **done** (`hypha/tests/conformance.rs` + `fuzz.rs`;
 this pass also caught and fixed a real bug: twin keys carry `0x01`, which XML 1.0 can't represent,
 so `delete_twins` must use single-object `DeleteObject`, never the batch `DeleteObjects` whose body
-would be rejected — it had broken every durable overwrite/delete of an already-written key).
+would be rejected — it had broken every durable overwrite/delete of an already-written key; the
+carve-out survives the §6 keyspace split, since a twin key still carries `0x01`).
 Remaining: the s3s-e2e black-box pass (§11) later found this surface still drops user
 `x-amz-meta-*` metadata and accepts a wrong `Content-MD5` — both fixes land under phase 3; also
 conformance vs. SeaweedFS as the cache backend, and ZeroFS against the durable endpoint.
@@ -1134,7 +1273,7 @@ embedded parts table
 (§6/§7) both landed, superseding the original metadata records + completed-object part-index
 approach.
 Native-remote-multipart proxy (§7): per-part encryption + inline `pmd5`, listable mpu records
-(`p{n:05};<retag>;<pmd5>;<nonce>` key-encoded, `pmd5` the sole stored datum) under the reserved prefix;
+(`p{n:05};<retag>;<pmd5>;<nonce>` key-encoded, `pmd5` the sole stored datum) in `<meta><b>`;
 complete resolves the winning part set via the remote's `ListParts` (retag-matched, geometry from
 the remote's sizes), composes the composite ETag, and lands the terminating trailer —
 `table ‖ facts ‖ tag ‖ version` — in the same atomic native complete (self-describing, no records
@@ -1162,6 +1301,26 @@ ops: CopyObject (single-part + composite source, `COPY`/`REPLACE`, copy-source p
 result, crash mid-batch repair, XML-clean-keys-only remote batch), v1 LIST, multipart list/parts,
 and GetObjectAttributes part geometry — all covered in `hypha/tests/multipart.rs` and the s3s-e2e
 pass against MinIO.
+
+**Phase 3a — the keyspace split (§6), a prerequisite for v1 LIST.** Sequenced ahead of the
+remaining phase-3 surface because v1's `NextMarker` is not expressible under the old layout at all,
+and because the twin-suffix headroom it removes is what capped client keys at 900 bytes.
+
+1. **Config + buckets** — the `<data>`/`<meta>` cache split, prefix-length and prefix-collision
+   validation (§7 *Buckets*), the create/delete/head lifecycle over three backend buckets, and the
+   `<data><b>`-only emptiness rule.
+2. **`meta` module** — the structural `0x01` ranges replacing `RESERVED_PREFIX`, bit-packed
+   base-92 facts, twin build/parse against the 986-byte threshold, admission relaxed to S3's 1024.
+3. **Move twins, markers, and mpu state** into `<meta><b>`; `refresh_twin` / `delete_twins` /
+   the settle and tombstone paths; shadow bodies keyed by `sha256(K)`.
+4. **LIST merge join** — two concurrent cursors, delimiter mirroring, pairing by key equality, the
+   HEAD fallback for missing and over-threshold twins.
+5. **v1 pagination** — `NextMarker` = the client cursor's last raw key; un-ignore
+   `list_objects_v1_pagination`.
+
+*Exit*: the v1 pagination test green under twin dilution at several page sizes; a key above the
+twin threshold round-tripping PUT → LIST → GET through the HEAD fallback; `ListBuckets` not leaking
+cache buckets; and the reconcile sweep's marker scan proven `O(pending)` with evicted keys present.
 
 **Phase 4 — cached mode, single replica.** Marker writes + the in-flight ref count on the PUT
 path, the reconcile sweep, cached DELETE propagation, rehydrate (single-part into K + twin

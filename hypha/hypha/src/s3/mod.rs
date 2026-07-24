@@ -171,6 +171,13 @@ impl s3s::S3 for Hypha {
         self.op_delete_object(req).await
     }
 
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        self.op_delete_objects(req).await
+    }
+
     async fn get_bucket_location(
         &self,
         req: S3Request<GetBucketLocationInput>,
@@ -211,6 +218,13 @@ impl s3s::S3 for Hypha {
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
         self.op_list_multipart_uploads(req).await
+    }
+
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        self.op_list_objects(req).await
     }
 
     async fn list_objects_v2(

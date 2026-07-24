@@ -420,6 +420,148 @@ async fn list_pagination_short_pages() {
     }
 }
 
+/// LIST v1: the same classifier and plaintext facts as v2, over v1's `marker`/`NextMarker` shell.
+/// Paginating under twin dilution must still cover every key exactly once, in order.
+#[tokio::test]
+async fn list_objects_v1() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let bodies = [("a/1", 10usize), ("a/2", 20), ("b/1", 30)];
+    for (k, n) in bodies {
+        put(&client, B, k, &pattern(n)).await;
+    }
+
+    let out = client
+        .list_objects()
+        .bucket(B)
+        .send()
+        .await
+        .expect("list v1");
+    let objs = out.contents();
+    assert_eq!(objs.len(), 3, "all three keys must list");
+    for o in objs {
+        let (_, want) = bodies.iter().find(|(k, _)| *k == o.key().unwrap()).unwrap();
+        // Plaintext facts, not the ciphertext's — the twin is what LIST reads.
+        assert_eq!(o.size(), Some(*want as i64), "plaintext size {:?}", o.key());
+        assert_eq!(
+            o.e_tag().unwrap().trim_matches('"'),
+            md5_hex(&pattern(*want)),
+            "plaintext ETag {:?}",
+            o.key()
+        );
+    }
+    assert_eq!(out.name(), Some(B));
+    assert_eq!(out.is_truncated(), Some(false));
+
+    // Prefix.
+    let pfx = client
+        .list_objects()
+        .bucket(B)
+        .prefix("a/")
+        .send()
+        .await
+        .expect("prefixed list v1");
+    let keys: Vec<&str> = pfx.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, vec!["a/1", "a/2"]);
+
+    // Delimiter → common prefixes, no direct contents.
+    let d = client
+        .list_objects()
+        .bucket(B)
+        .delimiter("/")
+        .send()
+        .await
+        .expect("delimited list v1");
+    let mut cps: Vec<String> = d
+        .common_prefixes()
+        .iter()
+        .filter_map(|c| c.prefix().map(str::to_string))
+        .collect();
+    cps.sort();
+    assert_eq!(cps, vec!["a/", "b/"]);
+    assert!(d.contents().is_empty());
+
+    // `marker` resumes strictly after its argument, and is echoed back.
+    let after = client
+        .list_objects()
+        .bucket(B)
+        .marker("a/1")
+        .send()
+        .await
+        .expect("marker list v1");
+    assert_eq!(after.marker(), Some("a/1"));
+    let keys: Vec<&str> = after.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, vec!["a/2", "b/1"]);
+}
+
+/// v1 pagination under twin dilution: short pages are valid, but following `NextMarker` (falling
+/// back to the last key received, as S3 documents) must cover every key exactly once with no gaps
+/// or repeats — and must terminate.
+///
+/// Ignored: v1's resume position is a *key*, not an opaque token, and §7's forwarded-token
+/// discipline does not carry over. A raw page can end on a twin, whose `0x01` no XML response can
+/// carry; mapping that twin back to its base makes the next page repeat the same marker forever.
+/// No XML-safe key exists between a twin and the next client key, so the pagination shell needs a
+/// design decision — see the note in §7.
+#[tokio::test]
+#[ignore = "v1 NextMarker cannot be derived from a single raw page; design pending"]
+async fn list_objects_v1_pagination() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let n = 25usize;
+    let mut expected: Vec<String> = (0..n).map(|i| format!("obj/{i:03}")).collect();
+    expected.sort();
+    for k in &expected {
+        put(&client, B, k, &pattern(32)).await;
+    }
+
+    for page_size in [1i32, 7, 10] {
+        let mut collected: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        // A bound that can only be hit by a non-terminating pager.
+        for _ in 0..(4 * n + 8) {
+            let mut req = client.list_objects().bucket(B).max_keys(page_size);
+            if let Some(m) = &marker {
+                req = req.marker(m.clone());
+            }
+            let page = req.send().await.expect("list v1 page");
+            let keys: Vec<String> = page
+                .contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string))
+                .collect();
+            assert!(
+                keys.len() <= page_size as usize,
+                "never exceed MaxKeys ({page_size})"
+            );
+            collected.extend(keys.iter().cloned());
+
+            if page.is_truncated() != Some(true) {
+                marker = None;
+                break;
+            }
+            // S3: use NextMarker when present, else the last key of the page.
+            marker = page
+                .next_marker()
+                .map(str::to_string)
+                .or_else(|| keys.last().cloned());
+            assert!(
+                marker.is_some(),
+                "a truncated page must leave a resume position (size {page_size})"
+            );
+        }
+        assert!(marker.is_none(), "pagination did not terminate");
+        assert_eq!(
+            collected, expected,
+            "page size {page_size}: every key exactly once, in order, no gap/dup/twin-leak"
+        );
+    }
+}
+
 /// Keys with control bytes and prefix-adjacent names round-trip byte-exact through PUT/GET, and
 /// prefix-adjacent keys list in correct lexicographic order with their twins paired away.
 #[tokio::test]
@@ -721,7 +863,120 @@ async fn storage_class_passthrough() {
     assert_eq!(head.storage_class(), Some(&StorageClass::Standard));
 }
 
+/// Batch DELETE: a fan-out of independent single-key deletes. Absent keys succeed, a repeated key
+/// is not a self-deadlock, untargeted keys survive, and every deleted key leaves the cache clean.
+#[tokio::test]
+async fn delete_objects_batch() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    for k in ["gone/1", "gone/2", "gone/3", "kept"] {
+        put(&client, B, k, &pattern(4096)).await;
+    }
+
+    // "missing" was never written and "gone/1" appears twice — both are successes.
+    let targets = ["gone/1", "gone/2", "gone/3", "gone/1", "missing"];
+    let out = delete_objects(&client, B, &targets, false).await;
+
+    let deleted: Vec<&str> = out
+        .deleted()
+        .iter()
+        .filter_map(|d| d.key())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        deleted.len(),
+        targets.len(),
+        "non-quiet mode reports one entry per requested object, got {deleted:?}"
+    );
+    assert!(
+        out.errors().is_empty(),
+        "no key should fail: {:?}",
+        out.errors()
+    );
+
+    assert_eq!(list_keys(&client, B, None).await, vec!["kept".to_string()]);
+    for k in ["gone/1", "gone/2", "gone/3"] {
+        let got = client.get_object().bucket(B).key(k).send().await;
+        assert_eq!(
+            sdk_err_code(&got.unwrap_err()).as_deref(),
+            Some("NoSuchKey")
+        );
+    }
+    // Settle removes the cache entry and its twins outright — absent is the authoritative 404.
+    let cached = raw_list(&h.raw(), &h.cache_bucket(B), Some("gone/")).await;
+    assert!(
+        cached.is_empty(),
+        "deleted keys left cache state: {cached:?}"
+    );
+
+    // The survivor is untouched, body included.
+    assert_eq!(get_all(&client, B, "kept").await, pattern(4096));
+}
+
+/// Quiet mode returns errors only, and a key hypha refuses at admission fails *per key* — the rest
+/// of the batch still commits.
+#[tokio::test]
+async fn delete_objects_quiet_and_partial_failure() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    put(&client, B, "ok", &pattern(64)).await;
+    let reserved = format!("{}mpu/forged/u", hypha_core::meta::RESERVED_PREFIX);
+    let out = delete_objects(&client, B, &["ok", &reserved], true).await;
+
+    assert!(
+        out.deleted().is_empty(),
+        "quiet mode must omit successes: {:?}",
+        out.deleted()
+    );
+    let errors = out.errors();
+    assert_eq!(errors.len(), 1, "only the reserved key fails: {errors:?}");
+    assert_eq!(errors[0].key(), Some(reserved.as_str()));
+    assert_eq!(errors[0].code(), Some("InvalidArgument"));
+
+    // The valid key still committed despite its neighbour's rejection.
+    let got = client.get_object().bucket(B).key("ok").send().await;
+    assert_eq!(
+        sdk_err_code(&got.unwrap_err()).as_deref(),
+        Some("NoSuchKey")
+    );
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────
+
+/// Batch-delete `keys` through hypha.
+async fn delete_objects(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    keys: &[&str],
+    quiet: bool,
+) -> aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput {
+    use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+    let objects: Vec<ObjectIdentifier> = keys
+        .iter()
+        .map(|k| {
+            ObjectIdentifier::builder()
+                .key(*k)
+                .build()
+                .expect("object id")
+        })
+        .collect();
+    client
+        .delete_objects()
+        .bucket(bucket)
+        .delete(
+            Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(quiet)
+                .build()
+                .expect("delete container"),
+        )
+        .send()
+        .await
+        .expect("delete_objects")
+}
 
 /// Client-visible keys, optionally prefix-filtered, in listing order.
 async fn list_keys(client: &aws_sdk_s3::Client, bucket: &str, prefix: Option<&str>) -> Vec<String> {

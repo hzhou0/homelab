@@ -25,6 +25,21 @@ use hypha_core::meta;
 use super::get::facts_from_tombstone;
 use super::{ts_ms, Hypha};
 
+/// The client-visible projection of one raw cache page — what both LIST versions put in `Contents`
+/// and `CommonPrefixes`. Pagination is not in here: the versions resume differently.
+struct PageView {
+    entries: Vec<Object>,
+    common_prefixes: Vec<CommonPrefix>,
+}
+
+/// A raw cache key as a key *position* a client may be handed back (v1's `NextMarker`). Only twins
+/// need translating: their `0x01` separator is not a legal XML character, so a raw twin key cannot
+/// survive the response at all. A reserved record passes through — it is XML-representable, and
+/// hypha cannot assume the reserved range is the keyspace's end.
+fn client_key_position(raw: &str) -> String {
+    meta::parse_twin(raw).map_or_else(|| raw.to_string(), |(base, _)| base.to_string())
+}
+
 impl Hypha {
     pub(super) async fn op_head_object(
         &self,
@@ -99,8 +114,115 @@ impl Hypha {
             )
             .await?;
 
-        let objs = raw.contents.unwrap_or_default();
+        let page = self
+            .project_page(
+                &bucket,
+                raw.contents.unwrap_or_default(),
+                raw.common_prefixes.unwrap_or_default(),
+            )
+            .await?;
 
+        // KeyCount counts keys and common prefixes alike (S3). It is ≤ MaxKeys but may be strictly
+        // less: filtered twins/records leave a short — but honestly truncated — page.
+        let key_count = (page.entries.len() + page.common_prefixes.len()) as i32;
+        let resp = ListObjectsV2Output {
+            name: Some(bucket),
+            prefix: input.prefix,
+            delimiter: input.delimiter,
+            key_count: Some(key_count),
+            max_keys: raw.max_keys,
+            // The backend's key-position token and flag, forwarded verbatim: a short page still
+            // paginates correctly, and a client follows the token until IsTruncated is false.
+            is_truncated: raw.is_truncated,
+            continuation_token: input.continuation_token,
+            next_continuation_token: raw.next_continuation_token,
+            common_prefixes: Some(page.common_prefixes),
+            contents: Some(page.entries),
+            ..Default::default()
+        };
+        Ok(S3Response::new(resp))
+    }
+
+    /// LIST v1. The classifier and the forwarded-pagination discipline are v2's verbatim (s3s does
+    /// not translate v1→v2, so it is its own method); only the pagination shell differs —
+    /// `marker` in, `NextMarker` out. Short pages are as valid under v1 as under v2.
+    pub(super) async fn op_list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let raw = self
+            .cache()
+            .list_v1(
+                &bucket,
+                input.prefix.clone(),
+                input.delimiter.clone(),
+                input.marker.clone(),
+                input.max_keys,
+            )
+            .await?;
+
+        let is_truncated = raw.is_truncated;
+        // v1 has no opaque token to forward: `NextMarker` is a *key*, so hypha must compute the
+        // resume position itself rather than echo the backend's. It is the key position the raw
+        // page actually reached — the greater of its last raw key and its last common prefix,
+        // because with a delimiter the two interleave and resuming from the last *content* key
+        // would re-roll a group hypha already emitted. The raw page end is also what keeps a page
+        // of nothing but filtered records from returning an empty marker and looping forever.
+        let next_marker = raw
+            .contents
+            .iter()
+            .flatten()
+            .next_back()
+            .and_then(|o| o.key())
+            // A page can end on a twin, whose `0x01` no XML response can carry: resume from its
+            // base instead. The base was emitted already and `marker` is exclusive, so the next
+            // page re-lists only the twin, which filters out again.
+            .map(client_key_position)
+            .into_iter()
+            .chain(
+                raw.common_prefixes
+                    .iter()
+                    .flatten()
+                    .next_back()
+                    .and_then(|cp| cp.prefix())
+                    .map(str::to_string),
+            )
+            .max()
+            .filter(|_| is_truncated == Some(true));
+
+        let page = self
+            .project_page(
+                &bucket,
+                raw.contents.unwrap_or_default(),
+                raw.common_prefixes.unwrap_or_default(),
+            )
+            .await?;
+
+        let resp = ListObjectsOutput {
+            name: Some(bucket),
+            prefix: input.prefix,
+            delimiter: input.delimiter,
+            marker: input.marker,
+            next_marker,
+            max_keys: raw.max_keys,
+            is_truncated,
+            common_prefixes: Some(page.common_prefixes),
+            contents: Some(page.entries),
+            ..Default::default()
+        };
+        Ok(S3Response::new(resp))
+    }
+
+    /// One raw cache page → the client-visible entries and common prefixes it projects (§7's
+    /// classifier). Shared by both LIST versions, which differ only in their pagination shell.
+    async fn project_page(
+        &self,
+        bucket: &str,
+        objs: Vec<aws_sdk_s3::types::Object>,
+        raw_prefixes: Vec<aws_sdk_s3::types::CommonPrefix>,
+    ) -> S3Result<PageView> {
         // Walk the raw page, filtering the reserved keyspace and pairing each base key with the
         // twin that sorts immediately after it.
         let mut entries: Vec<Object> = Vec::new();
@@ -154,15 +276,15 @@ impl Hypha {
                     // Also fires when a pair straddles the page boundary (base last on this page,
                     // twin first on the next) — a per-key HEAD, correct but an extra round trip.
                     None => {
-                        if let Some(o) = self.head_facts(&bucket, key).await? {
+                        if let Some(o) = self.head_facts(bucket, key).await? {
                             entries.push(o);
                         }
                     }
                 },
                 // Mid-bracket: the one classification that leaves the cache — remote HEAD (§7).
-                Some(meta::TombKind::Transit) => match self.remote().head(&bucket, key).await {
+                Some(meta::TombKind::Transit) => match self.remote().head(bucket, key).await {
                     Ok(h) => {
-                        let f = self.tier.remote_facts(&bucket, key, &h).await?;
+                        let f = self.tier.remote_facts(bucket, key, &h).await?;
                         entries.push(Object {
                             key: Some(key.to_string()),
                             size: Some(f.plen as i64),
@@ -178,33 +300,16 @@ impl Hypha {
             i += if consumed_twin { 2 } else { 1 };
         }
 
-        let common_prefixes: Vec<CommonPrefix> = raw
-            .common_prefixes
-            .unwrap_or_default()
+        let common_prefixes: Vec<CommonPrefix> = raw_prefixes
             .into_iter()
             .map(|cp| CommonPrefix { prefix: cp.prefix })
             .filter(|cp| !cp.prefix.as_deref().is_some_and(meta::is_reserved_key))
             .collect();
 
-        // KeyCount counts keys and common prefixes alike (S3). It is ≤ MaxKeys but may be strictly
-        // less: filtered twins/records leave a short — but honestly truncated — page.
-        let key_count = (entries.len() + common_prefixes.len()) as i32;
-        let resp = ListObjectsV2Output {
-            name: Some(bucket),
-            prefix: input.prefix,
-            delimiter: input.delimiter,
-            key_count: Some(key_count),
-            max_keys: raw.max_keys,
-            // The backend's key-position token and flag, forwarded verbatim: a short page still
-            // paginates correctly, and a client follows the token until IsTruncated is false.
-            is_truncated: raw.is_truncated,
-            continuation_token: input.continuation_token,
-            next_continuation_token: raw.next_continuation_token,
-            common_prefixes: Some(common_prefixes),
-            contents: Some(entries),
-            ..Default::default()
-        };
-        Ok(S3Response::new(resp))
+        Ok(PageView {
+            entries,
+            common_prefixes,
+        })
     }
 
     /// HEAD-fallback facts for an eviction tombstone missing its twin (§6). `None` if the key

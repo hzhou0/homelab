@@ -1,17 +1,33 @@
-//! DELETE. Durable mode runs the §7 bracket under K's write lock: mark → remote `DeleteObject`
-//! (the commit; NotFound ⇒ already absent, still committed) → settle by removing K's cache entry
-//! and twins — absent is the authoritative 404. While marked, readers keep serving the object
-//! from the remote, so an unacked delete stays invisible. The delete-tombstone + marker
-//! machinery that propagates deletes asynchronously is a cached-path concern (Phase 4).
+//! DELETE, single and batch. Durable mode runs the §7 bracket under K's write lock: mark → remote
+//! delete (the commit; NotFound ⇒ already absent, still committed) → settle by removing K's cache
+//! entry and twins — absent is the authoritative 404. While marked, readers keep serving the object
+//! from the remote, so an unacked delete stays invisible. The delete-tombstone + marker machinery
+//! that propagates deletes asynchronously is a cached-path concern (Phase 4).
+//!
+//! `DeleteObjects` is that same bracket widened from one key to the batch: the invariant is
+//! per-key, so batching is a transport question, not a correctness one — only the *remote* leg
+//! collapses into one native call, and each key still gets its own mask, its own commit slice, and
+//! its own verdict in the reply.
 
+use std::collections::HashMap;
+
+use futures::StreamExt as _;
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
+use hypha_core::backend::BatchDeleteError;
 use hypha_core::config::Mode;
 use hypha_core::error::Error;
 use hypha_core::meta;
 
 use super::Hypha;
+
+/// S3's hard cap on one `DeleteObjects` request.
+const MAX_BATCH_KEYS: usize = 1000;
+
+/// How many of a batch's per-key cache legs run at once. The keys are independent, but a 1000-key
+/// batch must not open 1000 simultaneous cache requests.
+const BATCH_FANOUT: usize = 32;
 
 impl Hypha {
     pub(super) async fn op_delete_object(
@@ -30,18 +46,7 @@ impl Hypha {
 
         let _guard = self.tier.locks.lock(&key).await;
 
-        // A leftover mark is repaired before this op takes its own (§7) — the bracket below must
-        // start from a settled projection or a mark could hide an object the delete should 404.
-        match self.cache().head(&bucket, &key).await {
-            Ok(head) => {
-                let md = head.metadata.clone().unwrap_or_default();
-                if meta::tomb_kind(&md) == Some(meta::TombKind::Transit) {
-                    self.tier.repair_locked(&bucket, &key).await?;
-                }
-            }
-            Err(Error::NotFound) => {}
-            Err(e) => return Err(e.into()),
-        }
+        self.repair_leftover_mark_locked(&bucket, &key).await?;
 
         // Mark → commit → settle. Crash before the remote delete: the object survives and repair
         // restores its projection. Crash after: 404 everywhere, repair removes the entry.
@@ -59,5 +64,183 @@ impl Hypha {
         self.tier.settle_absent_locked(&bucket, &key).await?;
 
         Ok(S3Response::new(DeleteObjectOutput::default()))
+    }
+
+    /// A fan-out of ≤ 1000 independent single-key deletes, **never a raw backend batch over client
+    /// state**. Deleting an absent key is a success; `VersionId` is ignored (versioning is exempt).
+    pub(super) async fn op_delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let bucket = req.input.bucket;
+        let quiet = req.input.delete.quiet.unwrap_or(false);
+        let requested: Vec<String> = req
+            .input
+            .delete
+            .objects
+            .into_iter()
+            .map(|obj| obj.key)
+            .collect();
+
+        if requested.is_empty() || requested.len() > MAX_BATCH_KEYS {
+            return Err(s3_error!(
+                MalformedXML,
+                "DeleteObjects takes between 1 and 1000 objects"
+            ));
+        }
+        if self.mode != Mode::Durable {
+            return Err(s3_error!(
+                NotImplemented,
+                "cached-mode DeleteObjects pending"
+            ));
+        }
+
+        // Per-key failures land here; a key absent from the map at the end succeeded.
+        let mut failed: HashMap<String, BatchDeleteError> = HashMap::new();
+
+        // Sorted and deduped: overlapping batches acquire their shared keys in the same order, so
+        // two batch deletes can't deadlock, and a key repeated within one request never waits on
+        // the lock it already holds. The reply is still built per *requested* entry.
+        let mut keys: Vec<String> = requested.clone();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.retain(|key| match meta::validate_client_key(key) {
+            Ok(()) => true,
+            Err(why) => {
+                failed.insert(key.clone(), batch_error(key, "InvalidArgument", why));
+                false
+            }
+        });
+
+        // Sequentially, in sorted order — the deadlock-freedom argument is the acquisition order.
+        let mut guards = Vec::with_capacity(keys.len());
+        for key in &keys {
+            guards.push(self.tier.locks.lock(key).await);
+        }
+
+        // Mark each key, dropping any that couldn't be masked: an unmasked key must stay out of
+        // the commit, or a crash could leave it deleted on the remote but live in the cache.
+        let marked = self.mark_batch(&bucket, keys, &mut failed).await;
+
+        // Commit: one native call, but each key's slice of it is still its own atomic commit.
+        // A whole-call failure leaves every mark standing — the indeterminate outcome the repair
+        // rule resolves — and fails the request outright.
+        let remote_failed = self
+            .remote()
+            .delete_objects_reporting(&bucket, &marked)
+            .await?;
+        let settle: Vec<String> = {
+            let refused: std::collections::HashSet<&str> =
+                remote_failed.iter().map(|e| e.key.as_str()).collect();
+            let settle = marked
+                .iter()
+                .filter(|k| !refused.contains(k.as_str()))
+                .cloned()
+                .collect();
+            // A refused key keeps its mark, so readers resolve it from the remote — where it still
+            // is — and the next access repairs it.
+            failed.extend(remote_failed.into_iter().map(|e| (e.key.clone(), e)));
+            settle
+        };
+
+        // Settle each confirmed delete. A settle failure is not a client failure: the commit
+        // already happened, so a reader following the leftover mark to the remote gets the 404
+        // this delete promised. Only the stale cache entry survives, until repair sweeps it.
+        let bucket = bucket.as_str();
+        futures::stream::iter(settle.iter())
+            .for_each_concurrent(BATCH_FANOUT, |key| async move {
+                if let Err(e) = self.tier.settle_absent_locked(bucket, key).await {
+                    tracing::warn!(key = %key, error = %e, "settle after committed delete failed; leftover mark repaired on next access");
+                }
+            })
+            .await;
+
+        drop(guards);
+
+        let mut deleted = Vec::new();
+        let mut errors = Vec::new();
+        for key in requested {
+            match failed.get(&key) {
+                Some(e) => errors.push(s3s::dto::Error {
+                    code: Some(e.code.clone()),
+                    message: Some(e.message.clone()),
+                    key: Some(key),
+                    version_id: None,
+                }),
+                None if !quiet => deleted.push(DeletedObject {
+                    key: Some(key),
+                    ..Default::default()
+                }),
+                None => {}
+            }
+        }
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted: (!deleted.is_empty()).then_some(deleted),
+            errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        }))
+    }
+
+    /// Mark every key of a batch, returning those that carry a mark and so belong in the commit.
+    /// Distinct keys, so the marks run concurrently; each holds its own lock already.
+    async fn mark_batch(
+        &self,
+        bucket: &str,
+        keys: Vec<String>,
+        failed: &mut HashMap<String, BatchDeleteError>,
+    ) -> Vec<String> {
+        let outcomes = futures::stream::iter(keys)
+            .map(|key| async move {
+                let marked = async {
+                    self.repair_leftover_mark_locked(bucket, &key).await?;
+                    self.tier.mark_transit_locked(bucket, &key).await
+                }
+                .await;
+                (key, marked)
+            })
+            .buffer_unordered(BATCH_FANOUT)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut marked = Vec::with_capacity(outcomes.len());
+        for (key, outcome) in outcomes {
+            match outcome {
+                Ok(()) => marked.push(key),
+                Err(e) => {
+                    failed.insert(
+                        key.clone(),
+                        batch_error(&key, "InternalError", &e.to_string()),
+                    );
+                }
+            }
+        }
+        // The commit body follows the marks, so it stays sorted.
+        marked.sort_unstable();
+        marked
+    }
+
+    /// A leftover mark is repaired before an op takes its own (§7) — the bracket must start from a
+    /// settled projection, or a stale mark could hide an object this delete should 404. Caller
+    /// holds K's write lock.
+    async fn repair_leftover_mark_locked(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        match self.cache().head(bucket, key).await {
+            Ok(head) => {
+                let md = head.metadata.clone().unwrap_or_default();
+                if meta::tomb_kind(&md) == Some(meta::TombKind::Transit) {
+                    self.tier.repair_locked(bucket, key).await?;
+                }
+                Ok(())
+            }
+            Err(Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+fn batch_error(key: &str, code: &str, message: &str) -> BatchDeleteError {
+    BatchDeleteError {
+        key: key.to_string(),
+        code: code.to_string(),
+        message: message.to_string(),
     }
 }

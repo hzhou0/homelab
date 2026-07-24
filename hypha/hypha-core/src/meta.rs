@@ -130,9 +130,22 @@ pub const USER_PREFIX: &str = "u-";
 
 /// Client metadata values are percent-encoded at rest so a non-ASCII or control byte survives the
 /// backend's own header round trip byte-exact. (The *client* wire leg is RFC 2047, which s3s
-/// encodes and decodes for us — hypha only ever sees decoded values.) Escaping everything outside
-/// `[A-Za-z0-9]` covers `%` itself, so the encoding is unambiguous.
-const META_ESCAPE: &percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC;
+/// encodes and decodes for us — hypha only ever sees decoded values.)
+///
+/// The set is deliberately **narrow**: this carrier is capped at S3's 2 KB for all user metadata,
+/// and hypha shares it with the client, so every byte the encoding adds is a byte of the client's
+/// budget spent. Escaping everything outside `[A-Za-z0-9]` cost up to 3× and put hypha's effective
+/// limit at roughly a third of S3's — an invisible conformance shortfall. Ordinary ASCII now passes
+/// through unchanged and only genuinely unsafe bytes expand:
+///
+/// - **controls and `DEL`** — illegal in an HTTP header value,
+/// - **space** — SigV4 canonicalization collapses runs of whitespace in a header value, so an
+///   unescaped double space would sign differently than it transmits, and leading/trailing
+///   whitespace is trimmed outright,
+/// - **`%`** — what keeps the encoding self-delimiting.
+///
+/// Non-ASCII needs no entry: `utf8_percent_encode` always escapes bytes above `0x7F`.
+const META_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b' ').add(b'%');
 
 /// Client `x-amz-meta-*` entries → the cache object's namespaced user-metadata.
 pub fn encode_user_metadata(
@@ -418,6 +431,8 @@ mod tests {
         let mut client = std::collections::HashMap::new();
         client.insert("colour".to_string(), "café ☕".to_string());
         client.insert("plain".to_string(), "value".to_string());
+        client.insert("mime".to_string(), "text/plain;charset=utf-8".to_string());
+        client.insert("spaced".to_string(), "two  spaces".to_string());
 
         // hypha's own facts share the carrier and must survive untouched, unread as client keys.
         let mut stored: std::collections::HashMap<String, String> =
@@ -429,6 +444,17 @@ mod tests {
         assert_eq!(storage_class(&stored), "STANDARD_IA");
         // Percent-encoded at rest, so no backend header round trip can mangle a value.
         assert!(stored.values().all(|v| v.is_ascii()));
+        // The escape set is narrow on purpose: the carrier is capped at 2 KB and shared with the
+        // client, so ordinary ASCII must not spend the client's budget on encoding.
+        for bare in ["value", "text/plain;charset=utf-8"] {
+            assert!(
+                stored.values().any(|v| v == bare),
+                "safe ASCII must ride through unencoded, got {stored:?}"
+            );
+        }
+        // Space is the one printable that must still escape: SigV4 canonicalization collapses runs
+        // of whitespace in a header value, so `two  spaces` would sign as `two spaces`.
+        assert_eq!(stored.get("u-spaced").unwrap(), "two%20%20spaces");
 
         // A client key colliding with a hypha key name stays namespaced apart.
         let mut shadow = std::collections::HashMap::new();

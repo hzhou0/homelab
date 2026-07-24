@@ -16,6 +16,7 @@ use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput;
+use aws_sdk_s3::operation::list_objects::ListObjectsOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
@@ -26,6 +27,15 @@ use percent_encoding::percent_decode_str;
 
 use crate::config::S3Endpoint;
 use crate::error::{Error, Result};
+
+/// One key's failure inside a batch delete. S3 models `DeleteObjects` outcomes per key, so a
+/// batch can partially succeed and the caller decides whether that is fatal.
+#[derive(Clone, Debug)]
+pub struct BatchDeleteError {
+    pub key: String,
+    pub code: String,
+    pub message: String,
+}
 
 #[derive(Clone)]
 pub struct Backend {
@@ -170,12 +180,16 @@ impl Backend {
         Ok(())
     }
 
-    /// Batch-delete up to 1000 keys in one round trip (S3 `DeleteObjects`). Used to reclaim a
-    /// key's twins and an upload's per-part records without a request per object. `quiet` so the
-    /// response omits per-key success entries; a partial failure surfaces via `from_sdk`.
-    pub async fn delete_objects(&self, bucket: &str, keys: &[String]) -> Result<()> {
+    /// Batch-delete up to 1000 keys in one round trip (S3 `DeleteObjects`), reporting the keys the
+    /// remote refused. `quiet` suppresses only the per-key *success* entries — the failures come
+    /// back either way — so the caller reads "absent from the returned list" as deleted.
+    pub async fn delete_objects_reporting(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<Vec<BatchDeleteError>> {
         if keys.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let build_err = |e: aws_sdk_s3::error::BuildError| {
             Error::Backend(format!("building DeleteObjects request: {e}"))
@@ -190,14 +204,42 @@ impl Backend {
             .quiet(true)
             .build()
             .map_err(build_err)?;
-        self.client
+        let out = self
+            .client
             .delete_objects()
             .bucket(self.bkt(bucket))
             .delete(delete)
             .send()
             .await
             .map_err(Error::from_sdk)?;
-        Ok(())
+        Ok(out
+            .errors
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| BatchDeleteError {
+                key: e.key.unwrap_or_default(),
+                code: e.code.unwrap_or_else(|| "InternalError".to_string()),
+                message: e.message.unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Batch-delete where any per-key failure is the caller's failure: hypha's own sweeps (a key's
+    /// twins, an upload's part records) have no per-key contract to honour, so a partial result is
+    /// simply an error.
+    pub async fn delete_objects(&self, bucket: &str, keys: &[String]) -> Result<()> {
+        let failed = self.delete_objects_reporting(bucket, keys).await?;
+        match failed.first() {
+            None => Ok(()),
+            Some(first) => Err(Error::Backend(format!(
+                "batch delete: {} of {} keys failed, first {:?}: {} {}",
+                failed.len(),
+                keys.len(),
+                first.key,
+                first.code,
+                first.message
+            ))),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -232,6 +274,41 @@ impl Backend {
         for cp in out.common_prefixes.iter_mut().flatten() {
             cp.prefix = cp.prefix.take().map(|p| url_decode(&p));
         }
+        Ok(out)
+    }
+
+    /// The v1 listing, kept native rather than emulated on top of [`Self::list`]: `NextMarker` is a
+    /// *key position* under the backend's own delimiter/rollup rules, and reconstructing one from a
+    /// v2 page would mean guessing where a common-prefix group ends. Forwarding the backend's
+    /// marker verbatim is the same discipline the v2 path applies to its continuation token.
+    pub async fn list_v1(
+        &self,
+        bucket: &str,
+        prefix: Option<String>,
+        delimiter: Option<String>,
+        marker: Option<String>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsOutput> {
+        let mut out = self
+            .client
+            .list_objects()
+            .bucket(self.bkt(bucket))
+            .set_prefix(prefix)
+            .set_delimiter(delimiter)
+            .set_marker(marker)
+            .set_max_keys(max_keys)
+            .encoding_type(EncodingType::Url)
+            .send()
+            .await
+            .map_err(Error::from_sdk)?;
+        for obj in out.contents.iter_mut().flatten() {
+            obj.key = obj.key.take().map(|k| url_decode(&k));
+        }
+        for cp in out.common_prefixes.iter_mut().flatten() {
+            cp.prefix = cp.prefix.take().map(|p| url_decode(&p));
+        }
+        // Unlike v2's opaque continuation token, `NextMarker` is a key and comes back encoded too.
+        out.next_marker = out.next_marker.take().map(|m| url_decode(&m));
         Ok(out)
     }
 
