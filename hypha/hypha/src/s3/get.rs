@@ -136,59 +136,9 @@ impl Hypha {
             Some(range) => Some(plaintext_range(range, plen)?),
         };
 
-        let body = if meta::is_composite_etag(&facts.cetag) {
-            // The trailer's parts table (recovered in one tail read) gives every part's ciphertext
-            // window and plaintext length — no remote part-index calls.
-            let tail = self.tier.read_tail(bucket, key).await?.ok_or_else(|| {
-                Error::Backend(format!("composite {key:?} carries no hypha trailer"))
-            })?;
-            match &pt {
-                // Whole object: one GET of the concatenated parts, decrypted part-by-part in-stream.
-                None => {
-                    let out = self
-                        .remote()
-                        .get(
-                            bucket,
-                            key,
-                            Some(format!("bytes=0-{}", tail.body_ct_len - 1)),
-                        )
-                        .await?;
-                    let part_lens = tail.windows.iter().map(|w| w.end - w.start).collect();
-                    codec::decrypt_composite_full(self.env(), out.body, part_lens)
-                }
-                // Range: fetch only the parts it touches.
-                Some(pt) => {
-                    let segments = composite_segments(&tail.windows, &tail.plens, pt);
-                    codec::decrypt_composite(
-                        self.env(),
-                        self.remote().clone(),
-                        bucket.to_string(),
-                        key.to_string(),
-                        segments,
-                    )
-                }
-            }
-        } else {
-            match &pt {
-                None => {
-                    let out = self.remote().get(bucket, key, None).await?;
-                    let ct_len = envelope_len(key, out.content_length)?;
-                    codec::decrypt_full(self.env(), out.body, ct_len)
-                }
-                Some(pt) => {
-                    let rhead = self.remote().head(bucket, key).await?;
-                    let ct_len = envelope_len(key, rhead.content_length)?;
-                    codec::decrypt_range(
-                        self.env(),
-                        self.remote().clone(),
-                        bucket.to_string(),
-                        key.to_string(),
-                        ct_len,
-                        pt.clone(),
-                    )
-                }
-            }
-        };
+        let body = self
+            .decrypt_remote_body(bucket, key, &facts.cetag, pt.clone())
+            .await?;
 
         let resp = match pt {
             None => GetObjectOutput {
@@ -220,6 +170,72 @@ impl Hypha {
             ))
         } else {
             Ok(S3Response::new(resp))
+        }
+    }
+
+    /// Decrypt a remote-resident object into a plaintext stream — the whole body, or a plaintext
+    /// sub-range `pt` (§7). Single-part goes through `decrypt_full`/`decrypt_range`; a composite
+    /// recovers its parts table from one tail read and decrypts part-by-part. Shared by GET's remote
+    /// path and UploadPartCopy's re-encrypt source read.
+    pub(super) async fn decrypt_remote_body(
+        &self,
+        bucket: &str,
+        key: &str,
+        cetag: &str,
+        pt: Option<ByteRange<u64>>,
+    ) -> Result<StreamingBlob, Error> {
+        if meta::is_composite_etag(cetag) {
+            // The trailer's parts table (recovered in one tail read) gives every part's ciphertext
+            // window and plaintext length — no remote part-index calls.
+            let tail = self.tier.read_tail(bucket, key).await?.ok_or_else(|| {
+                Error::Backend(format!("composite {key:?} carries no hypha trailer"))
+            })?;
+            Ok(match &pt {
+                // Whole object: one GET of the concatenated parts, decrypted part-by-part in-stream.
+                None => {
+                    let out = self
+                        .remote()
+                        .get(
+                            bucket,
+                            key,
+                            Some(format!("bytes=0-{}", tail.body_ct_len - 1)),
+                        )
+                        .await?;
+                    let part_lens = tail.windows.iter().map(|w| w.end - w.start).collect();
+                    codec::decrypt_composite_full(self.env(), out.body, part_lens)
+                }
+                // Range: fetch only the parts it touches.
+                Some(pt) => {
+                    let segments = composite_segments(&tail.windows, &tail.plens, pt);
+                    codec::decrypt_composite(
+                        self.env(),
+                        self.remote().clone(),
+                        bucket.to_string(),
+                        key.to_string(),
+                        segments,
+                    )
+                }
+            })
+        } else {
+            Ok(match &pt {
+                None => {
+                    let out = self.remote().get(bucket, key, None).await?;
+                    let ct_len = envelope_len(key, out.content_length)?;
+                    codec::decrypt_full(self.env(), out.body, ct_len)
+                }
+                Some(pt) => {
+                    let rhead = self.remote().head(bucket, key).await?;
+                    let ct_len = envelope_len(key, rhead.content_length)?;
+                    codec::decrypt_range(
+                        self.env(),
+                        self.remote().clone(),
+                        bucket.to_string(),
+                        key.to_string(),
+                        ct_len,
+                        pt.clone(),
+                    )
+                }
+            })
         }
     }
 

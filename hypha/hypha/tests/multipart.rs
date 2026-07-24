@@ -709,7 +709,155 @@ async fn get_object_attributes_composite_parts() {
     assert_eq!(pp.total_parts_count(), Some(3));
 }
 
+/// UploadPartCopy fast path (§7): a whole, single-part source copies **server-side** as a part,
+/// with `pmd5` = the source's plaintext MD5 (its single-part cetag). Source is part 1 (≥ 5 MiB, so
+/// it admits a successor and stays on the fast path); a small uploaded tail follows. The completed
+/// object is `source ‖ tail`.
+#[tokio::test]
+async fn upload_part_copy_whole_single_part() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let src = pattern_seeded(MIN_PART, 9);
+    put(&client, B, "src/obj", &src).await;
+
+    let tail = pattern_seeded(4096, 8);
+    let key = "dst/copied";
+    let up = create_mpu(&client, B, key).await;
+    let e1 = upload_part_copy(&client, B, key, &up, 1, B, "src/obj", None).await;
+    assert_eq!(
+        e1,
+        md5_hex(&src),
+        "copied-part ETag is the source's plaintext MD5"
+    );
+    let e2 = upload_part(&client, B, key, &up, 2, &tail).await;
+
+    let etag = complete_mpu(&client, B, key, &up, &[(1, e1), (2, e2)]).await;
+    assert_eq!(etag, expected_composite_etag(&[&src, &tail]));
+
+    let whole: Vec<u8> = [src.as_slice(), tail.as_slice()].concat();
+    assert_eq!(get_all(&client, B, key).await, whole);
+}
+
+/// A ranged UploadPartCopy re-encrypts (the fast path is whole-object only): copy a 5 MiB slice at
+/// a non-zero offset out of a larger single-part source as part 1, then a small tail. The offset
+/// catches a mis-sliced range.
+#[tokio::test]
+async fn upload_part_copy_range_reencrypts() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let src = pattern_seeded(MIN_PART + 4096, 5);
+    put(&client, B, "src/ranged", &src).await;
+    let slice = &src[100..100 + MIN_PART];
+
+    let tail = pattern_seeded(2048, 6);
+    let key = "dst/ranged";
+    let up = create_mpu(&client, B, key).await;
+    let range = format!("bytes=100-{}", 100 + MIN_PART - 1);
+    let e1 = upload_part_copy(&client, B, key, &up, 1, B, "src/ranged", Some(&range)).await;
+    assert_eq!(e1, md5_hex(slice), "re-encrypted slice MD5");
+    let e2 = upload_part(&client, B, key, &up, 2, &tail).await;
+
+    complete_mpu(&client, B, key, &up, &[(1, e1), (2, e2)]).await;
+    let whole: Vec<u8> = [slice, tail.as_slice()].concat();
+    assert_eq!(get_all(&client, B, key).await, whole);
+}
+
+/// A composite source re-encrypts on copy — each source part is its own age file, so the whole is
+/// not a single reusable age file. Build a 2-part composite, copy the whole of it as one part, add
+/// a tail, and verify the bytes.
+#[tokio::test]
+async fn upload_part_copy_composite_source_reencrypts() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let sp1 = pattern_seeded(MIN_PART, 1);
+    let sp2 = pattern_seeded(1024 * 1024, 2);
+    let src_whole: Vec<u8> = [sp1.as_slice(), sp2.as_slice()].concat();
+    let sup = create_mpu(&client, B, "src/comp").await;
+    let s1 = upload_part(&client, B, "src/comp", &sup, 1, &sp1).await;
+    let s2 = upload_part(&client, B, "src/comp", &sup, 2, &sp2).await;
+    complete_mpu(&client, B, "src/comp", &sup, &[(1, s1), (2, s2)]).await;
+
+    let tail = pattern_seeded(4096, 3);
+    let key = "dst/from-comp";
+    let up = create_mpu(&client, B, key).await;
+    let e1 = upload_part_copy(&client, B, key, &up, 1, B, "src/comp", None).await;
+    assert_eq!(
+        e1,
+        md5_hex(&src_whole),
+        "re-encrypted copy MD5 is over the whole source plaintext"
+    );
+    let e2 = upload_part(&client, B, key, &up, 2, &tail).await;
+
+    complete_mpu(&client, B, key, &up, &[(1, e1), (2, e2)]).await;
+    let whole: Vec<u8> = [src_whole.as_slice(), tail.as_slice()].concat();
+    assert_eq!(get_all(&client, B, key).await, whole);
+}
+
+/// A copy from a source that does not exist is a client-visible 404.
+#[tokio::test]
+async fn upload_part_copy_missing_source() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let key = "dst/nope";
+    let up = create_mpu(&client, B, key).await;
+    let err = client
+        .upload_part_copy()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .part_number(1)
+        .copy_source(format!("{B}/does/not/exist"))
+        .send()
+        .await
+        .expect_err("copy from a missing source must fail");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("NoSuchKey"),
+        "missing copy source is a 404"
+    );
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────
+
+/// Copy (a range of) a source object into part `part_number` of `upload_id`; returns the part ETag.
+#[allow(clippy::too_many_arguments)]
+async fn upload_part_copy(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    src_bucket: &str,
+    src_key: &str,
+    range: Option<&str>,
+) -> String {
+    let mut b = client
+        .upload_part_copy()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .copy_source(format!("{src_bucket}/{src_key}"));
+    if let Some(r) = range {
+        b = b.copy_source_range(r);
+    }
+    b.send()
+        .await
+        .unwrap_or_else(|e| panic!("upload_part_copy {part_number}: {e}"))
+        .copy_part_result()
+        .and_then(|r| r.e_tag())
+        .expect("copy part etag")
+        .trim_matches('"')
+        .to_string()
+}
 
 /// Like [`complete_mpu`] but returns the `Result` so failure can be asserted.
 async fn complete_mpu_res(

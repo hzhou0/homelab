@@ -691,7 +691,12 @@ part, write the mpu record — identical to a normal `UploadPart` past the byte 
 optimization:* a whole (unranged) **single-part** source is already one age file, so
 `UploadPartCopy` its body range `[0, body_ct_len)` server-side (trailer excluded) with
 `pmd5 = source cetag`; composite sources and any ranged copy re-encrypt. Same caps as `UploadPart`
-(plaintext ≤ 4 GiB, part ≤ 10000, 5 MiB non-final minimum).
+(plaintext ≤ 4 GiB, part ≤ 10000, 5 MiB non-final minimum). The server-side fast path also declines
+whenever the part *admits no successor* (final-and-under-5-MiB, or part 10000): complete's trailer
+fold re-uploads that part as `part ‖ trailer`, which needs its ciphertext retained in the cache
+stash — and a server-side copy never routes the bytes through hypha, so nothing is there to stash.
+The re-encrypt path's tee produces the stash as a side effect, so those parts take it instead; the
+choice is invisible to the client (the part lands identically either way).
 
 **ListMultipartUploads** (both modes): **proxy the remote's own** `ListMultipartUploads`. The
 remote is already the source of truth for multipart, and hypha's mapping is transparent enough that

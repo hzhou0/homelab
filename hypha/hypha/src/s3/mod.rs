@@ -281,4 +281,11 @@ impl s3s::S3 for Hypha {
     ) -> S3Result<S3Response<UploadPartOutput>> {
         self.op_upload_part(req).await
     }
+
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        self.op_upload_part_copy(req).await
+    }
 }

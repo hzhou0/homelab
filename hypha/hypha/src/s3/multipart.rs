@@ -22,12 +22,13 @@ use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use hypha_core::error::Error;
 use hypha_core::meta;
-use hypha_format::offset::{plaintext_len_from, HLEN};
+use hypha_format::offset::{ciphertext_len, plaintext_len_from, HLEN};
 use hypha_format::{encode_trailer, Footer, FooterKind};
 
+use super::get::facts_from_tombstone;
 use super::{resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT};
 use crate::codec;
-use crate::tier;
+use crate::tier::{self, RemoteFacts};
 
 /// A fresh token naming one part's retained ciphertext ([`meta::mpu_stash_key`]). Minted before the
 /// part streams, since the remote's `retag` — which disambiguates re-uploads everywhere else —
@@ -129,8 +130,32 @@ impl Hypha {
             Err(e) => return Err(e.into()),
         }
 
-        // Encrypt the part as its own pure age file, computing its plaintext MD5 inline in the
-        // same pass (§7); the ciphertext streams to the remote as the native part.
+        // Past the byte source, a part is a part: encrypt as a pure age file, stream to the remote,
+        // record its facts. The copy path (`op_upload_part_copy`) shares this tail (§7).
+        let pmd5 = self
+            .stream_part(&bucket, &key, &input.upload_id, part_number, plen, body)
+            .await?;
+
+        let resp = UploadPartOutput {
+            e_tag: Some(ETag::Strong(pmd5)),
+            ..Default::default()
+        };
+        Ok(S3Response::new(resp))
+    }
+
+    /// Encrypt one plaintext part body as its own pure age file, stream it to the remote's native
+    /// upload, and record its facts (§7) — the shared tail of `UploadPart` and the re-encrypt leg of
+    /// `UploadPartCopy`. Returns the part's plaintext MD5 (`pmd5`), computed inline as the body
+    /// streams. `plen` is the part's plaintext length.
+    async fn stream_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        plen: u64,
+        body: StreamingBlob,
+    ) -> S3Result<String> {
         let (ct_len, enc, etag_rx) =
             codec::encrypt_blob_with_etag(self.env(), body, plen, None, None)
                 .await
@@ -149,28 +174,28 @@ impl Hypha {
         let out = if stash_nonce.is_empty() {
             self.remote()
                 .upload_part(
-                    &bucket,
-                    &key,
-                    &input.upload_id,
+                    bucket,
+                    key,
+                    upload_id,
                     part_number,
                     enc,
                     Some(ct_len as i64),
                 )
                 .await?
         } else {
-            let stash_key = meta::mpu_stash_key(&input.upload_id, part_number, &stash_nonce);
+            let stash_key = meta::mpu_stash_key(upload_id, part_number, &stash_nonce);
             let (to_remote, to_cache) = codec::tee(enc);
             let (out, _) = tokio::try_join!(
                 self.remote().upload_part(
-                    &bucket,
-                    &key,
-                    &input.upload_id,
+                    bucket,
+                    key,
+                    upload_id,
                     part_number,
                     to_remote,
                     Some(ct_len as i64),
                 ),
                 self.meta().put(
-                    &bucket,
+                    bucket,
                     &stash_key,
                     to_cache,
                     Some(ct_len as i64),
@@ -188,7 +213,7 @@ impl Hypha {
             .ok_or_else(|| Error::Backend("part upload returned no ETag".into()))?
             .trim_matches('"')
             .to_string();
-        // `UploadPart` passes no expected digest, so the mismatch arm is unreachable here.
+        // No expected digest passes through this path, so the mismatch arm is unreachable here.
         let pmd5 = etag_rx
             .await
             .map_err(|_| Error::Backend("MD5 task dropped before completing".into()))?
@@ -196,22 +221,36 @@ impl Hypha {
                 Error::Backend("unexpected digest mismatch on an unchecked part".into())
             })?;
 
-        // Persist the part's facts in the record KEY (§6): `pmd5` (the plaintext MD5, unknowable to
-        // the remote), `retag` (its last-write-wins token), and the nonce naming any retained
-        // ciphertext. A re-upload writes a new key; the stale one is resolved away at complete by
-        // the remote's `ListParts`, which is also what points the fold at the right retained copy.
-        // Survives process restarts across a multi-hour upload; `plen` isn't stored — it's
-        // `plaintext_len_from` the remote's part size at complete.
+        self.record_part(bucket, upload_id, part_number, &retag, &pmd5, &stash_nonce)
+            .await?;
+        Ok(pmd5)
+    }
+
+    /// Persist a part's facts in the record KEY (§6): `pmd5` (the plaintext MD5, unknowable to the
+    /// remote), `retag` (its last-write-wins token), and the nonce naming any retained ciphertext. A
+    /// re-upload writes a new key; the stale one is resolved away at complete by the remote's
+    /// `ListParts`, which is also what points the fold at the right retained copy. Survives process
+    /// restarts across a multi-hour upload; `plen` isn't stored — it's `plaintext_len_from` the
+    /// remote's part size at complete.
+    async fn record_part(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: i32,
+        retag: &str,
+        pmd5: &str,
+        stash_nonce: &str,
+    ) -> Result<(), Error> {
         self.meta()
             .put_small(
-                &bucket,
+                bucket,
                 &meta::mpu_part_key(
-                    &input.upload_id,
+                    upload_id,
                     meta::MpuPart {
                         part_number,
-                        retag: &retag,
-                        pmd5: &pmd5,
-                        stash_nonce: &stash_nonce,
+                        retag,
+                        pmd5,
+                        stash_nonce,
                     },
                 ),
                 Vec::new(),
@@ -220,9 +259,157 @@ impl Hypha {
                 None,
             )
             .await?;
+        Ok(())
+    }
 
-        let resp = UploadPartOutput {
-            e_tag: Some(ETag::Strong(pmd5)),
+    /// **UploadPartCopy** (§7): the copy-source is just an alternate byte source for a part. The
+    /// baseline is the **re-encrypt** path — read the (ranged) source plaintext, then it's a part
+    /// like any other (`stream_part`). One fast path: a whole, unranged, single-part, remote-resident
+    /// source is already one age file, so its body range copies **server-side** with `pmd5` = the
+    /// source cetag and no bytes through hypha. Composite sources, any ranged copy, and parts that
+    /// would need complete's fold all re-encrypt.
+    pub(super) async fn op_upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
+
+        let part_number = input.part_number;
+        if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
+            return Err(s3_error!(
+                InvalidPart,
+                "part number must be between 1 and 10000"
+            ));
+        }
+
+        let (src_bucket, src_key) = parse_copy_source(&input.copy_source)?;
+        meta::validate_client_key(&src_key).map_err(|e| Error::Invalid(e.to_string()))?;
+
+        // The destination upload must be known to us — the eventual complete needs these records.
+        match self
+            .meta()
+            .head(&bucket, &meta::mpu_upload_key(&input.upload_id))
+            .await
+        {
+            Ok(_) => {}
+            Err(Error::NotFound) => return Err(s3_error!(NoSuchUpload, "unknown upload id")),
+            Err(e) => return Err(e.into()),
+        }
+
+        // Resolve the source's facts + residency exactly as a read would (§7): a tombstone carries
+        // them in its metadata, a leftover mark repairs from the remote, a live cache body reports
+        // them natively.
+        let src_head = self.data().head(&src_bucket, &src_key).await?;
+        let src_md = src_head.metadata.clone().unwrap_or_default();
+        let (facts, live) = match meta::tomb_kind(&src_md) {
+            Some(meta::TombKind::Delete) => {
+                return Err(s3_error!(NoSuchKey, "copy source does not exist"))
+            }
+            Some(meta::TombKind::Evict) => (facts_from_tombstone(&src_key, &src_md)?, false),
+            Some(meta::TombKind::Transit) => {
+                match self.resolve_transit(&src_bucket, &src_key).await? {
+                    None => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
+                    Some(f) => (f, false),
+                }
+            }
+            None => (
+                RemoteFacts {
+                    plen: src_head.content_length.unwrap_or(0).max(0) as u64,
+                    cetag: src_head
+                        .e_tag
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string(),
+                    mtime_ms: src_head
+                        .last_modified
+                        .and_then(|t| t.to_millis().ok())
+                        .unwrap_or_default(),
+                },
+                true,
+            ),
+        };
+
+        // The copy range over the source's PLAINTEXT: the whole object, or `copy-source-range`.
+        let pt = match input.copy_source_range.as_deref() {
+            None => 0..facts.plen,
+            Some(r) => parse_copy_source_range(r, facts.plen)?,
+        };
+        let part_plen = pt.end - pt.start;
+        if part_plen > MAX_INLINE_PLAINTEXT {
+            return Err(s3_error!(
+                EntityTooLarge,
+                "parts are capped at {MAX_INLINE_PLAINTEXT} bytes"
+            ));
+        }
+        let whole = pt == (0..facts.plen);
+        let composite = meta::is_composite_etag(&facts.cetag);
+
+        // Fast path: a whole, unranged, single-part, remote-resident source is one age file — copy
+        // its body range server-side (trailer excluded), `pmd5` = source cetag (a single-part cetag
+        // *is* its plaintext MD5). Declined when the part admits no successor: complete's fold needs
+        // the ciphertext retained, which only the re-encrypt tee produces — a server-side copy never
+        // routes the bytes through hypha, so there is nothing to stash.
+        let body_ct_len = ciphertext_len(part_plen, HLEN);
+        let pmd5 = if !live
+            && !composite
+            && whole
+            && !meta::admits_no_successor(part_number, body_ct_len, MIN_REMOTE_PART)
+        {
+            let out = self
+                .remote()
+                .upload_part_copy(
+                    &bucket,
+                    &key,
+                    &input.upload_id,
+                    part_number,
+                    &src_bucket,
+                    &src_key,
+                    Some(format!("bytes=0-{}", body_ct_len - 1)),
+                )
+                .await?;
+            let retag = out
+                .copy_part_result()
+                .and_then(|r| r.e_tag())
+                .ok_or_else(|| Error::Backend("part copy returned no ETag".into()))?
+                .trim_matches('"')
+                .to_string();
+            let pmd5 = facts.cetag.clone();
+            self.record_part(&bucket, &input.upload_id, part_number, &retag, &pmd5, "")
+                .await?;
+            pmd5
+        } else {
+            // Re-encrypt path: obtain the source plaintext (whole or ranged), then it's a part like
+            // any other. A live cache body is already plaintext; a remote object decrypts.
+            let plaintext = if live {
+                let range = (!whole).then(|| format!("bytes={}-{}", pt.start, pt.end - 1));
+                let out = self.data().get(&src_bucket, &src_key, range).await?;
+                codec::bytestream_to_blob(out.body)
+            } else {
+                let sub = (!whole).then(|| pt.clone());
+                self.decrypt_remote_body(&src_bucket, &src_key, &facts.cetag, sub)
+                    .await?
+            };
+            self.stream_part(
+                &bucket,
+                &key,
+                &input.upload_id,
+                part_number,
+                part_plen,
+                plaintext,
+            )
+            .await?
+        };
+
+        let resp = UploadPartCopyOutput {
+            copy_part_result: Some(CopyPartResult {
+                e_tag: Some(ETag::Strong(pmd5)),
+                last_modified: Some(ts_ms(facts.mtime_ms)),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         Ok(S3Response::new(resp))
@@ -693,4 +880,53 @@ impl Hypha {
             }
         }
     }
+}
+
+/// Resolve an `x-amz-copy-source` to a `(bucket, key)` this deployment can serve (§7). hypha has no
+/// versioning and no access-point/outpost addressing, so those forms are rejected rather than
+/// silently mishandled.
+fn parse_copy_source(cs: &CopySource) -> S3Result<(String, String)> {
+    match cs {
+        CopySource::Bucket {
+            bucket,
+            key,
+            version_id,
+        } => {
+            if version_id.is_some() {
+                return Err(s3_error!(
+                    NotImplemented,
+                    "hypha does not support versioned copy sources"
+                ));
+            }
+            Ok((bucket.to_string(), key.to_string()))
+        }
+        _ => Err(s3_error!(
+            NotImplemented,
+            "access point and outpost copy sources are not supported"
+        )),
+    }
+}
+
+/// Parse a `copy-source-range` header (`bytes=first-last`, both bounds required) into a half-open
+/// plaintext range, validated against the source length.
+fn parse_copy_source_range(raw: &str, plen: u64) -> S3Result<std::ops::Range<u64>> {
+    let malformed = || {
+        s3_error!(
+            InvalidArgument,
+            "copy-source-range must be of the form bytes=first-last"
+        )
+    };
+    let (a, b) = raw
+        .strip_prefix("bytes=")
+        .and_then(|spec| spec.split_once('-'))
+        .ok_or_else(malformed)?;
+    let first: u64 = a.trim().parse().map_err(|_| malformed())?;
+    let last: u64 = b.trim().parse().map_err(|_| malformed())?;
+    if first > last || last >= plen {
+        return Err(s3_error!(
+            InvalidArgument,
+            "copy-source-range is out of the source object's bounds"
+        ));
+    }
+    Ok(first..last + 1)
 }

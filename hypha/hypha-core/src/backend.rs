@@ -20,10 +20,11 @@ use aws_sdk_s3::operation::list_objects::ListObjectsOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+use aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, Delete, EncodingType, ObjectIdentifier};
 use aws_sdk_s3::Client;
-use percent_encoding::percent_decode_str;
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 use crate::config::S3Endpoint;
 use crate::error::{Error, Result};
@@ -421,6 +422,41 @@ impl Backend {
             .map_err(Error::from_sdk)
     }
 
+    /// Server-side `UploadPartCopy` (§7): copy a byte range of a source object straight into a part
+    /// of an in-progress native upload, remote→remote, no bytes through hypha. `src_range` is over
+    /// the **source object's** bytes (`bytes=a-b`), used to exclude the source's tail trailer.
+    ///
+    /// The SDK sends `x-amz-copy-source` verbatim, so the key must arrive already URL-encoded; the
+    /// bucket prefix is applied to the source bucket, as it is to every other backend bucket ref.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_part_copy(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        src_bucket: &str,
+        src_key: &str,
+        src_range: Option<String>,
+    ) -> Result<UploadPartCopyOutput> {
+        let copy_source = format!(
+            "{}/{}",
+            self.bkt(src_bucket),
+            encode_copy_source_key(src_key)
+        );
+        self.client
+            .upload_part_copy()
+            .bucket(self.bkt(bucket))
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .copy_source(copy_source)
+            .set_copy_source_range(src_range)
+            .send()
+            .await
+            .map_err(Error::from_sdk)
+    }
+
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -545,4 +581,20 @@ impl Backend {
 /// (which hypha never writes) degrades lossily rather than erroring a whole page.
 fn url_decode(s: &str) -> String {
     percent_decode_str(s).decode_utf8_lossy().into_owned()
+}
+
+/// RFC 3986 unreserved bytes; everything else is percent-encoded per path segment (control bytes a
+/// client key may carry included), then segments rejoin on `/` so it stays a key path separator.
+const KEY_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// URL-encode a source key for the `x-amz-copy-source` header (the SDK sends it verbatim, §7).
+fn encode_copy_source_key(key: &str) -> String {
+    key.split('/')
+        .map(|seg| utf8_percent_encode(seg, KEY_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
