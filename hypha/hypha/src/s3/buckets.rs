@@ -12,7 +12,10 @@
 //! backend's own prefix (backend.rs).
 
 use s3s::dto::*;
-use s3s::{S3Request, S3Response, S3Result};
+use s3s::{s3_error, S3Request, S3Response, S3Result};
+
+use hypha_core::error::Error;
+use hypha_core::meta;
 
 use super::{ts_ms, Hypha};
 
@@ -22,7 +25,15 @@ impl Hypha {
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let bucket = &req.input.bucket;
-        self.cache().create_bucket(bucket).await?;
+        // The configured prefix is charged against S3's 63-byte cap; reject over-long names up
+        // front rather than as an opaque backend error (§7 *Buckets*).
+        meta::validate_bucket_name(bucket, self.max_bucket_prefix_len)
+            .map_err(|e| s3_error!(InvalidBucketName, "{e}"))?;
+        // Both cache projections first, then the remote — the remote create is the durable commit;
+        // a crash before it leaves harmless orphan cache buckets. Idempotent, so retry repairs a
+        // partial create.
+        self.data().create_bucket(bucket).await?;
+        self.meta().create_bucket(bucket).await?;
         self.remote().create_bucket(bucket).await?;
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
@@ -32,9 +43,44 @@ impl Hypha {
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
         let bucket = &req.input.bucket;
+        // Remote first — the durable commit that makes the bucket cease to exist, and the emptiness
+        // gate: the remote holds every committed object, so a non-empty client bucket fails here.
         self.remote().delete_bucket(bucket).await?;
-        self.cache().delete_bucket(bucket).await?;
+        // Then both cache buckets. Emptiness is judged on the remote above, not on `<meta>`:
+        // leftover twins/markers are hypha's own state, so drain them rather than let them block
+        // the delete (§7 *Buckets*). `<data>` holds only bare-K tombstones after the client emptied
+        // the bucket; drain defends against crash-leftover marks all the same.
+        self.drain_and_delete_bucket(self.data(), bucket).await?;
+        self.drain_and_delete_bucket(self.meta(), bucket).await?;
         Ok(S3Response::new(DeleteBucketOutput::default()))
+    }
+
+    /// Empty a cache bucket, then delete it. Keys are deleted one at a time: the `<meta>` bucket's
+    /// twins and mpu records carry the `0x01` control byte, which the batch `DeleteObjects` XML body
+    /// cannot represent (§6). Buckets are rare control-plane events, so the per-key cost is fine.
+    async fn drain_and_delete_bucket(
+        &self,
+        backend: &hypha_core::Backend,
+        bucket: &str,
+    ) -> Result<(), Error> {
+        loop {
+            let page = backend.list(bucket, None, None, None, None, None).await?;
+            let keys: Vec<String> = page
+                .contents
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|o| o.key)
+                .collect();
+            if keys.is_empty() {
+                break;
+            }
+            let deletes = keys.iter().map(|k| backend.delete(bucket, k));
+            futures::future::try_join_all(deletes).await?;
+            if page.is_truncated != Some(true) {
+                break;
+            }
+        }
+        backend.delete_bucket(bucket).await
     }
 
     pub(super) async fn op_head_bucket(

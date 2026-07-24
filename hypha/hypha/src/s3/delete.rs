@@ -223,7 +223,7 @@ impl Hypha {
     /// settled projection, or a stale mark could hide an object this delete should 404. Caller
     /// holds K's write lock.
     async fn repair_leftover_mark_locked(&self, bucket: &str, key: &str) -> Result<(), Error> {
-        match self.cache().head(bucket, key).await {
+        match self.data().head(bucket, key).await {
             Ok(head) => {
                 let md = head.metadata.clone().unwrap_or_default();
                 if meta::tomb_kind(&md) == Some(meta::TombKind::Transit) {

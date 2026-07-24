@@ -339,10 +339,16 @@ positional argument. Twins are written in the same locked sequence as their tomb
 body or a transition mark first.
 
 **Facts encoding.** `{md5(128) ‖ plen(46) ‖ mtime_ms(42) ‖ part-count(14)}` = 230 bits, bit-packed
-and rendered in a 92-symbol printable-ASCII alphabet (6.52 bits/char) → **36 chars**, fixed width.
-The alphabet excludes `/` — a `/` in the facts would make a twin roll up under a delimiter listing
-and vanish from the twin cursor (§7) — and `+`, which form-style decoders turn into a space. It
-also excludes `;`, though only by construction: one packed field needs no separator.
+(as a 256-bit integer, base-converted by repeated division) and rendered in a **91-symbol**
+printable-ASCII alphabet (`0x21..=0x7E`, 6.51 bits/char) → **36 chars**, fixed width (`91³⁶ > 2²³⁰`;
+the tightest base that still fits is 84, so 91 leaves headroom). The alphabet excludes four bytes,
+each for a round-trip reason: `/` — a `/` in the facts would make a twin roll up under a delimiter
+listing and vanish from the twin cursor (§7); `+` — form-style decoders turn it into a space; **space
+(0x20)** — the converse hazard, since a literal space round-trips through the `encoding-type=url`
+LIST as `+` on some backends, so a space in the facts would corrupt the twin key hypha reads back
+(and then `delete_twins` would miss it); and `;`, kept out only by construction (one packed field
+needs no separator). The part count is 0 for a single-part object (`unpack` rebuilds a bare-MD5
+ETag) and `N ≥ 1` for a composite (rebuilds `<md5>-N`), so the twin needn't carry the `-N` literally.
 
 **Twins are optional per key.** Twin overhead is `2 + 36 = 38` bytes, so a key longer than **986**
 bytes gets no twin, and its eviction tombstone resolves through the per-key HEAD fallback that
@@ -426,13 +432,21 @@ disambiguated at complete by the one authority that already resolved the race �
 `ListParts`**, which returns the winning `(n → retag, size)` for the in-progress upload. hypha
 matches each winning `retag` to the record carrying it (a ciphertext MD5 ⇒ the match is exact),
 takes that record's `pmd5` (and its `nonce`, where a fold needs the retained bytes), and ignores
-the losing orphans (swept by the batched delete below). All of an upload's records share the
-prefix `0x01 0x01 m ‖ <upload-id> ‖ 0x01`, so that one LIST is a prefix scan and the sweep at
-complete/abort is a prefix range.
+the losing orphans (swept with the rest of the upload's records). All of an upload's records share
+the prefix `0x01 0x01 m ‖ <upload-id> ‖ 0x01`, so that one LIST is a prefix scan and the sweep is a
+prefix range.
 This is why no hypha-minted version counter is needed: `UploadPart` returns no ordering token, and
 a durable monotonic counter across the active/passive pods would be its own distributed problem —
-the remote's retag *is* the version. Survives process restarts across a multi-hour upload; dropped
-at complete/abort via a batched multi-object delete.
+the remote's retag *is* the version. Survives process restarts across a multi-hour upload.
+
+> **Cleanup is deferred to GC (§8), not run inline at complete/abort.** These records carry `0x01`
+> (range A), so they can't be batch-deleted (§11 carve-out) — a maxed 10 000-part upload would cost
+> that many single-object deletes on the complete/abort path. The cost is real only in that extreme
+> and the deletes are pure post-commit cleanup, so the §8 debris sweep reclaims each upload's record
+> range (its prefix is self-describing) rather than paying it on the client's critical path. On the
+> **local** cache the request-count saving a batch delete would buy is small anyway (sub-ms RTT), so
+> deferral — not batching, and not a third bucket to make the keys XML-safe — is the right lever.
+> Until phase 5 lands the sweep, complete/abort still drop the range inline as a fallback.
 
 **The sync marker**: an object at `0x01 0x01 s`, present iff a namespace
 reconciliation has completed — namespace trust recorded in the cache itself, dying with the
@@ -646,7 +660,9 @@ apply).
 4. **Commit**: native complete on the remote — one atomic op lands the concatenated body *and* its
    facts at K. Its part set is either the client parts plus the separate trailer part, or (folded
    case) the client parts with the trailer riding the last one.
-5. **Settle**: eviction tombstone + twin, drop the mpu state (batched multi-object delete). Ack.
+5. **Settle**: eviction tombstone + twin. Ack. The mpu state is left for the §8 debris sweep to
+   reclaim (deferred, not inline — see *Multipart upload state* in §6); a phase-4/5-less build drops
+   it inline as a fallback.
 
 Crash before 4: K untouched; the dangling native upload (trailer part included) is an orphan
 (swept, aborted). Crash after 4: committed — marked readers serve it from the remote, and
@@ -654,8 +670,9 @@ repair (or, after a simultaneous cache loss, the restore sweep) reads the facts 
 trailer; lost-ack. In cached mode the composite enters the cache lazily on first GET via
 rehydrate (§8); in durable mode it stays tombstoned like everything else.
 
-**AbortMultipartUpload**: native abort on the remote; drop the mpu state. The §8 sweep reclaims
-leftovers of abandoned uploads.
+**AbortMultipartUpload**: native abort on the remote; the mpu state is left for the §8 debris sweep
+(deferred, as at complete), which reclaims it alongside the records of uploads abandoned without
+either complete or abort.
 
 **UploadPartCopy** (both modes — the multipart path): copy-source is just an alternate byte source
 for `UploadPart`. The `CopyObject` ciphertext-reuse trick does **not** generally apply — every part
@@ -995,8 +1012,12 @@ cache, then runs the normal §4 path.
 
 A single background task of the active (the passive never scavenges), phase 5. In durable mode
 there are no bodies to evict — the task only sweeps debris: orphan twins, leftover transition
-marks (repaired per §7), abandoned mpu state and native uploads. In
-cached mode it additionally evicts under pressure:
+marks (repaired per §7), and **all mpu record ranges** — both those of uploads abandoned without
+complete/abort *and* the leftovers of completed/aborted uploads, whose inline drop is deferred here
+(§6, *Multipart upload state*) so complete/abort never pays a large single-object delete on the
+client path. Each range is self-describing by its `0x01 0x01 m ‖ <upload-id> ‖ 0x01` prefix, so the
+sweep finds and reclaims it without a side index. In cached mode it additionally evicts under
+pressure:
 
 **Write-awareness: the in-flight ref count.** The PUT path's only in-process state is a per-key
 `Arc<AtomicUsize>` in a swept `DashMap`: `inc` → body write → marker write → `dec`. The window it
@@ -1302,25 +1323,44 @@ result, crash mid-batch repair, XML-clean-keys-only remote batch), v1 LIST, mult
 and GetObjectAttributes part geometry — all covered in `hypha/tests/multipart.rs` and the s3s-e2e
 pass against MinIO.
 
-**Phase 3a — the keyspace split (§6), a prerequisite for v1 LIST.** Sequenced ahead of the
-remaining phase-3 surface because v1's `NextMarker` is not expressible under the old layout at all,
-and because the twin-suffix headroom it removes is what capped client keys at 900 bytes.
+**Phase 3a — the keyspace split (§6), a prerequisite for v1 LIST. Done (vs. MinIO).** Sequenced
+ahead of the remaining phase-3 surface because v1's `NextMarker` is not expressible under the old
+layout at all, and because the twin-suffix headroom it removes is what capped client keys at 900
+bytes.
 
-1. **Config + buckets** — the `<data>`/`<meta>` cache split, prefix-length and prefix-collision
-   validation (§7 *Buckets*), the create/delete/head lifecycle over three backend buckets, and the
-   `<data><b>`-only emptiness rule.
+1. **Config + buckets** — the `<data>`/`<meta>` cache split (the `<meta>` backend is a
+   `Backend::with_prefix` sibling over the one cache endpoint), `cache_meta_prefix` config with the
+   startup prefix-collision invariant, `validate_bucket_name` against the 63-byte budget, the
+   create/delete/head lifecycle over three backend buckets, and the remote-as-emptiness-gate delete
+   that drains both cache buckets. **Done.**
 2. **`meta` module** — the structural `0x01` ranges replacing `RESERVED_PREFIX`, bit-packed
-   base-92 facts, twin build/parse against the 986-byte threshold, admission relaxed to S3's 1024.
-3. **Move twins, markers, and mpu state** into `<meta><b>`; `refresh_twin` / `delete_twins` /
-   the settle and tombstone paths; shadow bodies keyed by `sha256(K)`.
-4. **LIST merge join** — two concurrent cursors, delimiter mirroring, pairing by key equality, the
-   HEAD fallback for missing and over-threshold twins.
-5. **v1 pagination** — `NextMarker` = the client cursor's last raw key; un-ignore
-   `list_objects_v1_pagination`.
+   base-91 facts, twin build/parse against the 986-byte threshold, admission relaxed to S3's 1024.
+   **Done.**
+3. **Move twins, markers, and mpu state** into `<meta><b>` (`Reconciler` split into `data`/`meta`
+   backends); `refresh_twin` / `delete_twins` / the settle and tombstone paths; `shadow_key` helper
+   for `sha256(K)` (unwired until phase 4's rehydrate). `drop_mpu_state` moved to single-object
+   deletes — the range-A keys now carry `0x01`, so they inherit the twins' batch-delete carve-out
+   (§11). **Done.**
+4. **LIST merge join** — the `<data>` client cursor plus a `<meta>` twin cursor
+   (`prefix = 0x01 ‖ <client prefix>`, mirrored delimiter, `start_after` past range A), paired by
+   base-key equality, HEAD fallback for missing and over-threshold twins. **Done.**
+5. **v1 pagination** — `NextMarker` = the client cursor's last raw key; `list_objects_v1_pagination`
+   un-ignored and green. **Done.**
 
-*Exit*: the v1 pagination test green under twin dilution at several page sizes; a key above the
-twin threshold round-tripping PUT → LIST → GET through the HEAD fallback; `ListBuckets` not leaking
-cache buckets; and the reconcile sweep's marker scan proven `O(pending)` with evicted keys present.
+> **One spec correction during implementation.** §6 originally specified a **92-symbol** facts
+> alphabet (`0x20..=0x7E` minus `/`,`+`,`;`), keeping space. But space is the exact converse of the
+> `+` hazard the spec already guarded: a literal space in a twin key round-trips through the
+> `encoding-type=url` LIST as `+` on MinIO, so `delete_twins` read back a corrupted key and left the
+> real twin behind (caught by `delete_objects_batch`). The alphabet is now **91 symbols** —
+> `0x21..=0x7E` minus `/`,`+`,`;`, space excluded. Still 36 chars (`91³⁶ > 2²³⁰`), so the 986-byte
+> threshold and every other constant are unchanged; only the symbol count moved.
+
+*Exit* (met): the v1 pagination test green under twin dilution at several page sizes
+(`list_objects_v1_pagination`); a key above the twin threshold round-tripping PUT → LIST → GET
+through the HEAD fallback (`list_over_threshold_key_head_fallback`); `ListBuckets` not leaking cache
+buckets (`list_buckets_hides_backend_projections`). The reconcile sweep's `O(pending)` marker scan
+is a structural property of the bare-`K` marker range (§6, §7) — it lands with the sweep itself in
+phase 4, where its complexity is asserted directly.
 
 **Phase 4 — cached mode, single replica.** Marker writes + the in-flight ref count on the PUT
 path, the reconcile sweep, cached DELETE propagation, rehydrate (single-part into K + twin
@@ -1331,9 +1371,11 @@ default `s3.internal` deployment with correctness intact, only failover seamless
 **Phase 5 — GC + restore.** Walk cursor, threshold-ratchet eviction, Bloom ring (fill rotation)
 + slice persistence, usage
 source + vacuum, prefix-hint writer, sync marker + parallel restore sweep, debris sweeps (orphan
-twins, orphan shadow bodies, leftover transition marks, abandoned mpu
-state). *Exit*:
-scavenge/rehydrate and cache-wipe → restore-sweep → rehydrate scenarios.
+twins, orphan shadow bodies, leftover transition marks, and **all mpu record ranges** — abandoned
+uploads *and* the deferred cleanup of completed/aborted ones, §6/§8, replacing the inline
+`drop_mpu_state` fallback). *Exit*:
+scavenge/rehydrate and cache-wipe → restore-sweep → rehydrate scenarios; mpu ranges reclaimed
+without an inline complete/abort delete.
 
 **Phase 6 — `hypha-fence` + active-passive.** Two-pod StatefulSet, leader-elected controller,
 lease, fence→confirm→drain→promote, graceful-release fast path. First step: verify the fence

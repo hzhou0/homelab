@@ -62,6 +62,17 @@ impl Backend {
         }
     }
 
+    /// A sibling backend over the **same** endpoint/client but a different bucket prefix — the
+    /// cache's `<data>`/`<meta>` split (§6) is two prefixes on one cache endpoint, so the `<meta>`
+    /// backend shares the `<data>` backend's connection and only remaps bucket names.
+    pub fn with_prefix(&self, bucket_prefix: String) -> Self {
+        Self {
+            client: self.client.clone(),
+            region: self.region.clone(),
+            bucket_prefix,
+        }
+    }
+
     pub fn client(&self) -> &Client {
         &self.client
     }

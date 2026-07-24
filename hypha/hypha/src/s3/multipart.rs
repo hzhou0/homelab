@@ -10,10 +10,10 @@
 //! The table is the per-part cumulative ciphertext end-offsets, so reads recover every part boundary
 //! from the trailer alone — no remote part-index calls (§6).
 //!
-//! hypha's own state per upload is minimal and cache-resident under the reserved prefix:
-//! per-part `{pmd5, plen, retag}` facts, needed at complete because an in-progress upload's
-//! parts aren't readable. Its loss with the cache volume merely fails the eventual complete —
-//! never-acked, the client retries.
+//! hypha's own state per upload is minimal and lives in the `<meta>` cache bucket's range A
+//! (`0x01 0x01 m …`, §6): per-part `{pmd5, retag}` facts, needed at complete because an in-progress
+//! upload's parts aren't readable. Its loss with the cache volume merely fails the eventual
+//! complete — never-acked, the client retries.
 
 use std::collections::HashMap;
 
@@ -68,7 +68,7 @@ impl Hypha {
         // The upload's own record: client key as the body (keys may carry bytes an ASCII
         // metadata header can't), and — in its metadata — the pass-through carrier this upload
         // will settle with, parked here because complete is where it reaches the tombstone (§7).
-        self.cache()
+        self.meta()
             .put_small(
                 &bucket,
                 &meta::mpu_upload_key(&upload_id),
@@ -120,7 +120,7 @@ impl Hypha {
 
         // Fail fast if the upload is unknown to us — the eventual complete needs these records.
         match self
-            .cache()
+            .meta()
             .head(&bucket, &meta::mpu_upload_key(&input.upload_id))
             .await
         {
@@ -169,7 +169,7 @@ impl Hypha {
                     to_remote,
                     Some(ct_len as i64),
                 ),
-                self.cache().put(
+                self.meta().put(
                     &bucket,
                     &stash_key,
                     to_cache,
@@ -202,7 +202,7 @@ impl Hypha {
         // the remote's `ListParts`, which is also what points the fold at the right retained copy.
         // Survives process restarts across a multi-hour upload; `plen` isn't stored — it's
         // `plaintext_len_from` the remote's part size at complete.
-        self.cache()
+        self.meta()
             .put_small(
                 &bucket,
                 &meta::mpu_part_key(
@@ -264,7 +264,7 @@ impl Hypha {
         // The upload record also carries the pass-through metadata + storage class recorded at
         // create (§7); settle stamps them onto the tombstone below.
         let carrier = match self
-            .cache()
+            .meta()
             .head(&bucket, &meta::mpu_upload_key(&upload_id))
             .await
         {
@@ -368,7 +368,7 @@ impl Hypha {
                 .cloned()
                 .unwrap_or_default();
             let stash_key = meta::mpu_stash_key(&upload_id, last_n, &nonce);
-            let stashed = match self.cache().get(&bucket, &stash_key, None).await {
+            let stashed = match self.meta().get(&bucket, &stash_key, None).await {
                 Ok(o) => o,
                 Err(Error::NotFound) => {
                     return Err(Error::Backend(format!(
@@ -447,7 +447,6 @@ impl Hypha {
             }
             return Err(e.into());
         }
-
         // 5. Settle: project the tombstone + twin, drop the mpu state.
         self.tier
             .settle_evict_locked(&bucket, &key, total_plen, &cetag, mtime_ms, carrier)
@@ -561,7 +560,7 @@ impl Hypha {
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
         match self
-            .cache()
+            .meta()
             .head(&bucket, &meta::mpu_upload_key(&input.upload_id))
             .await
         {
@@ -639,7 +638,7 @@ impl Hypha {
         let mut token: Option<String> = None;
         loop {
             let page = self
-                .cache()
+                .meta()
                 .list(
                     bucket,
                     Some(prefix.clone()),
@@ -675,20 +674,20 @@ impl Hypha {
         let prefix = meta::mpu_prefix(upload_id);
         loop {
             let page = self
-                .cache()
+                .meta()
                 .list(bucket, Some(prefix.clone()), None, None, None, None)
                 .await?;
             let objs = page.contents.unwrap_or_default();
             if objs.is_empty() {
                 return Ok(());
             }
-            // One LIST page is ≤1000 keys — exactly one batch DeleteObjects.
-            let keys: Vec<String> = objs
-                .iter()
-                .filter_map(|o| o.key())
-                .map(str::to_string)
-                .collect();
-            self.cache().delete_objects(bucket, &keys).await?;
+            // mpu record keys carry the 0x01 control byte (range A, §6), which XML 1.0 can't
+            // represent — so, like twins (§11 carve-out), they go through single-object
+            // `DeleteObject` (key in the percent-encoded URL path), never the batch `DeleteObjects`
+            // whose XML body would be rejected. One LIST page (≤1000 keys) deleted concurrently.
+            let keys: Vec<String> = objs.into_iter().filter_map(|o| o.key).collect();
+            let deletes = keys.iter().map(|k| self.meta().delete(bucket, k));
+            futures::future::try_join_all(deletes).await?;
             if page.is_truncated != Some(true) {
                 return Ok(());
             }

@@ -31,6 +31,9 @@ pub struct Hypha {
     /// table. Every data-path op reaches the backends through here.
     pub tier: Reconciler,
     pub mode: Mode,
+    /// Longest configured bucket prefix, charged against S3's 63-byte cap so the client-visible
+    /// bucket-name limit is `63 − this` (§7 *Buckets*). Checked at CreateBucket.
+    pub max_bucket_prefix_len: usize,
     /// Contiguous encrypt/decrypt above this offloads to `spawn_blocking` (§5). Unwired until
     /// an inline (non-offloaded) codec path exists — today every codec bridge offloads.
     #[allow(dead_code)]
@@ -38,29 +41,39 @@ pub struct Hypha {
 }
 
 impl Hypha {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         remote: Backend,
-        cache: Backend,
+        data: Backend,
+        meta: Backend,
         env: Envelope,
         trailer_key: TrailerKey,
         mode: Mode,
         offload_threshold: usize,
+        max_bucket_prefix_len: usize,
     ) -> Self {
         Self {
             tier: Reconciler {
-                cache,
+                data,
+                meta,
                 remote,
                 env: Arc::new(env),
                 trailer_key,
                 locks: KeyLocks::default(),
             },
             mode,
+            max_bucket_prefix_len,
             offload_threshold,
         }
     }
 
-    pub(crate) fn cache(&self) -> &Backend {
-        &self.tier.cache
+    /// The `<data>` cache bucket: client bodies and tombstones at bare `K` (§6).
+    pub(crate) fn data(&self) -> &Backend {
+        &self.tier.data
+    }
+    /// The `<meta>` cache bucket: twins, pending markers, and mpu records (§6).
+    pub(crate) fn meta(&self) -> &Backend {
+        &self.tier.meta
     }
     pub(crate) fn remote(&self) -> &Backend {
         &self.tier.remote

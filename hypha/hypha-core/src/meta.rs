@@ -1,5 +1,7 @@
-//! The cache-side structures plaintext facts travel through (§6): tombstones, facts twins, and
-//! the reserved-prefix records — plus the composite-ETag arithmetic and key admission.
+//! The cache-side structures plaintext facts travel through (§6): tombstones in the `<data>`
+//! bucket, and — in the `<meta>` bucket, keyed apart by the two control bytes client keys may not
+//! use — facts twins, pending markers, and mpu records. Plus the composite-ETag arithmetic and key
+//! admission.
 //!
 //! The *remote* carrier of an object's facts is the authenticated trailer behind its age
 //! ciphertext (`hypha_format::trailer`), landed atomically with every commit; nothing here is
@@ -183,29 +185,41 @@ pub fn storage_class(metadata: &std::collections::HashMap<String, String>) -> St
         .unwrap_or_else(|| STANDARD.to_string())
 }
 
-// ── The reserved prefix (§6) ────────────────────────────────────────────────────────────────
+// ── The `<meta>` bucket keyspace (§6) ─────────────────────────────────────────────────────────
 //
-// Everything hypha stores *about* objects — mpu state, and later the phase-4 pending markers —
-// lives under one fixed reserved key prefix. It leads with U+10FFFD — the **highest
-// interchange-safe** codepoint (the last plane-16 private-use char, just below the U+10FFFE/F
-// noncharacters that XML serializers may reject) — so the reserved keyspace sorts above every
-// client key except one starting with exactly U+10FFFD, clustering at the **end** of a LIST
-// instead of interleaving a client's scan. This is efficiency, not correctness: LIST filters
-// reserved keys per-entry (`is_reserved_key`), so a client that does use such keys just scans less
-// efficiently there. The base64url tail (~128 random bits) is what actually prevents collision —
-// a client can't land on the reserved keyspace without guessing it. Stable by contract (existing
-// reserved keys carry it).
+// hypha's object-side state lives in a *separate* cache bucket (`<meta><b>`) from client bodies
+// (`<data><b>`), so the client keyspace stays clean — no reserved prefix, no twin dilution, and a
+// LIST page whose last key is always a client key (which is what makes v1's `NextMarker`
+// expressible, §7). Within `<meta><b>`, two control bytes — both inadmissible in client keys
+// ([`validate_client_key`]) — carve three non-interleaving ranges:
+//
+//   0x01 0x01 <tag> …       range A: mpu state (`m`), and phase-4/5 sync (`s`) / recency (`r`) /
+//                                    shadow-body (`b`) records — prefix-scanned per tag.
+//   0x01 <K> 0x01 <facts>   range B: facts twins. K's first byte is >= 0x02 (admission), so the
+//                                    single 0x01 lead can never collide with range A's doubled one.
+//   <K>                     range C: pending markers, **bare** — zero overhead, so every
+//                                    admissible key has one (a marker is a durability signal, §6).
+//
+// The ranges sort A < B < C and never interleave, so the reconcile sweep reaches the markers with
+// one flat `start_after` past the 0x01 block — `O(pending)`, never `O(evicted)` (§7).
 
-pub const RESERVED_PREFIX: &str = "\u{10FFFD}3uYGNMVZsD97OWTV3oBHrd/";
+/// The control byte both `<meta>` ranges and the twin separator are built from; forbidden in client
+/// keys so the split is structural, not probabilistic.
+pub const CTRL: u8 = 0x01;
 
-pub fn is_reserved_key(key: &str) -> bool {
-    key.starts_with(RESERVED_PREFIX)
+/// Range-A tag for multipart-upload records.
+const TAG_MPU: char = 'm';
+
+/// The `0x01 0x01 m <upload-id> 0x01` prefix every record of one upload shares — a range-A prefix
+/// scan yields the whole set, and a range delete sweeps it (§7).
+fn mpu_range(upload_id: &str) -> String {
+    format!("{c}{c}{TAG_MPU}{upload_id}{c}", c = CTRL as char)
 }
 
-/// Cache: an upload's own record — the client key as the body (keys may exceed what an ASCII
-/// metadata header can carry).
+/// Cache (`<meta>`): an upload's own record — the client key as the body (keys may exceed what an
+/// ASCII metadata header can carry).
 pub fn mpu_upload_key(upload_id: &str) -> String {
-    format!("{RESERVED_PREFIX}mpu/{upload_id}/u")
+    format!("{}u", mpu_range(upload_id))
 }
 
 /// The facts an mpu part record carries in its key (§6).
@@ -221,15 +235,16 @@ pub struct MpuPart<'a> {
     pub stash_nonce: &'a str,
 }
 
-/// Cache: per-part record for a multipart upload, its facts encoded **in the key** so complete
-/// recovers them with one LIST and no per-part HEAD (§7). A re-uploaded part writes a *new* key,
-/// and the stale one is resolved away at complete by the remote's `ListParts`. `retag` and `pmd5`
-/// are hex and `stash_nonce` is base64url, so none contain `;` or a control byte and the
+/// Cache (`<meta>`): per-part record for a multipart upload, its facts encoded **in the key** so
+/// complete recovers them with one LIST and no per-part HEAD (§7). A re-uploaded part writes a
+/// *new* key, and the stale one is resolved away at complete by the remote's `ListParts`. `retag`
+/// and `pmd5` are hex and `stash_nonce` is base64url, so none contain `;` or a control byte and the
 /// `;`-delimited form is unambiguous; the zero-padded number keeps LIST order and lets
-/// [`parse_mpu_part`] reject the `/u` upload record.
+/// [`parse_mpu_part`] reject the `u` upload record.
 pub fn mpu_part_key(upload_id: &str, part: MpuPart<'_>) -> String {
     format!(
-        "{RESERVED_PREFIX}mpu/{upload_id}/p{:05};{};{};{}",
+        "{}p{:05};{};{};{}",
+        mpu_range(upload_id),
         part.part_number,
         part.retag.trim_matches('"'),
         part.pmd5,
@@ -237,11 +252,15 @@ pub fn mpu_part_key(upload_id: &str, part: MpuPart<'_>) -> String {
     )
 }
 
-/// Parse an mpu part record key; `None` for the upload's own `/u` record, a retained-ciphertext
-/// `c` record, or a malformed key. Reads only the final path segment, so a full or
-/// deployment-stripped key both work.
+/// Parse an mpu part record key; `None` for the upload's own `u` record, a retained-ciphertext
+/// `c` record, or a malformed key. Reads only the record segment after the final `0x01`, so the
+/// upload id (which never contains `0x01`) can't be mistaken for it.
 pub fn parse_mpu_part(key: &str) -> Option<MpuPart<'_>> {
-    let mut it = key.rsplit('/').next()?.strip_prefix('p')?.splitn(4, ';');
+    let mut it = key
+        .rsplit(CTRL as char)
+        .next()?
+        .strip_prefix('p')?
+        .splitn(4, ';');
     let part_number: i32 = it.next()?.parse().ok()?;
     let retag = it.next()?;
     let pmd5 = it.next()?;
@@ -267,10 +286,10 @@ pub fn parse_mpu_part(key: &str) -> Option<MpuPart<'_>> {
 /// rides [`MpuPart::stash_nonce`] on the part record, which already disambiguates re-uploads — so
 /// concurrent writes each retain under their own nonce and complete folds *exactly* the remote's
 /// `ListParts` winner, never a divergent cache last-writer. Prefix `c` — distinct from `p` records
-/// and the `/u` upload record — so [`parse_mpu_part`] skips it and it is swept with the rest of the
-/// `mpu/<id>/` range at complete/abort.
+/// and the `u` upload record — so [`parse_mpu_part`] skips it and it is swept with the rest of the
+/// upload's range at complete/abort.
 pub fn mpu_stash_key(upload_id: &str, part_number: i32, nonce: &str) -> String {
-    format!("{RESERVED_PREFIX}mpu/{upload_id}/c{part_number:05};{nonce}")
+    format!("{}c{part_number:05};{nonce}", mpu_range(upload_id))
 }
 
 /// Highest part number a client may use — S3's own limit, which hypha does not reduce (§7).
@@ -285,30 +304,90 @@ pub fn admits_no_successor(part_number: i32, ct_len: u64, min_remote_part: u64) 
     ct_len < min_remote_part || part_number >= MAX_CLIENT_PART
 }
 
-/// Cache: everything recorded for one upload — dropped at complete/abort.
+/// Cache (`<meta>`): everything recorded for one upload — dropped at complete/abort.
 pub fn mpu_prefix(upload_id: &str) -> String {
-    format!("{RESERVED_PREFIX}mpu/{upload_id}/")
+    mpu_range(upload_id)
+}
+
+/// Cache (`<meta>`): a rehydrated composite's plaintext (cached mode, §6). Range-A tag `b`, keyed by
+/// `sha256(K)[..160 bits]` rather than K — the access pattern is a point lookup, so the key can be
+/// a hash, which lifts every length condition. SHA-256 (not the MD5 already in the tree) because a
+/// collision here would serve another key's plaintext; a second independent digest of K rides the
+/// shadow's metadata and is verified on read (§6).
+pub fn shadow_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    format!("{c}{c}b{}", hex::encode(&digest[..20]), c = CTRL as char)
 }
 
 // ── LIST facts twins (§6) ───────────────────────────────────────────────────────────────────
 //
-// A twin is a zero-byte cache object at `base_key ‖ 0x01 ‖ facts`. Because `0x01` sorts below
-// every admissible client-key byte (see [`validate_client_key`]), a twin sorts immediately after
-// its own key and before any longer key, so one LIST pass yields `(K, K's twin)` adjacent and can
-// emit correct plaintext facts with no per-key HEAD. The facts live in the *key name* — the one
-// field a raw LIST returns per entry. Only eviction tombstones need a twin: a live body carries
-// its own plaintext size and client ETag natively in the cache.
+// A twin is a zero-byte object in the `<meta>` bucket at `0x01 ‖ base_key ‖ 0x01 ‖ facts` (range B
+// above). Both `0x01`s are inadmissible in client keys, which makes the twin range
+// **order-isomorphic to the client keyspace**: for `A < B`, if `A` is a proper prefix of `B` the
+// twins diverge where `twin(A)` holds `0x01` and `twin(B)` a byte >= 0x02, so `twin(A) < twin(B)`;
+// otherwise they diverge on a shared byte. LIST therefore pairs twins to keys by a **merge join**
+// over the client (`<data>`) cursor and this twin cursor, matched by base-key equality (§7) — not
+// by adjacency, since the twins no longer sit beside their keys.
 //
-// A twin applies **iff K's own entry classifies as an eviction tombstone** — next to anything
-// else it is a crash-window leftover, ignored and swept. The gate is sound because every path
-// that replaces an eviction tombstone passes through a live body or a transition mark first, so
-// an eviction tombstone is never adjacent to another epoch's twin (§6).
+// A twin applies **iff K's own entry classifies as an eviction tombstone** — against anything else
+// it is a crash-window leftover, ignored and swept. A live body's facts are native, so a stale
+// twin can never override them. Only eviction tombstones need a twin.
+//
+// The facts live in the *key name* — the one field a raw LIST returns per entry — bit-packed into
+// a fixed 36-char field (below), so a twin is `2 + 36 = 38` bytes longer than its base key. A key
+// longer than [`TWIN_MAX_KEY_LEN`] therefore gets **no** twin ([`Facts::twin_key`] returns `None`),
+// and its eviction tombstone resolves through the per-key HEAD fallback LIST already runs for a
+// genuinely-missing twin (§6): the tombstone metadata is the authoritative copy, the twin only its
+// LIST projection, so a missing one costs a round trip and never correctness.
 
-/// Separator between a key and its twin's facts. Forbidden in client keys (along with `0x00`), so
-/// it can never appear in one and always sorts a twin right after its base key. `0x01` (not `0x00`)
-/// because NUL is a string-terminator hazard across backends; the LIST round-trip carries it via
-/// `encoding-type=url` (`Backend::list`), since `0x01` is not a valid XML character.
-pub const TWIN_SEP: u8 = 0x01;
+/// Longest base key that still gets a twin: `1024 − 2·|CTRL| − |facts|`. Above it, twins degrade to
+/// the HEAD fallback. A **format constant**, not a tunable — changing the facts encoding moves
+/// previously-written twins across it.
+pub const TWIN_MAX_KEY_LEN: usize = 1024 - 2 - FACTS_CHARS;
+
+/// The packed facts field width. `{md5(128) ‖ plen(46) ‖ mtime_ms(42) ‖ part-count(14)}` = 230
+/// bits, and 36 base-91 chars hold `36·log2(91) ≈ 234.3` bits — the tightest fixed width that fits.
+const FACTS_CHARS: usize = 36;
+const FACTS_BASE: u64 = 91;
+const FACTS_BITS_MD5: u32 = 128;
+const FACTS_BITS_PLEN: u32 = 46;
+const FACTS_BITS_MTIME: u32 = 42;
+const FACTS_BITS_COUNT: u32 = 14;
+
+/// The 91-symbol printable-ASCII alphabet the packed facts render in: `0x21..=0x7E` minus `/` (a
+/// `/` would let a twin roll up under a delimiter listing and vanish from the twin cursor, §7),
+/// `+` (form-style decoders turn it into a space), and `;` (kept out only by construction). **Space
+/// (0x20) is excluded too**: a literal space in a key round-trips through the `encoding-type=url`
+/// LIST as `+` on some backends, so a space in the facts would corrupt the twin key hypha reads
+/// back — every char here percent-encodes unambiguously and never collides with the `+`/space trap.
+const fn facts_alphabet() -> [u8; FACTS_BASE as usize] {
+    let mut a = [0u8; FACTS_BASE as usize];
+    let mut c = 0x21u8;
+    let mut i = 0;
+    while c <= 0x7E {
+        if c != b'/' && c != b'+' && c != b';' {
+            a[i] = c;
+            i += 1;
+        }
+        c += 1;
+    }
+    a
+}
+const FACTS_ALPHABET: [u8; FACTS_BASE as usize] = facts_alphabet();
+
+/// Inverse of [`FACTS_ALPHABET`]: byte → digit value, or `-1` for a byte outside the alphabet.
+const fn facts_rev() -> [i8; 256] {
+    let mut r = [-1i8; 256];
+    let a = FACTS_ALPHABET;
+    let mut i = 0;
+    while i < FACTS_BASE as usize {
+        r[a[i] as usize] = i as i8;
+        i += 1;
+    }
+    r
+}
+const FACTS_REV: [i8; 256] = facts_rev();
 
 /// The facts a twin projects for LIST: exactly what LIST must emit for an evicted key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,27 +400,125 @@ pub struct Facts {
 }
 
 impl Facts {
-    /// The twin's full key for a given base key. Fields are `;`-joined after the separator; none
-    /// of them contain `;` or bytes `< 0x20`, so the encoding is unambiguous.
-    pub fn twin_key(&self, base_key: &str) -> String {
-        format!(
-            "{base_key}{}{};{};{}",
-            TWIN_SEP as char, self.client_etag, self.plen, self.mtime_ms
-        )
+    /// The twin's full `<meta>`-bucket key for `base_key`: `0x01 ‖ base_key ‖ 0x01 ‖ facts`. `None`
+    /// if `base_key` exceeds [`TWIN_MAX_KEY_LEN`] (no twin — HEAD fallback) or the ETag/fields don't
+    /// pack (a malformed ETag, or a field beyond the packed width — never happens for real facts).
+    pub fn twin_key(&self, base_key: &str) -> Option<String> {
+        if base_key.len() > TWIN_MAX_KEY_LEN {
+            return None;
+        }
+        let facts = self.pack()?;
+        let c = CTRL as char;
+        Some(format!("{c}{base_key}{c}{facts}"))
+    }
+
+    /// Bit-pack the facts into their fixed 36-char field, or `None` if the ETag is malformed or a
+    /// field overflows its width.
+    fn pack(&self) -> Option<String> {
+        // Split the client ETag into its raw MD5 and part count: bare 32-hex ⇒ single-part, count
+        // 0; `<32-hex>-N` ⇒ composite of N parts. `pack` stores the count and `unpack` rebuilds the
+        // exact string, so the twin needn't carry the `-N` suffix literally.
+        let (md5_hex, count) = match self.client_etag.rsplit_once('-') {
+            Some((h, n)) => (h, n.parse::<u32>().ok()?),
+            None => (self.client_etag.as_str(), 0),
+        };
+        let md5 =
+            u128::from_be_bytes(<[u8; 16]>::try_from(hex::decode(md5_hex).ok()?.as_slice()).ok()?);
+        if self.plen >> FACTS_BITS_PLEN != 0
+            || self.mtime_ms < 0
+            || (self.mtime_ms as u64) >> FACTS_BITS_MTIME != 0
+            || count >> FACTS_BITS_COUNT != 0
+        {
+            return None;
+        }
+        // hi = plen(46) ‖ mtime(42) ‖ count(14) = 102 bits; the 230-bit value is hi·2^128 + md5.
+        let hi = ((self.plen as u128) << (FACTS_BITS_MTIME + FACTS_BITS_COUNT))
+            | ((self.mtime_ms as u128) << FACTS_BITS_COUNT)
+            | count as u128;
+        let mut limbs = [md5 as u64, (md5 >> 64) as u64, hi as u64, (hi >> 64) as u64];
+
+        let mut digits = [0u8; FACTS_CHARS];
+        for d in digits.iter_mut() {
+            *d = FACTS_ALPHABET[divmod_small(&mut limbs, FACTS_BASE) as usize];
+        }
+        digits.reverse(); // most-significant digit first
+        Some(String::from_utf8(digits.to_vec()).expect("alphabet is ASCII"))
+    }
+
+    /// Inverse of [`Self::pack`]: 36 alphabet chars → `Facts`, or `None` if any char is off-alphabet
+    /// or the decoded value exceeds 230 bits (a corrupt twin key).
+    fn unpack(s: &str) -> Option<Facts> {
+        if s.len() != FACTS_CHARS {
+            return None;
+        }
+        let mut limbs = [0u64; 4];
+        for b in s.bytes() {
+            let digit = FACTS_REV[b as usize];
+            if digit < 0 {
+                return None;
+            }
+            mul_add_small(&mut limbs, FACTS_BASE, digit as u64);
+        }
+        // A valid value is < 2^230, so limbs[3] (bits 192..) must be < 2^38.
+        if limbs[3]
+            >> (FACTS_BITS_MD5 + FACTS_BITS_PLEN + FACTS_BITS_MTIME + FACTS_BITS_COUNT - 192)
+            != 0
+        {
+            return None;
+        }
+        let md5 = (limbs[0] as u128) | ((limbs[1] as u128) << 64);
+        let hi = (limbs[2] as u128) | ((limbs[3] as u128) << 64);
+        let count = (hi & ((1 << FACTS_BITS_COUNT) - 1)) as u32;
+        let mtime_ms = ((hi >> FACTS_BITS_COUNT) & ((1 << FACTS_BITS_MTIME) - 1)) as i64;
+        let plen =
+            ((hi >> (FACTS_BITS_COUNT + FACTS_BITS_MTIME)) & ((1 << FACTS_BITS_PLEN) - 1)) as u64;
+        let md5_hex = hex::encode(md5.to_be_bytes());
+        let client_etag = if count == 0 {
+            md5_hex
+        } else {
+            format!("{md5_hex}-{count}")
+        };
+        Some(Facts {
+            client_etag,
+            plen,
+            mtime_ms,
+        })
     }
 }
 
-/// Split a full cache key into `(base_key, Facts)` if it is a twin, else `None`.
+/// Split a full `<meta>`-bucket key into `(base_key, Facts)` if it is a twin (range B), else `None`
+/// — including range-A records (`0x01 0x01 …`), which lead with a doubled `0x01` a twin never does.
 pub fn parse_twin(full_key: &str) -> Option<(&str, Facts)> {
-    let sep = full_key.find(TWIN_SEP as char)?;
-    let (base, rest) = full_key.split_at(sep);
-    let mut it = rest[1..].splitn(3, ';');
-    let facts = Facts {
-        client_etag: it.next()?.to_string(),
-        plen: it.next()?.parse().ok()?,
-        mtime_ms: it.next()?.parse().ok()?,
-    };
-    Some((base, facts))
+    let c = CTRL as char;
+    let rest = full_key.strip_prefix(c)?;
+    if rest.starts_with(c) {
+        return None; // range A, not a twin
+    }
+    let sep = rest.find(c)?; // base contains no 0x01 (admission), so this is the separator
+    let (base, tail) = rest.split_at(sep);
+    Some((base, Facts::unpack(&tail[1..])?))
+}
+
+/// Long-division of the little-endian 256-bit value in `limbs` by a small `d < 2^32`, returning the
+/// remainder. Used to render the packed facts in base 91.
+fn divmod_small(limbs: &mut [u64; 4], d: u64) -> u64 {
+    let mut rem: u128 = 0;
+    for limb in limbs.iter_mut().rev() {
+        let cur = (rem << 64) | *limb as u128;
+        *limb = (cur / d as u128) as u64;
+        rem = cur % d as u128;
+    }
+    rem as u64
+}
+
+/// `limbs = limbs·m + add` over the little-endian 256-bit value — the Horner step decoding base 91.
+fn mul_add_small(limbs: &mut [u64; 4], m: u64, add: u64) {
+    let mut carry: u128 = add as u128;
+    for limb in limbs.iter_mut() {
+        let cur = *limb as u128 * m as u128 + carry;
+        *limb = cur as u64;
+        carry = cur >> 64;
+    }
 }
 
 /// The raw digest half of the composite ETag: `md5(md5₀‖…‖md5ₙ)` over the ordered per-part
@@ -368,20 +545,37 @@ pub fn composite_etag(part_md5s_hex: &[String]) -> Option<String> {
     ))
 }
 
-/// hypha constrains client keys beyond stock S3 only where the twin scheme needs it (architecture
-/// § *S3 surface*): no `0x00` or `0x01` — `0x01` is [`TWIN_SEP`], and both sort at or below it, so
-/// allowing them could place a client key between a base key and its twin — a length cap short of
-/// 1024 leaving twin-suffix headroom, and no [`RESERVED_PREFIX`] collisions. Other control bytes
-/// are fine: LIST rides `encoding-type=url` (see `Backend::list`), so any byte round-trips.
+/// S3's max key length; hypha does not reduce it (§6) now that twins live in a separate bucket.
+pub const MAX_KEY_LEN: usize = 1024;
+
+/// S3's max bucket-name length. The configured bucket prefix (§2) is charged against it, so the
+/// client-visible cap is `S3_MAX_BUCKET_NAME − max(prefix length)` (§7 *Buckets*).
+pub const S3_MAX_BUCKET_NAME: usize = 63;
+
+/// Key admission (§6): S3's own 1024-byte cap plus the one structural rule the `<meta>` ranges rest
+/// on — no `0x00` or `0x01`. Those two bytes build every `<meta>` range, and both sort at or below
+/// the twin separator, so either in a client key could fall inside the twin range. Every other byte,
+/// control chars included, is permitted: LIST rides `encoding-type=url` (`Backend::list`), so any
+/// byte round-trips. Enforced at every op that takes a key.
 pub fn validate_client_key(key: &str) -> Result<(), &'static str> {
-    if key.len() > 900 {
-        return Err("key too long (max 900 bytes, leaving twin-suffix headroom)");
+    if key.len() > MAX_KEY_LEN {
+        return Err("key too long (max 1024 bytes)");
     }
-    if key.bytes().any(|b| b <= TWIN_SEP) {
-        return Err("key contains a 0x00 or 0x01 byte, reserved by hypha for the twin separator");
+    if key.bytes().any(|b| b == 0x00 || b == CTRL) {
+        return Err("key contains a 0x00 or 0x01 byte, reserved by hypha");
     }
-    if is_reserved_key(key) {
-        return Err("key prefix is reserved by hypha");
+    Ok(())
+}
+
+/// Client bucket-name admission (§7 *Buckets*): the prefix is charged against S3's 63-byte cap, so
+/// reject up front with a clean error rather than an opaque backend failure once `max_prefix_len`
+/// characters of prefix are prepended.
+pub fn validate_bucket_name(name: &str, max_prefix_len: usize) -> Result<(), String> {
+    if name.len() + max_prefix_len > S3_MAX_BUCKET_NAME {
+        return Err(format!(
+            "bucket name too long: {} + {max_prefix_len}-byte prefix exceeds the {S3_MAX_BUCKET_NAME}-byte S3 limit",
+            name.len()
+        ));
     }
     Ok(())
 }
@@ -391,20 +585,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn twin_roundtrips_and_sorts_after_base() {
-        let f = Facts {
+    fn twin_roundtrips() {
+        // A single-part twin (bare-MD5 ETag, count 0).
+        let single = Facts {
             client_etag: "ab".repeat(16),
             plen: 4096,
             mtime_ms: 1_700_000_000_000,
         };
-        let tk = f.twin_key("dir/obj");
-        let (base, decoded) = parse_twin(&tk).unwrap();
-        assert_eq!(base, "dir/obj");
-        assert_eq!(decoded, f);
-        // Twin sorts after its base key and before any longer admissible key (0x01 < 0x20).
-        assert!(tk.as_str() > "dir/obj");
-        assert!(tk.as_str() < "dir/obj\x20");
-        assert!(tk.as_str() < "dir/obj/child");
+        // A composite twin (`<md5>-N`), exercising the packed part count.
+        let composite = Facts {
+            client_etag: format!("{}-137", "cd".repeat(16)),
+            plen: (1u64 << 46) - 1, // max plen the 46-bit field holds
+            mtime_ms: 1,
+        };
+        for f in [single, composite] {
+            let tk = f.twin_key("dir/obj").unwrap();
+            let (base, decoded) = parse_twin(&tk).unwrap();
+            assert_eq!(base, "dir/obj");
+            assert_eq!(decoded, f);
+            // 0x01 lead + base + 0x01 sep + 36 packed facts chars.
+            assert_eq!(tk.len(), 1 + "dir/obj".len() + 1 + FACTS_CHARS);
+        }
+    }
+
+    #[test]
+    fn twin_range_is_order_isomorphic() {
+        // The merge join (§7) relies on `A < B  ⇒  twin(A) < twin(B)`, including the prefix case.
+        let f = Facts {
+            client_etag: "ab".repeat(16),
+            plen: 1,
+            mtime_ms: 1,
+        };
+        let mut keys = ["a", "a/b", "a!b", "ab", "b", "a\u{7f}"];
+        keys.sort();
+        for w in keys.windows(2) {
+            let ta = f.twin_key(w[0]).unwrap();
+            let tb = f.twin_key(w[1]).unwrap();
+            assert!(ta < tb, "twin order broke for {:?} < {:?}", w[0], w[1]);
+        }
+        // A twin never collides with a range-A record, whose doubled 0x01 lead parse_twin rejects.
+        assert!(parse_twin(&mpu_upload_key("id")).is_none());
+        assert!(parse_twin(&shadow_key("k")).is_none());
+    }
+
+    #[test]
+    fn twin_degrades_above_threshold() {
+        let f = Facts {
+            client_etag: "ab".repeat(16),
+            plen: 1,
+            mtime_ms: 1,
+        };
+        assert!(f.twin_key(&"k".repeat(TWIN_MAX_KEY_LEN)).is_some());
+        // One byte over: no twin — the eviction tombstone resolves via the HEAD fallback (§6).
+        assert!(f.twin_key(&"k".repeat(TWIN_MAX_KEY_LEN + 1)).is_none());
+    }
+
+    #[test]
+    fn facts_alphabet_excludes_delimiter_hazards() {
+        assert_eq!(FACTS_ALPHABET.len(), 91);
+        for bad in *b"/+;" {
+            assert!(!FACTS_ALPHABET.contains(&bad));
+            assert!(FACTS_REV[bad as usize] < 0);
+        }
+        // Every alphabet byte round-trips through the reverse table.
+        for (i, &b) in FACTS_ALPHABET.iter().enumerate() {
+            assert_eq!(FACTS_REV[b as usize], i as i8);
+        }
     }
 
     #[test]
@@ -472,35 +718,41 @@ mod tests {
         assert!(validate_client_key("tab\tand\x1fctrl").is_ok());
         assert!(validate_client_key("bad\x00key").is_err());
         assert!(validate_client_key("bad\x01key").is_err());
-        assert!(validate_client_key(&"x".repeat(1000)).is_err());
+        // Full S3 key length is now admissible; only 1025+ is rejected.
+        assert!(validate_client_key(&"x".repeat(MAX_KEY_LEN)).is_ok());
+        assert!(validate_client_key(&"x".repeat(MAX_KEY_LEN + 1)).is_err());
+        // The <meta> ranges live in a separate bucket, but their keys carry 0x01 and so are
+        // inadmissible as client keys regardless.
         assert!(validate_client_key(&mpu_upload_key("id")).is_err());
-        assert!(validate_client_key(&format!("{RESERVED_PREFIX}anything")).is_err());
+        // Plane-16 keys are fine — nothing reserved in the client keyspace anymore.
+        assert!(validate_client_key("\u{100000}anything").is_ok());
     }
 
     #[test]
-    fn reserved_prefix_sorts_after_practical_keys() {
-        // Leads with U+10FFFD (highest interchange-safe codepoint), above every practical client
-        // key, so the reserved keyspace clusters at the end of a LIST rather than interleaving.
-        assert!(RESERVED_PREFIX.starts_with('\u{10FFFD}'));
-        assert!(RESERVED_PREFIX.ends_with('/'));
-        for k in [
-            "",
-            "zzz",
-            "~~~",
-            "\u{FFFF}tail",
-            "\u{FFFFF}",
-            "\u{FFFFF}zzzz",
-        ] {
-            assert!(
-                k < RESERVED_PREFIX,
-                "{k:?} must sort before the reserved prefix"
-            );
-            assert!(format!("{RESERVED_PREFIX}mpu/x").as_str() > k);
-        }
-        // Not an admission rule — a client *may* use plane-16 keys, just scanning less efficiently
-        // there; only the reserved keyspace itself is off-limits, by prefix.
-        assert!(validate_client_key("\u{100000}anything").is_ok());
-        assert!(validate_client_key(&format!("{RESERVED_PREFIX}x")).is_err());
+    fn bucket_name_budget() {
+        // 63-byte S3 cap minus the longest configured prefix.
+        assert!(validate_bucket_name(&"b".repeat(61), 2).is_ok());
+        assert!(validate_bucket_name(&"b".repeat(62), 2).is_err());
+        assert!(validate_bucket_name("bucket", 0).is_ok());
+    }
+
+    #[test]
+    fn meta_ranges_sort_and_separate() {
+        // Range A (0x01 0x01 …) < range B twins (0x01 <K≥0x02> …) < range C markers (bare K).
+        let range_a = mpu_upload_key("u");
+        let f = Facts {
+            client_etag: "ab".repeat(16),
+            plen: 1,
+            mtime_ms: 1,
+        };
+        let range_b = f.twin_key("obj").unwrap();
+        let range_c = "obj".to_string(); // a bare pending marker
+        assert!(range_a < range_b);
+        assert!(range_b < range_c);
+        // Only range B parses as a twin.
+        assert!(parse_twin(&range_a).is_none());
+        assert!(parse_twin(&range_b).is_some());
+        assert!(parse_twin(&range_c).is_none());
     }
 
     fn part(n: i32, retag: &'static str, pmd5: &'static str) -> MpuPart<'static> {
@@ -539,17 +791,16 @@ mod tests {
         assert_eq!(parse_mpu_part(&ks), Some(stashed));
         assert_eq!(
             mpu_stash_key("up-1", 10_000, "AAAA-nonce_1"),
-            format!("{RESERVED_PREFIX}mpu/up-1/c10000;AAAA-nonce_1")
+            format!("\u{1}\u{1}mup-1\u{1}c10000;AAAA-nonce_1")
         );
         // `c` records are not part records, so one LIST separates them by prefix alone.
         assert_eq!(parse_mpu_part(&mpu_stash_key("up-1", 10_000, "n")), None);
 
         // The upload's own record and malformed keys don't parse as parts.
         assert_eq!(parse_mpu_part(&mpu_upload_key("up-1")), None);
-        assert_eq!(
-            parse_mpu_part(&format!("{RESERVED_PREFIX}mpu/up-1/p00007")),
-            None
-        );
+        // Every record of one upload sorts under its prefix, ahead of the twin/marker ranges.
+        assert!(mpu_upload_key("up-1").starts_with(&mpu_prefix("up-1")));
+        assert!(ks.starts_with(&mpu_prefix("up-1")));
         // Records sort by part number under one LIST.
         assert!(
             mpu_part_key("up-1", part(2, retag, pmd5))

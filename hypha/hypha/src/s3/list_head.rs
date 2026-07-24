@@ -1,20 +1,23 @@
 //! HEAD and LIST, both cache-served and reporting **plaintext** facts (§7). HEAD reads them off
-//! the object (native for a live body, metadata for a tombstone; a transition mark resolves from
-//! the remote). LIST classifies each entry from its (size, ETag) sentinel pair (§6) and pairs it
-//! with its adjacent facts twin in one pass — the twin applies **iff the entry classifies as an
-//! eviction tombstone**; per-key HEADs happen only for the rare missing-twin fallback and for
-//! transition marks (the one classification that leaves the cache).
+//! the `<data>` object (native for a live body, metadata for a tombstone; a transition mark
+//! resolves from the remote). LIST is a **merge join** of two cursors (§6/§7): the client cursor
+//! over `<data><b>` (client bodies + tombstones, so its keys and pagination are clean), and the
+//! twin cursor over `<meta><b>`'s range B, `prefix = 0x01 ‖ <client prefix>`, delimiter mirrored.
+//! Each client entry is classified from its (size, ETag) sentinel pair (§6); an eviction tombstone
+//! takes its facts from the twin matched **by base-key equality**, with a per-key `<data>` HEAD
+//! fallback when the twin is missing (crash window, page straddle, or a key over the §6 twin
+//! threshold). Delete-tombstones are dropped; transition marks resolve from the remote.
 //!
-//! LIST is a **single cache page**, forwarded pagination. A facts twin sits beside every eviction
-//! tombstone, and delete-tombstones and reserved records are dropped, so a page can yield fewer
-//! than `MaxKeys` client entries even when more exist — a short page, which is valid S3 as long as
-//! `IsTruncated` and the continuation token are honest. hypha forwards the backend's own
-//! (key-position) continuation token and truncation flag verbatim, so a client pages correctly with
-//! no gaps or repeats even under concurrent mutation. It deliberately does **not** backfill to fill
-//! a page: coalescing multiple cache pages would require either reusing a backend cursor across
-//! requests or resuming by a client-entry count, and both weaken S3's key-position guarantee (a
-//! concurrent insert/delete in the re-listed range could dup or drop an untouched key). Short pages
-//! are the cost; a client simply follows the token until `IsTruncated` is false.
+//! LIST is a **single page**, forwarded pagination — the client cursor drives it. Delete-tombstones
+//! are dropped, so a page can yield fewer than `MaxKeys` client entries (a short page, valid S3 as
+//! long as `IsTruncated` and the resume position are honest); but with the twins moved out of the
+//! client keyspace, pages are short only where keys were *deleted*, not for every evicted key.
+//! hypha forwards the `<data>` cursor's own continuation token / truncation flag (v2) or last raw
+//! key (v1's `NextMarker`) and deliberately does **not** backfill to fill a page: coalescing pages
+//! would require reusing a backend cursor across requests or resuming by a client-entry count, and
+//! both weaken S3's key-position guarantee under concurrent mutation.
+
+use std::collections::HashMap;
 
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
@@ -32,14 +35,6 @@ struct PageView {
     common_prefixes: Vec<CommonPrefix>,
 }
 
-/// A raw cache key as a key *position* a client may be handed back (v1's `NextMarker`). Only twins
-/// need translating: their `0x01` separator is not a legal XML character, so a raw twin key cannot
-/// survive the response at all. A reserved record passes through — it is XML-representable, and
-/// hypha cannot assume the reserved range is the keyspace's end.
-fn client_key_position(raw: &str) -> String {
-    meta::parse_twin(raw).map_or_else(|| raw.to_string(), |(base, _)| base.to_string())
-}
-
 impl Hypha {
     pub(super) async fn op_head_object(
         &self,
@@ -50,7 +45,7 @@ impl Hypha {
         if meta::validate_client_key(&key).is_err() {
             return Err(Error::NotFound.into());
         }
-        let head = self.cache().head(&bucket, &key).await?;
+        let head = self.data().head(&bucket, &key).await?;
         let md = head.metadata.clone().unwrap_or_default();
 
         let (content_length, e_tag, last_modified) = match meta::tomb_kind(&md) {
@@ -103,7 +98,7 @@ impl Hypha {
         let input = req.input;
         let bucket = input.bucket.clone();
         let raw = self
-            .cache()
+            .data()
             .list(
                 &bucket,
                 input.prefix.clone(),
@@ -117,13 +112,15 @@ impl Hypha {
         let page = self
             .project_page(
                 &bucket,
+                input.prefix.as_deref(),
+                input.delimiter.as_deref(),
                 raw.contents.unwrap_or_default(),
                 raw.common_prefixes.unwrap_or_default(),
             )
             .await?;
 
         // KeyCount counts keys and common prefixes alike (S3). It is ≤ MaxKeys but may be strictly
-        // less: filtered twins/records leave a short — but honestly truncated — page.
+        // less: dropped delete-tombstones leave a short — but honestly truncated — page.
         let key_count = (page.entries.len() + page.common_prefixes.len()) as i32;
         let resp = ListObjectsV2Output {
             name: Some(bucket),
@@ -153,7 +150,7 @@ impl Hypha {
         let input = req.input;
         let bucket = input.bucket.clone();
         let raw = self
-            .cache()
+            .data()
             .list_v1(
                 &bucket,
                 input.prefix.clone(),
@@ -164,22 +161,20 @@ impl Hypha {
             .await?;
 
         let is_truncated = raw.is_truncated;
-        // v1 has no opaque token to forward: `NextMarker` is a *key*, so hypha must compute the
-        // resume position itself rather than echo the backend's. It is the key position the raw
-        // page actually reached — the greater of its last raw key and its last common prefix,
-        // because with a delimiter the two interleave and resuming from the last *content* key
-        // would re-roll a group hypha already emitted. The raw page end is also what keeps a page
-        // of nothing but filtered records from returning an empty marker and looping forever.
+        // v1's `NextMarker` is a *key*, not v2's opaque token, so hypha computes the resume
+        // position: the key position the `<data>` page actually reached — the greater of its last
+        // raw key and its last common prefix (with a delimiter the two interleave, and resuming
+        // from the last *content* key would re-roll a group already emitted). This is expressible
+        // only because `<data><b>` holds nothing but client objects (§6): the last raw key is
+        // always an XML-safe, strictly-increasing client key — never a twin (which would carry an
+        // illegal `0x01`), and never an empty marker that loops on a page of filtered records.
         let next_marker = raw
             .contents
             .iter()
             .flatten()
             .next_back()
             .and_then(|o| o.key())
-            // A page can end on a twin, whose `0x01` no XML response can carry: resume from its
-            // base instead. The base was emitted already and `marker` is exclusive, so the next
-            // page re-lists only the twin, which filters out again.
-            .map(client_key_position)
+            .map(str::to_string)
             .into_iter()
             .chain(
                 raw.common_prefixes
@@ -195,6 +190,8 @@ impl Hypha {
         let page = self
             .project_page(
                 &bucket,
+                input.prefix.as_deref(),
+                input.delimiter.as_deref(),
                 raw.contents.unwrap_or_default(),
                 raw.common_prefixes.unwrap_or_default(),
             )
@@ -215,78 +212,91 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// One raw cache page → the client-visible entries and common prefixes it projects (§7's
-    /// classifier). Shared by both LIST versions, which differ only in their pagination shell.
+    /// One `<data>` page → the client-visible entries and common prefixes it projects (§7's
+    /// classifier), pairing eviction tombstones with their `<meta>` twins by a merge join. Shared by
+    /// both LIST versions, which differ only in their pagination shell. `<data><b>` holds only
+    /// client objects, so there is nothing hypha-internal to filter out here.
     async fn project_page(
         &self,
         bucket: &str,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
         objs: Vec<aws_sdk_s3::types::Object>,
         raw_prefixes: Vec<aws_sdk_s3::types::CommonPrefix>,
     ) -> S3Result<PageView> {
-        // Walk the raw page, filtering the reserved keyspace and pairing each base key with the
-        // twin that sorts immediately after it.
-        let mut entries: Vec<Object> = Vec::new();
-        let mut i = 0;
-        while i < objs.len() {
+        // Classify each entry first, collecting the eviction tombstones that need a twin. The twin
+        // cursor is then fetched once, bounded to the span those keys occupy (§7).
+        enum Kind {
+            Live,
+            Evict,
+            Transit,
+        }
+        let mut classified: Vec<(String, i64, String, Option<Timestamp>, Kind)> = Vec::new();
+        for o in &objs {
             // Every S3 object has a key; a keyless LIST entry is a broken backend response.
-            let key = objs[i]
+            let key = o
                 .key()
                 .ok_or_else(|| Error::Backend("LIST returned an entry with no key".into()))?;
-            // Reserved-prefix records and orphan twins are hypha-internal, never listed.
-            if meta::is_reserved_key(key) || meta::parse_twin(key).is_some() {
-                i += 1;
-                continue;
-            }
-            // The twin, if the next entry is this key's twin.
-            let twin = objs.get(i + 1).and_then(|o| {
-                let k = o.key().unwrap_or_default();
-                meta::parse_twin(k)
-                    .filter(|(base, _)| *base == key)
-                    .map(|(_, f)| f)
-            });
-            let consumed_twin = twin.is_some();
+            let size = o.size().unwrap_or_default();
+            let etag = o.e_tag().unwrap_or_default().trim_matches('"').to_string();
+            let lm = o
+                .last_modified()
+                .and_then(|t| t.to_millis().ok())
+                .map(ts_ms);
+            let kind = match meta::classify_entry(size, &etag) {
+                None => Kind::Live,
+                Some(meta::TombKind::Delete) => continue, // client-visibly absent
+                Some(meta::TombKind::Evict) => Kind::Evict,
+                Some(meta::TombKind::Transit) => Kind::Transit,
+            };
+            classified.push((key.to_string(), size, etag, lm, kind));
+        }
 
-            let size = objs[i].size().unwrap_or_default();
-            let etag = objs[i].e_tag().unwrap_or_default().trim_matches('"');
+        // The twin cursor, over exactly the key span the eviction tombstones on this page occupy.
+        let evict_keys: Vec<&str> = classified
+            .iter()
+            .filter(|(_, _, _, _, k)| matches!(k, Kind::Evict))
+            .map(|(key, ..)| key.as_str())
+            .collect();
+        let twins = match (evict_keys.first(), evict_keys.last()) {
+            (Some(lo), Some(hi)) => self.fetch_twins(bucket, prefix, delimiter, lo, hi).await?,
+            _ => HashMap::new(),
+        };
 
-            match meta::classify_entry(size, etag) {
-                // Live plaintext body: native facts; any adjacent twin is stale — ignored.
-                None => entries.push(Object {
-                    key: Some(key.to_string()),
+        let mut entries: Vec<Object> = Vec::new();
+        for (key, size, etag, lm, kind) in classified {
+            match kind {
+                Kind::Live => entries.push(Object {
+                    key: Some(key),
                     size: Some(size),
-                    e_tag: Some(ETag::Strong(etag.to_string())),
-                    last_modified: objs[i]
-                        .last_modified()
-                        .and_then(|t| t.to_millis().ok())
-                        .map(ts_ms),
+                    e_tag: Some(ETag::Strong(etag)),
+                    last_modified: lm,
                     ..Default::default()
                 }),
-                Some(meta::TombKind::Delete) => {} // client-visibly absent
-                Some(meta::TombKind::Evict) => match twin {
-                    // The classification gate (§6): a twin next to an eviction tombstone is
+                Kind::Evict => match twins.get(&key) {
+                    // Paired by base-key equality (§7): a twin against an eviction tombstone is
                     // valid by construction.
                     Some(f) => entries.push(Object {
-                        key: Some(key.to_string()),
+                        key: Some(key),
                         size: Some(f.plen as i64),
-                        e_tag: Some(ETag::Strong(f.client_etag)),
+                        e_tag: Some(ETag::Strong(f.client_etag.clone())),
                         last_modified: Some(ts_ms(f.mtime_ms)),
                         ..Default::default()
                     }),
-                    // Missing/unparseable twin: the tombstone's metadata is authoritative (§6).
-                    // Also fires when a pair straddles the page boundary (base last on this page,
-                    // twin first on the next) — a per-key HEAD, correct but an extra round trip.
+                    // No twin: a crash window, a page straddle, or a key over the §6 twin threshold.
+                    // The tombstone's own metadata is authoritative — one per-key HEAD (§6).
                     None => {
-                        if let Some(o) = self.head_facts(bucket, key).await? {
+                        if let Some(o) = self.head_facts(bucket, &key).await? {
                             entries.push(o);
                         }
                     }
                 },
                 // Mid-bracket: the one classification that leaves the cache — remote HEAD (§7).
-                Some(meta::TombKind::Transit) => match self.remote().head(bucket, key).await {
+                Kind::Transit => match self.remote().head(bucket, &key).await {
                     Ok(h) => {
-                        let f = self.tier.remote_facts(bucket, key, &h).await?;
+                        let f = self.tier.remote_facts(bucket, &key, &h).await?;
                         entries.push(Object {
-                            key: Some(key.to_string()),
+                            key: Some(key),
                             size: Some(f.plen as i64),
                             e_tag: Some(ETag::Strong(f.cetag)),
                             last_modified: Some(ts_ms(f.mtime_ms)),
@@ -297,13 +307,12 @@ impl Hypha {
                     Err(e) => return Err(e.into()),
                 },
             }
-            i += if consumed_twin { 2 } else { 1 };
         }
 
+        // `<data>` common prefixes are pure client keyspace — no hypha-internal groups to filter.
         let common_prefixes: Vec<CommonPrefix> = raw_prefixes
             .into_iter()
             .map(|cp| CommonPrefix { prefix: cp.prefix })
-            .filter(|cp| !cp.prefix.as_deref().is_some_and(meta::is_reserved_key))
             .collect();
 
         Ok(PageView {
@@ -312,10 +321,65 @@ impl Hypha {
         })
     }
 
+    /// The twin cursor (§6/§7): `<meta>` range B over `[lo, hi]`, keyed back to base keys. Prefix
+    /// `0x01 ‖ <client prefix>` and the mirrored delimiter make its shape track the client cursor's
+    /// — a twin whose base rolls up under the delimiter rolls up identically (the facts alphabet
+    /// excludes `/`, §6), so only individual twins (those matching individual client entries) come
+    /// back as content. `start_after` past `0x01 ‖ lo` skips range A (mpu/shadow, `0x01 0x01 …`).
+    async fn fetch_twins(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
+        lo: &str,
+        hi: &str,
+    ) -> S3Result<HashMap<String, meta::Facts>> {
+        let c = meta::CTRL as char;
+        let twin_prefix = format!("{c}{}", prefix.unwrap_or(""));
+        let start_after = format!("{c}{lo}");
+        let mut map = HashMap::new();
+        let mut token: Option<String> = None;
+        loop {
+            let first = token.is_none();
+            let page = self
+                .meta()
+                .list(
+                    bucket,
+                    Some(twin_prefix.clone()),
+                    delimiter.map(str::to_string),
+                    token.clone(),
+                    first.then(|| start_after.clone()),
+                    None,
+                )
+                .await?;
+            let mut past_hi = false;
+            for obj in page.contents.unwrap_or_default() {
+                let Some(k) = obj.key else { continue };
+                // Range-A records never appear (start_after skips them); a stray non-twin is
+                // ignored. Twins past `hi` end the scan — the cursor is sorted.
+                if let Some((base, facts)) = meta::parse_twin(&k) {
+                    if base > hi {
+                        past_hi = true;
+                        break;
+                    }
+                    map.insert(base.to_string(), facts);
+                }
+            }
+            if past_hi || page.is_truncated != Some(true) {
+                break;
+            }
+            token = page.next_continuation_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(map)
+    }
+
     /// HEAD-fallback facts for an eviction tombstone missing its twin (§6). `None` if the key
     /// moved on (deleted / absent) since the LIST page was cut.
     async fn head_facts(&self, bucket: &str, key: &str) -> S3Result<Option<Object>> {
-        match self.cache().head(bucket, key).await {
+        match self.data().head(bucket, key).await {
             Ok(head) => {
                 let md = head.metadata.clone().unwrap_or_default();
                 match meta::tomb_kind(&md) {

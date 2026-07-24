@@ -9,6 +9,83 @@ use common::*;
 
 const B: &str = "objs";
 
+/// One client bucket maps to three prefixed backend buckets (§7), but `ListBuckets` must show only
+/// the client name — the cache `<data>`/`<meta>` prefixes never leak even though all three share
+/// one MinIO account in the harness. DeleteBucket then removes every backend projection, twins and
+/// markers included.
+#[tokio::test]
+async fn list_buckets_hides_backend_projections() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    // Write an object so both cache buckets hold state (tombstone in <data>, twin in <meta>).
+    put(&client, B, "obj", &pattern(64)).await;
+
+    let names: Vec<String> = client
+        .list_buckets()
+        .send()
+        .await
+        .expect("list buckets")
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name().map(str::to_string))
+        .collect();
+    assert_eq!(
+        names,
+        vec![B.to_string()],
+        "only the client name is visible"
+    );
+    // The raw backend really does hold the three prefixed buckets underneath.
+    let raw_buckets: Vec<String> = h
+        .raw()
+        .list_buckets()
+        .send()
+        .await
+        .expect("raw list buckets")
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name().map(str::to_string))
+        .collect();
+    for want in [h.cache_bucket(B), h.meta_bucket(B), h.remote_bucket(B)] {
+        assert!(
+            raw_buckets.contains(&want),
+            "backend missing {want}: {raw_buckets:?}"
+        );
+    }
+
+    // DeleteBucket after emptying the client bucket sweeps all three projections.
+    client
+        .delete_object()
+        .bucket(B)
+        .key("obj")
+        .send()
+        .await
+        .expect("delete obj");
+    client
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect("delete bucket");
+    let after: Vec<String> = h
+        .raw()
+        .list_buckets()
+        .send()
+        .await
+        .expect("raw list buckets")
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name().map(str::to_string))
+        .collect();
+    for gone in [h.cache_bucket(B), h.meta_bucket(B), h.remote_bucket(B)] {
+        assert!(
+            !after.contains(&gone),
+            "bucket {gone} outlived delete: {after:?}"
+        );
+    }
+}
+
 /// PUT→GET identity and ETag correctness across sizes spanning the 64 KiB chunk boundary, plus the
 /// at-rest guarantee: what lands on the remote is age ciphertext, never the plaintext.
 #[tokio::test]
@@ -366,13 +443,16 @@ async fn list_pagination_short_pages() {
         put(&client, B, k, &pattern(32)).await;
     }
 
-    // Confirm the dilution is real: the cache holds ≥ 2n raw objects (tombstone + twin per key).
-    let raw = raw_list(&h.raw(), &h.cache_bucket(B), None).await;
-    assert!(
-        raw.len() >= 2 * n,
-        "expected twin dilution, got {} raw objects",
-        raw.len()
+    // The keyspace split (§6) keeps twins out of the client cursor: <data> holds one tombstone per
+    // key (no dilution), and the n twins live in <meta>. So the client cursor pages cleanly below.
+    let data = raw_list(&h.raw(), &h.cache_bucket(B), None).await;
+    assert_eq!(
+        data.len(),
+        n,
+        "one tombstone per key in <data>, no twin dilution"
     );
+    let twins = raw_list(&h.raw(), &h.meta_bucket(B), None).await;
+    assert_eq!(twins.len(), n, "one twin per key in <meta>");
 
     for page_size in [1i32, 7, 10] {
         let mut collected = Vec::new();
@@ -500,13 +580,10 @@ async fn list_objects_v1() {
 /// back to the last key received, as S3 documents) must cover every key exactly once with no gaps
 /// or repeats — and must terminate.
 ///
-/// Ignored: v1's resume position is a *key*, not an opaque token, and §7's forwarded-token
-/// discipline does not carry over. A raw page can end on a twin, whose `0x01` no XML response can
-/// carry; mapping that twin back to its base makes the next page repeat the same marker forever.
-/// No XML-safe key exists between a twin and the next client key, so the pagination shell needs a
-/// design decision — see the note in §7.
+/// Unblocked by the §6 keyspace split: `<data><b>` holds only client objects, so the client
+/// cursor's last raw key is always an XML-safe, strictly-increasing client key — a valid resume
+/// position, where the pre-split interleaved layout (twins at `K ‖ 0x01`) had none (§7).
 #[tokio::test]
-#[ignore = "v1 NextMarker cannot be derived from a single raw page; design pending"]
 async fn list_objects_v1_pagination() {
     let h = Harness::durable().await;
     h.create_bucket(B).await;
@@ -560,6 +637,52 @@ async fn list_objects_v1_pagination() {
             "page size {page_size}: every key exactly once, in order, no gap/dup/twin-leak"
         );
     }
+}
+
+/// A key over the §6 twin threshold (986 bytes) gets **no** twin, so LIST must recover its facts
+/// through the per-key HEAD fallback rather than the twin cursor — and still report them correctly.
+/// This is the graceful-degradation path that lets admission accept S3's full 1024-byte keys.
+#[tokio::test]
+async fn list_over_threshold_key_head_fallback() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    // 999 > 986, so no twin is emitted; 999 ≤ 1024, so admission accepts it. Segmented at 199-byte
+    // path components: MinIO's filesystem backend caps a single segment at 255 bytes (a backend
+    // limit, not hypha's — the real cache is SeaweedFS, §9), so an unsegmented key wouldn't store.
+    let key = vec!["k".repeat(199); 5].join("/");
+    assert!(key.len() > 986 && key.len() <= 1024);
+    let body = pattern(4096);
+    let put_etag = put(&client, B, &key, &body).await;
+
+    // The <meta> bucket carries no twin for this key (its twin would be `0x01 key 0x01 …`).
+    let twin = raw_list(&h.raw(), &h.meta_bucket(B), Some(&format!("\u{1}{key}"))).await;
+    assert!(
+        twin.is_empty(),
+        "over-threshold key must have no twin: {twin:?}"
+    );
+
+    // LIST still reports the key with correct facts, resolved via the HEAD fallback.
+    let listed = client
+        .list_objects_v2()
+        .bucket(B)
+        .send()
+        .await
+        .expect("list");
+    let entry = listed
+        .contents()
+        .iter()
+        .find(|o| o.key() == Some(key.as_str()))
+        .expect("over-threshold key must appear in LIST");
+    assert_eq!(entry.size(), Some(body.len() as i64));
+    assert_eq!(
+        entry.e_tag().map(|e| e.trim_matches('"')),
+        Some(put_etag.as_str())
+    );
+
+    // And it round-trips through GET.
+    assert_eq!(get_all(&client, B, &key).await, body);
 }
 
 /// Keys with control bytes and prefix-adjacent names round-trip byte-exact through PUT/GET, and
@@ -903,11 +1026,17 @@ async fn delete_objects_batch() {
             Some("NoSuchKey")
         );
     }
-    // Settle removes the cache entry and its twins outright — absent is the authoritative 404.
+    // Settle removes the <data> entry and the <meta> twin outright — absent is the authoritative
+    // 404. (Twins are prefixed `0x01 gone/…` in <meta>, §6.)
     let cached = raw_list(&h.raw(), &h.cache_bucket(B), Some("gone/")).await;
     assert!(
         cached.is_empty(),
-        "deleted keys left cache state: {cached:?}"
+        "deleted keys left <data> state: {cached:?}"
+    );
+    let twins = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}gone/")).await;
+    assert!(
+        twins.is_empty(),
+        "deleted keys left <meta> twins: {twins:?}"
     );
 
     // The survivor is untouched, body included.
@@ -923,8 +1052,10 @@ async fn delete_objects_quiet_and_partial_failure() {
     let client = h.client();
 
     put(&client, B, "ok", &pattern(64)).await;
-    let reserved = format!("{}mpu/forged/u", hypha_core::meta::RESERVED_PREFIX);
-    let out = delete_objects(&client, B, &["ok", &reserved], true).await;
+    // A key hypha refuses at admission (over S3's 1024-byte cap) — XML-valid, so it reaches the
+    // per-key admission check rather than the request parser (§6/§7).
+    let bad_key = "z".repeat(1025);
+    let out = delete_objects(&client, B, &["ok", &bad_key], true).await;
 
     assert!(
         out.deleted().is_empty(),
@@ -932,8 +1063,8 @@ async fn delete_objects_quiet_and_partial_failure() {
         out.deleted()
     );
     let errors = out.errors();
-    assert_eq!(errors.len(), 1, "only the reserved key fails: {errors:?}");
-    assert_eq!(errors[0].key(), Some(reserved.as_str()));
+    assert_eq!(errors.len(), 1, "only the refused key fails: {errors:?}");
+    assert_eq!(errors[0].key(), Some(bad_key.as_str()));
     assert_eq!(errors[0].code(), Some("InvalidArgument"));
 
     // The valid key still committed despite its neighbour's rejection.

@@ -70,7 +70,7 @@ impl Hypha {
         // body reports it natively, a tombstone carries it in metadata, an absent key has none,
         // and a leftover transition mark is repaired first (§7 — the marking writer held this
         // lock, so a mark seen here is always a crash leftover).
-        let current_etag = match self.cache().head(&bucket, &key).await {
+        let current_etag = match self.data().head(&bucket, &key).await {
             Ok(head) => {
                 let md = head.metadata.clone().unwrap_or_default();
                 match meta::tomb_kind(&md) {

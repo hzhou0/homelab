@@ -41,7 +41,7 @@ impl Hypha {
             return Err(Error::NotFound.into());
         }
 
-        let head = self.cache().head(&bucket, &key).await?;
+        let head = self.data().head(&bucket, &key).await?;
         let md = head.metadata.clone().unwrap_or_default();
 
         match meta::tomb_kind(&md) {
@@ -84,7 +84,7 @@ impl Hypha {
         md: &std::collections::HashMap<String, String>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let out = self
-            .cache()
+            .data()
             .get(bucket, key, input.range.as_ref().map(range_header))
             .await?;
         let status = if input.range.is_some() {

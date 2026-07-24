@@ -114,7 +114,8 @@ async fn multipart_reupload_resolution() {
     );
 
     // All per-upload records (including the superseded one) are dropped at complete.
-    let residue = raw_list(&h.raw(), &h.cache_bucket(B), Some(meta::RESERVED_PREFIX)).await;
+    // mpu records live in the <meta> bucket's range A (0x01 0x01 m …, §6).
+    let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
     assert!(
         residue.is_empty(),
         "mpu records must be swept at complete, found {residue:?}"
@@ -224,7 +225,8 @@ async fn multipart_abort_cleanup() {
         .await
         .expect("abort");
 
-    let residue = raw_list(&h.raw(), &h.cache_bucket(B), Some(meta::RESERVED_PREFIX)).await;
+    // mpu records live in the <meta> bucket's range A (0x01 0x01 m …, §6).
+    let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
     assert!(
         residue.is_empty(),
         "abort must sweep mpu records, found {residue:?}"
@@ -393,10 +395,11 @@ async fn multipart_last_part_number_folds_trailer() {
         "the trailer rode part 10000, so the object has two parts"
     );
 
-    // And the retained ciphertext that made the fold possible is swept at complete.
-    let leftovers = raw_list(&h.raw(), &h.cache_bucket(B), None).await;
+    // And the retained ciphertext that made the fold possible is swept at complete. Its stash key
+    // is `…m<id>0x01 c10000;<nonce>` in the <meta> bucket (§6).
+    let leftovers = raw_list(&h.raw(), &h.meta_bucket(B), None).await;
     assert!(
-        leftovers.iter().all(|k| !k.contains("/c10000;")),
+        leftovers.iter().all(|k| !k.contains("c10000;")),
         "retained part-10000 ciphertext must not outlive complete: {leftovers:?}"
     );
 }

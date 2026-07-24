@@ -20,7 +20,10 @@ use crate::keylocks::KeyLocks;
 
 #[derive(Clone)]
 pub struct Reconciler {
-    pub cache: Backend,
+    /// `<data>` cache bucket: client bodies and tombstones at bare `K` (§6).
+    pub data: Backend,
+    /// `<meta>` cache bucket: facts twins, pending markers, mpu records (§6).
+    pub meta: Backend,
     pub remote: Backend,
     pub env: Arc<Envelope>,
     /// Keys the tail trailer's authentication tag (§6); derived once from the master passphrase.
@@ -45,7 +48,7 @@ impl Reconciler {
     pub(crate) async fn mark_transit_locked(&self, bucket: &str, key: &str) -> Result<()> {
         let mut md = HashMap::new();
         md.insert(meta::TOMB.to_string(), meta::TOMB_TRANSIT.to_string());
-        self.cache
+        self.data
             .put_small(bucket, key, meta::TRANSIT_SENTINEL.to_vec(), md, None, None)
             .await?;
         Ok(())
@@ -80,7 +83,7 @@ impl Reconciler {
         md.insert(meta::PLEN.to_string(), plen.to_string());
         md.insert(meta::CETAG.to_string(), cetag.to_string());
         md.insert(meta::MTIME.to_string(), mtime_ms.to_string());
-        self.cache
+        self.data
             .put_small(bucket, key, meta::EVICT_SENTINEL.to_vec(), md, None, None)
             .await?;
         Ok(())
@@ -89,7 +92,7 @@ impl Reconciler {
     /// **Settle** after a commit that removed K from the remote: absent is the authoritative 404.
     pub(crate) async fn settle_absent_locked(&self, bucket: &str, key: &str) -> Result<()> {
         self.delete_twins(bucket, key).await?;
-        self.cache.delete(bucket, key).await?;
+        self.data.delete(bucket, key).await?;
         Ok(())
     }
 
@@ -190,7 +193,7 @@ impl Reconciler {
     /// conditional PUT from ever queuing behind a multi-second transfer.
     #[allow(dead_code)] // phase 4: the cached-mode reconcile sweep
     pub(crate) async fn upload_locked(&self, bucket: &str, key: &str) -> Result<()> {
-        let out = self.cache.get(bucket, key, None).await?;
+        let out = self.data.get(bucket, key, None).await?;
         let plen = out.content_length().unwrap_or(0).max(0) as u64;
         // Single-part client ETag == the cache's own MD5 (composites route around this path, §7);
         // the trailer recomputes it from the streamed body, so validating the shape here suffices.
@@ -243,7 +246,7 @@ impl Reconciler {
         key: &str,
         remote_confirmed: bool,
     ) -> Result<()> {
-        let head = self.cache.head(bucket, key).await?;
+        let head = self.data.head(bucket, key).await?;
         let body_etag = head
             .e_tag()
             .unwrap_or_default()
@@ -272,7 +275,7 @@ impl Reconciler {
         md.insert(meta::PLEN.to_string(), plen.to_string());
         md.insert(meta::CETAG.to_string(), body_etag.clone());
         md.insert(meta::MTIME.to_string(), mtime_ms.to_string());
-        self.cache
+        self.data
             .put_small(
                 bucket,
                 key,
@@ -285,42 +288,40 @@ impl Reconciler {
         Ok(())
     }
 
-    /// Delete any stale twins of `key`, then write the fresh zero-byte twin. A crash between
-    /// leaves only a twin next to a non-evict entry — ignored by the classification gate (§6)
-    /// and swept later.
+    /// Delete any stale twins of `key` in `<meta>`, then write the fresh zero-byte twin. A key over
+    /// the §6 twin threshold gets **no** twin (`twin_key` is `None`) and resolves through LIST's
+    /// HEAD fallback instead — the tombstone metadata is authoritative either way. A crash between
+    /// leaves only a twin whose base key is a live/absent entry — ignored by the LIST gate (§6),
+    /// swept later.
     async fn refresh_twin(&self, bucket: &str, key: &str, facts: &meta::Facts) -> Result<()> {
         self.delete_twins(bucket, key).await?;
-        self.cache
-            .put_small(
-                bucket,
-                &facts.twin_key(key),
-                Vec::new(),
-                HashMap::new(),
-                None,
-                None,
-            )
-            .await?;
+        if let Some(twin_key) = facts.twin_key(key) {
+            self.meta
+                .put_small(bucket, &twin_key, Vec::new(), HashMap::new(), None, None)
+                .await?;
+        }
         Ok(())
     }
 
-    /// Delete every twin of `key` (the `key ‖ 0x01 …` suffix range). Twins carry the `0x01`
-    /// separator, which XML 1.0 cannot represent at all — so they must go through single-object
+    /// Delete `key`'s twin from `<meta>` (range B, `0x01 ‖ key ‖ 0x01 ‖ …`). Twin keys carry the
+    /// `0x01` control byte, which XML 1.0 cannot represent — so they must go through single-object
     /// `DeleteObject` (key in the percent-encoded URL path), never the batch `DeleteObjects` whose
     /// XML body would be rejected as malformed. There is ≤ 1 twin per key in steady state (refresh
-    /// deletes the stale one before writing the new); the rare multi-twin cleanup fires the
-    /// per-key deletes concurrently.
+    /// deletes the stale one before writing the new); the rare multi-twin cleanup fires the per-key
+    /// deletes concurrently.
     pub(crate) async fn delete_twins(&self, bucket: &str, key: &str) -> Result<()> {
-        let sep = format!("{}{}", key, meta::TWIN_SEP as char);
+        let c = meta::CTRL as char;
+        let prefix = format!("{c}{key}{c}");
         let existing = self
-            .cache
-            .list(bucket, Some(sep), None, None, None, None)
+            .meta
+            .list(bucket, Some(prefix), None, None, None, None)
             .await?;
         let deletes = existing
             .contents
             .unwrap_or_default()
             .into_iter()
             .filter_map(|obj| obj.key)
-            .map(|twin| async move { self.cache.delete(bucket, &twin).await });
+            .map(|twin| async move { self.meta.delete(bucket, &twin).await });
         futures::future::try_join_all(deletes).await?;
         Ok(())
     }

@@ -38,7 +38,8 @@ const MASTER_PASSPHRASE: &str = "integration-test-master-passphrase-0123456789ab
 
 /// hypha maps one client bucket onto `cache-<b>` and `remote-<b>` on the shared MinIO; the two
 /// prefixes are what keep the cache's tombstones/twins and the remote's ciphertext from colliding.
-const CACHE_PREFIX: &str = "cache-";
+const CACHE_PREFIX: &str = "data-";
+const META_PREFIX: &str = "meta-";
 const REMOTE_PREFIX: &str = "remote-";
 
 // ── MinIO ────────────────────────────────────────────────────────────────────────────────────
@@ -174,6 +175,7 @@ impl Harness {
         let config = Config {
             remote: endpoint_cfg(&minio.endpoint, REMOTE_PREFIX),
             cache: endpoint_cfg(&minio.endpoint, CACHE_PREFIX),
+            cache_meta_prefix: META_PREFIX.to_string(),
             mode,
             auth: ClientAuth {
                 access_key: HYPHA_ACCESS.to_string(),
@@ -204,8 +206,14 @@ impl Harness {
         format!("{REMOTE_PREFIX}{client_bucket}")
     }
 
+    /// The `<data>` cache bucket — client bodies + tombstones (§6).
     pub fn cache_bucket(&self, client_bucket: &str) -> String {
         format!("{CACHE_PREFIX}{client_bucket}")
+    }
+
+    /// The `<meta>` cache bucket — hypha's twins, markers, and mpu records (§6).
+    pub fn meta_bucket(&self, client_bucket: &str) -> String {
+        format!("{META_PREFIX}{client_bucket}")
     }
 
     /// Restart hypha against the same MinIO and config — models a process restart (crash/redeploy).
@@ -472,7 +480,12 @@ pub async fn raw_list(client: &Client, bucket: &str, prefix: Option<&str>) -> Ve
     let mut out = Vec::new();
     let mut token: Option<String> = None;
     loop {
-        let mut req = client.list_objects_v2().bucket(bucket);
+        // encoding-type=url so `<meta>` twin/mpu keys (which carry the 0x01 control byte, illegal in
+        // XML) survive the response; decode back to raw bytes.
+        let mut req = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .encoding_type(aws_sdk_s3::types::EncodingType::Url);
         if let Some(p) = prefix {
             req = req.prefix(p);
         }
@@ -482,7 +495,11 @@ pub async fn raw_list(client: &Client, bucket: &str, prefix: Option<&str>) -> Ve
         let page = req.send().await.expect("raw list");
         for o in page.contents() {
             if let Some(k) = o.key() {
-                out.push(k.to_string());
+                out.push(
+                    percent_encoding::percent_decode_str(k)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                );
             }
         }
         if page.is_truncated() != Some(true) {

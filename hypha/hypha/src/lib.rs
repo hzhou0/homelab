@@ -32,15 +32,20 @@ pub fn build_service(config: &Config) -> Result<S3Service, BoxError> {
     let trailer_key = hypha_format::TrailerKey::derive(&config.master_passphrase);
 
     let remote = Backend::connect(&config.remote);
-    let cache = Backend::connect(&config.cache);
+    // The cache is two buckets on one endpoint (§6): <data> holds client bodies + tombstones,
+    // <meta> holds hypha's twins, markers, and mpu records.
+    let data = Backend::connect(&config.cache);
+    let meta = data.with_prefix(config.cache_meta_prefix.clone());
 
     let app = Hypha::new(
         remote,
-        cache,
+        data,
+        meta,
         env,
         trailer_key,
         config.mode,
         config.serving.offload_threshold,
+        config.max_bucket_prefix_len(),
     );
 
     let mut b = S3ServiceBuilder::new(app);
