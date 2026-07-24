@@ -4,17 +4,15 @@
 //! state (bodies, tombstones, twins, mpu records) has somewhere to live, so it is created/deleted
 //! alongside but is never the authority.
 //!
-//! Create writes the cache projection first, then the remote — the remote create is the durable
-//! commit; a crash before it leaves a harmless orphan cache bucket (the bucket simply doesn't
-//! exist yet per the remote). Delete is the mirror: remote first (the durable commit that makes the
-//! bucket cease to exist), then the cache — a crash between leaves a retryable cache orphan, never a
-//! remote bucket the client believes is gone. The client's bucket passes through, mapped under each
-//! backend's own prefix (backend.rs).
+//! Lifecycle (Create/Delete) is owned by the bucket-control actor (`bucket_ctl.rs`), the sole
+//! writer of the cache substrate: these ops validate, then hand off and await the remote's own
+//! result. The remote create/delete is the commit; the cache projections are provisioned/drained
+//! around it. The client's bucket passes through, mapped under each backend's own prefix
+//! (backend.rs).
 
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
-use hypha_core::error::Error;
 use hypha_core::meta;
 
 use super::{ts_ms, Hypha};
@@ -29,12 +27,7 @@ impl Hypha {
         // front rather than as an opaque backend error (§7 *Buckets*).
         meta::validate_bucket_name(bucket, self.max_bucket_prefix_len)
             .map_err(|e| s3_error!(InvalidBucketName, "{e}"))?;
-        // Both cache projections first, then the remote — the remote create is the durable commit;
-        // a crash before it leaves harmless orphan cache buckets. Idempotent, so retry repairs a
-        // partial create.
-        self.data().create_bucket(bucket).await?;
-        self.meta().create_bucket(bucket).await?;
-        self.remote().create_bucket(bucket).await?;
+        self.buckets.create(bucket).await?;
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
@@ -42,45 +35,8 @@ impl Hypha {
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let bucket = &req.input.bucket;
-        // Remote first — the durable commit that makes the bucket cease to exist, and the emptiness
-        // gate: the remote holds every committed object, so a non-empty client bucket fails here.
-        self.remote().delete_bucket(bucket).await?;
-        // Then both cache buckets. Emptiness is judged on the remote above, not on `<meta>`:
-        // leftover twins/markers are hypha's own state, so drain them rather than let them block
-        // the delete (§7 *Buckets*). `<data>` holds only bare-K tombstones after the client emptied
-        // the bucket; drain defends against crash-leftover marks all the same.
-        self.drain_and_delete_bucket(self.data(), bucket).await?;
-        self.drain_and_delete_bucket(self.meta(), bucket).await?;
+        self.buckets.delete(&req.input.bucket).await?;
         Ok(S3Response::new(DeleteBucketOutput::default()))
-    }
-
-    /// Empty a cache bucket, then delete it. Keys are deleted one at a time: the `<meta>` bucket's
-    /// twins and mpu records carry the `0x01` control byte, which the batch `DeleteObjects` XML body
-    /// cannot represent (§6). Buckets are rare control-plane events, so the per-key cost is fine.
-    async fn drain_and_delete_bucket(
-        &self,
-        backend: &hypha_core::Backend,
-        bucket: &str,
-    ) -> Result<(), Error> {
-        loop {
-            let page = backend.list(bucket, None, None, None, None, None).await?;
-            let keys: Vec<String> = page
-                .contents
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|o| o.key)
-                .collect();
-            if keys.is_empty() {
-                break;
-            }
-            let deletes = keys.iter().map(|k| backend.delete(bucket, k));
-            futures::future::try_join_all(deletes).await?;
-            if page.is_truncated != Some(true) {
-                break;
-            }
-        }
-        backend.delete_bucket(bucket).await
     }
 
     pub(super) async fn op_head_bucket(

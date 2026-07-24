@@ -25,6 +25,7 @@ use hypha_core::error::Error;
 use hypha_core::meta;
 use hypha_format::SINGLE_TRAILER_LEN;
 
+use super::overlay::KeyState;
 use super::{ts_ms, Hypha};
 use crate::codec::{self, PartSegment};
 use crate::tier::RemoteFacts;
@@ -41,20 +42,12 @@ impl Hypha {
             return Err(Error::NotFound.into());
         }
 
-        let head = self.data().head(&bucket, &key).await?;
-        let md = head.metadata.clone().unwrap_or_default();
-
-        match meta::tomb_kind(&md) {
-            Some(meta::TombKind::Delete) => Err(Error::NotFound.into()),
-            Some(meta::TombKind::Evict) => {
-                let facts = facts_from_tombstone(&key, &md)?;
+        match self.resolve_key(&bucket, &key).await? {
+            KeyState::Absent => Err(Error::NotFound.into()),
+            KeyState::Remote { facts, md } => {
                 self.serve_remote(&bucket, &key, &input, &facts, &md).await
             }
-            Some(meta::TombKind::Transit) => match self.resolve_transit(&bucket, &key).await? {
-                None => Err(Error::NotFound.into()),
-                Some(facts) => self.serve_remote(&bucket, &key, &input, &facts, &md).await,
-            },
-            None => self.serve_cache_body(&bucket, &key, &input, &md).await,
+            KeyState::CacheBody { md, .. } => self.serve_cache_body(&bucket, &key, &input, &md).await,
         }
     }
 
@@ -255,29 +248,27 @@ impl Hypha {
             return Err(Error::NotFound.into());
         }
 
-        // Same dispatch as HEAD (§7): resolve the key's facts and storage class, or 404.
-        let head = self.data().head(&bucket, &key).await?;
-        let md = head.metadata.clone().unwrap_or_default();
-        let facts = match meta::tomb_kind(&md) {
-            Some(meta::TombKind::Delete) => return Err(Error::NotFound.into()),
-            Some(meta::TombKind::Evict) => facts_from_tombstone(&key, &md)?,
-            Some(meta::TombKind::Transit) => match self.resolve_transit(&bucket, &key).await? {
-                None => return Err(Error::NotFound.into()),
-                Some(f) => f,
-            },
-            None => RemoteFacts {
-                plen: head.content_length.unwrap_or(0).max(0) as u64,
-                cetag: head
-                    .e_tag
-                    .as_deref()
-                    .unwrap_or_default()
-                    .trim_matches('"')
-                    .to_string(),
-                mtime_ms: head
-                    .last_modified
-                    .and_then(|t| t.to_millis().ok())
-                    .unwrap_or_default(),
-            },
+        // Same dispatch as HEAD (§7), via the restore overlay: resolve the key's facts and storage
+        // class, or 404. A `Restoring` bucket resolves them from the remote.
+        let (facts, md) = match self.resolve_key(&bucket, &key).await? {
+            KeyState::Absent => return Err(Error::NotFound.into()),
+            KeyState::Remote { facts, md } => (facts, md),
+            KeyState::CacheBody { head, md } => (
+                RemoteFacts {
+                    plen: head.content_length.unwrap_or(0).max(0) as u64,
+                    cetag: head
+                        .e_tag
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string(),
+                    mtime_ms: head
+                        .last_modified
+                        .and_then(|t| t.to_millis().ok())
+                        .unwrap_or_default(),
+                },
+                md,
+            ),
         };
         let storage_class = meta::storage_class(&md);
 

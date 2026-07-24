@@ -352,7 +352,12 @@ impl Backend {
             .bucket(self.bkt(bucket))
             .send()
             .await
-            .map_err(Error::from_sdk)?;
+            // A missing bucket HEADs as a bodyless 404 (`NotFound`); the callers that branch on
+            // bucket existence want `NoSuchBucket`, not the key-level `NotFound`.
+            .map_err(|e| match Error::from_sdk(e) {
+                Error::NotFound => Error::NoSuchBucket,
+                e => e,
+            })?;
         Ok(())
     }
 

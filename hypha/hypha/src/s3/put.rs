@@ -41,6 +41,10 @@ impl Hypha {
             return Err(s3_error!(NotImplemented, "cached-mode PutObject pending"));
         }
 
+        // Overlay (§7): serving is never gated — a write to a restoring bucket first materializes K
+        // from the remote so the conditional-eval below runs against a correct tombstone.
+        self.prepare_write(&bucket, &key).await?;
+
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
         let expect_md5 = input
             .content_md5

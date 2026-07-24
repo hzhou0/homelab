@@ -82,9 +82,11 @@ hypha/src/
   auth.rs                S3Auth for hypha's own client credentials
   codec.rs               sync age ⇄ async body bridges; inline encrypt + MD5, trailer framing (§6)
   keylocks.rs            per-key async lock table (§4)
-  tier.rs                Reconciler: upload / tombstone / twin primitives (§7)
+  tier.rs                Reconciler: upload / tombstone / twin / restore-sweep primitives (§7)
+  bucket_ctl.rs          bucket-control actor: sole writer of the cache substrate; per-bucket restore (§7)
   s3/                    the s3s::S3 impl, split by op group
     put.rs get.rs list_head.rs delete.rs multipart.rs buckets.rs
+    overlay.rs           restore overlay: readiness gate + cache-vs-remote source for reads/writes (§7)
   replication.rs         (phase 4) the cached-mode reconcile sweep (§7)
   gc/                    (phase 5) scavenger task, active-only (§8); restore sweep (§7)
 
@@ -894,11 +896,12 @@ not obvious and both halves were observed:
 ### Buckets
 
 One client bucket maps to **three** backend buckets: `<data><b>` and `<meta><b>` on the cache,
-`<remote><b>` on the remote, each `Backend` prepending its own configured prefix (§2, §6). Like
-multipart, the **remote is the source of truth** and bucket ops are **always durable** (synchronous
-to the remote regardless of mode). The two cache buckets exist only to host object-side state
-(bodies and tombstones; twins, markers, and mpu records), so they are created/deleted alongside but
-are never the authority. Rare control-plane events — no markers.
+`<remote><b>` on the remote, each `Backend` prepending its own configured prefix (§2, §6). The
+**remote is the sole source of truth for bucket existence** and bucket ops are **always durable**
+(synchronous to the remote regardless of mode). The two cache buckets are a **rebuildable
+substrate**: they only host object-side state (bodies and tombstones; twins, markers, mpu records),
+never the authority — so, exactly like an object body, a missing one is *repaired rather than
+trusted*. Rare control-plane events — no markers.
 
 **Bucket-name budget.** S3 caps a bucket name at **63 characters** and the prefix is charged
 against it, so the client-visible cap is `63 − max(prefix length)`. Prefixes should therefore be
@@ -908,13 +911,75 @@ rather than surfacing as an opaque backend error. Two configuration invariants, 
 name — and no prefix may be a **prefix of another**, or `ListBuckets`' strip-and-filter
 mis-classifies and client buckets leak or vanish.
 
-- **CreateBucket**: create both cache projections, then the remote — the remote create is the
-  durable commit; a crash before it leaves harmless orphan cache buckets (not yet "created" per the
-  remote). Idempotent, so a partial create is repaired by retry.
-- **DeleteBucket**: delete the remote first (the durable commit that makes the bucket cease to
-  exist), then both cache buckets — a crash between leaves a retryable cache orphan, never a remote
-  bucket the client believes is gone. **Emptiness is judged on `<data><b>` alone**: leftover twins
-  or markers in `<meta><b>` are hypha's own state and must be swept rather than block the delete.
+**The substrate is restored, not assumed — one actor owns it.** The cache runs unreplicated and
+durability lives only on the remote, so `<remote><b>` routinely outlives its cache buckets (a lost
+cache volume, a pre-restore boot, a partial lifecycle op). By assumption a bucket's cache is lost
+**whole or not at all** — never partially — so its per-bucket **sync marker** (§6, `0x01 0x01 s` in
+`<meta><b>`) is a trustworthy all-or-nothing readiness signal: marker present ⇒ the projections
+survived intact and the cache is authoritative; marker absent ⇒ the cache is not authoritative and
+the remote is the read source of truth until a restore rebuilds it. All cache-substrate mutations —
+CreateBucket, DeleteBucket, and restore — are funnelled through a **single bucket-control actor** fed
+by a non-blocking unbounded queue, so the actor is the *sole writer* of the cache buckets and their
+serialization is **structural, not lock-based** (no per-bucket locks). The actor runs
+**per-bucket-serial, cross-bucket-parallel**: a worker drains one bucket's requests in arrival order
+while distinct buckets proceed concurrently, bounded by a global concurrency cap.
+
+Two request classes ride the queue:
+
+- **Client CreateBucket / DeleteBucket** — request-reply, serialized per bucket, **never coalesced**:
+  each returns the remote's own result, because a double-delete's loser must see `NoSuchBucket` and
+  a create must not merge with a same-name delete. The caller pushes (non-blocking) and awaits its
+  reply.
+- **Restore (repair)** — fire-and-forget and **coalesced by dedup**: the first op to find a bucket
+  unreconciled (marker absent, remote present) kicks a `Restore` and resolves itself from the remote
+  meanwhile — no 503, no waiter list. The actor ensures the projections exist, LISTs the remote and
+  rebuilds each object's eviction tombstone + twin from its authenticated tail trailer
+  (`Reconciler::restore_bucket`, the per-bucket restore sweep below), then writes the marker to flip
+  the bucket cache-authoritative. Idempotent, so a crash mid-sweep resumes by re-running; duplicate
+  restores collapse to one.
+
+**The restore overlay** keeps serving ungated while a bucket is unreconciled (one interface,
+`s3/overlay.rs`): a readiness verdict (memoized once the marker is observed) selects each op's source.
+Reads resolve a key's facts — and a LIST page's entries — from the cache tombstone namespace once
+`Ready`, or straight from the remote (facts off each object's tail trailer, common prefixes and
+pagination passing through the same client keyspace) while `Restoring`. A write to a `Restoring`
+bucket first materializes its key from the remote into the cache under the key lock, so the normal §4
+bracket then runs against a correct tombstone. Restore is **lazy** — triggered on first access, not a
+startup scan — so a warm cache pays nothing and only touched buckets are rebuilt. On shutdown the
+actor **drains its queue first** (pending client Create/Delete complete); in-flight restore is soft
+state, re-triggered on the next access.
+
+- **CreateBucket**: routed to the actor. When the remote bucket is absent it resets the cache
+  substrate (drain any stale orphan, provision empty projections), creates the remote — the **sole
+  commit** — and writes the marker (a fresh empty namespace is trivially reconciled → immediately
+  `Ready`). A duplicate create of a live bucket returns the remote's result and leaves cache and
+  marker untouched (it may be mid-restore).
+- **DeleteBucket**: routed to the actor. It deletes the remote first — the commit that makes the
+  bucket cease to exist, and the **emptiness gate** (the remote holds every committed object, so a
+  non-empty bucket is rejected here) — then best-effort drains and deletes both cache buckets and
+  clears the ready set. A failure or crash after the remote delete leaves a cache-without-remote
+  orphan a later restore/GC drops — never a remote bucket the client believes is gone. Leftover
+  twins/markers/marks are hypha's own state: drained, never allowed to block the delete.
+
+**Restore follow-ups** (open, deliberately deferred):
+
+- **Mid-life cache loss isn't re-detected without a restart.** The ready set memoizes `Ready`
+  permanently, so a volume that dies under a *running* active keeps resolving `Ready` and its ops
+  fail hard (cache `NoSuchBucket`) rather than re-restoring. This matches the "cache volume loss ⇒
+  discard and restart" operational model (§4/§8) — a restart clears the memo and the overlay
+  restores lazily — but a running active does not self-heal a live volume loss. Revisit if cache
+  loss should recover without an operator restart (e.g. invalidate the memo on a cache
+  `NoSuchBucket` from a supposedly-`Ready` bucket).
+- **Restore rebuilds object tombstones only, not multipart state.** `restore_bucket` reconstructs
+  the object namespace from remote objects + trailers; in-flight multipart records (`<meta>` range
+  A) are *not* rebuilt, so `ListParts`/`CompleteMultipartUpload` for an upload started before a
+  cache loss won't find its records after restore. Remote-as-truth for `ListMultipartUploads` (§7)
+  covers upload *existence*, not per-part cache state. Fold mpu-record restore in with the Phase-4/5
+  reconcile work.
+- **The overlay's `Restoring` arms are durable-only.** Reads resolve from the remote and writes
+  materialize-then-write with no cached-mode **pending overlay** (acked-but-unuploaded PUTs / pending
+  deletes). Phase 4 must extend `s3/overlay.rs`'s `Restoring` branches with that overlay so
+  read-after-write holds mid-restore in cached mode.
 - **ListBuckets**: remote-served, filtered to this deployment's remote prefix and stripped back to
   client-visible names — the cache prefixes never match, so cache buckets cannot leak into the
   listing even when both backends share one account.
@@ -995,13 +1060,16 @@ local storage once its ciphertext is provably on the remote.
 
 ### Background: the restore sweep (both modes)
 
-Runs when the active acquires its claim and finds the sync marker (§6) absent — a fresh or wiped
-cache. Until it completes, the remote is the read source of truth: remote LIST pages fan out
-bounded per-entry HEADs for facts, and in cached mode are merged with an in-memory **pending
-overlay** (acked-but-unuploaded PUTs patched in, pending deletes dropped; rebuilt from the marker
-LIST on promotion) so read-after-write holds while the cache is untrusted. The sweep:
+Runs **per bucket**, owned by the bucket-control actor and triggered by the restore overlay (§7
+*Buckets*) the first time an op finds a bucket's sync marker (§6) absent — a fresh or wiped cache.
+Until it completes, the overlay makes the remote that bucket's read source of truth: remote LIST
+pages fan out bounded per-entry trailer reads for facts, and in cached mode are merged with an
+in-memory **pending overlay** (acked-but-unuploaded PUTs patched in, pending deletes dropped; rebuilt
+from the marker LIST on promotion) so read-after-write holds while the cache is untrusted. The sweep,
+over the one bucket's keyspace:
 
-1. LIST remote and cache; recreate any bucket missing from the cache.
+1. Ensure the bucket's `<data>`/`<meta>` projections exist — a lost volume takes the buckets with it
+   — draining any stale orphan first.
 2. For each remote key with no cache entry (a surviving delete-tombstone counts as present, so
    pending deletes aren't resurrected), write an eviction tombstone + twin. Facts come from the
    object's authenticated tail trailer — one bounded suffix GET per key, single-part and

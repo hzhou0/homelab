@@ -125,6 +125,47 @@ impl Reconciler {
         Ok(Some(facts))
     }
 
+    /// Rebuild a bucket's cache namespace from the remote — the §7 restore sweep, per bucket. LIST
+    /// the remote and materialize each object's eviction tombstone + twin from its authenticated
+    /// tail trailer ([`Self::repair_locked`]), then write the sync marker so the bucket flips
+    /// cache-authoritative. Idempotent (repair only re-settles what a key already resolves to), so a
+    /// crash mid-sweep resumes by re-running — the marker, written last, is the only "done" signal.
+    /// Assumes the cache buckets already exist.
+    pub(crate) async fn restore_bucket(&self, bucket: &str) -> Result<()> {
+        let mut token = None;
+        loop {
+            let page = self
+                .remote
+                .list(bucket, None, None, token, None, Some(1000))
+                .await?;
+            let keys: Vec<String> = page
+                .contents
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|o| o.key)
+                .collect();
+            for key in keys {
+                let _guard = self.locks.lock(&key).await;
+                self.repair_locked(bucket, &key).await?;
+            }
+            match page.next_continuation_token {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        self.meta
+            .put_small(
+                bucket,
+                &meta::sync_marker_key(),
+                Vec::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Resolve a remote object's plaintext facts from its tail trailer (§6): **one speculative tail
     /// read**, single-part and composite alike — the trailer carries the complete facts either way,
     /// and its kind/count distinguish the two. Mid-bracket reads, repair, and the restore sweep all

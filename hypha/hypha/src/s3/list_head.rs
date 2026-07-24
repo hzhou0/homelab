@@ -26,6 +26,7 @@ use hypha_core::error::Error;
 use hypha_core::meta;
 
 use super::get::facts_from_tombstone;
+use super::overlay::{KeyState, Readiness};
 use super::{ts_ms, Hypha};
 
 /// The client-visible projection of one raw cache page — what both LIST versions put in `Contents`
@@ -45,44 +46,33 @@ impl Hypha {
         if meta::validate_client_key(&key).is_err() {
             return Err(Error::NotFound.into());
         }
-        let head = self.data().head(&bucket, &key).await?;
-        let md = head.metadata.clone().unwrap_or_default();
-
-        let (content_length, e_tag, last_modified) = match meta::tomb_kind(&md) {
-            Some(meta::TombKind::Delete) => return Err(Error::NotFound.into()),
-            Some(meta::TombKind::Evict) => {
-                let f = facts_from_tombstone(&key, &md)?;
-                (
-                    Some(f.plen as i64),
-                    Some(ETag::Strong(f.cetag)),
-                    Some(ts_ms(f.mtime_ms)),
-                )
-            }
-            Some(meta::TombKind::Transit) => match self.resolve_transit(&bucket, &key).await? {
-                None => return Err(Error::NotFound.into()),
-                Some(f) => (
-                    Some(f.plen as i64),
-                    Some(ETag::Strong(f.cetag)),
-                    Some(ts_ms(f.mtime_ms)),
+        let (content_length, e_tag, last_modified, md) =
+            match self.resolve_key(&bucket, &key).await? {
+                KeyState::Absent => return Err(Error::NotFound.into()),
+                KeyState::Remote { facts, md } => (
+                    Some(facts.plen as i64),
+                    Some(ETag::Strong(facts.cetag)),
+                    Some(ts_ms(facts.mtime_ms)),
+                    md,
                 ),
-            },
-            None => (
-                head.content_length,
-                head.e_tag
-                    .as_ref()
-                    .map(|e| ETag::Strong(e.trim_matches('"').to_string())),
-                head.last_modified
-                    .and_then(|t| t.to_millis().ok())
-                    .map(ts_ms),
-            ),
-        };
+                KeyState::CacheBody { head, md } => (
+                    head.content_length,
+                    head.e_tag
+                        .as_ref()
+                        .map(|e| ETag::Strong(e.trim_matches('"').to_string())),
+                    head.last_modified
+                        .and_then(|t| t.to_millis().ok())
+                        .map(ts_ms),
+                    md,
+                ),
+            };
 
         let resp = HeadObjectOutput {
             content_length,
             e_tag,
             last_modified,
-            // The pass-through carrier the facts above share (§7). A transition mark resolves its
-            // facts from the remote, which carries neither — so both fall back to their defaults.
+            // The pass-through carrier the facts above share (§7). A remote-resolved key (mid-bracket
+            // or mid-restore) carries neither, so both fall back to their defaults.
             metadata: Some(meta::decode_user_metadata(&md)),
             storage_class: Some(StorageClass::from(meta::storage_class(&md))),
             accept_ranges: Some("bytes".to_string()),
@@ -97,8 +87,15 @@ impl Hypha {
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
         let bucket = input.bucket.clone();
-        let raw = self
-            .data()
+        // While the cache restores, the remote is the read source of truth (§7); it holds the same
+        // client keyspace, so pagination forwards identically.
+        let restoring = match self.readiness(&bucket).await? {
+            Readiness::Absent => return Err(Error::NoSuchBucket.into()),
+            Readiness::Ready => false,
+            Readiness::Restoring => true,
+        };
+        let source = if restoring { self.remote() } else { self.data() };
+        let raw = source
             .list(
                 &bucket,
                 input.prefix.clone(),
@@ -108,33 +105,43 @@ impl Hypha {
                 input.max_keys,
             )
             .await?;
+        let max_keys = raw.max_keys;
+        let is_truncated = raw.is_truncated;
+        let next_continuation_token = raw.next_continuation_token.clone();
+        let objs = raw.contents.unwrap_or_default();
+        let prefixes = raw.common_prefixes.unwrap_or_default();
 
-        let page = self
-            .project_page(
-                &bucket,
-                input.prefix.as_deref(),
-                input.delimiter.as_deref(),
-                raw.contents.unwrap_or_default(),
-                raw.common_prefixes.unwrap_or_default(),
-            )
-            .await?;
+        let (entries, common_prefixes) = if restoring {
+            self.project_remote_page(&bucket, objs, prefixes).await?
+        } else {
+            let page = self
+                .project_page(
+                    &bucket,
+                    input.prefix.as_deref(),
+                    input.delimiter.as_deref(),
+                    objs,
+                    prefixes,
+                )
+                .await?;
+            (page.entries, page.common_prefixes)
+        };
 
         // KeyCount counts keys and common prefixes alike (S3). It is ≤ MaxKeys but may be strictly
         // less: dropped delete-tombstones leave a short — but honestly truncated — page.
-        let key_count = (page.entries.len() + page.common_prefixes.len()) as i32;
+        let key_count = (entries.len() + common_prefixes.len()) as i32;
         let resp = ListObjectsV2Output {
             name: Some(bucket),
             prefix: input.prefix,
             delimiter: input.delimiter,
             key_count: Some(key_count),
-            max_keys: raw.max_keys,
+            max_keys,
             // The backend's key-position token and flag, forwarded verbatim: a short page still
             // paginates correctly, and a client follows the token until IsTruncated is false.
-            is_truncated: raw.is_truncated,
+            is_truncated,
             continuation_token: input.continuation_token,
-            next_continuation_token: raw.next_continuation_token,
-            common_prefixes: Some(page.common_prefixes),
-            contents: Some(page.entries),
+            next_continuation_token,
+            common_prefixes: Some(common_prefixes),
+            contents: Some(entries),
             ..Default::default()
         };
         Ok(S3Response::new(resp))
@@ -149,8 +156,13 @@ impl Hypha {
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
         let bucket = input.bucket.clone();
-        let raw = self
-            .data()
+        let restoring = match self.readiness(&bucket).await? {
+            Readiness::Absent => return Err(Error::NoSuchBucket.into()),
+            Readiness::Ready => false,
+            Readiness::Restoring => true,
+        };
+        let source = if restoring { self.remote() } else { self.data() };
+        let raw = source
             .list_v1(
                 &bucket,
                 input.prefix.clone(),
@@ -160,26 +172,25 @@ impl Hypha {
             )
             .await?;
 
+        let max_keys = raw.max_keys;
         let is_truncated = raw.is_truncated;
+        let objs = raw.contents.unwrap_or_default();
+        let prefixes = raw.common_prefixes.unwrap_or_default();
+
         // v1's `NextMarker` is a *key*, not v2's opaque token, so hypha computes the resume
-        // position: the key position the `<data>` page actually reached — the greater of its last
-        // raw key and its last common prefix (with a delimiter the two interleave, and resuming
-        // from the last *content* key would re-roll a group already emitted). This is expressible
-        // only because `<data><b>` holds nothing but client objects (§6): the last raw key is
-        // always an XML-safe, strictly-increasing client key — never a twin (which would carry an
-        // illegal `0x01`), and never an empty marker that loops on a page of filtered records.
-        let next_marker = raw
-            .contents
+        // position: the greater of the page's last raw key and its last common prefix (with a
+        // delimiter the two interleave, and resuming from the last *content* key would re-roll a
+        // group already emitted). Both sources hold nothing but client objects at client keys (§6),
+        // so the last raw key is always an XML-safe, strictly-increasing client key.
+        let next_marker = objs
             .iter()
-            .flatten()
             .next_back()
             .and_then(|o| o.key())
             .map(str::to_string)
             .into_iter()
             .chain(
-                raw.common_prefixes
+                prefixes
                     .iter()
-                    .flatten()
                     .next_back()
                     .and_then(|cp| cp.prefix())
                     .map(str::to_string),
@@ -187,15 +198,20 @@ impl Hypha {
             .max()
             .filter(|_| is_truncated == Some(true));
 
-        let page = self
-            .project_page(
-                &bucket,
-                input.prefix.as_deref(),
-                input.delimiter.as_deref(),
-                raw.contents.unwrap_or_default(),
-                raw.common_prefixes.unwrap_or_default(),
-            )
-            .await?;
+        let (entries, common_prefixes) = if restoring {
+            self.project_remote_page(&bucket, objs, prefixes).await?
+        } else {
+            let page = self
+                .project_page(
+                    &bucket,
+                    input.prefix.as_deref(),
+                    input.delimiter.as_deref(),
+                    objs,
+                    prefixes,
+                )
+                .await?;
+            (page.entries, page.common_prefixes)
+        };
 
         let resp = ListObjectsOutput {
             name: Some(bucket),
@@ -203,10 +219,10 @@ impl Hypha {
             delimiter: input.delimiter,
             marker: input.marker,
             next_marker,
-            max_keys: raw.max_keys,
+            max_keys,
             is_truncated,
-            common_prefixes: Some(page.common_prefixes),
-            contents: Some(page.entries),
+            common_prefixes: Some(common_prefixes),
+            contents: Some(entries),
             ..Default::default()
         };
         Ok(S3Response::new(resp))

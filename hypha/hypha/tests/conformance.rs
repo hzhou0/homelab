@@ -86,6 +86,73 @@ async fn list_buckets_hides_backend_projections() {
     }
 }
 
+/// A bucket whose cache was lost is detected unreconciled on restart (its sync marker gone), served
+/// from the remote meanwhile, and rebuilt in the background — the tombstone namespace and marker
+/// return, and GET stays correct throughout (§7 restore overlay).
+#[tokio::test]
+async fn bucket_cache_loss_restores_from_remote() {
+    let mut h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let keys = ["a/1", "a/2", "b/3"];
+    let bodies: Vec<Vec<u8>> = (0..keys.len()).map(|i| pattern_seeded(48, i as u8)).collect();
+    for (k, body) in keys.iter().zip(&bodies) {
+        put(&client, B, k, body).await;
+    }
+
+    // Simulate cache-volume loss: wipe both projections' contents — the sync marker, tombstones,
+    // and twins — leaving the remote (the source of truth) intact.
+    let raw = h.raw();
+    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
+        for key in raw_list(&raw, &cache, None).await {
+            raw.delete_object()
+                .bucket(&cache)
+                .key(&key)
+                .send()
+                .await
+                .expect("wipe cache object");
+        }
+    }
+
+    // Fresh process: the in-memory ready set is empty, so the missing marker is observed and the
+    // bucket resolves as restoring. GET returns the real body from the remote meanwhile.
+    h.restart_hypha().await;
+    let client = h.client();
+    for (k, body) in keys.iter().zip(&bodies) {
+        let got = client.get_object().bucket(B).key(*k).send().await;
+        let data = got.expect("get mid-restore").body.collect().await.unwrap().to_vec();
+        assert_eq!(&data, body, "restore-overlay GET returned the wrong body for {k}");
+    }
+
+    // The background restore rebuilds the cache and writes the marker last. Poll for it.
+    let marker = "\u{1}\u{1}s";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while raw
+        .head_object()
+        .bucket(h.meta_bucket(B))
+        .key(marker)
+        .send()
+        .await
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restore never rewrote the sync marker"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Cache is authoritative again: one rebuilt tombstone per key in <data>, GET still correct.
+    let rebuilt = raw_list(&raw, &h.cache_bucket(B), None).await;
+    assert_eq!(rebuilt.len(), keys.len(), "restore rebuilt one tombstone per key");
+    for (k, body) in keys.iter().zip(&bodies) {
+        let got = client.get_object().bucket(B).key(*k).send().await;
+        let data = got.expect("get after restore").body.collect().await.unwrap().to_vec();
+        assert_eq!(&data, body, "post-restore GET returned the wrong body for {k}");
+    }
+}
+
 /// PUT→GET identity and ETag correctness across sizes spanning the 64 KiB chunk boundary, plus the
 /// at-rest guarantee: what lands on the remote is age ciphertext, never the plaintext.
 #[tokio::test]
@@ -451,7 +518,13 @@ async fn list_pagination_short_pages() {
         n,
         "one tombstone per key in <data>, no twin dilution"
     );
-    let twins = raw_list(&h.raw(), &h.meta_bucket(B), None).await;
+    // <meta> also holds the bucket's sync marker (§6, the reserved `0x01 0x01` range); twins are
+    // range B (`0x01 <K> 0x01 …`), so filter the doubled-control reserved keys back out.
+    let meta_objs = raw_list(&h.raw(), &h.meta_bucket(B), None).await;
+    let twins: Vec<&String> = meta_objs
+        .iter()
+        .filter(|k| !k.starts_with("\u{1}\u{1}"))
+        .collect();
     assert_eq!(twins.len(), n, "one twin per key in <meta>");
 
     for page_size in [1i32, 7, 10] {

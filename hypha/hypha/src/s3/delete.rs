@@ -44,6 +44,9 @@ impl Hypha {
             ));
         }
 
+        // Overlay (§7): serving is never gated — materialize K from the remote if restoring.
+        self.prepare_write(&bucket, &key).await?;
+
         let _guard = self.tier.locks.lock(&key).await;
 
         self.repair_leftover_mark_locked(&bucket, &key).await?;
@@ -111,6 +114,12 @@ impl Hypha {
                 false
             }
         });
+
+        // Overlay (§7): a restoring bucket has each key materialized from the remote first, so the
+        // batch marks/commits against correct tombstones; an absent bucket fails the whole call.
+        for key in &keys {
+            self.prepare_write(&bucket, key).await?;
+        }
 
         // Sequentially, in sorted order — the deadlock-freedom argument is the acquisition order.
         let mut guards = Vec::with_capacity(keys.len());

@@ -9,6 +9,7 @@ mod delete;
 mod get;
 mod list_head;
 mod multipart;
+mod overlay;
 mod put;
 
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ use hypha_core::config::Mode;
 use hypha_core::meta;
 use hypha_core::Backend;
 
+use crate::bucket_ctl::{self, BucketCtl};
 use crate::keylocks::KeyLocks;
 use crate::tier::Reconciler;
 
@@ -30,6 +32,9 @@ pub struct Hypha {
     /// Shared tiering machinery: cache + remote backends, the age envelope, and the per-key lock
     /// table. Every data-path op reaches the backends through here.
     pub tier: Reconciler,
+    /// The bucket-control actor — sole writer of the cache substrate (§7 *Buckets*). Bucket
+    /// lifecycle and repair route here; object reads/writes never do, beyond the 503 repair kick.
+    pub(crate) buckets: BucketCtl,
     pub mode: Mode,
     /// Longest configured bucket prefix, charged against S3's 63-byte cap so the client-visible
     /// bucket-name limit is `63 − this` (§7 *Buckets*). Checked at CreateBucket.
@@ -52,15 +57,18 @@ impl Hypha {
         offload_threshold: usize,
         max_bucket_prefix_len: usize,
     ) -> Self {
+        let tier = Reconciler {
+            data,
+            meta,
+            remote,
+            env: Arc::new(env),
+            trailer_key,
+            locks: KeyLocks::default(),
+        };
+        let buckets = bucket_ctl::spawn(tier.clone());
         Self {
-            tier: Reconciler {
-                data,
-                meta,
-                remote,
-                env: Arc::new(env),
-                trailer_key,
-                locks: KeyLocks::default(),
-            },
+            tier,
+            buckets,
             mode,
             max_bucket_prefix_len,
             offload_threshold,

@@ -4,6 +4,7 @@
 //! calls [`serve`]; the tests build the same service in-process and drive it with a real S3 client.
 
 mod auth;
+mod bucket_ctl;
 mod codec;
 mod keylocks;
 mod s3;

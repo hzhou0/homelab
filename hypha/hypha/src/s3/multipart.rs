@@ -55,6 +55,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.prepare_write(&bucket, &key).await?;
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
 
         let created = self
@@ -97,6 +98,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.prepare_write(&bucket, &key).await?;
         let part_number = input.part_number;
         if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
             return Err(s3_error!(
@@ -276,6 +278,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.prepare_write(&bucket, &key).await?;
 
         let part_number = input.part_number;
         if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
@@ -423,6 +426,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.prepare_write(&bucket, &key).await?;
         let upload_id = input.upload_id.clone();
 
         let requested = input
@@ -654,6 +658,7 @@ impl Hypha {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         let input = req.input;
+        self.prepare_write(&input.bucket, &input.key).await?;
         match self
             .remote()
             .abort_multipart(&input.bucket, &input.key, &input.upload_id)

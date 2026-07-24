@@ -210,6 +210,16 @@ pub const CTRL: u8 = 0x01;
 /// Range-A tag for multipart-upload records.
 const TAG_MPU: char = 'm';
 
+/// Range-A tag for the per-bucket sync marker.
+const TAG_SYNC: char = 's';
+
+/// Cache (`<meta><b>`): the sync marker (§6). Present iff this bucket's cache namespace has been
+/// reconciled from the remote and is therefore authoritative; its absence puts reads on the remote
+/// until the restore sweep rewrites it (§7). The presence is the whole signal — the body is empty.
+pub fn sync_marker_key() -> String {
+    format!("{c}{c}{TAG_SYNC}", c = CTRL as char)
+}
+
 /// The `0x01 0x01 m <upload-id> 0x01` prefix every record of one upload shares — a range-A prefix
 /// scan yields the whole set, and a range delete sweeps it (§7).
 fn mpu_range(upload_id: &str) -> String {
