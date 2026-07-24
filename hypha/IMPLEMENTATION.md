@@ -34,6 +34,14 @@ an `#[async_trait]` `S3` trait with one method per op, all defaulting to `NotImp
 implements only what it serves. `S3Auth` is a single `get_secret_key(access_key)`; that is where
 hypha validates its *own* clients' credentials.
 
+> **Follow-up (blocked on upstream release):** bump `s3s` to **0.15.0** once it publishes to
+> crates.io — the latest release is 0.14.1, which hypha pins. 0.15.0 carries the fix for
+> [Nugine/s3s#629](https://github.com/Nugine/s3s/issues/629) (GetObjectAttributes serializes the
+> ETag with quotes; AWS's body form is unquoted). On bump, drop the quoted-ETag workaround note in
+> §7 *GetObjectAttributes* and in `get.rs`, flip the `get_object_attributes` tests to assert the
+> unquoted value, and re-check the surface for 0.15.0 breaking changes. Not tracked as a task
+> because it isn't actionable until the release lands.
+
 **Clients (cache + remote) — `aws-sdk-s3`** with `aws-config`. Both backends are the same SDK type
 pointed at different endpoints; the architecture's loose coupling falls out naturally.
 
@@ -808,12 +816,19 @@ An unconditional cached copy takes no lock, racing on the cache like an uncondit
 
 A read projection over the **same key-state dispatch as HEAD** (live-body / eviction-tombstone /
 durable-always-remote / cached-shadow-probe), returning only the requested
-`x-amz-object-attributes`: `ObjectSize` = `plen`; `ETag` = client ETag (unquoted here — S3 quirk);
-`StorageClass` = the stored class (below). `ObjectParts` for a composite comes **straight off the
-trailer's offset table** — one bounded MAC-verified tail GET gives the part count (the ETag's `-N`)
-and per-part sizes via the closed form, with **no remote part index**; this is the capability that
-let §11 drop `GetObjectAttributes`/`HEAD partNumber` as a *remote backend* requirement — hypha now
-supplies it from the trailer. `Checksum` is omitted (deferred).
+`x-amz-object-attributes`: `ObjectSize` = `plen`; `ETag` = client ETag; `StorageClass` = the stored
+class (below). `ObjectParts` for a composite comes **straight off the trailer's offset table** — one
+bounded MAC-verified tail GET gives the part count (the ETag's `-N`) and per-part *plaintext* sizes
+via the closed form, paginated by `max-parts`/`part-number-marker`, with **no remote part index**;
+this is the capability that let §11 drop `GetObjectAttributes`/`HEAD partNumber` as a *remote
+backend* requirement — hypha now supplies it from the trailer. A single-part object reports no
+`ObjectParts` (S3 omits it for non-multipart objects). `Checksum` is omitted (deferred).
+
+> AWS returns this ETag **unquoted** in the GetObjectAttributes body (unlike the quoted HTTP
+> header), but s3s 0.14.1 quotes every `ETag` DTO value uniformly, so hypha emits it quoted. This is
+> an acknowledged upstream bug — [Nugine/s3s#629](https://github.com/Nugine/s3s/issues/629), fixed
+> for v0.15.0 (unreleased as of the current pin) — not a hypha defect; it resolves on the next s3s
+> bump. Harmless meanwhile: every S3 client trims ETag quotes.
 
 ### ListObjectsV2
 

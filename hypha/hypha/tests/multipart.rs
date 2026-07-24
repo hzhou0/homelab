@@ -645,6 +645,70 @@ async fn multipart_restore_from_trailer() {
     );
 }
 
+/// GetObjectAttributes `ObjectParts` for a composite comes straight off the trailer's offset table
+/// (§7): total part count and per-part *plaintext* sizes, no remote part index — and it paginates.
+#[tokio::test]
+async fn get_object_attributes_composite_parts() {
+    use aws_sdk_s3::types::ObjectAttributes;
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "composite/obj";
+
+    // Ragged: two 5 MiB parts and a 3 MiB tail (< MIN_PART, so the trailer folds into part 3).
+    let tail_len = 3 * 1024 * 1024;
+    let p1 = pattern_seeded(MIN_PART, 1);
+    let p2 = pattern_seeded(MIN_PART, 2);
+    let p3 = pattern_seeded(tail_len, 3);
+    let up = create_mpu(&client, B, key).await;
+    let e1 = upload_part(&client, B, key, &up, 1, &p1).await;
+    let e2 = upload_part(&client, B, key, &up, 2, &p2).await;
+    let e3 = upload_part(&client, B, key, &up, 3, &p3).await;
+    complete_mpu(&client, B, key, &up, &[(1, e1), (2, e2), (3, e3)]).await;
+
+    let out = client
+        .get_object_attributes()
+        .bucket(B)
+        .key(key)
+        .object_attributes(ObjectAttributes::ObjectSize)
+        .object_attributes(ObjectAttributes::ObjectParts)
+        .send()
+        .await
+        .expect("get object attributes (composite)");
+
+    assert_eq!(out.object_size(), Some((2 * MIN_PART + tail_len) as i64));
+    let parts = out.object_parts().expect("composite reports ObjectParts");
+    assert_eq!(parts.total_parts_count(), Some(3));
+    let nums: Vec<i32> = parts
+        .parts()
+        .iter()
+        .filter_map(|p| p.part_number())
+        .collect();
+    assert_eq!(nums, vec![1, 2, 3]);
+    let sizes: Vec<i64> = parts.parts().iter().filter_map(|p| p.size()).collect();
+    // Per-part *plaintext* sizes off the trailer table — the trailer folded into part 3 doesn't
+    // inflate its reported size.
+    assert_eq!(
+        sizes,
+        vec![MIN_PART as i64, MIN_PART as i64, tail_len as i64]
+    );
+
+    // Pagination truncates at max_parts.
+    let page = client
+        .get_object_attributes()
+        .bucket(B)
+        .key(key)
+        .object_attributes(ObjectAttributes::ObjectParts)
+        .max_parts(2)
+        .send()
+        .await
+        .expect("get object attributes (paged)");
+    let pp = page.object_parts().expect("ObjectParts");
+    assert_eq!(pp.is_truncated(), Some(true));
+    assert_eq!(pp.parts().len(), 2);
+    assert_eq!(pp.total_parts_count(), Some(3));
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
 /// Like [`complete_mpu`] but returns the `Result` so failure can be asserted.

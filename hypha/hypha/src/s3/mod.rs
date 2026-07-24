@@ -198,6 +198,20 @@ impl s3s::S3 for Hypha {
         self.op_get_bucket_location(req).await
     }
 
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        self.op_get_bucket_versioning(req).await
+    }
+
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        self.op_get_object_attributes(req).await
+    }
+
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,

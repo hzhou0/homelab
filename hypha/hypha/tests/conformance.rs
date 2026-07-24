@@ -1075,6 +1075,79 @@ async fn delete_objects_quiet_and_partial_failure() {
     );
 }
 
+/// GetObjectAttributes over the HEAD dispatch (§7): a durable single-part object (which settles to
+/// an eviction tombstone) reports its size, ETag, and storage class from the tombstone facts, and
+/// carries no `ObjectParts` (not multipart).
+#[tokio::test]
+async fn get_object_attributes_single_part() {
+    use aws_sdk_s3::types::ObjectAttributes;
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let body = pattern(50_000);
+    let etag = put(&client, B, "obj", &body).await;
+
+    let out = client
+        .get_object_attributes()
+        .bucket(B)
+        .key("obj")
+        .object_attributes(ObjectAttributes::ObjectSize)
+        .object_attributes(ObjectAttributes::Etag)
+        .object_attributes(ObjectAttributes::StorageClass)
+        .object_attributes(ObjectAttributes::ObjectParts)
+        .send()
+        .await
+        .expect("get object attributes");
+
+    assert_eq!(out.object_size(), Some(body.len() as i64));
+    // AWS returns this ETag unquoted; s3s quotes every ETag uniformly, so trim before comparing.
+    assert_eq!(
+        out.e_tag().map(|e| e.trim_matches('"')),
+        Some(etag.as_str())
+    );
+    assert_eq!(
+        out.storage_class(),
+        Some(&aws_sdk_s3::types::StorageClass::Standard)
+    );
+    // Single-part objects report no ObjectParts.
+    assert!(
+        out.object_parts().is_none(),
+        "single-part has no ObjectParts"
+    );
+
+    // A requested-but-unasked attribute is simply absent: omit ObjectSize and it's None.
+    let out2 = client
+        .get_object_attributes()
+        .bucket(B)
+        .key("obj")
+        .object_attributes(ObjectAttributes::Etag)
+        .send()
+        .await
+        .expect("get object attributes (etag only)");
+    assert!(out2.object_size().is_none(), "unrequested field is omitted");
+    assert_eq!(
+        out2.e_tag().map(|e| e.trim_matches('"')),
+        Some(etag.as_str())
+    );
+}
+
+/// GetBucketVersioning is a benign stub: an empty configuration (no Status), so `aws s3 sync` / boto
+/// probes see "not enabled" rather than a 501.
+#[tokio::test]
+async fn get_bucket_versioning_stub() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let out = h
+        .client()
+        .get_bucket_versioning()
+        .bucket(B)
+        .send()
+        .await
+        .expect("get bucket versioning");
+    assert!(out.status().is_none(), "versioning is never enabled");
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
 /// Batch-delete `keys` through hypha.

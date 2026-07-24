@@ -113,6 +113,21 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
+    /// **GetBucketVersioning** (§7): a benign stub — an empty versioning configuration, no backend
+    /// call. hypha buckets never carry versioning, but `aws s3 sync` / boto / `mc` probe this up
+    /// front and a `501` aborts them where "not enabled" passes; enabling it (`PutBucketVersioning`)
+    /// stays exempt/rejected.
+    pub(super) async fn op_get_bucket_versioning(
+        &self,
+        _req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        let resp = GetBucketVersioningOutput {
+            status: None,
+            mfa_delete: Some(MFADeleteStatus::from_static(MFADeleteStatus::DISABLED)),
+        };
+        Ok(S3Response::new(resp))
+    }
+
     pub(super) async fn op_get_bucket_location(
         &self,
         req: S3Request<GetBucketLocationInput>,

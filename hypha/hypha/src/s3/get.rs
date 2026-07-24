@@ -222,6 +222,117 @@ impl Hypha {
             Ok(S3Response::new(resp))
         }
     }
+
+    /// **GetObjectAttributes** (§7): a read projection over the *same key-state dispatch as HEAD* —
+    /// live body / eviction tombstone / transition-from-remote — returning only the
+    /// `x-amz-object-attributes` the client asked for. `ObjectParts` for a composite comes straight
+    /// off the trailer's offset table (one bounded MAC-verified tail GET → part count and per-part
+    /// plaintext sizes via the closed form, no remote part index, §6). `Checksum` is deferred (§11).
+    pub(super) async fn op_get_object_attributes(
+        &self,
+        req: S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        if meta::validate_client_key(&key).is_err() {
+            return Err(Error::NotFound.into());
+        }
+
+        // Same dispatch as HEAD (§7): resolve the key's facts and storage class, or 404.
+        let head = self.data().head(&bucket, &key).await?;
+        let md = head.metadata.clone().unwrap_or_default();
+        let facts = match meta::tomb_kind(&md) {
+            Some(meta::TombKind::Delete) => return Err(Error::NotFound.into()),
+            Some(meta::TombKind::Evict) => facts_from_tombstone(&key, &md)?,
+            Some(meta::TombKind::Transit) => match self.resolve_transit(&bucket, &key).await? {
+                None => return Err(Error::NotFound.into()),
+                Some(f) => f,
+            },
+            None => RemoteFacts {
+                plen: head.content_length.unwrap_or(0).max(0) as u64,
+                cetag: head
+                    .e_tag
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string(),
+                mtime_ms: head
+                    .last_modified
+                    .and_then(|t| t.to_millis().ok())
+                    .unwrap_or_default(),
+            },
+        };
+        let storage_class = meta::storage_class(&md);
+
+        let want = |name: &str| input.object_attributes.iter().any(|a| a.as_str() == name);
+
+        // ObjectParts: composite only, and only when requested. Sizes are the per-part *plaintext*
+        // lengths from the trailer's table (§6); the parts paginate like ListParts.
+        let object_parts =
+            if want(ObjectAttributes::OBJECT_PARTS) && meta::is_composite_etag(&facts.cetag) {
+                let tail = self.tier.read_tail(&bucket, &key).await?.ok_or_else(|| {
+                    Error::Backend(format!("composite {key:?} carries no hypha trailer"))
+                })?;
+                Some(build_object_parts(
+                    &tail.plens,
+                    input.part_number_marker,
+                    input.max_parts,
+                ))
+            } else {
+                None
+            };
+
+        let resp = GetObjectAttributesOutput {
+            // AWS returns this ETag *unquoted* in the GetObjectAttributes body (unlike the quoted
+            // HTTP header), but s3s 0.14.1 quotes every `ETag` DTO value uniformly — an upstream bug
+            // (Nugine/s3s#629, fixed for v0.15.0, unreleased as of this pin). Harmless (every S3
+            // client trims ETag quotes); drop this note when bumping s3s past 0.15.0.
+            e_tag: want(ObjectAttributes::ETAG).then(|| ETag::Strong(facts.cetag.clone())),
+            object_size: want(ObjectAttributes::OBJECT_SIZE).then_some(facts.plen as i64),
+            storage_class: want(ObjectAttributes::STORAGE_CLASS)
+                .then(|| StorageClass::from(storage_class)),
+            object_parts,
+            last_modified: Some(ts_ms(facts.mtime_ms)),
+            // No versioning, so never a delete marker; Checksum deferred (§11).
+            ..Default::default()
+        };
+        Ok(S3Response::new(resp))
+    }
+}
+
+/// The trailer-derived `ObjectParts` view for a composite (§7), paginated like `ListParts`: part
+/// *i* is part number `i+1` with plaintext `size = plens[i]`.
+fn build_object_parts(
+    plens: &[u64],
+    part_number_marker: Option<i32>,
+    max_parts: Option<i32>,
+) -> GetObjectAttributesParts {
+    let after = part_number_marker.unwrap_or(0);
+    let max = max_parts.unwrap_or(1000).max(0) as usize;
+    let mut parts: Vec<ObjectPart> = plens
+        .iter()
+        .enumerate()
+        .map(|(i, &plen)| (i as i32 + 1, plen))
+        .filter(|(n, _)| *n > after)
+        .map(|(n, plen)| ObjectPart {
+            part_number: Some(n),
+            size: Some(plen as i64),
+            ..Default::default()
+        })
+        .collect();
+    let is_truncated = parts.len() > max;
+    parts.truncate(max);
+    GetObjectAttributesParts {
+        total_parts_count: Some(plens.len() as i32),
+        part_number_marker: Some(after),
+        max_parts: Some(max as i32),
+        is_truncated: Some(is_truncated),
+        next_part_number_marker: is_truncated
+            .then(|| parts.last().and_then(|p| p.part_number))
+            .flatten(),
+        parts: Some(parts),
+    }
 }
 
 /// Resolve a plaintext range against a composite's parts (§7): with per-part windows and plaintext
