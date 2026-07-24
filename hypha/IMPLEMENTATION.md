@@ -14,7 +14,7 @@ Cargo workspace:
 
 - **`hypha-format`** — the age envelope wrapper: pure sync codec (age 0.11 is sync-only —
   `StreamWriter<W: Write>` / `StreamReader<R: Read>`), closed-form offset arithmetic, and the
-  `RangeReader` seek adapter; the serving binary bridges it to async bodies. Standalone so it
+  `RangeReader` seek adapter; the serving binary bridges itw to async bodies. Standalone so it
   carries the proptest/fuzz/bench suite without a server.
 - **`hypha-core`** — shared library: `Backend` (an `aws-sdk-s3` wrapper with bucket-prefix mapping),
   `meta` (tombstones, sentinels, facts twins, composite ETag, key admission), typed config
@@ -268,9 +268,10 @@ tail order is `table ‖ facts ‖ tag(16) ‖ version:u16`: the fixed-size fact
 known offset from the end, so its `count` sizes the preceding table, and the 2-byte version
 dispatches the format (the MAC covers the version, so a tampered tail fails to verify). A
 single-part PUT (`count = 1`) appends `facts ‖ tag ‖ version` in the same streaming `PutObject`;
-a composite's is the `table ‖ facts ‖ tag ‖ version` **terminating part** (part number above every
-client part — hence the 9999 client cap), so `CompleteMultipartUpload` stays the single atomic
-commit of body + facts. `hypha-format` owns the layout, `HLEN`, `MAX_PARTS`, and `MAX_TAIL_LEN`
+a composite's is the `table ‖ facts ‖ tag ‖ version` **terminating part** — normally its own part
+above every client part, and folded into the last client part when no part can follow that one
+(§7) — so `CompleteMultipartUpload` stays the single atomic commit of body + facts. Clients get
+S3's full 1–10000 part range; the trailer never costs them a part number. `hypha-format` owns the layout, `HLEN`, `MAX_PARTS`, and `MAX_TAIL_LEN`
 (the one-shot speculative tail-read size), plus the `encode` /
 `decode_tail(footer_key, object_len, tail)` API. DR: the body is stock age, and the plaintext
 tail parses directly for facts and boundaries.
@@ -332,7 +333,8 @@ there. A ~128-bit base64url tail is what prevents collision. Marker and body liv
 volume: both survive a process crash, both die together on volume loss. **The marker set is the
 durability signal**, enumerable as one flat LIST.
 
-**Multipart upload state**: one record per uploaded part, key `<marker-prefix>/mpu/<upload-id>/p{n:05};<retag>;<pmd5>`
+**Multipart upload state**: one record per uploaded part, key
+`<marker-prefix>/mpu/<upload-id>/p{n:05};<retag>;<pmd5>;<nonce>`
 (empty body) — the part's facts **encoded into the key** so `CompleteMultipartUpload` recovers
 them with **one LIST**, no per-part HEAD. The only irreducible datum is `pmd5`, the part's
 *plaintext* MD5: hypha hashes it inline during the streaming encrypt and it is never re-derivable,
@@ -340,12 +342,19 @@ because the remote only ever sees ciphertext. `retag` is the remote's part ETag 
 MD5). Everything else the remote can re-tell us — so `ct_len`/`plen` are **not** stored; a part's
 plaintext length is `plaintext_len_from(ct_size, HLEN)` over the size the remote reports.
 
+`nonce` is present only for a part that **admits no successor** (§7, *UploadPart*), and names its
+retained ciphertext at `<marker-prefix>/mpu/<upload-id>/c{n:05};<nonce>` — the copy complete folds
+the trailer into. It is a nonce rather than the `retag` because the retained bytes must be written
+*while* the part streams, before the remote has returned an ETag to key them by; carrying it here
+costs one field on a record that already exists to disambiguate re-uploads.
+
 Encoding the facts in the key means a re-uploaded part (legal in S3, last-write-wins) writes a
 *new* key rather than overwriting, so several records can coexist for one part number. They are
 disambiguated at complete by the one authority that already resolved the race — **the remote's own
 `ListParts`**, which returns the winning `(n → retag, size)` for the in-progress upload. hypha
 matches each winning `retag` to the record carrying it (a ciphertext MD5 ⇒ the match is exact),
-takes that record's `pmd5`, and ignores the losing orphans (swept by the batched delete below).
+takes that record's `pmd5` (and its `nonce`, where a fold needs the retained bytes), and ignores
+the losing orphans (swept by the batched delete below).
 This is why no hypha-minted version counter is needed: `UploadPart` returns no ordering token, and
 a durable monotonic counter across the active/passive pods would be its own distributed problem —
 the remote's retag *is* the version. Survives process restarts across a multi-hour upload; dropped
@@ -456,6 +465,39 @@ everywhere; repair removes the entry.
 3. Ack. Reconcile propagates below; the mask is what keeps a crash from resurrecting K from the
    remote before the delete propagates.
 
+### DeleteObjects — non-atomic batch
+
+A fan-out of ≤ 1000 independent single-key deletes, **never a raw backend batch over client
+state** — each key needs its own mask, and the S3 contract is per-key (`Deleted`/`Error` list,
+`Quiet` ⇒ errors only; deleting an absent key is a *success*; `VersionId` ignored — versioning
+exempt). The invariant is per-key, so batching is a transport question, not a correctness one.
+
+**Durable** — the transition bracket widened from one key to the batch, so the *remote* leg
+collapses to one native call while the cache leg stays per-key:
+
+1. Acquire the batch's write locks in **sorted key order** (two overlapping batch deletes can't
+   deadlock; single-key ops take one lock and queue); repair any leftover marks.
+2. **Mark** each K — per-key transition tombstones.
+3. **Commit**: one native remote `DeleteObjects` over all keys → per-key `Deleted`/`Error`
+   (NotFound ⇒ success).
+4. **Settle**: each remote-confirmed success removes its cache entry + twins (twins single-object,
+   §11 — `0x01`); a remote error **leaves the mark** (an indeterminate outcome the repair rule
+   resolves, §7) and records the client error. Release locks. Return the aggregated result.
+
+Each key still has exactly one atomic remote commit (its slice of the batch); the batch being
+non-atomic across keys *is* the S3 contract. A crash mid-batch is identical to a single-key
+crash — every marked key is repaired on restart. The batched remote body is always XML-safe: twins
+never reach the remote, and any client key that arrived *inside* the request was XML-representable
+by construction, so it re-encodes into the outbound body (a control-byte key from a percent-encoded
+PUT path can appear in neither the client's request nor hypha's batch — it is single-`DeleteObject`
+only).
+
+**Cached** — the remote isn't touched here, so there is nothing to batch: per key, under its write
+lock, overwrite K with the delete-tombstone and overwrite its marker (as single `DeleteObject`).
+Reconcile propagates below and is where the remote batching opportunity lives — a sweep coalesces
+its pending *delete* markers into native remote `DeleteObjects` calls (same XML-safe argument,
+client keys only).
+
 ### Multipart — one path, both modes
 
 Parts route **around the cache** onto the remote's own native multipart upload at K (a part
@@ -469,19 +511,28 @@ apply).
 
 **UploadPart**:
 
-1. Reject part numbers above **9999** (the number above every client part is reserved for the
-   terminating trailer part) and plaintext > **4 GiB** (so the envelope never pushes a part past
-   the remote's 5 GiB part cap; transparent re-splitting is a later refinement).
+1. Reject part numbers outside S3's **1–10000** and plaintext > **4 GiB** (so the envelope never
+   pushes a part past the remote's 5 GiB part cap; transparent re-splitting is a later refinement).
+   The 4 GiB cap is also what leaves room for a folded trailer (below): 4 GiB of plaintext frames to
+   ~4.3 GB, ~1 GiB clear of the part ceiling, so `part ‖ trailer` never overflows.
 2. Encrypt the part as **its own pure age file** (fresh file key; Content-Length computed from
-   `HLEN`), streaming to the remote as the native part; the plaintext MD5 is computed inline. A part
-   whose framed ciphertext is **below the backend's 5 MiB part minimum** — which any S3 backend
-   permits only as the upload's *final* part — is additionally retained in the cache mpu state
-   (keyed by its `retag`, ≤ 5 MiB) so complete can fold the trailer into it rather than append a
-   separate trailer part that would demote it to an illegal sub-minimum non-final part (see below).
-3. Persist the part's `pmd5` (with `retag`) as a key-encoded mpu record (§6) — an in-progress
-   upload's parts aren't readable, so complete needs its own copy of `pmd5`; its loss with the
-   cache volume merely fails the eventual complete (never-acked, client retries).
-4. Ack on the remote's part ack. Out-of-order / parallel / re-uploaded parts and concurrent
+   `HLEN`), streaming to the remote as the native part; the plaintext MD5 is computed inline.
+3. **Retain the ciphertext if the part admits no successor.** Two conditions, one meaning — a part
+   below the backend's **5 MiB minimum** (which any S3 backend permits only as the upload's *final*
+   part) and part number **10000** (which nothing can follow) can each only ever be the last part.
+   So if such a part lands in the committed set it is the object's tail, and it is the part that
+   must carry the terminating trailer; complete cannot re-derive its bytes, because an in-progress
+   upload's parts aren't readable. Retaining it in the cache mpu state is what makes the fold
+   possible. The encrypted stream is **split** and driven into the remote and the cache in one
+   pass — no buffering, and no size distinction, so a 4 KiB retained part and a 4 GiB one take the
+   same path with per-request memory bounded by the pipe. This is the one place durable mode's
+   cache transiently holds more than tombstones and twins: one part per upload, dropped at
+   complete/abort.
+4. Persist the part's `pmd5` (with `retag`, and the retained ciphertext's `nonce` if step 3 fired)
+   as a key-encoded mpu record (§6) — an in-progress upload's parts aren't readable, so complete
+   needs its own copy of `pmd5`; its loss with the cache volume merely fails the eventual complete
+   (never-acked, client retries).
+5. Ack on the remote's part ack. Out-of-order / parallel / re-uploaded parts and concurrent
    uploads to one key are the remote's native semantics; per-part file keys make them
    cryptographically independent, and a re-upload's superseded record is resolved away at complete
    by the remote's `ListParts` (§6).
@@ -496,15 +547,22 @@ apply).
    remote's part `size` + `HLEN`, and the cumulative-offset **parts table**. Reject if a requested
    part is absent from `ListParts`, or its client-supplied ETag doesn't match the matched `pmd5`.
 2. Build the **terminating trailer** (§6) — `table ‖ facts ‖ tag ‖ version` — and place it as the
-   object's final bytes. Normally it rides its **own part** above every client part (highest + 1);
-   the trailer's content is identical either way. **But** S3 exempts only the *last* part from the
-   5 MiB minimum, so when the highest client part is itself below that minimum — necessarily the
-   client's last part, as any backend rejects a smaller non-final part — a separate trailer part
-   would leave that part a sub-minimum non-final part the native complete rejects. In that case
-   **fold** the trailer into the highest part: re-upload it (from its retained ciphertext, keyed by
-   the remote's `ListParts` winning `retag` so the fold takes exactly that winner) as `part ‖
-   trailer`, keeping it the final part. The committed object K is **byte-identical** either way —
-   the same `age₁…ageₙ ‖ trailer` concatenation — so the read path is unaffected.
+   object's final bytes. The trailer's content is identical either way; only its placement varies,
+   on the one question of whether a part can follow the highest client part:
+   - **It can** (highest part < 10000 and at or above the 5 MiB minimum) — the trailer rides its
+     **own part** at highest + 1.
+   - **It cannot** — the highest part is either below the minimum (necessarily the client's last,
+     as any backend rejects a smaller non-final part, so a separate trailer part would demote it to
+     a sub-minimum non-final part the native complete rejects) or is part 10000 (nothing can follow
+     it). Both mean the same thing, and take the same remedy: **fold** the trailer into that part —
+     re-upload it as `part ‖ trailer`, keeping it final. This is why UploadPart retains exactly
+     these parts' ciphertext (§7, *UploadPart* step 3): an in-progress part can't be read back. The
+     fold takes the retained copy the remote's `ListParts` winner points at — winning `retag` → mpu
+     record → `nonce` → retained ciphertext — so a re-uploaded part folds *that* generation and
+     never a divergent cache last-writer.
+
+   The committed object K is **byte-identical** either way — the same `age₁…ageₙ ‖ trailer`
+   concatenation — so the read path is unaffected.
 3. **Mark** K.
 4. **Commit**: native complete on the remote — one atomic op lands the concatenated body *and* its
    facts at K. Its part set is either the client parts plus the separate trailer part, or (folded
@@ -519,6 +577,118 @@ rehydrate (§8); in durable mode it stays tombstoned like everything else.
 
 **AbortMultipartUpload**: native abort on the remote; drop the mpu state. The §8 sweep reclaims
 leftovers of abandoned uploads.
+
+**UploadPartCopy** (both modes — the multipart path): copy-source is just an alternate byte source
+for `UploadPart`. The `CopyObject` ciphertext-reuse trick does **not** generally apply — every part
+is its own independent age file (above) and a `copy-source-range` cuts age chunk boundaries — so the
+baseline is the **re-encrypt path**: GET the source, decrypt, apply the range over *plaintext*,
+then encrypt that range as a fresh per-part age file with inline `pmd5`, stream it as the native
+part, write the mpu record — identical to a normal `UploadPart` past the byte source. *One
+optimization:* a whole (unranged) **single-part** source is already one age file, so
+`UploadPartCopy` its body range `[0, body_ct_len)` server-side (trailer excluded) with
+`pmd5 = source cetag`; composite sources and any ranged copy re-encrypt. Same caps as `UploadPart`
+(plaintext ≤ 4 GiB, part ≤ 10000, 5 MiB non-final minimum).
+
+**ListMultipartUploads** (both modes): **proxy the remote's own** `ListMultipartUploads`. The
+remote is already the source of truth for multipart, and hypha's mapping is transparent enough that
+no translation is needed: the native upload is created *at the client key*, and the remote's upload
+id is what hypha handed the client at create. So a remote page already carries
+`Upload{Key, UploadId, Initiated}` verbatim, in S3's own `(key, upload_id)` order, with
+`prefix`/`delimiter`/`key-marker`/`upload-id-marker`/`max-uploads` forwarding natively — the
+key-position pagination guarantee is the backend's, not something hypha synthesises.
+
+Remote-as-truth is also what makes the two crash windows resolve correctly for free: an upload whose
+remote create landed but whose cache `/u` record didn't (create writes the remote first) genuinely
+exists and is abortable, so listing it is right; and a `/u` record whose remote upload was aborted or
+lifecycle-expired out from under it must *not* be listed, which a proxy does by construction. The
+cache records are consulted only where the remote cannot answer — `pmd5` at complete and `ListParts`
+(§6) — never for existence.
+
+`StorageClass` is reported as the remote gives it (`STANDARD`); the class the client requested at
+create lives in the `/u` record and would cost a per-upload fetch to recover — the same cosmetic
+corner LIST already accepts for objects (§7, *Storage class*).
+
+*Backend caveat.* `prefix`/`delimiter` are S3-specified here and forward natively, but **MinIO does
+not implement them** — it matches only a prefix equal to a key, closed "working as intended"
+(minio/minio#20989, #11686) — so a prefixed listing against MinIO returns empty. hypha forwards
+rather than emulating: the filter is the remote's to answer, and a deployment whose remote is
+MinIO simply doesn't get it. The §11 prefix test is `#[ignore]`d for that reason, since the
+integration harness runs MinIO.
+
+*Filtering (from the CopyObject phase on).* Every remote upload in a client bucket is a client
+upload today, so the proxy needs no filter. `CopyObject`'s large-body path (§7) creates a transient
+native upload at `K_dst`, which would otherwise surface here while the copy runs; from that point the
+page is filtered against the client uploads hypha knows about — **one** cache LIST of
+`<marker-prefix>/mpu/` with `delimiter=/`, whose common prefixes carry the upload ids in the key
+names, so membership is a set test with no per-entry fetch.
+
+**ListParts** (both modes): proxy the remote's `ListParts` (the winning `(n → retag, size)`),
+match each `retag` to its mpu record for `pmd5`, and emit `Part{PartNumber n, ETag = hex(pmd5),
+Size = plaintext_len_from(size, HLEN), LastModified}`; the trailer part, when it rides its own (> every client part), is
+filtered, re-uploaded duplicates resolve exactly as at complete (§6), and `part-number-marker`/
+`max-parts` forward the remote's pagination.
+
+### CopyObject
+
+Copy never re-encrypts a large body and never routes plaintext through the client leg: the age body
+ciphertext is **key-independent** (per-file keys, §6), so `age₁…ageₙ` is reusable verbatim across
+keys — only the trailer, whose MAC binds `object_key` (§6), is re-minted for the destination. That
+binding is not an obstacle so much as the one step of a copy an untrusted remote can't forge:
+re-stamping needs `footer_key`, which only hypha holds. A naive remote-side `CopyObject` of the
+stored object would carry a `K_src`-bound trailer and fail verify at `K_dst`.
+
+Preconditions split across both keys: `x-amz-copy-source-if-[none-]match` evaluate against the
+**source's** current client ETag (resolved as any conditional read resolves it — live-body /
+tombstone `cetag` / absent, §4), `If-[None-]Match` against the **destination** as in a normal PUT.
+`x-amz-metadata-directive: COPY` carries the source user-metadata forward, `REPLACE` takes the
+request's — the same-key + `REPLACE` in-place metadata edit is just a copy onto K. The destination
+ETag is the source client ETag unchanged (content-derived, §4) and `plen` carries over; only
+`LastModified` moves to now, and since the trailer is re-minted anyway its `mtime` is set with it —
+no stale-mtime restore corner.
+
+**Durable** — under `K_dst`'s write lock, the §7 mark → commit → settle bracket with the body
+sourced from the remote instead of the client:
+
+1. Resolve + evaluate both preconditions; repair a leftover mark on either key first. One bounded
+   `MAX_TAIL_LEN` tail GET of the **source's** remote trailer (MAC-verified at `K_src`) yields
+   `{cetag, plen, count, table}`; the source body-ciphertext length is the source object length
+   minus the decoded trailer length.
+2. **Mark** `K_dst`.
+3. **Commit** — one atomic remote op landing `body ‖ fresh-trailer` at `K_dst`:
+   - **Large body** (source body ct ≥ the backend's 5 MiB part minimum): a native multipart at
+     `K_dst` — **`UploadPartCopy`** the source range `[0, body_ct_len)` as one or more parts, each
+     ≤ the 5 GiB part cap and split so the **last** copied part stays ≥ 5 MiB (always possible once
+     the total clears the minimum), then a freshly built **trailer part** re-MAC'd over `K_dst` with
+     `mtime=now` as the sole final part, then `CompleteMultipartUpload`. The copy is remote→remote
+     (no bytes through hypha); the range excludes the source trailer, so single-part and composite
+     sources copy identically and a composite's offset table carries over untouched — offsets are
+     body-relative, hence key-independent. The trailer is always the final part, so multipart's small
+     final-part **fold** never arises here.
+   - **Small body** (below the part minimum — `UploadPartCopy` can't stand as a non-final part and a
+     copy-part can't absorb the trailer): the re-encrypt path — source GET → decrypt → one streaming
+     `PutObject` at `K_dst` with the fresh trailer inline. Cheap precisely because the body is small.
+4. **Settle**: eviction tombstone + twin at `K_dst` (`cetag`/`plen` from the source, `mtime=now`).
+   Ack.
+
+Crash mirrors durable PutObject: before the commit lands `K_dst` is untouched and the dangling
+native upload is a swept orphan; after, it's committed and repair completes the projection off the
+tail trailer. Every remote-side step reads only source ciphertext, so a mid-copy crash never exposes
+plaintext nor tears the source.
+
+**Cached** — copy produces a hot plaintext body at `K_dst`; the reconcile sweep re-encrypts and
+mints the `K_dst`-bound trailer on upload, so key-binding falls out of the normal PUT path with no
+special handling. Under `K_dst`'s write lock for the conditional case:
+
+1. *(conditional only)* resolve + evaluate as above; `inc` `K_dst`'s in-flight ref count (§8).
+2. **Commit** — land a plaintext body on the cache at `K_dst`:
+   - **Source hot** (live cache body): a **cache→cache** server-side `CopyObject` on SeaweedFS —
+     plaintext, same volume, ETag preserved natively, zero bytes through hypha.
+   - **Source cold** (evicted / shadow): rehydrate from the remote (§8), then the cache→cache copy;
+     equivalently source GET → decrypt → cache `PutObject` at `K_dst`.
+3. Overwrite the marker at `<marker-prefix>/K_dst` (last-writer-wins coalescing, §6). `dec`. Ack; the
+   remote trails via reconcile.
+
+An unconditional cached copy takes no lock, racing on the cache like an unconditional PUT (§4).
 
 ### GetObject / HeadObject
 
@@ -537,6 +707,17 @@ leftovers of abandoned uploads.
      state, and opportunistically repair.
    - **Absent**: authoritative 404 under the sync marker (§6); remote-as-truth during resync
      (restore sweep below).
+
+### GetObjectAttributes
+
+A read projection over the **same key-state dispatch as HEAD** (live-body / eviction-tombstone /
+durable-always-remote / cached-shadow-probe), returning only the requested
+`x-amz-object-attributes`: `ObjectSize` = `plen`; `ETag` = client ETag (unquoted here — S3 quirk);
+`StorageClass` = the stored class (below). `ObjectParts` for a composite comes **straight off the
+trailer's offset table** — one bounded MAC-verified tail GET gives the part count (the ETag's `-N`)
+and per-part sizes via the closed form, with **no remote part index**; this is the capability that
+let §11 drop `GetObjectAttributes`/`HEAD partNumber` as a *remote backend* requirement — hypha now
+supplies it from the trailer. `Checksum` is omitted (deferred).
 
 ### ListObjectsV2
 
@@ -564,6 +745,11 @@ leftovers of abandoned uploads.
    the next page's head before falling back to a HEAD; left for later, as the bounded HEAD fallback
    (which must exist anyway for genuinely-missing twins, §6) covers correctness meanwhile.
 
+**ListObjects (v1)** reuses this classifier verbatim (twin pairing, reserved filter, single-page /
+forwarded-token discipline — s3s does not translate v1→v2, so it is its own method): only the
+pagination shell differs — request `marker`, response `NextMarker` = the last returned key when
+`IsTruncated`. Short pages are as valid under v1 as v2. Cache-served, both modes identical.
+
 ### Buckets
 
 Buckets map one-to-one across client ⇄ cache ⇄ remote; the client bucket passes through, mapped to
@@ -581,6 +767,21 @@ is created/deleted alongside but is never the authority. Rare control-plane even
   client-visible names.
 - **HeadBucket / GetBucketLocation**: remote existence check; the latter reports the deployment's
   configured backend region.
+- **GetBucketVersioning**: a benign stub — an empty `VersioningConfiguration` (no `Status`,
+  `MFADelete: Disabled`), no backend call, hypha buckets never carry versioning. Load-bearing for
+  compatibility: `aws s3 sync` / boto / `mc` probe it up front and a 501 aborts them where
+  "not enabled" passes. Enabling it (`PutBucketVersioning`) stays exempt — rejected.
+
+### Storage class (passthrough, both modes)
+
+hypha has one physical tier, so a storage class is an echoed label. On PUT / CopyObject /
+CreateMultipartUpload: read `x-amz-storage-class`, **reject the archive family**
+(`GLACIER`/`DEEP_ARCHIVE`/`GLACIER_IR`/`SNOW`/`OUTPOSTS`) with `InvalidStorageClass` (they imply
+`RestoreObject`), accept the rest, default `STANDARD`; persist it on the **same user-metadata
+carrier** as `x-amz-meta-*` and echo on HEAD / GET / GetObjectAttributes. Two accepted cosmetic
+corners: **LIST reports `STANDARD`** for every key (the twin carries only `{cetag, plen, mtime}`;
+per-object class would mean a twin-format change), and a cache-loss restore falls the class back to
+`STANDARD` (the user-metadata carrier's durability limit).
 
 ### Background: the reconcile sweep (cached mode)
 
@@ -744,7 +945,10 @@ lists with it so twin keys (containing `0x01`) and control-byte client keys surv
 XML. Everything else the cache does is plain S3 objects, so it stays swappable; the only
 SeaweedFS-specific surface is usage/vacuum (§8), already pluggable. The **remote** needs native
 multipart including **`ListParts` on an in-progress upload** — core S3 multipart, universal
-(SeaweedFS, B2 included), used at complete to resolve the winning part set and its sizes (§6/§7).
+(SeaweedFS, B2 included), used at complete to resolve the winning part set and its sizes (§6/§7) —
+and **`ListMultipartUploads`**, which the client-facing op of that name proxies outright (§7):
+in-progress uploads are remote state, and the remote's own key-position pagination is what makes
+`key-marker`/`upload-id-marker` correct. Same core-multipart family, equally universal.
 This is strictly weaker than the *completed-object* part index the trailer's embedded offset table
 (§6) let us drop (`GetObjectAttributes`/`HEAD partNumber=n`, which not every remote implements);
 the earlier object-tagging requirement is gone too, so tagging- and part-index-less remotes (e.g.
@@ -825,6 +1029,56 @@ condition, not a readiness gate.
   and an `#[ignore]`d **load/concurrency** suite — throughput, no-double-create-under-contention,
   parallel multipart (`load.rs`). Still to add: SeaweedFS as the cache backend, and a real zero-loss
   client (ZeroFS) against the durable endpoint.
+- **External conformance** — third-party suites run against a booted hypha, complementing the
+  hand-written cases above (which assert hypha-specific internals the black-box suites can't see):
+  - **`s3s-e2e`** (`s3s-project/s3s`, version-matched to our `s3s`): the S3 test suite from the
+    framework hypha is built on. A CLI that drives `aws-sdk-s3` (path-style) against an endpoint
+    from the standard `AWS_*` env; `scripts/s3s-e2e.sh` boots MinIO + hypha with the integration
+    harness's config and points it at hypha. Adopted first — it speaks our exact `s3s`/aws-sdk
+    versions, so a failure is a real hypha bug, not a dialect gap. Checksum trailers pinned off
+    (`AWS_REQUEST_CHECKSUM_CALCULATION=when_required`) to match the client config in
+    `tests/common`.
+
+    First baseline (2026-07) — the in-house tests above are all green, but s3s-e2e, exercising the
+    same surface as a black box, is **not**, which is why phase 3 is not done:
+    - **Green**: `list_buckets`, `list_objects`, `get_object`, `delete_object`, `head_operations`,
+      `put_object` (tiny + larger), presigned PUT/GET.
+    - **Must fix (real gaps in hypha's declared surface):**
+      - *User metadata is dropped.* PUT with `x-amz-meta-*` then HEAD/GET returns no user metadata
+        — hypha commits its facts into the object's metadata slot and doesn't echo the client's
+        keys back (`test_put_object_with_metadata`, `..._non_ascii_metadata`). Needs a namespace
+        split: reserve a hypha prefix, pass client `x-amz-meta-*` through PUT→HEAD/GET verbatim
+        (RFC 2047 for non-ASCII). Touches the PUT/HEAD/GET path (phase 2 surface).
+      - *`Content-MD5` not validated.* A PUT with a deliberately wrong `Content-MD5` is accepted
+        instead of rejected (`test_put_object_with_content_checksums`) — an integrity check S3
+        clients rely on. Reject with `BadDigest`.
+      - *Multipart* (`test_multipart_upload`) and *LIST pagination*
+        (`test_list_objects_with_pagination`) fail beyond their checksum assertions (a part-count
+        `3 != 5`, a pagination panic). Triage pending: confirm which part is a real defect vs. the
+        expected twin-dilution / exact-`MaxKeys` dialect difference before deciding scope.
+    - **Now in scope for phase 3** — the full client surface minus the exempt families, designs in
+      §7: `CopyObject` (server-side body reuse via `UploadPartCopy` + re-minted trailer),
+      `DeleteObjects` (non-atomic fan-out; durable batches the remote leg), `ListObjects` v1,
+      `ListMultipartUploads`, `ListParts`, client-facing `UploadPartCopy`, `GetObjectAttributes`,
+      the `GetBucketVersioning` stub, and storage-class passthrough.
+    - **Deferred, not exempt** — revisit after phase 3: flexible checksums
+      (`test_put_object_with_checksum_algorithm`, the `checksum_crc32` asserts) — validate + persist
+      inline over plaintext (the `Content-MD5` slot), single-part first, composite checksum-of-
+      checksums last.
+    - **Out of scope — deselect, don't fix** (feature families that contradict the single-writer /
+      intrinsic-encryption / no-versioning model): ACLs, bucket policy, lifecycle, CORS, SSE
+      *configuration*, versioning writes + `ListObjectVersions`, object-lock/retention/legal-hold,
+      object & bucket tagging, replication/logging/notification/website/accelerate/request-payment/
+      ownership/public-access-block, analytics/metrics/inventory configs, `RestoreObject` + archive
+      storage classes, `SelectObjectContent`, `GetObjectTorrent`, STS `AssumeRole`, Object-Lambda.
+      For bucket-config GET probes the posture is the specific "not configured" error code rather
+      than a blanket `NotImplemented`.
+  - **Follow-up: Ceph `s3-tests`** (`ceph/s3-tests`, boto3/pytest) — the broad industry
+    compatibility suite (thousands of assertions) for deeper corner coverage once the core surface
+    is green. Must be curated to hypha's implemented ops (GET/PUT/HEAD/DELETE, LIST v1/v2,
+    multipart, `If-Match`/`If-None-Match`, ranged reads); its versioning/ACL/lifecycle/CORS/SSE/
+    object-lock families are out of scope and get deselected, not fixed (storage class is stubbed
+    passthrough, §7, so its round-trip cases stay in).
 
 ## 12. Risks
 
@@ -866,25 +1120,48 @@ age 0.11.x cannot grease a scrypt sole-stanza header, so `HLEN` is a hardcoded c
 this pass also caught and fixed a real bug: twin keys carry `0x01`, which XML 1.0 can't represent,
 so `delete_twins` must use single-object `DeleteObject`, never the batch `DeleteObjects` whose body
 would be rejected — it had broken every durable overwrite/delete of an already-written key).
-Remaining: conformance vs. SeaweedFS as the cache backend, and ZeroFS against the durable endpoint.
+Remaining: the s3s-e2e black-box pass (§11) later found this surface still drops user
+`x-amz-meta-*` metadata and accepts a wrong `Content-MD5` — both fixes land under phase 3; also
+conformance vs. SeaweedFS as the cache backend, and ZeroFS against the durable endpoint.
 
-**Phase 3 — multipart. Done (vs. MinIO).** Trailer + embedded parts table
+**Phase 3 — multipart. Machinery landed (vs. MinIO); *not done*.** The s3s-e2e black-box pass
+(§11) reopened it: user `x-amz-meta-*` metadata is dropped on PUT→HEAD/GET, a wrong `Content-MD5`
+is accepted instead of rejected, and the multipart + LIST-pagination cases fail beyond their
+checksum asserts (triage pending). The metadata/`Content-MD5`/pagination misses are on the phase-2
+durable surface; they and the multipart defect must be fixed before this phase closes. Trailer +
+embedded parts table
 (single-stream composite read, MAC'd trailer) and the mpu-record retag-match via `ListParts`
 (§6/§7) both landed, superseding the original metadata records + completed-object part-index
 approach.
 Native-remote-multipart proxy (§7): per-part encryption + inline `pmd5`, listable mpu records
-(`p{n:05};<retag>;<pmd5>` key-encoded, `pmd5` the sole stored datum) under the reserved prefix;
+(`p{n:05};<retag>;<pmd5>;<nonce>` key-encoded, `pmd5` the sole stored datum) under the reserved prefix;
 complete resolves the winning part set via the remote's `ListParts` (retag-matched, geometry from
 the remote's sizes), composes the composite ETag, and lands the terminating trailer —
 `table ‖ facts ‖ tag ‖ version` — in the same atomic native complete (self-describing, no records
 or tags, no *completed-object* part index): as its own part above every client part, or **folded
-into the last client part** when that part is under the backend's 5 MiB minimum (this pass added the
-fold — a separate trailer part would demote the small final part to an illegal non-final one on any
-real S3 backend); abort; the 4 GiB / 9999-part caps; single-stream composite full + ranged GET off
-the table; cleanup via batched multi-object delete.
+into the last client part** whenever nothing can follow that part — it is under the backend's 5 MiB
+minimum, or it is part 10000 (this pass added the fold, and generalized it from the first condition
+to both: a separate trailer part would demote a small final part to an illegal non-final one on any
+real S3 backend, and at part 10000 there is no number left to put one at). Clients therefore get
+S3's full 1–10000 range; UploadPart retains the ciphertext of exactly the parts that can end an
+upload, since an in-progress part can't be read back. Plus abort; the 4 GiB part cap;
+single-stream composite full + ranged GET off the table; cleanup via batched multi-object delete. This phase also closes the **rest of the client
+surface** (§7, the full API minus the exempt families): the phase-2 metadata/`Content-MD5`/
+pagination fixes; **CopyObject** on this same machinery (`UploadPartCopy` the source body range +
+a re-minted `K_dst`-bound trailer, or the small-body re-encrypt path; transition bracket in durable,
+cache→cache copy in cached); **DeleteObjects** (non-atomic fan-out — durable widens the bracket to
+mark-all → one native remote `DeleteObjects` → settle-all, cached is per-key tombstone+marker with
+the remote batch deferred to reconcile); **ListObjects v1**, **ListMultipartUploads**,
+**ListParts**, client-facing **UploadPartCopy**, **GetObjectAttributes** (parts off the trailer
+table); and the **GetBucketVersioning** stub + **storage-class** passthrough. Flexible checksums stay
+deferred (§11).
 *Exit*: §11 multipart scenarios — restart-mid-upload, re-upload/concurrent-part resolution
-(including a small final part), the trailer fold, and trailer-based restore recovery — all covered
-in `hypha/tests/multipart.rs` against MinIO.
+(including a small final part), the trailer fold, trailer-based restore recovery — plus the surface
+ops: CopyObject (single-part + composite source, `COPY`/`REPLACE`, copy-source preconditions, a
+`K_dst` trailer that verifies where a raw remote copy would not), DeleteObjects (partial-failure
+result, crash mid-batch repair, XML-clean-keys-only remote batch), v1 LIST, multipart list/parts,
+and GetObjectAttributes part geometry — all covered in `hypha/tests/multipart.rs` and the s3s-e2e
+pass against MinIO.
 
 **Phase 4 — cached mode, single replica.** Marker writes + the in-flight ref count on the PUT
 path, the reconcile sweep, cached DELETE propagation, rehydrate (single-part into K + twin

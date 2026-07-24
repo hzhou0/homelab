@@ -3,8 +3,8 @@
 //! part carrying the facts + parts table, and reads recover every part boundary from that trailer
 //! alone. Covers out-of-order/parallel parts, re-upload last-write-wins resolution, composite ETag
 //! correctness, single-stream + ranged composite GET (uniform and ragged parts), abort cleanup,
-//! process restart mid-upload, the part-number cap, and trailer-based recovery after a mid-complete
-//! crash mark.
+//! process restart mid-upload, the part-number range, the two fold conditions, the in-progress
+//! listing ops, and trailer-based recovery after a mid-complete crash mark.
 
 mod common;
 
@@ -330,20 +330,252 @@ async fn multipart_part_number_cap() {
     let key = "capped";
 
     let up = create_mpu(&client, B, key).await;
-    let res = client
-        .upload_part()
+    for n in [0, 10_001] {
+        let res = client
+            .upload_part()
+            .bucket(B)
+            .key(key)
+            .upload_id(&up)
+            .part_number(n)
+            .body(bytes_body(&pattern(1024)))
+            .content_length(1024)
+            .send()
+            .await;
+        assert_eq!(
+            sdk_err_code(&res.unwrap_err()).as_deref(),
+            Some("InvalidPart"),
+            "part number {n} is outside S3's range"
+        );
+    }
+}
+
+/// Part 10000 is usable, and it is the case where no trailer part can follow: the trailer must fold
+/// into it even though it is far above the 5 MiB minimum that drives the other fold. Uses a sparse
+/// part set (1, 10000) so the upload stays cheap while still ending on the last legal number.
+#[tokio::test]
+async fn multipart_last_part_number_folds_trailer() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "parts/at-the-limit";
+
+    // Both parts clear the 5 MiB minimum, so only the part number can force the fold.
+    let p1 = pattern_seeded(MIN_PART, 80);
+    let p2 = pattern_seeded(MIN_PART + 4096, 81);
+    let whole: Vec<u8> = [p1.as_slice(), p2.as_slice()].concat();
+
+    let up = create_mpu(&client, B, key).await;
+    let e1 = upload_part(&client, B, key, &up, 1, &p1).await;
+    let e2 = upload_part(&client, B, key, &up, 10_000, &p2).await;
+    let etag = complete_mpu(&client, B, key, &up, &[(1, e1), (10_000, e2)]).await;
+
+    assert_eq!(etag, expected_composite_etag(&[&p1, &p2]));
+    assert_eq!(get_all(&client, B, key).await, whole);
+    // The fold must not disturb the geometry the parts table describes.
+    assert_eq!(
+        get_range(&client, B, key, MIN_PART as u64 - 8, MIN_PART as u64 + 8).await,
+        whole[MIN_PART - 8..MIN_PART + 9]
+    );
+
+    // The committed object carries exactly the client's parts — no trailer part above 10000.
+    let raw = h
+        .raw()
+        .head_object()
+        .bucket(h.remote_bucket(B))
+        .key(key)
+        .part_number(1)
+        .send()
+        .await
+        .expect("head part 1");
+    assert_eq!(
+        raw.parts_count(),
+        Some(2),
+        "the trailer rode part 10000, so the object has two parts"
+    );
+
+    // And the retained ciphertext that made the fold possible is swept at complete.
+    let leftovers = raw_list(&h.raw(), &h.cache_bucket(B), None).await;
+    assert!(
+        leftovers.iter().all(|k| !k.contains("/c10000;")),
+        "retained part-10000 ciphertext must not outlive complete: {leftovers:?}"
+    );
+}
+
+/// `ListParts` reports the *plaintext* view of an in-progress upload — client part numbers, the
+/// plaintext MD5s hypha handed back at upload, and plaintext sizes — never the ciphertext geometry
+/// the remote actually holds. Pagination is over that same view.
+#[tokio::test]
+async fn list_parts_reports_plaintext_view() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "listable/parts";
+
+    let p1 = pattern_seeded(MIN_PART, 90);
+    let p2 = pattern_seeded(MIN_PART + 1234, 91);
+    let p3 = pattern_seeded(4096, 92);
+    let up = create_mpu(&client, B, key).await;
+    // Out of order, to prove the listing sorts by part number rather than arrival.
+    upload_part(&client, B, key, &up, 3, &p3).await;
+    upload_part(&client, B, key, &up, 1, &p1).await;
+    upload_part(&client, B, key, &up, 2, &p2).await;
+
+    let out = client
+        .list_parts()
         .bucket(B)
         .key(key)
         .upload_id(&up)
-        .part_number(10_000)
-        .body(bytes_body(&pattern(1024)))
-        .content_length(1024)
         .send()
-        .await;
+        .await
+        .expect("list_parts");
+    let parts = out.parts();
+    assert_eq!(parts.len(), 3);
+    for (i, (body, n)) in [(&p1, 1), (&p2, 2), (&p3, 3)].iter().enumerate() {
+        assert_eq!(parts[i].part_number(), Some(*n));
+        assert_eq!(
+            parts[i].e_tag().unwrap_or_default().trim_matches('"'),
+            md5_hex(body),
+            "part {n} ETag is the plaintext MD5"
+        );
+        assert_eq!(
+            parts[i].size(),
+            Some(body.len() as i64),
+            "part {n} size is the plaintext length, not the ciphertext's"
+        );
+    }
+
+    // Pagination over the plaintext view.
+    let page = client
+        .list_parts()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .max_parts(2)
+        .send()
+        .await
+        .expect("list_parts page 1");
+    assert_eq!(page.parts().len(), 2);
+    assert_eq!(page.is_truncated(), Some(true));
+    assert_eq!(page.next_part_number_marker(), Some("2"));
+
+    let rest = client
+        .list_parts()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .part_number_marker("2")
+        .send()
+        .await
+        .expect("list_parts page 2");
+    assert_eq!(rest.parts().len(), 1);
+    assert_eq!(rest.parts()[0].part_number(), Some(3));
+    assert_eq!(rest.is_truncated(), Some(false));
+
+    // An upload hypha doesn't know is not listable.
+    let err = client
+        .list_parts()
+        .bucket(B)
+        .key(key)
+        .upload_id("no-such-upload")
+        .send()
+        .await
+        .expect_err("unknown upload id");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("NoSuchUpload"));
+}
+
+/// `ListMultipartUploads` proxies the remote, which holds the client key and the client's own
+/// upload id — so uploads appear under the keys the client used, in `(key, upload_id)` order, and
+/// disappear on complete or abort.
+#[tokio::test]
+async fn list_multipart_uploads_tracks_in_progress() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    assert!(listed_uploads(&client, None).await.is_empty());
+
+    let a = create_mpu(&client, B, "docs/a").await;
+    let b = create_mpu(&client, B, "docs/b").await;
+    let c = create_mpu(&client, B, "other/c").await;
+
+    // Keys are the client's, ordered, and the ids round-trip as handed out at create.
     assert_eq!(
-        sdk_err_code(&res.unwrap_err()).as_deref(),
-        Some("InvalidPart")
+        listed_uploads(&client, None).await,
+        vec![
+            ("docs/a".to_string(), a.clone()),
+            ("docs/b".to_string(), b.clone()),
+            ("other/c".to_string(), c.clone()),
+        ]
     );
+
+    // Completing removes one; aborting removes another.
+    let body = pattern_seeded(MIN_PART, 93);
+    let e = upload_part(&client, B, "docs/a", &a, 1, &body).await;
+    complete_mpu(&client, B, "docs/a", &a, &[(1, e)]).await;
+    client
+        .abort_multipart_upload()
+        .bucket(B)
+        .key("docs/b")
+        .upload_id(&b)
+        .send()
+        .await
+        .expect("abort");
+
+    assert_eq!(
+        listed_uploads(&client, None).await,
+        vec![("other/c".to_string(), c)],
+        "completed and aborted uploads must drop out"
+    );
+}
+
+/// `prefix` filters in-progress uploads by client key, per the S3 spec — hypha forwards it to the
+/// remote, which is the only thing that can answer it.
+///
+/// **Ignored: the integration harness runs MinIO, which does not implement this.** MinIO returns
+/// matches only when the prefix equals a key exactly, closed "working as intended"
+/// (minio/minio#20989, #11686) — so this asserts hypha's contract against a compliant backend
+/// rather than the harness's. Run it against one with
+/// `cargo test --test multipart -- --ignored prefix`.
+#[tokio::test]
+#[ignore = "MinIO does not implement prefix on ListMultipartUploads (minio/minio#20989)"]
+async fn list_multipart_uploads_prefix_filter() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let a = create_mpu(&client, B, "docs/a").await;
+    let b = create_mpu(&client, B, "docs/b").await;
+    create_mpu(&client, B, "other/c").await;
+
+    assert_eq!(
+        listed_uploads(&client, Some("docs/")).await,
+        vec![("docs/a".to_string(), a), ("docs/b".to_string(), b)],
+        "prefix filters on the client key"
+    );
+    assert!(listed_uploads(&client, Some("nothing/")).await.is_empty());
+}
+
+/// In-progress uploads as `(client key, upload id)`, in listing order.
+async fn listed_uploads(
+    client: &aws_sdk_s3::Client,
+    prefix: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut req = client.list_multipart_uploads().bucket(B);
+    if let Some(p) = prefix {
+        req = req.prefix(p);
+    }
+    req.send()
+        .await
+        .expect("list_multipart_uploads")
+        .uploads()
+        .iter()
+        .map(|u| {
+            (
+                u.key().unwrap_or_default().to_string(),
+                u.upload_id().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Trailer-based recovery: after a completed composite, plant the crash-window state a mid-complete

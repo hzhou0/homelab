@@ -15,6 +15,7 @@ use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOut
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
@@ -388,6 +389,54 @@ impl Backend {
                 break;
             }
         }
+        Ok(out)
+    }
+
+    /// One page of the remote's in-progress uploads — what the client-facing
+    /// `ListMultipartUploads` proxies (§7). hypha creates each native upload *at the client key*
+    /// and hands the client the remote's own upload id, so a page needs no translation; the
+    /// backend's `(key, upload_id)` ordering and markers are what make the op's pagination correct.
+    ///
+    /// `prefix` and `delimiter` forward like the rest: S3 specifies both here (prefix filters keys,
+    /// delimiter groups them into `CommonPrefixes`), so a compliant backend answers them natively.
+    /// **MinIO is a known exception** — it returns matches only when the prefix equals a key
+    /// exactly, closed "working as intended" (minio/minio#20989, #11686) — so a prefixed listing
+    /// against MinIO comes back empty. That is the backend's deviation, not something hypha
+    /// emulates around.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: Option<String>,
+        delimiter: Option<String>,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        max_uploads: Option<i32>,
+    ) -> Result<ListMultipartUploadsOutput> {
+        // `encoding-type=url` for the same reason LIST uses it: a client key may carry control
+        // bytes the response XML cannot represent. Keys come back percent-encoded; decode them so
+        // callers see raw bytes.
+        let mut out = self
+            .client
+            .list_multipart_uploads()
+            .bucket(self.bkt(bucket))
+            .set_prefix(prefix)
+            .set_delimiter(delimiter)
+            .set_key_marker(key_marker)
+            .set_upload_id_marker(upload_id_marker)
+            .set_max_uploads(max_uploads)
+            .encoding_type(EncodingType::Url)
+            .send()
+            .await
+            .map_err(Error::from_sdk)?;
+        for u in out.uploads.iter_mut().flatten() {
+            u.key = u.key.take().map(|k| url_decode(&k));
+        }
+        for cp in out.common_prefixes.iter_mut().flatten() {
+            cp.prefix = cp.prefix.take().map(|p| url_decode(&p));
+        }
+        // The marker is a key too, and echoes back into the next request.
+        out.next_key_marker = out.next_key_marker.take().map(|m| url_decode(&m));
         Ok(out)
     }
 

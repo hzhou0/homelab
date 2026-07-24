@@ -48,13 +48,13 @@ impl Hypha {
             Some(meta::TombKind::Delete) => Err(Error::NotFound.into()),
             Some(meta::TombKind::Evict) => {
                 let facts = facts_from_tombstone(&key, &md)?;
-                self.serve_remote(&bucket, &key, &input, &facts).await
+                self.serve_remote(&bucket, &key, &input, &facts, &md).await
             }
             Some(meta::TombKind::Transit) => match self.resolve_transit(&bucket, &key).await? {
                 None => Err(Error::NotFound.into()),
-                Some(facts) => self.serve_remote(&bucket, &key, &input, &facts).await,
+                Some(facts) => self.serve_remote(&bucket, &key, &input, &facts, &md).await,
             },
-            None => self.serve_cache_body(&bucket, &key, &input).await,
+            None => self.serve_cache_body(&bucket, &key, &input, &md).await,
         }
     }
 
@@ -81,6 +81,7 @@ impl Hypha {
         bucket: &str,
         key: &str,
         input: &GetObjectInput,
+        md: &std::collections::HashMap<String, String>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let out = self
             .cache()
@@ -102,6 +103,8 @@ impl Hypha {
                 .and_then(|t| t.to_millis().ok())
                 .map(ts_ms),
             body: Some(codec::bytestream_to_blob(out.body)),
+            metadata: Some(meta::decode_user_metadata(md)),
+            storage_class: Some(StorageClass::from(meta::storage_class(md))),
             accept_ranges: Some("bytes".to_string()),
             ..Default::default()
         };
@@ -121,10 +124,13 @@ impl Hypha {
         key: &str,
         input: &GetObjectInput,
         facts: &RemoteFacts,
+        md: &std::collections::HashMap<String, String>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let plen = facts.plen;
         let etag = Some(ETag::Strong(facts.cetag.clone()));
         let last_modified = Some(ts_ms(facts.mtime_ms));
+        let metadata = Some(meta::decode_user_metadata(md));
+        let storage_class = Some(StorageClass::from(meta::storage_class(md)));
         let pt = match &input.range {
             None => None,
             Some(range) => Some(plaintext_range(range, plen)?),
@@ -190,6 +196,8 @@ impl Hypha {
                 content_length: Some(plen as i64),
                 e_tag: etag,
                 last_modified,
+                metadata,
+                storage_class,
                 accept_ranges: Some("bytes".to_string()),
                 ..Default::default()
             },
@@ -199,6 +207,8 @@ impl Hypha {
                 content_range: Some(format!("bytes {}-{}/{}", pt.start, pt.end - 1, plen)),
                 e_tag: etag,
                 last_modified,
+                metadata,
+                storage_class,
                 accept_ranges: Some("bytes".to_string()),
                 ..Default::default()
             },

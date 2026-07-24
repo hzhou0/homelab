@@ -11,13 +11,15 @@ mod list_head;
 mod multipart;
 mod put;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hypha_format::{Envelope, TrailerKey};
 use s3s::dto::*;
-use s3s::{S3Request, S3Response, S3Result};
+use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use hypha_core::config::Mode;
+use hypha_core::meta;
 use hypha_core::Backend;
 
 use crate::keylocks::KeyLocks;
@@ -76,6 +78,53 @@ pub(crate) const MAX_INLINE_PLAINTEXT: u64 = 4 * 1024 * 1024 * 1024;
 pub(crate) fn ts_ms(ms: i64) -> Timestamp {
     let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms.max(0) as u64);
     Timestamp::from(t)
+}
+
+/// Storage classes implying `RestoreObject`, which hypha's single physical tier cannot honour —
+/// accepting one would promise a retrieval workflow that never arrives (§7).
+const ARCHIVE_CLASSES: &[&str] = &[
+    StorageClass::GLACIER,
+    StorageClass::DEEP_ARCHIVE,
+    StorageClass::GLACIER_IR,
+    StorageClass::SNOW,
+    StorageClass::OUTPOSTS,
+];
+
+/// Validate a requested `x-amz-storage-class` and resolve it to the label hypha will echo (§7).
+/// One physical tier, so every non-archive class is accepted as-is and simply replayed on read.
+pub(crate) fn resolve_storage_class(requested: Option<&StorageClass>) -> S3Result<String> {
+    let Some(sc) = requested else {
+        return Ok(meta::STANDARD.to_string());
+    };
+    if ARCHIVE_CLASSES.contains(&sc.as_str()) {
+        return Err(s3_error!(
+            InvalidStorageClass,
+            "hypha has one storage tier; the archive classes are not supported"
+        ));
+    }
+    Ok(sc.as_str().to_string())
+}
+
+/// The cache-side user-metadata a write carries alongside its facts (§7): the client's
+/// `x-amz-meta-*` under hypha's namespace, plus the echoed storage class.
+pub(crate) fn write_metadata(
+    client: Option<&Metadata>,
+    storage_class: &str,
+) -> HashMap<String, String> {
+    let mut md: HashMap<String, String> = client
+        .map(|m| meta::encode_user_metadata(m).collect())
+        .unwrap_or_default();
+    md.insert(meta::SCLASS.to_string(), storage_class.to_string());
+    md
+}
+
+/// The raw MD5 a client's `Content-MD5` header declares (base64 of the 16 digest bytes).
+pub(crate) fn parse_content_md5(header: &str) -> S3Result<[u8; 16]> {
+    let raw = base64_simd::STANDARD
+        .decode_to_vec(header.as_bytes())
+        .map_err(|_| s3_error!(InvalidDigest, "Content-MD5 is not valid base64"))?;
+    <[u8; 16]>::try_from(raw.as_slice())
+        .map_err(|_| s3_error!(InvalidDigest, "Content-MD5 must decode to 16 bytes"))
 }
 
 #[async_trait::async_trait]
@@ -157,11 +206,25 @@ impl s3s::S3 for Hypha {
         self.op_list_buckets(req).await
     }
 
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        self.op_list_multipart_uploads(req).await
+    }
+
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         self.op_list_objects_v2(req).await
+    }
+
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        self.op_list_parts(req).await
     }
 
     async fn put_object(

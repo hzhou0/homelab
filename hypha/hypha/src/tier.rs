@@ -54,6 +54,11 @@ impl Reconciler {
     /// **Settle** after a commit that left K present on the remote: fresh twin, then the
     /// eviction tombstone carrying the full facts (kind, cetag, plen, original mtime) in its
     /// user-metadata — the authoritative copy; the twin is its LIST projection (§6).
+    ///
+    /// `extra` is the pass-through carrier those facts share (§7): the client's namespaced
+    /// `x-amz-meta-*` and the echoed storage class. It is cache-only — the remote's trailer holds
+    /// facts and nothing else — so a rebuild from the remote settles it empty, which is what
+    /// [`Self::repair_locked`] does.
     pub(crate) async fn settle_evict_locked(
         &self,
         bucket: &str,
@@ -61,6 +66,7 @@ impl Reconciler {
         plen: u64,
         cetag: &str,
         mtime_ms: i64,
+        extra: HashMap<String, String>,
     ) -> Result<()> {
         let facts = meta::Facts {
             client_etag: cetag.to_string(),
@@ -69,7 +75,7 @@ impl Reconciler {
         };
         self.refresh_twin(bucket, key, &facts).await?;
 
-        let mut md = HashMap::new();
+        let mut md = extra;
         md.insert(meta::TOMB.to_string(), meta::TOMB_EVICT.to_string());
         md.insert(meta::PLEN.to_string(), plen.to_string());
         md.insert(meta::CETAG.to_string(), cetag.to_string());
@@ -104,8 +110,15 @@ impl Reconciler {
             Err(e) => return Err(e),
         };
         let facts = self.remote_facts(bucket, key, &head).await?;
-        self.settle_evict_locked(bucket, key, facts.plen, &facts.cetag, facts.mtime_ms)
-            .await?;
+        self.settle_evict_locked(
+            bucket,
+            key,
+            facts.plen,
+            &facts.cetag,
+            facts.mtime_ms,
+            HashMap::new(),
+        )
+        .await?;
         Ok(Some(facts))
     }
 

@@ -16,7 +16,6 @@ path = "src/main.rs"
 [dependencies]
 hypha-core = { workspace = true }
 hypha-format = { workspace = true }
-anyhow = { workspace = true }
 s3s = { workspace = true }
 s3s-aws = { workspace = true }
 aws-sdk-s3 = { workspace = true }
@@ -29,7 +28,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 age = { workspace = true }
 md-5 = { workspace = true }
+rand = { workspace = true }
 hex = { workspace = true }
+base64-simd = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]

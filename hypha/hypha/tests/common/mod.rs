@@ -389,6 +389,12 @@ pub fn md5_hex(bytes: &[u8]) -> String {
     hex::encode(Md5::digest(bytes))
 }
 
+/// The `Content-MD5` header value for a body — base64 of the raw digest, not hex.
+pub fn base64_md5(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    base64_simd::STANDARD.encode_to_string(Md5::digest(bytes))
+}
+
 /// A deterministic byte pattern of `len` bytes — distinct per offset so a mis-sliced range is
 /// caught (matches the `hypha-format` roundtrip test's pattern).
 pub fn pattern(len: usize) -> Vec<u8> {

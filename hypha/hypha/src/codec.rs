@@ -17,6 +17,7 @@ use hypha_format::{
 use md5::Digest as _;
 use s3s::dto::StreamingBlob;
 use s3s_aws::conv::{try_from_aws, try_into_aws};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio_util::io::{ReaderStream, SyncIoBridge};
@@ -37,6 +38,17 @@ pub struct SingleTrailer {
     pub mtime_ms: i64,
 }
 
+/// The client's `Content-MD5` did not match the body that arrived. The digest is computed inline
+/// as the plaintext streams, so it does not exist until the last byte has passed — by which point
+/// the backend op is already in flight. The encrypt task answers by stopping there: the body ends
+/// short of its declared length, so the op fails and the commit never lands, leaving the caller to
+/// report `BadDigest` over an untouched key (§7).
+#[derive(Debug)]
+pub struct DigestMismatch;
+
+/// Resolves once the plaintext body has fully streamed: its hex MD5, or [`DigestMismatch`].
+pub type EtagReceiver = oneshot::Receiver<Result<String, DigestMismatch>>;
+
 /// Adapt an incoming client `StreamingBlob` into an SDK `ByteStream` (e.g. to write the plaintext
 /// straight through to the cache), via s3s-aws's own body bridge. No copy — the bytes stream.
 pub fn blob_to_bytestream(blob: StreamingBlob) -> ByteStream {
@@ -47,6 +59,52 @@ pub fn blob_to_bytestream(blob: StreamingBlob) -> ByteStream {
 /// the client, via s3s-aws's own body bridge. No copy — the bytes stream.
 pub fn bytestream_to_blob(bs: ByteStream) -> StreamingBlob {
     try_from_aws(bs).expect("ByteStream → StreamingBlob is Infallible")
+}
+
+/// Split one body into two identical streams, so it can reach two sinks in a single pass — the
+/// upload path for a retained part (§7), which must land on the remote *and* in the cache without
+/// the encrypt task running twice. A pump reads the source once and writes every chunk into both
+/// pipes, so per-request memory stays at pipe capacity however large the part is.
+///
+/// The two writes are driven concurrently, so neither pipe head-of-line blocks the other; the
+/// slower sink still paces the pump, which is the intended backpressure. If either sink goes away
+/// — its request failed, or was cancelled because the other did — writing to that pipe fails and
+/// the pump exits, closing both and letting the surviving side see a short body and error out.
+pub fn tee(src: ByteStream) -> (ByteStream, ByteStream) {
+    let (mut a_w, a_r) = tokio::io::duplex(PIPE_CAP);
+    let (mut b_w, b_r) = tokio::io::duplex(PIPE_CAP);
+    tokio::spawn(async move {
+        let mut rd = src.into_async_read();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match rd.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = %e, "tee: reading the source failed mid-stream");
+                    break;
+                }
+            };
+            let chunk = &buf[..n];
+            if tokio::try_join!(a_w.write_all(chunk), b_w.write_all(chunk)).is_err() {
+                // A sink dropped its half; the other will see a short body and fail its request.
+                break;
+            }
+        }
+        let _ = a_w.shutdown().await;
+        let _ = b_w.shutdown().await;
+    });
+    (
+        blob_to_bytestream(StreamingBlob::wrap(ReaderStream::new(a_r))),
+        blob_to_bytestream(StreamingBlob::wrap(ReaderStream::new(b_r))),
+    )
+}
+
+/// A stream of `body` followed by `tail`, without buffering `body` — the complete-time trailer
+/// fold (§7), where the retained part may be gigabytes but the trailer is a few dozen KB.
+pub fn append_bytes(body: ByteStream, tail: Vec<u8>) -> ByteStream {
+    let chained = body.into_async_read().chain(std::io::Cursor::new(tail));
+    blob_to_bytestream(StreamingBlob::wrap(ReaderStream::new(chained)))
 }
 
 /// Decrypt a whole remote object body to a plaintext `StreamingBlob`. One remote GET (the caller
@@ -139,8 +197,14 @@ pub async fn encrypt_stream(
     plen: u64,
     trailer: SingleTrailer,
 ) -> io::Result<(u64, ByteStream)> {
-    let (framed_len, body, _etag) =
-        encrypt_blob_with_etag(env, bytestream_to_blob(plaintext), plen, Some(trailer)).await?;
+    let (framed_len, body, _etag) = encrypt_blob_with_etag(
+        env,
+        bytestream_to_blob(plaintext),
+        plen,
+        Some(trailer),
+        None,
+    )
+    .await?;
     Ok((framed_len, body))
 }
 
@@ -150,6 +214,10 @@ pub async fn encrypt_stream(
 /// single-part PUT lands body and facts atomically (§6); `None` emits a pure age file — a multipart
 /// part, whose facts live in the object's terminating trailer part.
 ///
+/// `expect_md5` is the client's `Content-MD5`, checked against the digest the body actually
+/// produced; on a mismatch nothing further is written, so the backend op fails rather than
+/// committing a corrupt object (see [`DigestMismatch`]).
+///
 /// Returns `(body_len, body, etag_receiver)`. `body_len` is exact and synchronous (`HLEN` is
 /// constant). Await `etag_receiver` **after** fully consuming `body` (i.e. after the remote op
 /// returns): it resolves with the hex MD5 at stream end.
@@ -158,10 +226,11 @@ pub async fn encrypt_blob_with_etag(
     plaintext: StreamingBlob,
     plen: u64,
     trailer: Option<SingleTrailer>,
-) -> io::Result<(u64, ByteStream, oneshot::Receiver<String>)> {
+    expect_md5: Option<[u8; 16]>,
+) -> io::Result<(u64, ByteStream, EtagReceiver)> {
     let handle = Handle::current();
     let (pipe_w, pipe_r) = tokio::io::duplex(PIPE_CAP);
-    let (etag_tx, etag_rx) = oneshot::channel::<String>();
+    let (etag_tx, etag_rx) = oneshot::channel::<Result<String, DigestMismatch>>();
     let h = handle.clone();
 
     let body_ct_len = ciphertext_len(plen, HLEN);
@@ -198,6 +267,14 @@ pub async fn encrypt_blob_with_etag(
         };
         let md5 = md5_src.finish();
 
+        // The only point the client's declared digest can be checked at all — and still before the
+        // commit, since the trailer is what makes a single-part upload well-formed. Leaving the
+        // pipe short-and-closed is the signal to the caller (§7).
+        if expect_md5.is_some_and(|want| want != md5) {
+            let _ = etag_tx.send(Err(DigestMismatch));
+            return;
+        }
+
         if let Some(t) = trailer {
             let footer = Footer {
                 kind: FooterKind::Single,
@@ -212,7 +289,7 @@ pub async fn encrypt_blob_with_etag(
                 return;
             }
         }
-        let _ = etag_tx.send(hex::encode(md5));
+        let _ = etag_tx.send(Ok(hex::encode(md5)));
         let _ = sink.shutdown();
     });
 

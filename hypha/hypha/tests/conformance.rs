@@ -506,6 +506,221 @@ async fn bucket_lifecycle() {
     assert!(head.is_err(), "deleted bucket must not HEAD");
 }
 
+/// User metadata survives PUT→HEAD/GET, and never collides with the facts sharing the same cache
+/// carrier — a client key named `plen` must not shadow the tombstone's own.
+///
+/// Non-ASCII values come back as an **RFC 2047 encoded-word**, which is what S3 implementations do
+/// generally, not an s3s quirk: HTTP field values are US-ASCII (RFC 9110), so a UTF-8 metadata
+/// value needs an escape hatch on the response. Measured against this harness's MinIO, driven
+/// directly with no hypha in the path, the same value comes back `=?UTF-8?q?caf=C3=A9_=E2=98=95?=`
+/// — the Q (quoted-printable) variant where s3s emits B (base64). Both are valid encoded-words
+/// decoding to identical bytes. `aws-sdk-s3` encodes neither on request (it parses the value
+/// straight into a `HeaderValue`) nor decodes on response, so a client sees the encoded form.
+///
+/// hypha owns none of that leg — it stores the value s3s hands it — so what this pins for hypha is
+/// that the bytes survive the round trip intact, asserted by decoding the payload below.
+#[tokio::test]
+async fn user_metadata_roundtrips() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let body = pattern(4096);
+
+    client
+        .put_object()
+        .bucket(B)
+        .key("meta/obj")
+        .body(bytes_body(&body))
+        .content_length(body.len() as i64)
+        .metadata("colour", "café ☕")
+        .metadata("plain", "value")
+        .metadata("plen", "not-the-facts-plen")
+        .send()
+        .await
+        .expect("put with metadata");
+
+    let expected = |md: &std::collections::HashMap<String, String>| {
+        assert_eq!(md.get("plain").map(String::as_str), Some("value"));
+        assert_eq!(
+            md.get("plen").map(String::as_str),
+            Some("not-the-facts-plen")
+        );
+        // s3s's RFC 2047 form; the payload is the original value byte-for-byte.
+        let colour = md.get("colour").expect("non-ascii key present");
+        assert_eq!(colour, "=?UTF-8?B?Y2Fmw6kg4piV?=");
+        assert_eq!(
+            String::from_utf8(
+                base64_simd::STANDARD
+                    .decode_to_vec(
+                        colour
+                            .trim_start_matches("=?UTF-8?B?")
+                            .trim_end_matches("?=")
+                            .as_bytes()
+                    )
+                    .expect("rfc2047 payload is base64")
+            )
+            .expect("utf-8"),
+            "café ☕"
+        );
+        assert_eq!(
+            md.len(),
+            3,
+            "hypha's own facts must not leak as client keys"
+        );
+    };
+
+    let head = client
+        .head_object()
+        .bucket(B)
+        .key("meta/obj")
+        .send()
+        .await
+        .expect("head");
+    expected(head.metadata().expect("head metadata"));
+    // The facts riding the same carrier are unharmed by the colliding client key.
+    assert_eq!(head.content_length(), Some(body.len() as i64));
+
+    let got = client
+        .get_object()
+        .bucket(B)
+        .key("meta/obj")
+        .send()
+        .await
+        .expect("get");
+    expected(got.metadata().expect("get metadata"));
+    assert_eq!(got.body.collect().await.unwrap().to_vec(), body);
+
+    // An object written without metadata reports none, not a stale or defaulted map.
+    put(&client, B, "meta/bare", &body).await;
+    let bare = client
+        .head_object()
+        .bucket(B)
+        .key("meta/bare")
+        .send()
+        .await
+        .expect("head bare");
+    assert!(bare.metadata().is_none_or(|m| m.is_empty()));
+}
+
+/// A wrong `Content-MD5` is rejected with `BadDigest`, and — the part that matters — the commit
+/// never lands: an existing object at the key is left fully intact (§7's transition bracket, whose
+/// repair settles K back from the remote).
+#[tokio::test]
+async fn content_md5_is_validated() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let original = pattern(8192);
+    let original_etag = put(&client, B, "digest/obj", &original).await;
+
+    let body = pattern_seeded(4096, 9);
+    let wrong = base64_md5(&pattern_seeded(4096, 200));
+    let err = client
+        .put_object()
+        .bucket(B)
+        .key("digest/obj")
+        .body(bytes_body(&body))
+        .content_length(body.len() as i64)
+        .content_md5(wrong)
+        .send()
+        .await
+        .expect_err("wrong Content-MD5 must be rejected");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("BadDigest"));
+
+    // The rejected write must not have replaced (or torn) the object already there.
+    assert_eq!(get_all(&client, B, "digest/obj").await, original);
+    let head = client
+        .head_object()
+        .bucket(B)
+        .key("digest/obj")
+        .send()
+        .await
+        .expect("head after rejected put");
+    assert_eq!(
+        head.e_tag().unwrap_or_default().trim_matches('"'),
+        original_etag
+    );
+
+    // The matching digest goes through.
+    client
+        .put_object()
+        .bucket(B)
+        .key("digest/obj")
+        .body(bytes_body(&body))
+        .content_length(body.len() as i64)
+        .content_md5(base64_md5(&body))
+        .send()
+        .await
+        .expect("correct Content-MD5 must be accepted");
+    assert_eq!(get_all(&client, B, "digest/obj").await, body);
+}
+
+/// Storage class is an echoed label (§7): non-archive classes round-trip, the archive family is
+/// refused, and an unset class reads back as STANDARD.
+#[tokio::test]
+async fn storage_class_passthrough() {
+    use aws_sdk_s3::types::StorageClass;
+
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let body = pattern(1024);
+
+    client
+        .put_object()
+        .bucket(B)
+        .key("sc/ia")
+        .body(bytes_body(&body))
+        .content_length(body.len() as i64)
+        .storage_class(StorageClass::StandardIa)
+        .send()
+        .await
+        .expect("put with storage class");
+
+    let head = client
+        .head_object()
+        .bucket(B)
+        .key("sc/ia")
+        .send()
+        .await
+        .expect("head");
+    assert_eq!(head.storage_class(), Some(&StorageClass::StandardIa));
+    let got = client
+        .get_object()
+        .bucket(B)
+        .key("sc/ia")
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(got.storage_class(), Some(&StorageClass::StandardIa));
+
+    // Archive classes imply RestoreObject, which one physical tier cannot honour.
+    for archive in [StorageClass::Glacier, StorageClass::DeepArchive] {
+        let err = client
+            .put_object()
+            .bucket(B)
+            .key("sc/archive")
+            .body(bytes_body(&body))
+            .content_length(body.len() as i64)
+            .storage_class(archive.clone())
+            .send()
+            .await
+            .expect_err("archive storage class must be refused");
+        assert_eq!(sdk_err_code(&err).as_deref(), Some("InvalidStorageClass"));
+    }
+
+    put(&client, B, "sc/default", &body).await;
+    let head = client
+        .head_object()
+        .bucket(B)
+        .key("sc/default")
+        .send()
+        .await
+        .expect("head default");
+    assert_eq!(head.storage_class(), Some(&StorageClass::Standard));
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
 /// Client-visible keys, optionally prefix-filtered, in listing order.

@@ -25,8 +25,10 @@ tokio-util = { version = "0.7", features = ["io", "io-util", "codec"] }
 # S3 server surface + client
 async-trait = "0.1"
 md-5 = "0.10"
+rand = "0.8"           # mpu stash nonces (§6); already in-tree via age
 hex = "0.4"
 percent-encoding = "2"  # decode encoding-type=url LIST keys (§6)
+base64-simd = "0.8"     # Content-MD5 decode; already in the tree via s3s
 s3s = "0.14"
 s3s-aws = "0.14"
 aws-sdk-s3 = "1"
@@ -37,7 +39,6 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "server-gra
 serde = { version = "1", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 thiserror = "1"      # derive Display/Error/From on the layered error enums
-anyhow = "1"         # bootstrap-path error context in the serving binary
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 

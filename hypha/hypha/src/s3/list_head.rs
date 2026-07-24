@@ -71,6 +71,10 @@ impl Hypha {
             content_length,
             e_tag,
             last_modified,
+            // The pass-through carrier the facts above share (§7). A transition mark resolves its
+            // facts from the remote, which carries neither — so both fall back to their defaults.
+            metadata: Some(meta::decode_user_metadata(&md)),
+            storage_class: Some(StorageClass::from(meta::storage_class(&md))),
             accept_ranges: Some("bytes".to_string()),
             ..Default::default()
         };

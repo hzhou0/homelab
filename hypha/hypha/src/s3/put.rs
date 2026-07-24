@@ -7,6 +7,9 @@
 //! the **footer behind the ciphertext** (§6) — computed inline and framed into the same single
 //! streaming `PutObject`. K is marked for the transfer's duration; readers of K meanwhile
 //! resolve from the remote, which atomically holds the old object until the PUT completes.
+//!
+//! The client's `x-amz-meta-*` and storage class ride the cache tombstone written at settle,
+//! namespaced apart from the facts sharing that carrier (§7).
 
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
@@ -17,7 +20,9 @@ use hypha_core::config::Mode;
 use hypha_core::error::Error;
 use hypha_core::meta;
 
-use super::{Hypha, MAX_INLINE_PLAINTEXT};
+use super::{
+    parse_content_md5, resolve_storage_class, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
+};
 use crate::codec::{self, SingleTrailer};
 use crate::tier;
 
@@ -35,6 +40,13 @@ impl Hypha {
             // Cached (async write-through) path lands in Phase 4.
             return Err(s3_error!(NotImplemented, "cached-mode PutObject pending"));
         }
+
+        let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
+        let expect_md5 = input
+            .content_md5
+            .as_deref()
+            .map(parse_content_md5)
+            .transpose()?;
 
         let plen = input
             .content_length
@@ -95,11 +107,12 @@ impl Hypha {
             object_key: key.clone(),
             mtime_ms,
         };
-        let (framed_len, enc, etag_rx) = match codec::encrypt_blob_with_etag(
+        let (framed_len, enc, mut etag_rx) = match codec::encrypt_blob_with_etag(
             self.env(),
             body,
             plen,
             Some(trailer),
+            expect_md5,
         )
         .await
         {
@@ -127,21 +140,39 @@ impl Hypha {
             if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
                 tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
             }
-            return Err(e.into());
+            // A Content-MD5 mismatch cuts the ciphertext stream short, so it reaches us as a
+            // backend fault; the digest channel is what tells the two apart (§7).
+            return Err(match etag_rx.try_recv() {
+                Ok(Err(_)) => s3_error!(BadDigest, "Content-MD5 does not match the request body"),
+                _ => e.into(),
+            });
         }
         // The PUT consumed the whole framed body, footer included — the etag is ready. Its loss
         // means the encrypt task died mid-commit; repair settles K from the remote either way.
         let etag = match etag_rx.await {
-            Ok(e) => e,
-            Err(_) => {
+            Ok(Ok(e)) => e,
+            other => {
                 if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
                     tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
                 }
-                return Err(Error::Backend("MD5 task dropped before completing".into()).into());
+                return Err(match other {
+                    // A short body the remote nonetheless accepted: reject it, don't project it.
+                    Ok(Err(_)) => {
+                        s3_error!(BadDigest, "Content-MD5 does not match the request body")
+                    }
+                    _ => Error::Backend("MD5 task dropped before completing".into()).into(),
+                });
             }
         };
         self.tier
-            .settle_evict_locked(&bucket, &key, plen, &etag, mtime_ms)
+            .settle_evict_locked(
+                &bucket,
+                &key,
+                plen,
+                &etag,
+                mtime_ms,
+                write_metadata(input.metadata.as_ref(), &storage_class),
+            )
             .await?;
 
         let resp = PutObjectOutput {

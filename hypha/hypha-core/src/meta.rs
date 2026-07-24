@@ -14,6 +14,11 @@ pub const TOMB: &str = "tomb";
 /// Original client-write mtime (unix ms) on a tombstone — eviction must not move a key's
 /// client-visible LastModified (§6).
 pub const MTIME: &str = "mtime";
+/// Echoed storage class (§7). hypha has one physical tier, so the class is a label the write path
+/// records and the read path replays; absent ⇒ [`STANDARD`].
+pub const SCLASS: &str = "sc";
+
+pub const STANDARD: &str = "STANDARD";
 
 /// Tombstone kinds (value of the [`TOMB`] metadata key).
 pub const TOMB_EVICT: &str = "evict";
@@ -111,6 +116,60 @@ pub fn is_composite_etag(cetag: &str) -> bool {
     cetag.contains('-')
 }
 
+// ── Client user-metadata, namespaced (§7) ───────────────────────────────────────────────────
+//
+// A client's `x-amz-meta-*` and hypha's own facts share one carrier — the cache object's
+// user-metadata — so they need a namespace split, or a client key named `plen` would shadow the
+// tombstone's. hypha's keys stay bare and the client's ride under [`USER_PREFIX`], which is not a
+// prefix of any hypha key. Only the cache holds them: the remote's sole facts carrier is the
+// trailer (§6), so a repair or restore that rebuilds K from the remote drops the user metadata and
+// the storage class back to their defaults — the accepted durability limit of this carrier.
+
+/// Namespace for pass-through client metadata on a cache object.
+pub const USER_PREFIX: &str = "u-";
+
+/// Client metadata values are percent-encoded at rest so a non-ASCII or control byte survives the
+/// backend's own header round trip byte-exact. (The *client* wire leg is RFC 2047, which s3s
+/// encodes and decodes for us — hypha only ever sees decoded values.) Escaping everything outside
+/// `[A-Za-z0-9]` covers `%` itself, so the encoding is unambiguous.
+const META_ESCAPE: &percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC;
+
+/// Client `x-amz-meta-*` entries → the cache object's namespaced user-metadata.
+pub fn encode_user_metadata(
+    client: &std::collections::HashMap<String, String>,
+) -> impl Iterator<Item = (String, String)> + '_ {
+    client.iter().map(|(k, v)| {
+        (
+            format!("{USER_PREFIX}{k}"),
+            percent_encoding::utf8_percent_encode(v, META_ESCAPE).to_string(),
+        )
+    })
+}
+
+/// The inverse: a cache object's user-metadata → the client `x-amz-meta-*` entries it carries.
+/// hypha's own keys don't carry the prefix, so they drop out.
+pub fn decode_user_metadata(
+    stored: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    stored
+        .iter()
+        .filter_map(|(k, v)| {
+            let name = k.strip_prefix(USER_PREFIX)?;
+            let val = percent_encoding::percent_decode_str(v).decode_utf8().ok()?;
+            Some((name.to_string(), val.into_owned()))
+        })
+        .collect()
+}
+
+/// The storage class recorded on a cache object, defaulting to [`STANDARD`] — the value for
+/// anything written before the class was tracked, and for a key rebuilt from the remote.
+pub fn storage_class(metadata: &std::collections::HashMap<String, String>) -> String {
+    metadata
+        .get(SCLASS)
+        .cloned()
+        .unwrap_or_else(|| STANDARD.to_string())
+}
+
 // ── The reserved prefix (§6) ────────────────────────────────────────────────────────────────
 //
 // Everything hypha stores *about* objects — mpu state, and later the phase-4 pending markers —
@@ -136,46 +195,81 @@ pub fn mpu_upload_key(upload_id: &str) -> String {
     format!("{RESERVED_PREFIX}mpu/{upload_id}/u")
 }
 
+/// The facts an mpu part record carries in its key (§6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MpuPart<'a> {
+    pub part_number: i32,
+    /// The remote's ciphertext part ETag — the last-write-wins token complete matches against
+    /// `ListParts`.
+    pub retag: &'a str,
+    /// The part's *plaintext* MD5, the one datum the remote can't reproduce.
+    pub pmd5: &'a str,
+    /// Names this part's retained ciphertext ([`mpu_stash_key`]); empty when it wasn't retained.
+    pub stash_nonce: &'a str,
+}
+
 /// Cache: per-part record for a multipart upload, its facts encoded **in the key** so complete
-/// recovers them with one LIST and no per-part HEAD (§7). `pmd5` (the part's *plaintext* MD5) is
-/// the one datum the remote can't reproduce; `retag` (the remote's ciphertext part ETag) is the
-/// last-write-wins token complete matches against the remote's `ListParts` — a re-uploaded part
-/// writes a *new* key, and the stale one is resolved away at complete. Both are hex MD5s (no `;`,
-/// no control byte), so the `;`-delimited form is unambiguous; the zero-padded number keeps LIST
-/// order and lets [`parse_mpu_part`] reject the `/u` upload record.
-pub fn mpu_part_key(upload_id: &str, part_number: i32, retag: &str, pmd5: &str) -> String {
+/// recovers them with one LIST and no per-part HEAD (§7). A re-uploaded part writes a *new* key,
+/// and the stale one is resolved away at complete by the remote's `ListParts`. `retag` and `pmd5`
+/// are hex and `stash_nonce` is base64url, so none contain `;` or a control byte and the
+/// `;`-delimited form is unambiguous; the zero-padded number keeps LIST order and lets
+/// [`parse_mpu_part`] reject the `/u` upload record.
+pub fn mpu_part_key(upload_id: &str, part: MpuPart<'_>) -> String {
     format!(
-        "{RESERVED_PREFIX}mpu/{upload_id}/p{part_number:05};{};{}",
-        retag.trim_matches('"'),
-        pmd5
+        "{RESERVED_PREFIX}mpu/{upload_id}/p{:05};{};{};{}",
+        part.part_number,
+        part.retag.trim_matches('"'),
+        part.pmd5,
+        part.stash_nonce
     )
 }
 
-/// Parse an mpu part record key into `(part_number, retag, pmd5)`; `None` for the upload's own
-/// `/u` record or a malformed key. Reads only the final path segment, so a full or
+/// Parse an mpu part record key; `None` for the upload's own `/u` record, a retained-ciphertext
+/// `c` record, or a malformed key. Reads only the final path segment, so a full or
 /// deployment-stripped key both work.
-pub fn parse_mpu_part(key: &str) -> Option<(i32, &str, &str)> {
-    let mut it = key.rsplit('/').next()?.strip_prefix('p')?.splitn(3, ';');
-    let n: i32 = it.next()?.parse().ok()?;
+pub fn parse_mpu_part(key: &str) -> Option<MpuPart<'_>> {
+    let mut it = key.rsplit('/').next()?.strip_prefix('p')?.splitn(4, ';');
+    let part_number: i32 = it.next()?.parse().ok()?;
     let retag = it.next()?;
     let pmd5 = it.next()?;
-    (!pmd5.is_empty()).then_some((n, retag, pmd5))
+    let stash_nonce = it.next()?;
+    (!pmd5.is_empty()).then_some(MpuPart {
+        part_number,
+        retag,
+        pmd5,
+        stash_nonce,
+    })
 }
 
-/// Cache: retained ciphertext of a **small** part — one whose framed size is below the backend's
-/// 5 MiB part minimum, which any S3 backend permits only as the upload's *final* part. hypha's
-/// terminating trailer normally occupies that final-part slot, so such a part must instead *carry*
-/// the trailer; complete re-uploads it as `part ‖ trailer` (§7), and needs the ciphertext back to
-/// do so (an in-progress part isn't readable). Keyed by `retag` like [`mpu_part_key`] — so
-/// concurrent/re-uploaded writes to the one small part each stash under their own token and complete
-/// folds *exactly* the remote's `ListParts` winner, never a divergent cache last-writer. Prefix `c`
-/// — distinct from `p` records and the `/u` upload record — so [`parse_mpu_part`] skips it and it's
-/// swept with the rest of the `mpu/<id>/` range at complete/abort.
-pub fn mpu_stash_key(upload_id: &str, part_number: i32, retag: &str) -> String {
-    format!(
-        "{RESERVED_PREFIX}mpu/{upload_id}/c{part_number:05};{}",
-        retag.trim_matches('"')
-    )
+/// Cache: retained ciphertext of a part that **admits no successor** — one below the backend's
+/// 5 MiB part minimum (which any S3 backend permits only as the upload's *final* part), or part
+/// [`MAX_CLIENT_PART`] (which no number can follow). Either way such a part, if committed, is the
+/// object's tail, so it is the one that must carry the terminating trailer; complete re-uploads it
+/// as `part ‖ trailer` (§7) and needs the ciphertext back to do so, because an in-progress part
+/// isn't readable.
+///
+/// Keyed by a **nonce** rather than the part's `retag`: this write is fed by a split of the very
+/// stream going to the remote, so it starts long before the remote returns an ETag to key it by.
+/// The winner→stash mapping instead
+/// rides [`MpuPart::stash_nonce`] on the part record, which already disambiguates re-uploads — so
+/// concurrent writes each retain under their own nonce and complete folds *exactly* the remote's
+/// `ListParts` winner, never a divergent cache last-writer. Prefix `c` — distinct from `p` records
+/// and the `/u` upload record — so [`parse_mpu_part`] skips it and it is swept with the rest of the
+/// `mpu/<id>/` range at complete/abort.
+pub fn mpu_stash_key(upload_id: &str, part_number: i32, nonce: &str) -> String {
+    format!("{RESERVED_PREFIX}mpu/{upload_id}/c{part_number:05};{nonce}")
+}
+
+/// Highest part number a client may use — S3's own limit, which hypha does not reduce (§7).
+pub const MAX_CLIENT_PART: i32 = 10_000;
+
+/// Whether a part **admits no successor**, so that committing it makes it the object's final part.
+/// Two conditions, one meaning: S3 exempts only the last part from the 5 MiB minimum, and nothing
+/// follows part [`MAX_CLIENT_PART`]. This single predicate drives both decisions that must agree —
+/// UploadPart retains such a part's ciphertext ([`mpu_stash_key`]), and complete folds the trailer
+/// into it instead of appending a trailer part of its own (§7).
+pub fn admits_no_successor(part_number: i32, ct_len: u64, min_remote_part: u64) -> bool {
+    ct_len < min_remote_part || part_number >= MAX_CLIENT_PART
 }
 
 /// Cache: everything recorded for one upload — dropped at complete/abort.
@@ -320,6 +414,32 @@ mod tests {
     }
 
     #[test]
+    fn user_metadata_namespace_roundtrips() {
+        let mut client = std::collections::HashMap::new();
+        client.insert("colour".to_string(), "café ☕".to_string());
+        client.insert("plain".to_string(), "value".to_string());
+
+        // hypha's own facts share the carrier and must survive untouched, unread as client keys.
+        let mut stored: std::collections::HashMap<String, String> =
+            encode_user_metadata(&client).collect();
+        stored.insert(TOMB.to_string(), TOMB_EVICT.to_string());
+        stored.insert(SCLASS.to_string(), "STANDARD_IA".to_string());
+
+        assert_eq!(decode_user_metadata(&stored), client);
+        assert_eq!(storage_class(&stored), "STANDARD_IA");
+        // Percent-encoded at rest, so no backend header round trip can mangle a value.
+        assert!(stored.values().all(|v| v.is_ascii()));
+
+        // A client key colliding with a hypha key name stays namespaced apart.
+        let mut shadow = std::collections::HashMap::new();
+        shadow.insert(PLEN.to_string(), "99".to_string());
+        let stored: std::collections::HashMap<String, String> =
+            encode_user_metadata(&shadow).collect();
+        assert!(!stored.contains_key(PLEN));
+        assert_eq!(storage_class(&stored), STANDARD);
+    }
+
+    #[test]
     fn key_admission() {
         assert!(validate_client_key("normal/key.txt").is_ok());
         // Only 0x00 and 0x01 are reserved; other control bytes ride encoding-type=url.
@@ -357,17 +477,47 @@ mod tests {
         assert!(validate_client_key(&format!("{RESERVED_PREFIX}x")).is_err());
     }
 
+    fn part(n: i32, retag: &'static str, pmd5: &'static str) -> MpuPart<'static> {
+        MpuPart {
+            part_number: n,
+            retag,
+            pmd5,
+            stash_nonce: "",
+        }
+    }
+
     #[test]
     fn mpu_part_key_roundtrips_and_rejects_upload_record() {
-        let (retag, pmd5) = ("ab".repeat(16), "cd".repeat(16));
-        let k = mpu_part_key("up-1", 7, &retag, &pmd5);
-        assert_eq!(parse_mpu_part(&k), Some((7, retag.as_str(), pmd5.as_str())));
+        let (retag, pmd5): (&'static str, &'static str) =
+            ("ab".repeat(16).leak(), "cd".repeat(16).leak());
+        let k = mpu_part_key("up-1", part(7, retag, pmd5));
+        assert_eq!(parse_mpu_part(&k), Some(part(7, retag, pmd5)));
+
         // Quoted remote ETags are normalized on the way in.
-        let kq = mpu_part_key("up-1", 42, &format!("\"{retag}\""), &pmd5);
-        assert_eq!(
-            parse_mpu_part(&kq),
-            Some((42, retag.as_str(), pmd5.as_str()))
+        let quoted = format!("\"{retag}\"");
+        let kq = mpu_part_key(
+            "up-1",
+            MpuPart {
+                retag: &quoted,
+                ..part(42, retag, pmd5)
+            },
         );
+        assert_eq!(parse_mpu_part(&kq), Some(part(42, retag, pmd5)));
+
+        // A retained part carries the nonce naming its ciphertext.
+        let stashed = MpuPart {
+            stash_nonce: "AAAA-nonce_1",
+            ..part(10_000, retag, pmd5)
+        };
+        let ks = mpu_part_key("up-1", stashed);
+        assert_eq!(parse_mpu_part(&ks), Some(stashed));
+        assert_eq!(
+            mpu_stash_key("up-1", 10_000, "AAAA-nonce_1"),
+            format!("{RESERVED_PREFIX}mpu/up-1/c10000;AAAA-nonce_1")
+        );
+        // `c` records are not part records, so one LIST separates them by prefix alone.
+        assert_eq!(parse_mpu_part(&mpu_stash_key("up-1", 10_000, "n")), None);
+
         // The upload's own record and malformed keys don't parse as parts.
         assert_eq!(parse_mpu_part(&mpu_upload_key("up-1")), None);
         assert_eq!(
@@ -375,6 +525,21 @@ mod tests {
             None
         );
         // Records sort by part number under one LIST.
-        assert!(mpu_part_key("up-1", 2, &retag, &pmd5) < mpu_part_key("up-1", 10, &retag, &pmd5));
+        assert!(
+            mpu_part_key("up-1", part(2, retag, pmd5))
+                < mpu_part_key("up-1", part(10, retag, pmd5))
+        );
+    }
+
+    #[test]
+    fn admits_no_successor_covers_both_terminal_conditions() {
+        const MIN: u64 = 5 * 1024 * 1024;
+        // Below the 5 MiB minimum: no backend accepts it as a non-final part.
+        assert!(admits_no_successor(1, MIN - 1, MIN));
+        // The last part number: nothing can follow it, whatever its size.
+        assert!(admits_no_successor(MAX_CLIENT_PART, 4 << 30, MIN));
+        // An ordinary interior part admits a successor, so the trailer gets its own.
+        assert!(!admits_no_successor(1, MIN, MIN));
+        assert!(!admits_no_successor(MAX_CLIENT_PART - 1, 4 << 30, MIN));
     }
 }
