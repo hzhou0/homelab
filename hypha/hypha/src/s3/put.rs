@@ -193,7 +193,7 @@ impl Hypha {
 /// client-visibly absent). `if_match` / `if_none_match` are s3s's parsed condition:
 /// `ETagCondition::Any` is the `*` wildcard, `ETagCondition::ETag(e)` a specific tag (compare
 /// against `current_etag` via `e.value()`). Return `Err(Error::PreconditionFailed)` to reject.
-fn evaluate_precondition(
+pub(super) fn evaluate_precondition(
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,
     current_etag: Option<&str>,

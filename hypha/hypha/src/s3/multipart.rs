@@ -44,7 +44,7 @@ fn mint_nonce() -> String {
 /// normally occupies that final-part slot, so a client's last data part this small must instead
 /// *carry* the trailer (the fold in `op_complete_multipart_upload`, §7); `op_upload_part` retains
 /// such a part's ciphertext up front so complete can re-upload it as `part ‖ trailer`.
-const MIN_REMOTE_PART: u64 = 5 * 1024 * 1024;
+pub(super) const MIN_REMOTE_PART: u64 = 5 * 1024 * 1024;
 
 impl Hypha {
     pub(super) async fn op_create_multipart_upload(
@@ -880,7 +880,7 @@ impl Hypha {
 /// Resolve an `x-amz-copy-source` to a `(bucket, key)` this deployment can serve (§7). hypha has no
 /// versioning and no access-point/outpost addressing, so those forms are rejected rather than
 /// silently mishandled.
-fn parse_copy_source(cs: &CopySource) -> S3Result<(String, String)> {
+pub(super) fn parse_copy_source(cs: &CopySource) -> S3Result<(String, String)> {
     match cs {
         CopySource::Bucket {
             bucket,

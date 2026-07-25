@@ -47,7 +47,9 @@ impl Hypha {
             KeyState::Remote { facts, md } => {
                 self.serve_remote(&bucket, &key, &input, &facts, &md).await
             }
-            KeyState::CacheBody { md, .. } => self.serve_cache_body(&bucket, &key, &input, &md).await,
+            KeyState::CacheBody { md, .. } => {
+                self.serve_cache_body(&bucket, &key, &input, &md).await
+            }
         }
     }
 

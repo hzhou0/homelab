@@ -94,7 +94,11 @@ impl Hypha {
             Readiness::Ready => false,
             Readiness::Restoring => true,
         };
-        let source = if restoring { self.remote() } else { self.data() };
+        let source = if restoring {
+            self.remote()
+        } else {
+            self.data()
+        };
         let raw = source
             .list(
                 &bucket,
@@ -161,7 +165,11 @@ impl Hypha {
             Readiness::Ready => false,
             Readiness::Restoring => true,
         };
-        let source = if restoring { self.remote() } else { self.data() };
+        let source = if restoring {
+            self.remote()
+        } else {
+            self.data()
+        };
         let raw = source
             .list_v1(
                 &bucket,

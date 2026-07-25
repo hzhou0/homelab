@@ -37,10 +37,13 @@ hypha validates its *own* clients' credentials.
 > **Follow-up (blocked on upstream release):** bump `s3s` to **0.15.0** once it publishes to
 > crates.io — the latest release is 0.14.1, which hypha pins. 0.15.0 carries the fix for
 > [Nugine/s3s#629](https://github.com/Nugine/s3s/issues/629) (GetObjectAttributes serializes the
-> ETag with quotes; AWS's body form is unquoted). On bump, drop the quoted-ETag workaround note in
-> §7 *GetObjectAttributes* and in `get.rs`, flip the `get_object_attributes` tests to assert the
-> unquoted value, and re-check the surface for 0.15.0 breaking changes. Not tracked as a task
-> because it isn't actionable until the release lands.
+> ETag with quotes; AWS's body form is unquoted). On bump: (1) drop the quoted-ETag workaround note
+> in §7 *GetObjectAttributes* and in `get.rs`, and flip the `get_object_attributes` tests to assert
+> the unquoted value; (2) wire CopyObject's **destination** `If-[None-]Match` preconditions — 0.14.1's
+> `CopyObjectInput` predates S3's conditional-copy-on-destination fields, so `copy.rs` today evaluates
+> only the `copy-source-if-*` conditions; §7's dest half becomes reachable once the DTO carries the
+> fields; (3) re-check the surface for 0.15.0 breaking changes. Not tracked as a task because it
+> isn't actionable until the release lands.
 
 **Clients (cache + remote) — `aws-sdk-s3`** with `aws-config`. Both backends are the same SDK type
 pointed at different endpoints; the architecture's loose coupling falls out naturally.
@@ -1318,28 +1321,30 @@ condition, not a readiness gate.
     (`AWS_REQUEST_CHECKSUM_CALCULATION=when_required`) to match the client config in
     `tests/common`.
 
-    First baseline (2026-07) — the in-house tests above are all green, but s3s-e2e, exercising the
-    same surface as a black box, is **not**, which is why phase 3 is not done:
+    First baseline (2026-07) had the in-house tests green but s3s-e2e, exercising the same surface as
+    a black box, was **not** — the gaps that kept phase 3 open. Now (with CopyObject landed) every
+    in-scope s3s-e2e case passes; the only reds left are the deferred/out-of-scope families below.
     - **Green**: `list_buckets`, `list_objects`, `get_object`, `delete_object`, `head_operations`,
-      `put_object` (tiny + larger), presigned PUT/GET.
-    - **Must fix (real gaps in hypha's declared surface):**
-      - *User metadata is dropped.* PUT with `x-amz-meta-*` then HEAD/GET returns no user metadata
-        — hypha commits its facts into the object's metadata slot and doesn't echo the client's
-        keys back (`test_put_object_with_metadata`, `..._non_ascii_metadata`). Needs a namespace
-        split: reserve a hypha prefix, pass client `x-amz-meta-*` through PUT→HEAD/GET verbatim
-        (RFC 2047 for non-ASCII). Touches the PUT/HEAD/GET path (phase 2 surface).
-      - *`Content-MD5` not validated.* A PUT with a deliberately wrong `Content-MD5` is accepted
-        instead of rejected (`test_put_object_with_content_checksums`) — an integrity check S3
-        clients rely on. Reject with `BadDigest`.
-      - *Multipart* (`test_multipart_upload`) and *LIST pagination*
-        (`test_list_objects_with_pagination`) fail beyond their checksum assertions (a part-count
-        `3 != 5`, a pagination panic). Triage pending: confirm which part is a real defect vs. the
-        expected twin-dilution / exact-`MaxKeys` dialect difference before deciding scope.
-    - **Now in scope for phase 3** — the full client surface minus the exempt families, designs in
-      §7: `CopyObject` (server-side body reuse via `UploadPartCopy` + re-minted trailer),
-      `DeleteObjects` (non-atomic fan-out; durable batches the remote leg), `ListObjects` v1,
-      `ListMultipartUploads`, `ListParts`, client-facing `UploadPartCopy`, `GetObjectAttributes`,
-      the `GetBucketVersioning` stub, and storage-class passthrough.
+      `put_object` (tiny + larger + `with_metadata` + `non_ascii_metadata` + `content_checksums`),
+      **`copy_object`**, `list_objects_with_pagination`, presigned PUT/GET.
+    - **Fixed since the baseline (were real gaps in the declared surface):**
+      - *User metadata is dropped.* PUT with `x-amz-meta-*` now passes through PUT→HEAD/GET verbatim
+        under a reserved namespace, RFC 2047 for non-ASCII (`test_put_object_with_metadata`,
+        `..._non_ascii_metadata`).
+      - *`Content-MD5` not validated.* A wrong `Content-MD5` is now rejected with `BadDigest`
+        (`test_put_object_with_content_checksums`).
+      - *Multipart / LIST pagination.* `test_list_objects_with_pagination` is green; the part-count
+        mismatch was resolved with the phase-3 machinery. `test_multipart_upload`'s remaining red is
+        purely its `checksum_crc32` assertion — the deferred flexible-checksum family below, not a
+        multipart defect (hypha's own `multipart.rs` suite is green).
+    - **In scope for phase 3 — done.** The full client surface minus the exempt families, designs in
+      §7: **`CopyObject`** (server-side body reuse via `UploadPartCopy` + re-minted trailer, or the
+      small-body re-encrypt path — `copy.rs` + `tests/copy.rs`), `DeleteObjects` (non-atomic fan-out;
+      durable batches the remote leg), `ListObjects` v1, `ListMultipartUploads`, `ListParts`,
+      client-facing `UploadPartCopy`, `GetObjectAttributes`, the `GetBucketVersioning` stub, and
+      storage-class passthrough. (CopyObject's *destination* `If-[None-]Match` half of §7's
+      precondition split is not reachable: s3s 0.14.1's `CopyObjectInput` predates S3's
+      conditional-copy-on-destination fields, so only the `copy-source-if-*` conditions apply.)
     - **Deferred, not exempt** — revisit after phase 3: flexible checksums
       (`test_put_object_with_checksum_algorithm`, the `checksum_crc32` asserts) — validate + persist
       inline over plaintext (the `Content-MD5` slot), single-part first, composite checksum-of-
@@ -1404,12 +1409,12 @@ Remaining: the s3s-e2e black-box pass (§11) later found this surface still drop
 `x-amz-meta-*` metadata and accepts a wrong `Content-MD5` — both fixes land under phase 3; also
 conformance vs. SeaweedFS as the cache backend, and ZeroFS against the durable endpoint.
 
-**Phase 3 — multipart. Machinery landed (vs. MinIO); *not done*.** The s3s-e2e black-box pass
-(§11) reopened it: user `x-amz-meta-*` metadata is dropped on PUT→HEAD/GET, a wrong `Content-MD5`
-is accepted instead of rejected, and the multipart + LIST-pagination cases fail beyond their
-checksum asserts (triage pending). The metadata/`Content-MD5`/pagination misses are on the phase-2
-durable surface; they and the multipart defect must be fixed before this phase closes. Trailer +
-embedded parts table
+**Phase 3 — multipart + rest of client surface. Done (vs. MinIO).** The s3s-e2e black-box pass
+(§11) had reopened it — dropped user `x-amz-meta-*`, an unvalidated `Content-MD5`, and multipart +
+LIST-pagination reds — all since resolved: metadata pass-through, `BadDigest` on a wrong
+`Content-MD5`, green v1 pagination, and finally **CopyObject** (`copy.rs`), the last in-scope op.
+Every in-scope s3s-e2e case now passes; the remaining reds are the deferred flexible-checksum family
+and the out-of-scope families (§11). Trailer + embedded parts table
 (single-stream composite read, MAC'd trailer) and the mpu-record retag-match via `ListParts`
 (§6/§7) both landed, superseding the original metadata records + completed-object part-index
 approach.
@@ -1440,8 +1445,8 @@ deferred (§11).
 ops: CopyObject (single-part + composite source, `COPY`/`REPLACE`, copy-source preconditions, a
 `K_dst` trailer that verifies where a raw remote copy would not), DeleteObjects (partial-failure
 result, crash mid-batch repair, XML-clean-keys-only remote batch), v1 LIST, multipart list/parts,
-and GetObjectAttributes part geometry — all covered in `hypha/tests/multipart.rs` and the s3s-e2e
-pass against MinIO.
+and GetObjectAttributes part geometry — covered in `hypha/tests/multipart.rs`, CopyObject in
+`hypha/tests/copy.rs`, and the s3s-e2e pass against MinIO.
 
 **Phase 3a — the keyspace split (§6), a prerequisite for v1 LIST. Done (vs. MinIO).** Sequenced
 ahead of the remaining phase-3 surface because v1's `NextMarker` is not expressible under the old

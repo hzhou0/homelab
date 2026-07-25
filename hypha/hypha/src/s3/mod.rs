@@ -5,6 +5,7 @@
 //! is durable. Phase 4 adds cached mode (ack after cache write, async background upload).
 
 mod buckets;
+mod copy;
 mod delete;
 mod get;
 mod list_head;
@@ -162,6 +163,13 @@ impl s3s::S3 for Hypha {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         self.op_complete_multipart_upload(req).await
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        self.op_copy_object(req).await
     }
 
     async fn create_bucket(
