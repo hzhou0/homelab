@@ -920,7 +920,10 @@ survived intact and the cache is authoritative; marker absent ⇒ the cache is n
 the remote is the read source of truth until a restore rebuilds it. All cache-substrate mutations —
 CreateBucket, DeleteBucket, and restore — are funnelled through a **single bucket-control actor** fed
 by a non-blocking unbounded queue, so the actor is the *sole writer* of the cache buckets and their
-serialization is **structural, not lock-based** (no per-bucket locks). The actor runs
+serialization is **structural, not lock-based** (no per-bucket locks). The one exception is
+provisioning: the restore overlay's write path may create a missing projection bucket idempotently
+(create-if-absent tolerates a race with the actor) so a write can land ahead of the actor's restore
+— it never deletes. The actor runs
 **per-bucket-serial, cross-bucket-parallel**: a worker drains one bucket's requests in arrival order
 while distinct buckets proceed concurrently, bounded by a global concurrency cap.
 
@@ -942,7 +945,8 @@ Two request classes ride the queue:
 `s3/overlay.rs`): a readiness verdict (memoized once the marker is observed) selects each op's source.
 Reads resolve a key's facts — and a LIST page's entries — from the cache tombstone namespace once
 `Ready`, or straight from the remote (facts off each object's tail trailer, common prefixes and
-pagination passing through the same client keyspace) while `Restoring`. A write to a `Restoring`
+pagination passing through the same client keyspace) while `Restoring`; an `UploadPartCopy` source
+resolves as a read of its own bucket. A write to a `Restoring`
 bucket first materializes its key from the remote into the cache under the key lock, so the normal §4
 bracket then runs against a correct tombstone. Restore is **lazy** — triggered on first access, not a
 startup scan — so a warm cache pays nothing and only touched buckets are rebuilt. On shutdown the
@@ -980,6 +984,13 @@ state, re-triggered on the next access.
   materialize-then-write with no cached-mode **pending overlay** (acked-but-unuploaded PUTs / pending
   deletes). Phase 4 must extend `s3/overlay.rs`'s `Restoring` branches with that overlay so
   read-after-write holds mid-restore in cached mode.
+- **A v2 LIST paginating across the restore flip mixes token domains.** A page fetched while
+  `Restoring` forwards the *remote's* continuation token; if the bucket flips `Ready` before the
+  next page, that token is fed to the *cache* backend, and opaque tokens aren't formally
+  interchangeable. Tokens are key-position-encoded on every backend hypha targets, so in practice
+  the flip resumes at the right position or errors once (the client re-lists); v1 is immune (its
+  marker is a key). Accepted: hypha-minted resume tokens would add a cache-backend `start_after`
+  requirement for a once-per-bucket-lifetime window.
 - **ListBuckets**: remote-served, filtered to this deployment's remote prefix and stripped back to
   client-visible names — the cache prefixes never match, so cache buckets cannot leak into the
   listing even when both backends share one account.
@@ -1073,8 +1084,13 @@ over the one bucket's keyspace:
 2. For each remote key with no cache entry (a surviving delete-tombstone counts as present, so
    pending deletes aren't resurrected), write an eviction tombstone + twin. Facts come from the
    object's authenticated tail trailer — one bounded suffix GET per key, single-part and
-   composite alike (§6). An object whose trailer fails to verify was never written through
-   hypha and is deleted.
+   composite alike (§6). An object whose trailer fails to verify is **fatal**: hypha is by
+   assumption the only writer of the remote buckets, so a verify failure means either something
+   else holds write access or this process carries the wrong trailer key / an unknown format —
+   in every case hypha's picture of its own data is wrong. It logs the object and exits
+   `86`, rather than deleting data it cannot authenticate or serving around it. This is the rule
+   at *every* site that reads a trailer (restore sweep, mid-restore read and LIST projection,
+   composite body reads), so no path can route around one.
 3. Write the sync marker; flip reads back to the cache.
 
 Throughput comes from sharding the keyspace — LIST chains are serial per shard — with shard

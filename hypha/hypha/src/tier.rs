@@ -169,7 +169,8 @@ impl Reconciler {
     /// Resolve a remote object's plaintext facts from its tail trailer (§6): **one speculative tail
     /// read**, single-part and composite alike — the trailer carries the complete facts either way,
     /// and its kind/count distinguish the two. Mid-bracket reads, repair, and the restore sweep all
-    /// resolve through here. The HEAD supplies the mtime fallback only.
+    /// resolve through here. The HEAD supplies the mtime fallback only. A trailer that does not
+    /// authenticate breaks the sole-writer assumption and is fatal ([`hypha_core::fatal`]).
     pub(crate) async fn remote_facts(
         &self,
         bucket: &str,
@@ -181,10 +182,9 @@ impl Reconciler {
             .map(|t| t.to_millis().unwrap_or_default())
             .unwrap_or_else(now_ms);
 
-        let tail = self
-            .read_tail(bucket, key)
-            .await?
-            .ok_or_else(|| bad_facts(key))?;
+        let Some(tail) = self.read_tail(bucket, key).await? else {
+            hypha_core::fatal::foreign_object(bucket, key)
+        };
         let f = &tail.footer;
         Ok(RemoteFacts {
             plen: f.plen,
@@ -366,10 +366,6 @@ impl Reconciler {
         futures::future::try_join_all(deletes).await?;
         Ok(())
     }
-}
-
-fn bad_facts(key: &str) -> Error {
-    Error::Backend(format!("remote object {key:?} carries no hypha facts"))
 }
 
 /// Total object length from a `Content-Range: bytes <start>-<end>/<total>` header (the response to

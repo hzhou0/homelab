@@ -25,7 +25,7 @@ use hypha_core::meta;
 use hypha_format::offset::{ciphertext_len, plaintext_len_from, HLEN};
 use hypha_format::{encode_trailer, Footer, FooterKind};
 
-use super::get::facts_from_tombstone;
+use super::overlay::KeyState;
 use super::{resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT};
 use crate::codec;
 use crate::tier::{self, RemoteFacts};
@@ -55,7 +55,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.prepare_write(&bucket, &key).await?;
+        self.check_bucket(&bucket).await?;
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
 
         let created = self
@@ -98,7 +98,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.prepare_write(&bucket, &key).await?;
+        self.check_bucket(&bucket).await?;
         let part_number = input.part_number;
         if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
             return Err(s3_error!(
@@ -278,7 +278,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.prepare_write(&bucket, &key).await?;
+        self.check_bucket(&bucket).await?;
 
         let part_number = input.part_number;
         if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
@@ -302,32 +302,22 @@ impl Hypha {
             Err(e) => return Err(e.into()),
         }
 
-        // Resolve the source's facts + residency exactly as a read would (§7): a tombstone carries
-        // them in its metadata, a leftover mark repairs from the remote, a live cache body reports
-        // them natively.
-        let src_head = self.data().head(&src_bucket, &src_key).await?;
-        let src_md = src_head.metadata.clone().unwrap_or_default();
-        let (facts, live) = match meta::tomb_kind(&src_md) {
-            Some(meta::TombKind::Delete) => {
-                return Err(s3_error!(NoSuchKey, "copy source does not exist"))
-            }
-            Some(meta::TombKind::Evict) => (facts_from_tombstone(&src_key, &src_md)?, false),
-            Some(meta::TombKind::Transit) => {
-                match self.resolve_transit(&src_bucket, &src_key).await? {
-                    None => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
-                    Some(f) => (f, false),
-                }
-            }
-            None => (
+        // Resolve the source's facts + residency through the restore overlay, exactly as a read
+        // would (§7): a live cache body reports natively, anything else resolves remote-side —
+        // including a source bucket that is itself mid-restore.
+        let (facts, live) = match self.resolve_key(&src_bucket, &src_key).await? {
+            KeyState::Absent => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
+            KeyState::Remote { facts, .. } => (facts, false),
+            KeyState::CacheBody { head, .. } => (
                 RemoteFacts {
-                    plen: src_head.content_length.unwrap_or(0).max(0) as u64,
-                    cetag: src_head
+                    plen: head.content_length.unwrap_or(0).max(0) as u64,
+                    cetag: head
                         .e_tag
                         .as_deref()
                         .unwrap_or_default()
                         .trim_matches('"')
                         .to_string(),
-                    mtime_ms: src_head
+                    mtime_ms: head
                         .last_modified
                         .and_then(|t| t.to_millis().ok())
                         .unwrap_or_default(),
@@ -658,7 +648,7 @@ impl Hypha {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         let input = req.input;
-        self.prepare_write(&input.bucket, &input.key).await?;
+        self.check_bucket(&input.bucket).await?;
         match self
             .remote()
             .abort_multipart(&input.bucket, &input.key, &input.upload_id)

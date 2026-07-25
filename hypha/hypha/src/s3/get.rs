@@ -180,9 +180,9 @@ impl Hypha {
         if meta::is_composite_etag(cetag) {
             // The trailer's parts table (recovered in one tail read) gives every part's ciphertext
             // window and plaintext length — no remote part-index calls.
-            let tail = self.tier.read_tail(bucket, key).await?.ok_or_else(|| {
-                Error::Backend(format!("composite {key:?} carries no hypha trailer"))
-            })?;
+            let Some(tail) = self.tier.read_tail(bucket, key).await? else {
+                hypha_core::fatal::foreign_object(bucket, key)
+            };
             Ok(match &pt {
                 // Whole object: one GET of the concatenated parts, decrypted part-by-part in-stream.
                 None => {
@@ -278,9 +278,9 @@ impl Hypha {
         // lengths from the trailer's table (§6); the parts paginate like ListParts.
         let object_parts =
             if want(ObjectAttributes::OBJECT_PARTS) && meta::is_composite_etag(&facts.cetag) {
-                let tail = self.tier.read_tail(&bucket, &key).await?.ok_or_else(|| {
-                    Error::Backend(format!("composite {key:?} carries no hypha trailer"))
-                })?;
+                let Some(tail) = self.tier.read_tail(&bucket, &key).await? else {
+                    hypha_core::fatal::foreign_object(&bucket, &key)
+                };
                 Some(build_object_parts(
                     &tail.plens,
                     input.part_number_marker,

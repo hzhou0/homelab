@@ -96,7 +96,9 @@ async fn bucket_cache_loss_restores_from_remote() {
     let client = h.client();
 
     let keys = ["a/1", "a/2", "b/3"];
-    let bodies: Vec<Vec<u8>> = (0..keys.len()).map(|i| pattern_seeded(48, i as u8)).collect();
+    let bodies: Vec<Vec<u8>> = (0..keys.len())
+        .map(|i| pattern_seeded(48, i as u8))
+        .collect();
     for (k, body) in keys.iter().zip(&bodies) {
         put(&client, B, k, body).await;
     }
@@ -121,17 +123,207 @@ async fn bucket_cache_loss_restores_from_remote() {
     let client = h.client();
     for (k, body) in keys.iter().zip(&bodies) {
         let got = client.get_object().bucket(B).key(*k).send().await;
-        let data = got.expect("get mid-restore").body.collect().await.unwrap().to_vec();
-        assert_eq!(&data, body, "restore-overlay GET returned the wrong body for {k}");
+        let data = got
+            .expect("get mid-restore")
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .to_vec();
+        assert_eq!(
+            &data, body,
+            "restore-overlay GET returned the wrong body for {k}"
+        );
     }
 
     // The background restore rebuilds the cache and writes the marker last. Poll for it.
-    let marker = "\u{1}\u{1}s";
+    wait_for_sync_marker(&h, B).await;
+
+    // Cache is authoritative again: one rebuilt tombstone per key in <data>, GET still correct.
+    let rebuilt = raw_list(&raw, &h.cache_bucket(B), None).await;
+    assert_eq!(
+        rebuilt.len(),
+        keys.len(),
+        "restore rebuilt one tombstone per key"
+    );
+    for (k, body) in keys.iter().zip(&bodies) {
+        let got = client.get_object().bucket(B).key(*k).send().await;
+        let data = got
+            .expect("get after restore")
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .to_vec();
+        assert_eq!(
+            &data, body,
+            "post-restore GET returned the wrong body for {k}"
+        );
+    }
+}
+
+/// Whole-volume loss — the cache buckets themselves are gone, not just their contents (§7's "lost
+/// whole or not at all"). The overlay still serves (GET + LIST from the remote, a write
+/// materializes through `prepare_write`), and the restore re-provisions the buckets.
+#[tokio::test]
+async fn bucket_cache_volume_loss_restores_from_remote() {
+    let mut h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let keys = ["a/1", "a/2", "b/3"];
+    let bodies: Vec<Vec<u8>> = (0..keys.len())
+        .map(|i| pattern_seeded(48, i as u8))
+        .collect();
+    let mut etags = Vec::new();
+    for (k, body) in keys.iter().zip(&bodies) {
+        etags.push(put(&client, B, k, body).await);
+    }
+
+    let raw = h.raw();
+    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
+        for key in raw_list(&raw, &cache, None).await {
+            raw.delete_object()
+                .bucket(&cache)
+                .key(&key)
+                .send()
+                .await
+                .expect("wipe cache object");
+        }
+        raw.delete_bucket()
+            .bucket(&cache)
+            .send()
+            .await
+            .expect("wipe cache bucket");
+    }
+
+    h.restart_hypha().await;
+    let client = h.client();
+
+    // Mid-restore the remote is the read source of truth: GET returns the real bodies, and LIST
+    // projects the remote page with facts off each object's trailer. (The LIST may land either
+    // side of the restore flip — the projected entries are identical, so the assertion holds.)
+    for (k, body) in keys.iter().zip(&bodies) {
+        assert_eq!(
+            &get_all(&client, B, k).await,
+            body,
+            "mid-restore GET wrong for {k}"
+        );
+    }
+    let page = client
+        .list_objects_v2()
+        .bucket(B)
+        .send()
+        .await
+        .expect("mid-restore LIST");
+    let mut listed: Vec<(String, i64, String)> = page
+        .contents()
+        .iter()
+        .map(|o| {
+            (
+                o.key().unwrap_or_default().to_string(),
+                o.size().unwrap_or_default(),
+                o.e_tag().unwrap_or_default().trim_matches('"').to_string(),
+            )
+        })
+        .collect();
+    listed.sort();
+    let mut want: Vec<(String, i64, String)> = keys
+        .iter()
+        .zip(&bodies)
+        .zip(&etags)
+        .map(|((k, b), e)| (k.to_string(), b.len() as i64, e.clone()))
+        .collect();
+    want.sort();
+    assert_eq!(listed, want, "mid-restore LIST projected the wrong entries");
+
+    // A write mid-restore materializes its key (re-provisioning the buckets if it wins the race
+    // with the sweep) and commits normally.
+    let new_body = pattern_seeded(64, 9);
+    put(&client, B, "c/4", &new_body).await;
+    assert_eq!(get_all(&client, B, "c/4").await, new_body);
+
+    wait_for_sync_marker(&h, B).await;
+
+    let mut rebuilt = raw_list(&raw, &h.cache_bucket(B), None).await;
+    rebuilt.sort();
+    assert_eq!(
+        rebuilt,
+        vec!["a/1", "a/2", "b/3", "c/4"],
+        "one tombstone per key after restore"
+    );
+    assert_eq!(get_all(&client, B, "c/4").await, new_body);
+    for (k, body) in keys.iter().zip(&bodies) {
+        assert_eq!(
+            &get_all(&client, B, k).await,
+            body,
+            "post-restore GET wrong for {k}"
+        );
+    }
+}
+
+/// hypha is by assumption the only writer of the remote buckets (§7), so an object whose tail
+/// trailer does not authenticate means that assumption is broken — foreign writes, or the wrong
+/// trailer key. hypha refuses to guess: it logs the object and exits `EXIT_FOREIGN_OBJECT` rather
+/// than deleting data it cannot authenticate or serving around it. Runs the real binary, since the
+/// fatal path is `process::exit` — which also proves it fires from the background restore actor,
+/// where a panic would only have killed the task.
+#[tokio::test]
+async fn foreign_remote_object_terminates_hypha() {
+    let mut h = Harness::durable_subprocess().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    put(&client, B, "mine", &pattern(32)).await;
+
+    // Out-of-band write straight into the remote bucket: no age envelope, no trailer.
+    let raw = h.raw();
+    raw.put_object()
+        .bucket(h.remote_bucket(B))
+        .key("foreign")
+        .body(bytes_body(b"not written through hypha"))
+        .send()
+        .await
+        .expect("put foreign object");
+
+    // Drop the cache (marker included) so the next access to B triggers a restore sweep, and
+    // restart so hypha re-reads readiness instead of trusting its in-memory ready set.
+    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
+        for key in raw_list(&raw, &cache, None).await {
+            raw.delete_object()
+                .bucket(&cache)
+                .key(&key)
+                .send()
+                .await
+                .expect("wipe cache object");
+        }
+    }
+    h.restart_hypha().await;
+
+    // Kick the restore with a read of the *good* key — it resolves fine off its own trailer, so
+    // only the background sweep can reach `foreign`. Tolerate a failure: the sweep runs
+    // concurrently and may take the process down mid-request.
+    let _ = h.client().get_object().bucket(B).key("mine").send().await;
+
+    let status = h
+        .child()
+        .wait_exit(std::time::Duration::from_secs(20))
+        .await;
+    assert_eq!(
+        status.code(),
+        Some(hypha_core::fatal::EXIT_FOREIGN_OBJECT),
+        "hypha should exit EXIT_FOREIGN_OBJECT on an unverifiable remote object"
+    );
+}
+
+/// Poll for a bucket's sync marker on the raw backend. The restore is lazy — some hypha op must
+/// already have run against the bucket to trigger it; this only observes the outcome.
+async fn wait_for_sync_marker(h: &Harness, bucket: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while raw
+    while h
+        .raw()
         .head_object()
-        .bucket(h.meta_bucket(B))
-        .key(marker)
+        .bucket(h.meta_bucket(bucket))
+        .key("\u{1}\u{1}s")
         .send()
         .await
         .is_err()
@@ -141,15 +333,6 @@ async fn bucket_cache_loss_restores_from_remote() {
             "restore never rewrote the sync marker"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    // Cache is authoritative again: one rebuilt tombstone per key in <data>, GET still correct.
-    let rebuilt = raw_list(&raw, &h.cache_bucket(B), None).await;
-    assert_eq!(rebuilt.len(), keys.len(), "restore rebuilt one tombstone per key");
-    for (k, body) in keys.iter().zip(&bodies) {
-        let got = client.get_object().bucket(B).key(*k).send().await;
-        let data = got.expect("get after restore").body.collect().await.unwrap().to_vec();
-        assert_eq!(&data, body, "post-restore GET returned the wrong body for {k}");
     }
 }
 

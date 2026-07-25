@@ -156,11 +156,146 @@ impl Drop for Hypha {
     }
 }
 
+// ── hypha, as a real subprocess ────────────────────────────────────────────────────────────────
+
+/// hypha run as the shipped binary in its own process, configured through the `HYPHA_` env layer
+/// `Config::load` reads. Needed only where a test asserts *process-level* behaviour — a fatal exit
+/// (`hypha_core::fatal`) would take the test runner down with it in-process.
+pub struct ChildHypha {
+    child: Child,
+    pub endpoint: String,
+}
+
+impl ChildHypha {
+    /// Spawn the binary against `config` and wait for it to accept requests. `config.serving.listen`
+    /// must already name a free port.
+    async fn start(config: &Config) -> Self {
+        let listen = config.serving.listen.clone();
+        let child = Command::new(env!("CARGO_BIN_EXE_hypha"))
+            .envs(config_env(config))
+            // A stray `hypha.toml` in the crate dir would otherwise layer under the env config.
+            .current_dir(std::env::temp_dir())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawning the hypha binary");
+
+        let hypha = Self {
+            child,
+            endpoint: format!("http://{listen}"),
+        };
+        hypha.await_ready().await;
+        hypha
+    }
+
+    async fn await_ready(&self) {
+        let client = s3_client(&self.endpoint, HYPHA_ACCESS, HYPHA_SECRET);
+        for _ in 0..120 {
+            if client.list_buckets().send().await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("hypha at {} did not become ready within 12s", self.endpoint);
+    }
+
+    /// Block until the process exits, returning its status. Panics on timeout (with the child
+    /// killed), so a test asserting termination fails loudly instead of hanging.
+    pub async fn wait_exit(&mut self, within: Duration) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            match self.child.try_wait().expect("wait on hypha") {
+                Some(status) => return status,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!("hypha did not exit within {within:?}");
+                }
+                None => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for ChildHypha {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// `config` as the `HYPHA_`-prefixed environment `Config::load` parses (`__` nests).
+fn config_env(config: &Config) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = HashMap::new();
+    for (role, ep) in [("REMOTE", &config.remote), ("CACHE", &config.cache)] {
+        env.insert(format!("HYPHA_{role}__ENDPOINT"), ep.endpoint.clone());
+        env.insert(format!("HYPHA_{role}__REGION"), ep.region.clone());
+        env.insert(format!("HYPHA_{role}__ACCESS_KEY"), ep.access_key.clone());
+        env.insert(format!("HYPHA_{role}__SECRET_KEY"), ep.secret_key.clone());
+        env.insert(
+            format!("HYPHA_{role}__BUCKET_PREFIX"),
+            ep.bucket_prefix.clone(),
+        );
+    }
+    env.insert(
+        "HYPHA_CACHE_META_PREFIX".into(),
+        config.cache_meta_prefix.clone(),
+    );
+    env.insert(
+        "HYPHA_MODE".into(),
+        match config.mode {
+            Mode::Durable => "durable".into(),
+            Mode::Cached => "cached".into(),
+        },
+    );
+    env.insert(
+        "HYPHA_AUTH__ACCESS_KEY".into(),
+        config.auth.access_key.clone(),
+    );
+    env.insert(
+        "HYPHA_AUTH__SECRET_KEY".into(),
+        config.auth.secret_key.clone(),
+    );
+    env.insert(
+        "HYPHA_MASTER_PASSPHRASE".into(),
+        config.master_passphrase.clone(),
+    );
+    env.insert(
+        "HYPHA_SERVING__LISTEN".into(),
+        config.serving.listen.clone(),
+    );
+    env.insert(
+        "HYPHA_SERVING__OFFLOAD_THRESHOLD".into(),
+        config.serving.offload_threshold.to_string(),
+    );
+    env
+}
+
 // ── The harness ──────────────────────────────────────────────────────────────────────────────
+
+/// How the hypha under test is running. In-process is the default — cheaper and directly
+/// debuggable; a child process is only for assertions about the process itself.
+pub enum Server {
+    InProcess(Hypha),
+    Child(ChildHypha),
+}
+
+impl Server {
+    fn endpoint(&self) -> &str {
+        match self {
+            Server::InProcess(h) => &h.endpoint,
+            Server::Child(h) => &h.endpoint,
+        }
+    }
+}
 
 pub struct Harness {
     pub minio: Minio,
-    pub hypha: Hypha,
+    pub hypha: Server,
     pub config: Config,
 }
 
@@ -170,21 +305,32 @@ impl Harness {
         Self::with_mode(Mode::Durable).await
     }
 
+    /// The same deployment with hypha as a real subprocess — for tests that assert on how the
+    /// process itself lives or dies.
+    pub async fn durable_subprocess() -> Self {
+        let minio = Minio::start().await;
+        let mut config = base_config(&minio, Mode::Durable);
+        config.serving.listen = format!("127.0.0.1:{}", free_port());
+        let hypha = Server::Child(ChildHypha::start(&config).await);
+        Self {
+            minio,
+            hypha,
+            config,
+        }
+    }
+
+    /// The child process, for tests driving it directly. Panics on an in-process harness.
+    pub fn child(&mut self) -> &mut ChildHypha {
+        match &mut self.hypha {
+            Server::Child(h) => h,
+            Server::InProcess(_) => panic!("harness is running hypha in-process"),
+        }
+    }
+
     pub async fn with_mode(mode: Mode) -> Self {
         let minio = Minio::start().await;
-        let config = Config {
-            remote: endpoint_cfg(&minio.endpoint, REMOTE_PREFIX),
-            cache: endpoint_cfg(&minio.endpoint, CACHE_PREFIX),
-            cache_meta_prefix: META_PREFIX.to_string(),
-            mode,
-            auth: ClientAuth {
-                access_key: HYPHA_ACCESS.to_string(),
-                secret_key: HYPHA_SECRET.to_string(),
-            },
-            master_passphrase: MASTER_PASSPHRASE.to_string(),
-            serving: Serving::default(),
-        };
-        let hypha = Hypha::start(&config).await;
+        let config = base_config(&minio, mode);
+        let hypha = Server::InProcess(Hypha::start(&config).await);
         Self {
             minio,
             hypha,
@@ -194,7 +340,7 @@ impl Harness {
 
     /// A fresh S3 client pointed at hypha, authenticating as a hypha client.
     pub fn client(&self) -> Client {
-        s3_client(&self.hypha.endpoint, HYPHA_ACCESS, HYPHA_SECRET)
+        s3_client(self.hypha.endpoint(), HYPHA_ACCESS, HYPHA_SECRET)
     }
 
     /// A client pointed straight at the MinIO backend (root creds) — bypasses hypha.
@@ -219,8 +365,16 @@ impl Harness {
     /// Restart hypha against the same MinIO and config — models a process restart (crash/redeploy).
     /// Cache-resident state (mpu records, tombstones) persists on the backend across this.
     pub async fn restart_hypha(&mut self) {
-        self.hypha.stop().await;
-        self.hypha = Hypha::start(&self.config).await;
+        match &mut self.hypha {
+            Server::InProcess(h) => {
+                h.stop().await;
+                self.hypha = Server::InProcess(Hypha::start(&self.config).await);
+            }
+            Server::Child(h) => {
+                h.stop();
+                self.hypha = Server::Child(ChildHypha::start(&self.config).await);
+            }
+        }
     }
 
     /// Create a client bucket (hypha creates the paired cache + remote buckets).
@@ -231,6 +385,21 @@ impl Harness {
             .send()
             .await
             .expect("create bucket");
+    }
+}
+
+fn base_config(minio: &Minio, mode: Mode) -> Config {
+    Config {
+        remote: endpoint_cfg(&minio.endpoint, REMOTE_PREFIX),
+        cache: endpoint_cfg(&minio.endpoint, CACHE_PREFIX),
+        cache_meta_prefix: META_PREFIX.to_string(),
+        mode,
+        auth: ClientAuth {
+            access_key: HYPHA_ACCESS.to_string(),
+            secret_key: HYPHA_SECRET.to_string(),
+        },
+        master_passphrase: MASTER_PASSPHRASE.to_string(),
+        serving: Serving::default(),
     }
 }
 

@@ -276,9 +276,11 @@ impl Worker {
     /// a leftover projection is a cache-without-remote orphan a later restore/GC drops.
     async fn delete(&self, bucket: &str) -> Result<()> {
         self.tier.remote.delete_bucket(bucket).await?;
+        // The commit already landed, so the ready entry is stale no matter how the drain fares —
+        // drop it before, not after, or a failed drain would leave reads trusting a dead bucket.
+        self.ready.lock().unwrap().remove(bucket);
         drain_and_delete_if_exists(&self.tier.data, bucket).await?;
         drain_and_delete_if_exists(&self.tier.meta, bucket).await?;
-        self.ready.lock().unwrap().remove(bucket);
         Ok(())
     }
 
@@ -286,6 +288,11 @@ impl Worker {
     /// remote no longer holds (a stray trigger for a deleted bucket). On failure the bucket stays
     /// unready, so the next access re-triggers.
     async fn restore(&self, bucket: &str) {
+        // Triggers that arrived while another sweep (or a create) was flipping this bucket ready
+        // would re-run a full sweep over an already-authoritative namespace.
+        if self.ready.lock().unwrap().contains(bucket) {
+            return;
+        }
         if self.tier.remote.head_bucket(bucket).await.is_err() {
             return;
         }

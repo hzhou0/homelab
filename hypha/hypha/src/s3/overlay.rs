@@ -161,9 +161,18 @@ impl Hypha {
         }
     }
 
+    /// Validate a bucket exists, kicking its restore if unreconciled — the overlay hook for ops
+    /// that route around the cache entirely (the multipart part path, §7) and so have no key
+    /// state to materialize.
+    pub(super) async fn check_bucket(&self, bucket: &str) -> S3Result<()> {
+        match self.readiness(bucket).await? {
+            Readiness::Absent => Err(Error::NoSuchBucket.into()),
+            _ => Ok(()),
+        }
+    }
+
     /// Project a remote LIST page into client-visible entries while the cache restores (§7): each
-    /// object's plaintext facts come from its authenticated tail trailer, fanned out bounded. An
-    /// object with no hypha trailer (foreign / never written through hypha) is dropped. Common
+    /// object's plaintext facts come from its authenticated tail trailer, fanned out bounded. Common
     /// prefixes are pure client keyspace and pass through. The caller forwards the remote's own
     /// pagination, so a restore-time LIST paginates exactly as the steady-state one does.
     pub(super) async fn project_remote_page(
@@ -175,10 +184,11 @@ impl Hypha {
         let keys: Vec<String> = objs.into_iter().filter_map(|o| o.key).collect();
         let mut entries: Vec<Object> = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(REMOTE_LIST_FANOUT) {
-            let batch =
-                futures::future::try_join_all(chunk.iter().map(|k| self.remote_list_entry(bucket, k)))
-                    .await?;
-            entries.extend(batch.into_iter().flatten());
+            let batch = futures::future::try_join_all(
+                chunk.iter().map(|k| self.remote_list_entry(bucket, k)),
+            )
+            .await?;
+            entries.extend(batch);
         }
         let common_prefixes = raw_prefixes
             .into_iter()
@@ -187,15 +197,19 @@ impl Hypha {
         Ok((entries, common_prefixes))
     }
 
-    /// One remote LIST entry's client-visible facts, off its tail trailer. `None` if the object
-    /// carries no hypha trailer.
-    async fn remote_list_entry(&self, bucket: &str, key: &str) -> Result<Option<Object>, Error> {
-        Ok(self.tier.read_tail(bucket, key).await?.map(|tail| Object {
+    /// One remote LIST entry's client-visible facts, off its tail trailer. A trailer that does not
+    /// authenticate is fatal ([`hypha_core::fatal`]) — hypha is the only writer of these buckets, so
+    /// the object cannot be dismissed as foreign junk.
+    async fn remote_list_entry(&self, bucket: &str, key: &str) -> Result<Object, Error> {
+        let Some(tail) = self.tier.read_tail(bucket, key).await? else {
+            hypha_core::fatal::foreign_object(bucket, key)
+        };
+        Ok(Object {
             key: Some(key.to_string()),
             size: Some(tail.footer.plen as i64),
             e_tag: Some(ETag::Strong(tail.footer.client_etag())),
             last_modified: Some(ts_ms(tail.footer.mtime_ms.max(0))),
             ..Default::default()
-        }))
+        })
     }
 }

@@ -16,3 +16,4 @@ md-5 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 percent-encoding = { workspace = true }
+tracing = { workspace = true }
