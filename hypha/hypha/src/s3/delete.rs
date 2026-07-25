@@ -37,17 +37,16 @@ impl Hypha {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        if self.mode != Mode::Durable {
-            return Err(s3_error!(
-                NotImplemented,
-                "cached-mode DeleteObject pending"
-            ));
-        }
 
         // Overlay (§7): serving is never gated — materialize K from the remote if restoring.
         self.prepare_write(&bucket, &key).await?;
 
-        let _guard = self.tier.locks.lock(&key).await;
+        if self.mode == Mode::Cached {
+            self.commit_cached_delete(&bucket, &key).await?;
+            return Ok(S3Response::new(DeleteObjectOutput::default()));
+        }
+
+        let _guard = self.write_lock(&bucket, &key).await;
 
         self.repair_leftover_mark_locked(&bucket, &key).await?;
 
@@ -91,11 +90,10 @@ impl Hypha {
                 "DeleteObjects takes between 1 and 1000 objects"
             ));
         }
-        if self.mode != Mode::Durable {
-            return Err(s3_error!(
-                NotImplemented,
-                "cached-mode DeleteObjects pending"
-            ));
+        if self.mode == Mode::Cached {
+            return self
+                .op_delete_objects_cached(bucket, quiet, requested)
+                .await;
         }
 
         // Per-key failures land here; a key absent from the map at the end succeeded.
@@ -124,7 +122,7 @@ impl Hypha {
         // Sequentially, in sorted order — the deadlock-freedom argument is the acquisition order.
         let mut guards = Vec::with_capacity(keys.len());
         for key in &keys {
-            guards.push(self.tier.locks.lock(key).await);
+            guards.push(self.write_lock(&bucket, key).await);
         }
 
         // Mark each key, dropping any that couldn't be masked: an unmasked key must stay out of
@@ -188,6 +186,103 @@ impl Hypha {
             errors: (!errors.is_empty()).then_some(errors),
             ..Default::default()
         }))
+    }
+
+    /// Cached-mode DeleteObjects (§7): the remote isn't touched here, so there is nothing to batch —
+    /// it is a per-key fan-out of the cached single delete (its own write lock, tombstone + marker),
+    /// with reconcile propagating the remote deletes (and where the remote-batching opportunity
+    /// lives). Same S3 contract as durable: deleting an absent key succeeds, `VersionId` is ignored.
+    async fn op_delete_objects_cached(
+        &self,
+        bucket: String,
+        quiet: bool,
+        requested: Vec<String>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let mut failed: HashMap<String, BatchDeleteError> = HashMap::new();
+
+        // Dedup so a key repeated in one request doesn't wait on the lock it already holds; the reply
+        // is still built per *requested* entry. Admission rejects per key, the rest still commit.
+        let mut keys: Vec<String> = requested.clone();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.retain(|key| match meta::validate_client_key(key) {
+            Ok(()) => true,
+            Err(why) => {
+                failed.insert(key.clone(), batch_error(key, "InvalidArgument", why));
+                false
+            }
+        });
+
+        for key in &keys {
+            self.prepare_write(&bucket, key).await?;
+        }
+
+        let bucket = bucket.as_str();
+        let outcomes = futures::stream::iter(keys)
+            .map(|key| async move {
+                let r = self.commit_cached_delete(bucket, &key).await;
+                (key, r)
+            })
+            .buffer_unordered(BATCH_FANOUT)
+            .collect::<Vec<_>>()
+            .await;
+        for (key, outcome) in outcomes {
+            if let Err(e) = outcome {
+                failed.insert(
+                    key.clone(),
+                    batch_error(&key, "InternalError", &e.to_string()),
+                );
+            }
+        }
+
+        let mut deleted = Vec::new();
+        let mut errors = Vec::new();
+        for key in requested {
+            match failed.get(&key) {
+                Some(e) => errors.push(s3s::dto::Error {
+                    code: Some(e.code.clone()),
+                    message: Some(e.message.clone()),
+                    key: Some(key),
+                    version_id: None,
+                }),
+                None if !quiet => deleted.push(DeletedObject {
+                    key: Some(key),
+                    ..Default::default()
+                }),
+                None => {}
+            }
+        }
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted: (!deleted.is_empty()).then_some(deleted),
+            errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        }))
+    }
+
+    /// Cached-mode delete of one key (§7), under its write lock: overwrite K with the delete-tombstone
+    /// — the commit, which the caller acks on (GET/HEAD 404 and LIST omits K immediately, and the mask
+    /// keeps a crash from resurrecting K from the remote before the delete propagates) — and hand the
+    /// pending-delete marker to the marker queue, same ack rule as the cached PUT. The reconcile sweep's
+    /// delete branch does the remote `DeleteObject` and clears both.
+    async fn commit_cached_delete(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        let _guard = self.write_lock(bucket, key).await;
+
+        let mut tomb_md = HashMap::new();
+        tomb_md.insert(meta::TOMB.to_string(), meta::TOMB_DELETE.to_string());
+        self.data()
+            .put_small(
+                bucket,
+                key,
+                meta::DELETE_SENTINEL.to_vec(),
+                tomb_md,
+                None,
+                None,
+            )
+            .await?;
+        // Marker body = the intended cache ETag (the delete sentinel's), mirroring the PUT marker; the
+        // reconcile classifies K from the *data* body, so only the marker's own ETag (M_etag) matters.
+        self.markers.owe(bucket, key, meta::delete_sentinel_etag());
+        Ok(())
     }
 
     /// Mark every key of a batch, returning those that carry a mark and so belong in the commit.

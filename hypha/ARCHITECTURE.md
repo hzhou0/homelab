@@ -239,9 +239,13 @@ completion-time re-encryption pass.
 
 ## Data path
 
-- **PUT** (single-object) → in a cached deployment, write plaintext to the cache, write a pending
-  marker, and ack; a background reconcile pass frame-encrypts and uploads to the remote (write-through
-  async). In a durable deployment, frame-encrypt and upload straight to the remote — the commit —
+- **PUT** (single-object) → in a cached deployment, write plaintext to the cache and ack — that write
+  is the commit — then queue a pending marker naming the key; a background reconcile pass
+  frame-encrypts and uploads to the remote (write-through
+  async). The marker is only an index over the pending set: it makes the sweep proportional to the
+  keys awaiting upload rather than to the whole namespace, and a marker lost to a crash is
+  rediscovered by comparing cache against remote, so it delays durability rather than costing the
+  write. In a durable deployment, frame-encrypt and upload straight to the remote — the commit —
   with the key marked in-transition so readers resolve it from the remote and never see torn
   state; then settle the cache tombstone and ack.
 - **UploadPart** → routed around the cache in both deployments: frame-encrypt and stream straight to
@@ -267,7 +271,8 @@ completion-time re-encryption pass.
   (acked only once both confirm) regardless of mode, and `HeadBucket`/`ListBuckets` are answered
   from the remote, not the cache.
 - **DELETE** → in a cached deployment, overwrite the local body at K with a delete-tombstone (so
-  GET answers 404 and LIST omits K) and write a pending marker; the background reconcile propagates
+  GET answers 404 and LIST omits K) and ack; the tombstone is the commit and a marker follows it as
+  for a PUT. The background reconcile propagates
   `DeleteObject` to the remote, then clears marker and tombstone — the mask keeps the local
   namespace authoritative and a crash mid-delete cannot resurrect the object. In a durable
   deployment the remote delete is the commit: K is marked in-transition (readers keep seeing the
@@ -305,14 +310,15 @@ pluggable *usage source* (below) — against a high-water and low-water mark:
   copy is durable, deletes the local body from the cache, and leaves a **tombstone** — the
   metadata stays, marking the body as remote-only.
 - Recency is tracked by an in-memory **Bloom-ring sketch** (one filter per fill window — a slice
-  rotates when enough distinct keys have been touched — fed by GET/HEAD,
+  rotates when enough distinct keys have been touched — fed by reads *and* writes: GET/HEAD and
+  PUT/complete/copy, but never LIST, which would mark a whole bucket hot;
   sealed slices persisted to the cache). The newest slice containing a key quantizes its
   last-access age, so eviction works coldest-first: keys the ring has no memory of, then
   progressively younger age buckets until the target is met, LastModified breaking ties within a
   bucket. If the sketch is lost or absent (first boot), every key falls into one bucket and
   eviction degrades to LastModified alone — churnier for one cycle, never incorrect.
-- Reading a tombstoned object rehydrates it (optionally) and refreshes its LRU position, so working sets
-  stay hot and cold data drifts out to the remote.
+- Reading a tombstoned object rehydrates it (optionally); reading *or* writing any object refreshes
+  its recency position, so working sets stay hot and cold data drifts out to the remote.
 - The same pass reclaims orphaned age files from aborted multipart uploads.
 
 **Usage source (pluggable).** How hypha measures cache usage is an interface with several

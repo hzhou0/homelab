@@ -26,7 +26,7 @@ async fn main() -> Result<(), BoxError> {
     let config = Config::load().map_err(ctx("loading config"))?;
     tracing::info!(mode = ?config.mode, "hypha starting");
 
-    let service = build_service(&config)?;
+    let (service, lifecycle) = build_service(&config)?;
 
     let listener = TcpListener::bind(&config.serving.listen)
         .await
@@ -42,5 +42,5 @@ async fn main() -> Result<(), BoxError> {
         }
     };
 
-    serve(listener, service, shutdown).await
+    serve(listener, service, lifecycle, shutdown).await
 }

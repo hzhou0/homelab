@@ -21,14 +21,15 @@ use std::ops::Range as ByteRange;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 
+use hypha_core::config::Mode;
 use hypha_core::error::Error;
 use hypha_core::meta;
-use hypha_format::SINGLE_TRAILER_LEN;
 
 use super::overlay::KeyState;
 use super::{ts_ms, Hypha};
-use crate::codec::{self, PartSegment};
-use crate::tier::RemoteFacts;
+use crate::background;
+use crate::codec;
+use crate::tier::{shadow_matches, RemoteFacts};
 
 impl Hypha {
     pub(super) async fn op_get_object(
@@ -45,12 +46,103 @@ impl Hypha {
         match self.resolve_key(&bucket, &key).await? {
             KeyState::Absent => Err(Error::NotFound.into()),
             KeyState::Remote { facts, md } => {
-                self.serve_remote(&bucket, &key, &input, &facts, &md).await
+                // Cached mode promotes an eviction-tombstoned read back into the cache (§8): probe the
+                // shadow for a composite, else serve from the remote and kick an async rehydrate. A
+                // transition mark or a restoring bucket resolves from the remote with no rehydrate.
+                if self.mode == Mode::Cached && meta::tomb_kind(&md) == Some(meta::TombKind::Evict)
+                {
+                    self.serve_evicted_cached(&bucket, &key, &input, &facts, &md)
+                        .await
+                } else {
+                    self.serve_remote(&bucket, &key, &input, &facts, &md).await
+                }
             }
             KeyState::CacheBody { md, .. } => {
                 self.serve_cache_body(&bucket, &key, &input, &md).await
             }
         }
+    }
+
+    /// Serve an eviction-tombstoned key in cached mode, rehydrating (§8). A composite is probed in the
+    /// shadow body first and served on a verified hit; on a miss — or for a single-part object — the
+    /// read is served from the remote and a rehydrate is queued on the background actor
+    /// ([`crate::background`]) to land the plaintext (single-part into K, composite into the shadow)
+    /// so the next read is a cache hit. Submitting is a map insert plus a `try_send` and never
+    /// blocks: the read owes the client bytes, not a warm cache.
+    async fn serve_evicted_cached(
+        &self,
+        bucket: &str,
+        key: &str,
+        input: &GetObjectInput,
+        facts: &RemoteFacts,
+        md: &std::collections::HashMap<String, String>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        if meta::is_composite_etag(&facts.cetag) {
+            if let Some(resp) = self.try_serve_shadow(bucket, key, input, facts, md).await? {
+                return Ok(resp);
+            }
+        }
+        self.background.submit(background::Job::Rehydrate {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            cetag: facts.cetag.clone(),
+            plen: facts.plen,
+        });
+        self.serve_remote(bucket, key, input, facts, md).await
+    }
+
+    /// Serve a rehydrated composite from its shadow body, or `None` if there is no verified shadow (a
+    /// miss, or a 160-bit key-digest collision the full digest catches — §6). The shadow holds the
+    /// full plaintext, so a range maps straight through; the client-visible facts (composite ETag,
+    /// plen, mtime, pass-through metadata) come from K's tombstone, not the shadow's native fields.
+    async fn try_serve_shadow(
+        &self,
+        bucket: &str,
+        key: &str,
+        input: &GetObjectInput,
+        facts: &RemoteFacts,
+        md: &std::collections::HashMap<String, String>,
+    ) -> S3Result<Option<S3Response<GetObjectOutput>>> {
+        let shadow = meta::shadow_key(key);
+        let out = match self
+            .meta()
+            .get(bucket, &shadow, input.range.as_ref().map(range_header))
+            .await
+        {
+            Ok(o) => o,
+            Err(Error::NotFound) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // A shadow serves only if it is both K's (full-digest check, since the key is a 160-bit
+        // prefix) *and* the current generation's (its stored ETag equals the live tombstone's cetag).
+        // A superseded shadow — K overwritten by a newer composite — misses here and falls through to
+        // the remote, which re-rehydrates; without the cetag gate it would serve the old bytes under
+        // the new ETag/length.
+        if !shadow_matches(out.metadata(), key, &facts.cetag) {
+            return Ok(None);
+        }
+
+        let ranged = input.range.is_some();
+        let resp = GetObjectOutput {
+            content_length: if ranged {
+                out.content_length
+            } else {
+                Some(facts.plen as i64)
+            },
+            content_range: out.content_range,
+            e_tag: Some(ETag::Strong(facts.cetag.clone())),
+            last_modified: Some(ts_ms(facts.mtime_ms)),
+            body: Some(codec::bytestream_to_blob(out.body)),
+            metadata: Some(meta::decode_user_metadata(md)),
+            storage_class: Some(StorageClass::from(meta::storage_class(md))),
+            accept_ranges: Some("bytes".to_string()),
+            ..Default::default()
+        };
+        Ok(Some(if ranged {
+            S3Response::with_status(resp, hyper::StatusCode::PARTIAL_CONTENT)
+        } else {
+            S3Response::new(resp)
+        }))
     }
 
     /// Resolve a transition-marked K from the remote (§7): repair it if its lock is free (crash
@@ -132,6 +224,7 @@ impl Hypha {
         };
 
         let body = self
+            .tier
             .decrypt_remote_body(bucket, key, &facts.cetag, pt.clone())
             .await?;
 
@@ -165,72 +258,6 @@ impl Hypha {
             ))
         } else {
             Ok(S3Response::new(resp))
-        }
-    }
-
-    /// Decrypt a remote-resident object into a plaintext stream — the whole body, or a plaintext
-    /// sub-range `pt` (§7). Single-part goes through `decrypt_full`/`decrypt_range`; a composite
-    /// recovers its parts table from one tail read and decrypts part-by-part. Shared by GET's remote
-    /// path and UploadPartCopy's re-encrypt source read.
-    pub(super) async fn decrypt_remote_body(
-        &self,
-        bucket: &str,
-        key: &str,
-        cetag: &str,
-        pt: Option<ByteRange<u64>>,
-    ) -> Result<StreamingBlob, Error> {
-        if meta::is_composite_etag(cetag) {
-            // The trailer's parts table (recovered in one tail read) gives every part's ciphertext
-            // window and plaintext length — no remote part-index calls.
-            let Some(tail) = self.tier.read_tail(bucket, key).await? else {
-                hypha_core::fatal::foreign_object(bucket, key)
-            };
-            Ok(match &pt {
-                // Whole object: one GET of the concatenated parts, decrypted part-by-part in-stream.
-                None => {
-                    let out = self
-                        .remote()
-                        .get(
-                            bucket,
-                            key,
-                            Some(format!("bytes=0-{}", tail.body_ct_len - 1)),
-                        )
-                        .await?;
-                    let part_lens = tail.windows.iter().map(|w| w.end - w.start).collect();
-                    codec::decrypt_composite_full(self.env(), out.body, part_lens)
-                }
-                // Range: fetch only the parts it touches.
-                Some(pt) => {
-                    let segments = composite_segments(&tail.windows, &tail.plens, pt);
-                    codec::decrypt_composite(
-                        self.env(),
-                        self.remote().clone(),
-                        bucket.to_string(),
-                        key.to_string(),
-                        segments,
-                    )
-                }
-            })
-        } else {
-            Ok(match &pt {
-                None => {
-                    let out = self.remote().get(bucket, key, None).await?;
-                    let ct_len = envelope_len(key, out.content_length)?;
-                    codec::decrypt_full(self.env(), out.body, ct_len)
-                }
-                Some(pt) => {
-                    let rhead = self.remote().head(bucket, key).await?;
-                    let ct_len = envelope_len(key, rhead.content_length)?;
-                    codec::decrypt_range(
-                        self.env(),
-                        self.remote().clone(),
-                        bucket.to_string(),
-                        key.to_string(),
-                        ct_len,
-                        pt.clone(),
-                    )
-                }
-            })
         }
     }
 
@@ -341,60 +368,6 @@ fn build_object_parts(
             .then(|| parts.last().and_then(|p| p.part_number))
             .flatten(),
         parts: Some(parts),
-    }
-}
-
-/// Resolve a plaintext range against a composite's parts (§7): with per-part windows and plaintext
-/// lengths already in hand (from the trailer's parts table), clip the parts that cover `pt`.
-fn composite_segments(
-    windows: &[ByteRange<u64>],
-    plens: &[u64],
-    pt: &ByteRange<u64>,
-) -> Vec<PartSegment> {
-    let mut segs = Vec::new();
-    let mut acc = 0u64;
-    for (w, &p) in windows.iter().zip(plens) {
-        if acc >= pt.end {
-            break;
-        }
-        segs.extend(clip(w, acc, p, pt));
-        acc += p;
-    }
-    segs
-}
-
-/// The age-envelope length of a single-part remote object: its Content-Length minus the tail
-/// trailer, which must never reach the decryptor (§6).
-fn envelope_len(key: &str, content_length: Option<i64>) -> Result<u64, Error> {
-    let framed = content_length
-        .filter(|&n| n >= 0)
-        .ok_or_else(|| Error::Backend("remote response missing content-length".into()))?
-        as u64;
-    framed
-        .checked_sub(SINGLE_TRAILER_LEN as u64)
-        .ok_or_else(|| Error::Backend(format!("remote object {key:?} shorter than a trailer")))
-}
-
-/// The segment (if any) part `w` contributes to plaintext range `pt`, given the part's plaintext
-/// starts at `start_pt` and holds `part_plen` bytes.
-fn clip(
-    w: &ByteRange<u64>,
-    start_pt: u64,
-    part_plen: u64,
-    pt: &ByteRange<u64>,
-) -> Option<PartSegment> {
-    let lo = pt.start.max(start_pt);
-    let hi = pt.end.min(start_pt + part_plen);
-    if lo >= hi {
-        return None;
-    }
-    if lo == start_pt && hi == start_pt + part_plen {
-        Some(PartSegment::Whole(w.clone()))
-    } else {
-        Some(PartSegment::Partial {
-            ct: w.clone(),
-            pt: (lo - start_pt)..(hi - start_pt),
-        })
     }
 }
 

@@ -75,6 +75,17 @@ impl TombKind {
     }
 }
 
+/// Whether `body` equals one of the reserved 16-byte tombstone sentinels (§6). A client body that
+/// did would be classified as a tombstone by every (size, ETag) scan — LIST would hide it, reconcile
+/// would reap or skip it — so cached-mode writes reject such a body at the write path
+/// ([`classify_entry`] can only fire for a 16-byte object, so this is the exact set to exclude).
+pub fn is_reserved_sentinel(body: &[u8]) -> bool {
+    body.len() == 16
+        && [EVICT_SENTINEL, DELETE_SENTINEL, TRANSIT_SENTINEL]
+            .iter()
+            .any(|s| s.as_slice() == body)
+}
+
 /// Classify a cache LIST entry from its (size, ETag) pair alone (§6). `None` ⇒ a live body.
 pub fn classify_entry(size: i64, etag: &str) -> Option<TombKind> {
     if size != 16 {
@@ -176,6 +187,21 @@ pub fn decode_user_metadata(
         .collect()
 }
 
+/// The client-visible pass-through carried on a tombstone: its `x-amz-meta-*` (under [`USER_PREFIX`])
+/// and echoed storage class ([`SCLASS`]), dropping hypha's own facts (`tomb`/`plen`/`cetag`/`mtime`).
+/// Used when rehydrate promotes an eviction tombstone back to a live cache body (§8): the facts
+/// become native (size/ETag/mtime), but the pass-through must survive, and a stray `tomb` key would
+/// make [`tomb_kind`] mis-classify the live body as a tombstone.
+pub fn passthrough_metadata(
+    metadata: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    metadata
+        .iter()
+        .filter(|(k, _)| k.starts_with(USER_PREFIX) || k.as_str() == SCLASS)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// The storage class recorded on a cache object, defaulting to [`STANDARD`] — the value for
 /// anything written before the class was tracked, and for a key rebuilt from the remote.
 pub fn storage_class(metadata: &std::collections::HashMap<String, String>) -> String {
@@ -213,11 +239,23 @@ const TAG_MPU: char = 'm';
 /// Range-A tag for the per-bucket sync marker.
 const TAG_SYNC: char = 's';
 
+/// Range-A tag for the per-bucket clean marker.
+const TAG_CLEAN: char = 'c';
+
 /// Cache (`<meta><b>`): the sync marker (§6). Present iff this bucket's cache namespace has been
 /// reconciled from the remote and is therefore authoritative; its absence puts reads on the remote
 /// until the restore sweep rewrites it (§7). The presence is the whole signal — the body is empty.
 pub fn sync_marker_key() -> String {
     format!("{c}{c}{TAG_SYNC}", c = CTRL as char)
+}
+
+/// Cache (`<meta><b>`): the clean marker (§6). Present iff this bucket's pending-marker range is a
+/// *complete* account of its pending set — not an empty one; pending markers beside it are the
+/// steady state. Written only by a graceful drain, deleted for every bucket at startup before the
+/// first request is served, so its absence (the default everywhere) costs a recovery scan rather
+/// than a silently non-durable write. Presence is the whole signal — the body is empty.
+pub fn clean_marker_key() -> String {
+    format!("{c}{c}{TAG_CLEAN}", c = CTRL as char)
 }
 
 /// The `0x01 0x01 m <upload-id> 0x01` prefix every record of one upload shares — a range-A prefix
@@ -328,6 +366,45 @@ pub fn shadow_key(key: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(key.as_bytes());
     format!("{c}{c}b{}", hex::encode(&digest[..20]), c = CTRL as char)
+}
+
+/// Metadata key on a shadow body carrying the **full** SHA-256 of K (the shadow key itself is only
+/// the leading 160 bits, §6). Verified on read: a mismatch means the 160-bit key digest collided
+/// with another key's, so the hit is treated as a miss and the read falls through to the remote —
+/// turning the one catastrophic failure (serving another key's plaintext) into a cache miss.
+pub const SHADOW_KEY_DIGEST: &str = "kd";
+
+/// The full-width digest of K a shadow body stores at [`SHADOW_KEY_DIGEST`] and a rehydrated read
+/// re-derives to confirm the shadow is K's, not a 160-bit collision's.
+pub fn shadow_key_digest(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+/// Cache (`<meta><b>`): the pending marker for `key` — **bare K**, range C (§6). Its body is the
+/// body ETag of the most recently acked cache PUT, its own S3 ETag the reconciler's CAS handle;
+/// concurrent PUTs overwrite it last-writer-wins (the write-coalescing point). Bare because a marker
+/// is a durability signal, not an optimization — every admissible key has one, no threshold. Returned
+/// borrowed since it *is* the client key; a named helper so the "marker lives at bare K" fact has one
+/// home.
+pub fn pending_marker_key(key: &str) -> &str {
+    key
+}
+
+/// `start_after` for the reconcile sweep's flat marker LIST (§7): a value above every range-A/B key
+/// (all lead with `0x01`) yet below every range-C bare marker (client keys, whose first byte is
+/// ≥ `0x02` by admission), so one LIST past it enumerates only markers — `O(pending)`, never
+/// `O(evicted)`. It leads with `0x01` (hence below all client keys) then the maximum code point
+/// repeated past the longest possible `0x01`-prefixed key (a `<meta>` key is ≤ 1024 bytes; 256
+/// four-byte chars overrun that), so it sorts above them all. The sweep still filters defensively —
+/// any residual `0x01`-lead key it sees is skipped — so a boundary miscompare can never mis-handle a
+/// twin as a marker.
+pub fn marker_scan_start_after() -> String {
+    let mut s = String::from(CTRL as char);
+    for _ in 0..256 {
+        s.push('\u{10FFFF}');
+    }
+    s
 }
 
 // ── LIST facts twins (§6) ───────────────────────────────────────────────────────────────────
@@ -636,6 +713,69 @@ mod tests {
         // A twin never collides with a range-A record, whose doubled 0x01 lead parse_twin rejects.
         assert!(parse_twin(&mpu_upload_key("id")).is_none());
         assert!(parse_twin(&shadow_key("k")).is_none());
+    }
+
+    #[test]
+    fn reserved_sentinel_detection() {
+        for s in [EVICT_SENTINEL, DELETE_SENTINEL, TRANSIT_SENTINEL] {
+            assert!(is_reserved_sentinel(&s));
+        }
+        assert!(
+            !is_reserved_sentinel(&[0u8; 16]),
+            "an ordinary 16-byte body is not a sentinel"
+        );
+        // Length gate: only 16-byte bodies can collide (classify_entry requires size == 16).
+        let mut longer = EVICT_SENTINEL.to_vec();
+        longer.push(0);
+        assert!(!is_reserved_sentinel(&longer));
+        assert!(!is_reserved_sentinel(&EVICT_SENTINEL[..15]));
+    }
+
+    #[test]
+    fn marker_scan_boundary_splits_ranges() {
+        let boundary = marker_scan_start_after();
+        // Above every range-A record and range-B twin (all lead with 0x01)…
+        let f = Facts {
+            client_etag: "ab".repeat(16),
+            plen: 1,
+            mtime_ms: 1,
+        };
+        assert!(boundary > mpu_upload_key("some-upload-id"));
+        assert!(boundary > sync_marker_key());
+        assert!(boundary > clean_marker_key());
+        assert!(boundary > shadow_key("\u{10FFFF}".repeat(240).as_str()));
+        // A twin over a maximal (all-U+10FFFF) key is the hardest case for the boundary.
+        let hard = "\u{10FFFF}".repeat(240);
+        assert!(boundary > f.twin_key(&hard).unwrap());
+        // …and below every range-C bare marker (client keys start ≥ 0x02).
+        for k in ["\u{2}", "obj", "dir/obj", "\u{10FFFF}", &"z".repeat(1024)] {
+            assert!(
+                boundary.as_str() < pending_marker_key(k),
+                "boundary must precede {k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn passthrough_metadata_keeps_client_facts_only() {
+        let mut md = std::collections::HashMap::new();
+        md.insert(TOMB.to_string(), TOMB_EVICT.to_string());
+        md.insert(PLEN.to_string(), "42".to_string());
+        md.insert(CETAG.to_string(), "ab".repeat(16));
+        md.insert(MTIME.to_string(), "7".to_string());
+        md.insert(SCLASS.to_string(), "REDUCED_REDUNDANCY".to_string());
+        md.insert(format!("{USER_PREFIX}color"), "blue".to_string());
+        let kept = passthrough_metadata(&md);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(
+            kept.get(SCLASS).map(String::as_str),
+            Some("REDUCED_REDUNDANCY")
+        );
+        assert_eq!(
+            kept.get(&format!("{USER_PREFIX}color")).map(String::as_str),
+            Some("blue")
+        );
+        assert!(!kept.contains_key(TOMB));
     }
 
     #[test]

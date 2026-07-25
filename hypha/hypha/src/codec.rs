@@ -190,7 +190,6 @@ fn pump_decrypt_range(
 /// [`HLEN`], so `ciphertext_len` is exact) and no spill. Returns `(framed_len, body)`. The trailer
 /// carries the plaintext MD5, computed inline as the body streams (§6) — the reconcile path knows
 /// `plen`/mtime from the same cache GET that streams the body, so the framed facts can't disagree.
-#[allow(dead_code)] // phase 4: the reconcile sweep's cache-body → remote upload
 pub async fn encrypt_stream(
     env: Arc<Envelope>,
     plaintext: ByteStream,

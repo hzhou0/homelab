@@ -5,17 +5,20 @@
 //! same primitives (Phases 4–5).
 
 use std::collections::HashMap;
+use std::ops::Range as ByteRange;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::primitives::ByteStream;
 use hypha_format::{decode_tail, Tail, TrailerKey};
-use hypha_format::{Envelope, MAX_TAIL_LEN};
+use hypha_format::{Envelope, MAX_TAIL_LEN, SINGLE_TRAILER_LEN};
+use s3s::dto::StreamingBlob;
 
 use hypha_core::error::{Error, Result};
 use hypha_core::{meta, Backend};
 
-use crate::codec::{self, SingleTrailer};
+use crate::codec::{self, PartSegment, SingleTrailer};
 use crate::keylocks::KeyLocks;
 
 #[derive(Clone)]
@@ -28,7 +31,26 @@ pub struct Reconciler {
     pub env: Arc<Envelope>,
     /// Keys the tail trailer's authentication tag (§6); derived once from the master passphrase.
     pub trailer_key: TrailerKey,
+    /// The **write** lock table (§4): conditional writes, the durable finalize, GC tombstone
+    /// transitions, and rehydrate all serialize on it.
     pub locks: KeyLocks,
+    /// The **upload** lock table (§4) — a *second* instance, reconcile-only. Same-key reconcile
+    /// passes serialize here so an unserialized older upload can't finish after a newer one and leave
+    /// the remote stale, while a replication upload never blocks a client's conditional PUT (which
+    /// takes `locks`, not this).
+    pub upload_locks: KeyLocks,
+}
+
+/// What one reconcile upload attempt found at K (§7). The marker is cleared only on a real upload;
+/// the other two arms leave it for the pass that owns that transition.
+pub(crate) enum UploadOutcome {
+    /// A live client body was encrypted and PUT to the remote.
+    Uploaded,
+    /// K is a tombstone — a cached delete raced in under the write lock. The delete branch (driven by
+    /// the marker that delete rewrote) propagates it; this pass leaves the marker be.
+    SkippedTombstone,
+    /// K is gone from the cache entirely: the marker is an orphan to clear.
+    Vanished,
 }
 
 /// The plaintext facts of a committed remote object, read off its tail footer (§6).
@@ -227,19 +249,38 @@ impl Reconciler {
     /// GET response that streams the body, so the framed facts can never disagree with the
     /// uploaded bytes. Assumes the caller holds `key`'s lock.
     ///
-    /// Phase 4 note: the cached-mode reconciler serializes same-key passes on a dedicated per-key
-    /// *upload* lock (a second `KeyLocks` instance), not the write lock — held across the whole
-    /// upload + marker CAS. Unserialized same-key uploads can finish out of order and leave the
-    /// remote stale with an empty pending set (IMPLEMENTATION §7); the separate instance keeps a
-    /// conditional PUT from ever queuing behind a multi-second transfer.
-    #[allow(dead_code)] // phase 4: the cached-mode reconcile sweep
-    pub(crate) async fn upload_locked(&self, bucket: &str, key: &str) -> Result<()> {
-        let out = self.data.get(bucket, key, None).await?;
+    /// The reconciler serializes same-key passes on the dedicated per-key **upload** lock
+    /// ([`Self::upload_locks`]), not the write lock — held across the whole upload + marker CAS.
+    /// Unserialized same-key uploads can finish out of order and leave the remote stale with an empty
+    /// pending set (§7); the separate instance keeps a conditional PUT from ever queuing behind a
+    /// multi-second transfer.
+    ///
+    /// The cache GET yields `plen`, ETag, and body from **one** response, so the framed facts can't
+    /// disagree with the uploaded bytes. Reconcile takes only the upload lock, so a cached delete
+    /// (which takes the *write* lock) can overwrite K with a tombstone concurrently — hence the
+    /// classify guard: a sentinel body is never uploaded as if it were a client object.
+    pub(crate) async fn upload_locked(&self, bucket: &str, key: &str) -> Result<UploadOutcome> {
+        let out = match self.data.get(bucket, key, None).await {
+            Ok(o) => o,
+            Err(Error::NotFound) => return Ok(UploadOutcome::Vanished),
+            Err(e) => return Err(e),
+        };
         let plen = out.content_length().unwrap_or(0).max(0) as u64;
+        let cetag = out
+            .e_tag()
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
+        // A tombstone sentinel raced in (a concurrent cached delete under the write lock): body and
+        // ETag are the compiled sentinel, classifiable with no metadata read (§6). Don't upload it. A
+        // *client* body can't spoof this: cached PUT rejects any body equal to a sentinel at write
+        // time (`meta::is_reserved_sentinel`), so a sentinel here is always hypha's own tombstone.
+        if meta::classify_entry(plen as i64, &cetag).is_some() {
+            return Ok(UploadOutcome::SkippedTombstone);
+        }
         // Single-part client ETag == the cache's own MD5 (composites route around this path, §7);
         // the trailer recomputes it from the streamed body, so validating the shape here suffices.
-        let cetag = out.e_tag().unwrap_or_default().trim_matches('"');
-        if hex::decode(cetag).map(|b| b.len()) != Ok(16) {
+        if hex::decode(&cetag).map(|b| b.len()) != Ok(16) {
             return Err(Error::Backend(format!(
                 "cache ETag for {key:?} is not an MD5"
             )));
@@ -265,6 +306,212 @@ impl Reconciler {
                 enc,
                 Some(framed_len as i64),
                 HashMap::new(),
+                None,
+                None,
+                None,
+            )
+            .await?;
+        Ok(UploadOutcome::Uploaded)
+    }
+
+    /// **Delete branch** of the reconcile sweep (§7), under K's upload lock. A cached delete left a
+    /// delete-tombstone + a rewritten marker; propagate it: remote `DeleteObject` (the commit),
+    /// clear the delete-tombstone (conditional on the delete sentinel — a concurrent create moved the
+    /// ETag, so its 412 leaves the new body), then clear the marker (conditional on `M_etag`). The
+    /// remote delete must be serialized against same-key uploads or a stale in-flight upload could
+    /// land bytes *after* the delete and resurrect K at the next restore sweep — which the shared
+    /// upload lock ensures.
+    pub(crate) async fn propagate_delete_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        m_etag: &str,
+    ) -> Result<()> {
+        match self.remote.delete(bucket, key).await {
+            Ok(()) | Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        match self
+            .data
+            .delete_if_match(bucket, key, quote(&meta::delete_sentinel_etag()))
+            .await
+        {
+            Ok(()) | Err(Error::PreconditionFailed) | Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        self.clear_marker_cas(bucket, key, m_etag).await
+    }
+
+    /// Clear the pending marker at bare `K`, conditional on its `M_etag` (§7). A PUT that landed a
+    /// newer body mid-pass rewrote the marker, so the CAS 412s and the next pass uploads that
+    /// version — the remote is transiently one version behind, never stale with an empty pending set.
+    /// A 404 (already cleared) is equally fine.
+    pub(crate) async fn clear_marker_cas(
+        &self,
+        bucket: &str,
+        key: &str,
+        m_etag: &str,
+    ) -> Result<()> {
+        match self
+            .meta
+            .delete_if_match(bucket, meta::pending_marker_key(key), quote(m_etag))
+            .await
+        {
+            Ok(()) | Err(Error::PreconditionFailed) | Err(Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// **Rehydrate** a single-part body back to a live cache entry at K (§8): the decrypted plaintext
+    /// (streamed by the caller from the remote) overwrites the eviction tombstone, conditional on the
+    /// evict sentinel so a concurrent write/rehydrate aborts us. The sentinel ETag is constant across
+    /// generations, so the CAS alone can't see an evict→rehydrate→re-evict ABA — the caller re-reads
+    /// the tombstone's `cetag` under the lock for that ([`crate::background`]). `md` is the
+    /// tombstone's client pass-through ([`meta::passthrough_metadata`]).
+    ///
+    /// The caller drops K's twin ([`Self::delete_twins`]) once this returns, making K's facts native
+    /// again. Deliberately *not* done here: this PUT is what drives the remote fetch, so it is the
+    /// long, cancellable half of a rehydrate (§8), while the twin drop must run to completion — a
+    /// cancel between the two would leave a live body beside a stale twin (benign, ignored by the
+    /// LIST gate per §6, but debris nothing else reclaims until phase 5).
+    pub(crate) async fn land_rehydrated_single_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: ByteStream,
+        plen: u64,
+        md: HashMap<String, String>,
+    ) -> Result<()> {
+        self.data
+            .put(
+                bucket,
+                key,
+                body,
+                Some(plen as i64),
+                md,
+                None,
+                Some(quote(&meta::evict_sentinel_etag())),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Whether K's shadow body already holds the current composite generation (its stored digest and
+    /// ETag both match) — a HEAD, no body fetch. Lets a rehydrate skip re-downloading a composite an
+    /// earlier read already landed (§8).
+    pub(crate) async fn shadow_is_current(
+        &self,
+        bucket: &str,
+        key: &str,
+        cetag: &str,
+    ) -> Result<bool> {
+        match self.meta.head(bucket, &meta::shadow_key(key)).await {
+            Ok(h) => Ok(shadow_matches(h.metadata(), key, cetag)),
+            Err(Error::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Decrypt a remote-resident object into a plaintext stream — the whole body, or a plaintext
+    /// sub-range `pt` (§7). Single-part goes through `decrypt_full`/`decrypt_range`; a composite
+    /// recovers its parts table from one tail read and decrypts part-by-part. Shared by GET's remote
+    /// path, UploadPartCopy's re-encrypt source read, and the background rehydrate (§8).
+    pub(crate) async fn decrypt_remote_body(
+        &self,
+        bucket: &str,
+        key: &str,
+        cetag: &str,
+        pt: Option<ByteRange<u64>>,
+    ) -> Result<StreamingBlob> {
+        if meta::is_composite_etag(cetag) {
+            // The trailer's parts table (recovered in one tail read) gives every part's ciphertext
+            // window and plaintext length — no remote part-index calls.
+            let Some(tail) = self.read_tail(bucket, key).await? else {
+                hypha_core::fatal::foreign_object(bucket, key)
+            };
+            Ok(match &pt {
+                // Whole object: one GET of the concatenated parts, decrypted part-by-part in-stream.
+                None => {
+                    let out = self
+                        .remote
+                        .get(
+                            bucket,
+                            key,
+                            Some(format!("bytes=0-{}", tail.body_ct_len - 1)),
+                        )
+                        .await?;
+                    let part_lens = tail.windows.iter().map(|w| w.end - w.start).collect();
+                    codec::decrypt_composite_full(self.env.clone(), out.body, part_lens)
+                }
+                // Range: fetch only the parts it touches.
+                Some(pt) => {
+                    let segments = composite_segments(&tail.windows, &tail.plens, pt);
+                    codec::decrypt_composite(
+                        self.env.clone(),
+                        self.remote.clone(),
+                        bucket.to_string(),
+                        key.to_string(),
+                        segments,
+                    )
+                }
+            })
+        } else {
+            Ok(match &pt {
+                None => {
+                    let out = self.remote.get(bucket, key, None).await?;
+                    let ct_len = envelope_len(key, out.content_length)?;
+                    codec::decrypt_full(self.env.clone(), out.body, ct_len)
+                }
+                Some(pt) => {
+                    let rhead = self.remote.head(bucket, key).await?;
+                    let ct_len = envelope_len(key, rhead.content_length)?;
+                    codec::decrypt_range(
+                        self.env.clone(),
+                        self.remote.clone(),
+                        bucket.to_string(),
+                        key.to_string(),
+                        ct_len,
+                        pt.clone(),
+                    )
+                }
+            })
+        }
+    }
+
+    /// **Rehydrate** a composite into its shadow body (§8): a rehydrated composite's plaintext lives
+    /// at `sha256(K)`-keyed [`meta::shadow_key`] (a point lookup, so K's length can't constrain it),
+    /// with the full-width key digest in metadata for the read-time collision check. K's tombstone
+    /// and twin stay untouched, so composite rehydration is invisible to LIST/HEAD and rewrites no
+    /// twin. Caller holds K's write lock.
+    ///
+    /// The shadow key is deterministic in K, so a later composite at K overwrites the *same* shadow —
+    /// but a same-K key digest doesn't distinguish generations. `cetag` (the rehydrated composite's
+    /// client ETag) rides the metadata and is checked against the current tombstone on read, so a
+    /// shadow left over from a superseded generation misses and re-rehydrates rather than serving
+    /// stale bytes under the new ETag.
+    pub(crate) async fn land_shadow_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: ByteStream,
+        plen: u64,
+        cetag: &str,
+    ) -> Result<()> {
+        let mut md = HashMap::new();
+        md.insert(
+            meta::SHADOW_KEY_DIGEST.to_string(),
+            meta::shadow_key_digest(key),
+        );
+        md.insert(meta::CETAG.to_string(), cetag.to_string());
+        self.meta
+            .put(
+                bucket,
+                &meta::shadow_key(key),
+                body,
+                Some(plen as i64),
+                md,
+                None,
                 None,
                 None,
             )
@@ -372,6 +619,74 @@ impl Reconciler {
 /// a suffix-range GET). `None` if the header is malformed or the size is unknown (`*`).
 fn parse_content_range_total(cr: &str) -> Option<u64> {
     cr.rsplit_once('/')?.1.trim().parse().ok()
+}
+
+/// Whether a shadow body's metadata identifies it as K's *current* composite generation (§6/§8):
+/// the full key digest must match (the shadow key is only a 160-bit prefix) **and** the stored client
+/// ETag must equal `cetag` (the live tombstone's), so a shadow left over from a superseded generation
+/// is treated as a miss.
+pub(crate) fn shadow_matches(
+    metadata: Option<&HashMap<String, String>>,
+    key: &str,
+    cetag: &str,
+) -> bool {
+    let Some(md) = metadata else { return false };
+    md.get(meta::SHADOW_KEY_DIGEST) == Some(&meta::shadow_key_digest(key))
+        && md.get(meta::CETAG).map(String::as_str) == Some(cetag)
+}
+
+/// Resolve a plaintext range against a composite's parts (§7): with per-part windows and plaintext
+/// lengths already in hand (from the trailer's parts table), clip the parts that cover `pt`.
+fn composite_segments(
+    windows: &[ByteRange<u64>],
+    plens: &[u64],
+    pt: &ByteRange<u64>,
+) -> Vec<PartSegment> {
+    let mut segs = Vec::new();
+    let mut acc = 0u64;
+    for (w, &p) in windows.iter().zip(plens) {
+        if acc >= pt.end {
+            break;
+        }
+        segs.extend(clip(w, acc, p, pt));
+        acc += p;
+    }
+    segs
+}
+
+/// The segment (if any) part `w` contributes to plaintext range `pt`, given the part's plaintext
+/// starts at `start_pt` and holds `part_plen` bytes.
+fn clip(
+    w: &ByteRange<u64>,
+    start_pt: u64,
+    part_plen: u64,
+    pt: &ByteRange<u64>,
+) -> Option<PartSegment> {
+    let lo = pt.start.max(start_pt);
+    let hi = pt.end.min(start_pt + part_plen);
+    if lo >= hi {
+        return None;
+    }
+    if lo == start_pt && hi == start_pt + part_plen {
+        Some(PartSegment::Whole(w.clone()))
+    } else {
+        Some(PartSegment::Partial {
+            ct: w.clone(),
+            pt: (lo - start_pt)..(hi - start_pt),
+        })
+    }
+}
+
+/// The age-envelope length of a single-part remote object: its Content-Length minus the tail
+/// trailer, which must never reach the decryptor (§6).
+fn envelope_len(key: &str, content_length: Option<i64>) -> Result<u64> {
+    let framed = content_length
+        .filter(|&n| n >= 0)
+        .ok_or_else(|| Error::Backend("remote response missing content-length".into()))?
+        as u64;
+    framed
+        .checked_sub(SINGLE_TRAILER_LEN as u64)
+        .ok_or_else(|| Error::Backend(format!("remote object {key:?} shorter than a trailer")))
 }
 
 pub(crate) fn now_ms() -> i64 {

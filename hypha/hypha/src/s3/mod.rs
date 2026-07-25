@@ -16,7 +16,7 @@ mod put;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hypha_format::{Envelope, TrailerKey};
+use hypha_format::Envelope;
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
@@ -24,8 +24,10 @@ use hypha_core::config::Mode;
 use hypha_core::meta;
 use hypha_core::Backend;
 
+use crate::background::{self, Background};
 use crate::bucket_ctl::{self, BucketCtl};
-use crate::keylocks::KeyLocks;
+use crate::keylocks::Guard;
+use crate::markers::Markers;
 use crate::tier::Reconciler;
 
 #[derive(Clone)]
@@ -36,6 +38,12 @@ pub struct Hypha {
     /// The bucket-control actor — sole writer of the cache substrate (§7 *Buckets*). Bucket
     /// lifecycle and repair route here; object reads/writes never do, beyond the 503 repair kick.
     pub(crate) buckets: BucketCtl,
+    /// The background-transition actor (§8): rehydrate today, GC eviction in phase 5. Client writes
+    /// reach it only through [`Hypha::write_lock`], which cancels K's transition before queuing.
+    pub(crate) background: Background,
+    /// Pending-marker obligations (§7). A cached write acks on its body write and raises the marker
+    /// here; the ack never depends on the marker landing.
+    pub(crate) markers: Markers,
     pub mode: Mode,
     /// Longest configured bucket prefix, charged against S3's 63-byte cap so the client-visible
     /// bucket-name limit is `63 − this` (§7 *Buckets*). Checked at CreateBucket.
@@ -44,36 +52,50 @@ pub struct Hypha {
     /// an inline (non-offloaded) codec path exists — today every codec bridge offloads.
     #[allow(dead_code)]
     pub offload_threshold: usize,
+    /// Liveness sentinel shared by every `Hypha` clone: the reconcile sweep (Phase 4) holds only a
+    /// `Weak` to it and exits once the last clone drops, so the background task stops with the
+    /// service without any explicit shutdown plumbing.
+    liveness: Arc<()>,
 }
 
 impl Hypha {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        remote: Backend,
-        data: Backend,
-        meta: Backend,
-        env: Envelope,
-        trailer_key: TrailerKey,
+    pub(crate) fn new(
+        tier: Reconciler,
+        markers: Markers,
         mode: Mode,
         offload_threshold: usize,
         max_bucket_prefix_len: usize,
+        background_cfg: hypha_core::config::Background,
     ) -> Self {
-        let tier = Reconciler {
-            data,
-            meta,
-            remote,
-            env: Arc::new(env),
-            trailer_key,
-            locks: KeyLocks::default(),
-        };
         let buckets = bucket_ctl::spawn(tier.clone());
+        let background = background::spawn(tier.clone(), background_cfg);
         Self {
             tier,
             buckets,
+            background,
+            markers,
             mode,
             max_bucket_prefix_len,
             offload_threshold,
+            liveness: Arc::new(()),
         }
+    }
+
+    /// A `Weak` to the liveness sentinel — the background reconcile sweep polls it and exits once the
+    /// service (and all its `Hypha` clones) drop.
+    pub(crate) fn liveness(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.liveness)
+    }
+
+    /// Take K's **write** lock for a client write (§4), first telling any background transition on K
+    /// to stop (§8). Every client write-lock acquisition goes through here rather than
+    /// `tier.locks.lock` directly: a rehydrate holds the lock across a whole-object fetch, so
+    /// without the cancel a conditional PUT, DELETE, or CompleteMultipartUpload on a hot key would
+    /// park behind a multi-minute transfer. The cancel is a map lookup and needs no reply — see
+    /// [`crate::background`] for why the lock handoff is a sufficient rendezvous.
+    pub(crate) async fn write_lock(&self, bucket: &str, key: &str) -> Guard {
+        self.background.cancel(bucket, key);
+        self.tier.locks.lock(key).await
     }
 
     /// The `<data>` cache bucket: client bodies and tombstones at bare `K` (§6).

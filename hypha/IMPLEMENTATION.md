@@ -87,9 +87,11 @@ hypha/src/
   keylocks.rs            per-key async lock table (§4)
   tier.rs                Reconciler: upload / tombstone / twin / restore-sweep primitives (§7)
   bucket_ctl.rs          bucket-control actor: sole writer of the cache substrate; per-bucket restore (§7)
+  background.rs          background-transition actor: bounded, deduped, client-cancellable rehydrate/evict (§8)
   s3/                    the s3s::S3 impl, split by op group
     put.rs get.rs list_head.rs delete.rs multipart.rs buckets.rs
     overlay.rs           restore overlay: readiness gate + cache-vs-remote source for reads/writes (§7)
+  markers.rs             pending-marker obligations, the clean marker, the recovery scan (§6/§7)
   replication.rs         (phase 4) the cached-mode reconcile sweep (§7)
   gc/                    (phase 5) scavenger task, active-only (§8); restore sweep (§7)
 
@@ -154,8 +156,8 @@ block *other reconciles of the same key*, never make a conditional PUT queue beh
 transfer.
 
 **Unconditional cached-mode PUTs take no lock** — they race on the cache (S3 last-writer-wins) and
-are fenced against eviction by the §8 in-flight ref count and conditional tombstones, not by the
-lock.
+are fenced against eviction by §8's remote-generation confirmation and conditional tombstones, not
+by the lock.
 
 The cache's own ETag is the **version token**, but not always the client-visible ETag (tombstones
 carry a sentinel ETag; the client ETag rides their metadata — §6). A
@@ -305,7 +307,7 @@ remote — the fourth being the client bucket name itself, which never leaves hy
 
 | Range                     | Contents                                              | How it is scanned                                    |
 |---------------------------|-------------------------------------------------------|------------------------------------------------------|
-| `0x01 0x01 ‖ tag ‖ …`     | mpu state, sync marker, recency slices, shadow bodies | prefix scan per tag                                  |
+| `0x01 0x01 ‖ tag ‖ …`     | mpu state, sync + clean markers, recency slices, shadow bodies | prefix scan per tag                         |
 | `0x01 ‖ K ‖ 0x01 ‖ facts` | facts twins                                           | prefix `0x01 ‖ <client prefix>`, delimiter mirrored  |
 | `K`                       | pending markers, **bare**                             | `start_after` past the `0x01` block                  |
 
@@ -315,10 +317,17 @@ collide with one; the three ranges sort in the order above and never interleave.
 This split is what the whole of §7's LIST rests on. Because `<data><b>` contains only client keys,
 a LIST page needs no reserved-key filter, carries no twin dilution, and its **last raw key is
 always a client key** — which is what makes v1's `NextMarker` expressible at all (§7,
-*ListObjectsV2*). It also gives the pending marker a zero-overhead home, so the marker — the one
-structure that is a durability signal rather than an optimization and therefore cannot degrade —
-supports the full 1024-byte key. Markers stay bare and *twins* carry the prefix, deliberately: a
-marker that cannot be written is data loss, where a twin that cannot be written is one HEAD.
+*ListObjectsV2*). It also gives the pending marker a zero-overhead home, so the marker supports the
+full 1024-byte key. Markers stay bare and *twins* carry the prefix, deliberately: a twin that cannot
+be written costs one HEAD, where a marker that cannot be written costs a namespace scan to
+rediscover what it would have named (§7).
+
+**The marker is an index, not the source of truth.** What makes a cached write pending is a state of
+the world, not a record hypha keeps: a live body at `K` whose generation the remote does not hold,
+or a delete-tombstone at `K` the remote has not yet honoured. Both are derivable from the cache and
+the remote alone. The marker's only job is to make that set enumerable in `O(pending)` instead of
+`O(keyspace)` — which is why losing one delays durability rather than losing the write, and why the
+recovery scan (§7) can rebuild the entire set from first principles.
 
 Splitting markers into a bucket of their own would cost a third: markers and twins are
 non-colliding but **interleave**, and the reconcile sweep's `O(pending)` flat LIST (§7) would
@@ -335,7 +344,23 @@ is mid-bracket, §7; cache facts are distrusted and readers resolve K from the r
 are **random** (CSPRNG-generated once, then fixed), not readable markers: each kind gets a
 deterministic (size==16, ETag) pair, so a plain LIST classifies every key with no HEAD, and each
 sentinel's constant ETag doubles as a CAS token. Random 16-byte values so no client body collides
-with the classification token by accident.
+with the classification token by accident. In **cached** mode client bodies also live at bare `K` in
+`<data>` (durable stores only tombstones there), so the (size, ETag) classification could be
+*spoofed* by a client body equal to a sentinel — LIST would hide it, reconcile would reap it. Only a
+16-byte body can collide, so **PutObject rejects any body equal to a sentinel**
+(`meta::is_reserved_sentinel`) with `InvalidRequest` before it lands — a cryptographically negligible
+carve-out (three specific 16-byte values) that keeps the cheap (size, ETag) classifier sound
+everywhere it *acts* (reconcile upload/delete).
+
+The check sits **ahead of the mode split**, not on the cached path that needs it: durable mode has no
+plaintext at `K` and so nothing to spoof today, but the remote object outlives the mode that wrote
+it, and a bucket switched from durable to cached rehydrates that plaintext to bare `K` — where it
+*is* the classification, and where landing it would have LIST hide a live key and the recovery scan
+(§7) read it as an unpropagated delete and reap the remote object. Enforcing at ingest makes "no
+hypha-written object has a reserved sentinel as its plaintext" a property of the whole store rather
+than of one mode, so no later path has to re-derive the hazard. PutObject is the only ingest that
+needs it: multipart is remote-first in both modes and leaves `K` tombstoned with the plaintext in the
+shadow, and copy sources are bodies that already passed this check.
 
 **Facts twins** — a zero-byte object in `<meta><b>` at `0x01 ‖ K ‖ 0x01 ‖ facts`, carrying in its
 key name (the one field LIST returns per entry) exactly the facts LIST needs for an evicted key:
@@ -405,7 +430,11 @@ has, so the digest must resist deliberate collision, and a second independent di
 shadow's user-metadata to be verified on read (a mismatch is a miss that falls through to the
 remote, turning a corruption risk into a cache miss). K itself cannot ride there — a 1024-byte key
 percent-encodes past S3's 2 KB metadata ceiling. The tombstone and twin at K stay untouched, so
-composite rehydration is invisible to LIST/HEAD and rewrites no twin.
+composite rehydration is invisible to LIST/HEAD and rewrites no twin. Because the shadow key is
+deterministic in K, a *later* composite at K overwrites the same shadow — but the key digest alone
+can't tell generations apart, so the shadow also carries the rehydrated **client ETag** and a read
+serves it only when that equals K's current tombstone `cetag`. A shadow left from a superseded
+generation therefore misses and re-rehydrates rather than serving stale bytes under the new ETag.
 
 **The pending marker** (cached mode) lives in `<meta><b>` at **bare `K`** — **one per key**,
 body = the body ETag of the most recently acked PUT. Concurrent PUTs overwrite it; last writer
@@ -467,6 +496,34 @@ the remote's retag *is* the version. Survives process restarts across a multi-ho
 reconciliation has completed — namespace trust recorded in the cache itself, dying with the
 volume by construction. Present ⇒ reads are cache-authoritative and an absent key is a definitive
 404. Absent ⇒ the remote is the read source of truth until the restore sweep rewrites it (§7).
+
+**The clean marker**: an object at `0x01 0x01 c`, per bucket, encoding one claim —
+*no un-indexed write has happened in this bucket since the last completed drain*. Present ⇒ the
+marker range is an exhaustive account of the pending set — **complete, not empty**: pending markers
+alongside a clean marker are the ordinary steady state. Absent ⇒ a write may have landed without its
+marker, and the bucket owes a recovery scan (§7). Like the sync marker it lives in the cache, so it
+dies with the volume, and its write is subject to the same fence as any other — a fenced replica
+cannot forge one, so a hard failover always scans and a graceful handover never does.
+
+> **Dirty is the default, and the default is established before anything can run.** *At startup*,
+> every bucket's marker is read and then **deleted — all of them, before the first request is
+> served**, so from the instant hypha can take a write, no bucket on disk claims to be clean. There
+> is no bookkeeping of which buckets a run "touched", because a run that has to remember what it
+> touched can forget. A bucket whose marker fails to clear is not served at all: skipping the scan on
+> a marker one then fails to delete would skip it again next run, by which time real orphans exist.
+> *At the other end*, the marker is written at exactly one point in the drain (§7), so every path
+> that does not reach that line leaves it absent — crash, panic, task abort, `SIGKILL` past the grace
+> period, an error nobody handled, a code path nobody has written yet. A crash can happen anywhere,
+> and everywhere it happens the answer is absent, which costs a scan rather than a missed write.
+>
+> The drain must therefore *earn* the marker per bucket rather than fail to disqualify one, and what
+> it earns it with is not "was this bucket written to" but **does this run account for the bucket's
+> pending set**: either its marker was present at startup, or this run's recovery scan rebuilt it.
+> That is the run's only per-bucket state, and it is a membership rather than a flag — a bucket left
+> dirty by an earlier crash and untouched by this run is simply not in the set, and must end this run
+> dirty too, since its orphans are still unindexed and a clean marker would bury them permanently.
+> The one other condition is not per-bucket at all: a marker still owed when the drain seals means
+> the run did not end gracefully, and **no** bucket is marked clean.
 
 **Recency slices**: sealed Bloom filters under `0x01 0x01 r ‖ …`, the persisted form of
 the §8 recency ring.
@@ -537,15 +594,32 @@ repair restores its projection; the op never happened. Crash after: committed �
 serve the new object from the remote, repair completes the projection (facts off the trailer);
 lost-ack.
 
-**Cached** — the write lock covers steps 1–4 for conditional PUTs; unconditional PUTs take no
+**Cached** — the write lock covers steps 1–2 for conditional PUTs; unconditional PUTs take no
 lock:
 
 1. *(conditional only)* resolve + evaluate as above.
-2. `inc` K's in-flight ref count (§8).
-3. **Commit**: `PutObject` plaintext at K — the cache computes the ETag natively.
-4. Overwrite the single marker at `<meta><b>`'s bare `K` with the body ETag (last writer wins —
-   the coalescing point, §6).
-5. `dec`. Ack. The remote trails via the reconcile sweep below.
+2. **Commit**: `PutObject` plaintext at K — the cache computes the ETag natively. **Ack.**
+3. Hand `(K, body ETag)` to the marker queue, which overwrites the single marker at `<meta><b>`'s
+   bare `K` (last writer wins — the coalescing point, §6). The remote trails via the reconcile sweep.
+
+The hand-off is a channel send that cannot block or fail (below), so it costs the ack nothing and
+adds no failure mode to it. Writing the marker *inline* before returning would put a second round
+trip on every write's critical path, and doing it inline *after* the ack is not expressible — the
+response is sent when the handler returns, so anything after that point is another task, which then
+has to be joined before the run can claim anything about what landed.
+
+> **The ack is the commit, and the commit is the body write.** The marker follows immediately and
+> virtually always lands, but the ack does not *depend* on it — because acking only
+> after the marker leaves no good answer when the marker write fails. The body is already live and
+> client-visible by then, so returning an error means either abandoning it — a live object the client
+> was told does not exist, never durable, never reconciled — or rolling it back, which is destructive
+> (deleting K hides a perfectly good remote generation, and the delete races the deliberately
+> unserialized unconditional PUT path). Repairing it *behind* a returned error is worse than both:
+> hypha would then finish a write it reported as failed, which is exactly the outcome a client
+> reasoning from that error — retrying elsewhere, or relying on `If-None-Match` to create once —
+> cannot survive. Acking the commit and owing the index is the only option that keeps the ack
+> honest, and it costs nothing the marker was carrying: the marker never *was* the durability
+> record, the body is (§6).
 
 ### DeleteObject
 
@@ -563,10 +637,12 @@ everywhere; repair removes the entry.
 **Cached**:
 
 1. *(under the write lock)* **Commit**: overwrite K with the **delete-tombstone** — GET/HEAD
-   answer 404 and LIST omits K immediately.
-2. Overwrite the marker (K's pending op is now a delete).
-3. Ack. Reconcile propagates below; the mask is what keeps a crash from resurrecting K from the
-   remote before the delete propagates.
+   answer 404 and LIST omits K immediately. **Ack.**
+2. Hand K to the marker queue (its pending op is now a delete). Reconcile propagates below; the mask
+   is what keeps a crash from resurrecting K from the remote before the delete propagates.
+
+Same ack rule and same reason as the cached PUT: the tombstone is the commit, and a delete-tombstone
+the remote has not yet honoured is self-describing without its marker.
 
 ### DeleteObjects — non-atomic batch
 
@@ -795,14 +871,14 @@ plaintext nor tears the source.
 mints the `K_dst`-bound trailer on upload, so key-binding falls out of the normal PUT path with no
 special handling. Under `K_dst`'s write lock for the conditional case:
 
-1. *(conditional only)* resolve + evaluate as above; `inc` `K_dst`'s in-flight ref count (§8).
+1. *(conditional only)* resolve + evaluate as above.
 2. **Commit** — land a plaintext body on the cache at `K_dst`:
    - **Source hot** (live cache body): a **cache→cache** server-side `CopyObject` on SeaweedFS —
      plaintext, same volume, ETag preserved natively, zero bytes through hypha.
    - **Source cold** (evicted / shadow): rehydrate from the remote (§8), then the cache→cache copy;
      equivalently source GET → decrypt → cache `PutObject` at `K_dst`.
-3. Overwrite the marker at `<meta><b>`'s bare `K_dst` (last-writer-wins coalescing, §6). `dec`. Ack; the
-   remote trails via reconcile.
+3. Ack — same rule as the cached PUT — and hand `K_dst` to the marker queue (last-writer-wins
+   coalescing, §6). The remote trails via reconcile.
 
 An unconditional cached copy takes no lock, racing on the cache like an unconditional PUT (§4).
 
@@ -1001,8 +1077,10 @@ state, re-triggered on the next access.
   reconcile work.
 - **The overlay's `Restoring` arms are durable-only.** Reads resolve from the remote and writes
   materialize-then-write with no cached-mode **pending overlay** (acked-but-unuploaded PUTs / pending
-  deletes). Phase 4 must extend `s3/overlay.rs`'s `Restoring` branches with that overlay so
-  read-after-write holds mid-restore in cached mode.
+  deletes), so read-after-write does not hold mid-restore in cached mode. Deferred to the **Phase-5
+  restore** work (restore itself is Phase 5): extend `s3/overlay.rs`'s `Restoring` branches with that
+  overlay. Phase 4 covers cached steady state on a `Ready` bucket — its rehydrate machinery is what
+  Phase-5 restore then drives.
 - **A v2 LIST paginating across the restore flip mixes token domains.** A page fetched while
   `Restoring` forwards the *remote's* continuation token; if the bucket flips `Ready` before the
   next page, that token is fed to the *cache* backend, and opaque tokens aren't formally
@@ -1078,15 +1156,97 @@ The upload path for acked cache writes — a continual duty of the active (phase
    `If-Match: M_etag`. A concurrent create races the clear benignly (either order yields the same
    client-visible semantics).
 
-**Bounded loss window (cached mode).** A process crash loses nothing: acked bodies and their
-markers are in the cache; the new active resumes from the marker LIST. True loss requires the
-**cache volume** to die with markers outstanding; the loss set is `O(pending)` and dies with the
-volume — nothing to enumerate afterward, by construction. Durable mode has no loss window: its
-commits are remote-side.
+**The marker queue.** Every acked cached write hands its marker here (§7, *PutObject*) and a single
+worker writes them, coalesced per key and retried for the life of the process. Order between markers
+for one key does not matter — the sweep classifies K from the *data* body and CASes on the marker's
+own ETag, so a marker's payload is diagnostic and any of them is as good as the last — but the writes
+do run concurrently, since a marker sits on every acked write's path to durability and serializing
+them would make the queue the write path's throughput ceiling.
+
+It is **unbounded**, which follows from where the hand-off sits rather than being a choice: it
+happens on the write path after the commit, so a bounded queue would either block the ack behind the
+marker — reintroducing exactly the coupling §7's ack rule removes — or shed it, and a shed has to be
+recorded somewhere, which means a flag whose only job is to be remembered on a failure path. An
+enqueue that cannot fail needs neither. Depth is an outage symptom, not a tunable: if it grows, the
+cache is refusing small writes, and `markers_owed` (§10) says so.
+
+**Quiescence: what the clean marker is allowed to claim.** The marker asserts that the pending set
+on disk is *complete*, so writing one while any write still owes a marker converts a recoverable gap
+into a permanent one — the next run trusts the marker, skips the scan, and nothing else ever looks.
+Emptiness of the queue is not evidence of this: a write that has committed but not yet attempted its
+marker, an attempt in flight against the cache, an entry in the worker's hand mid-backoff, and a
+multi-GiB body still streaming are all outstanding work that no observation of the queue can see. So
+the drain proves quiescence by **two joins and one closure**, never by inspecting a count:
+
+1. The accept loop stops, and hyper's graceful shutdown signals every live connection — HTTP/1
+   finishes its current request and closes, HTTP/2 sends GOAWAY — then resolves only once every
+   connection future has completed. When it returns, **every handler has returned and no new one can
+   start**, which covers the committed-but-not-yet-attempted and still-streaming cases together and
+   makes a commit-point gate unnecessary. If it times out instead, *every* bucket is dirty: the
+   claim being made is about work we can no longer bound.
+2. Every other sender is **handler-local**: the write path upgrades one from the weak handle the
+   service keeps, sends, and drops it before returning, so the service never holds the channel open.
+   After step 1 the serving loop's is the only sender left, and nothing can enqueue behind what it
+   sends — no join over stray tasks, because nothing but a handler ever sends. It then sends an
+   explicit **seal**, which FIFO places after every marker of the run.
+3. The seal is a *message*, not the channel closing. The serving future owns the queue handle, so an
+   aborted or panicking server closes the channel exactly as a drain does; if closure alone
+   authorized the clean markers, a killed process would write them on its way out and rob the next
+   run of the very scan meant to catch what it dropped. Closure ends the worker; only a seal lets it
+   vouch for anything.
+4. On the seal the worker makes one final attempt — never a retry loop, since the drain does not
+   wait out a backoff — and marks clean only if **nothing is left owed**. A marker still outstanding means the
+   run did not end gracefully, so it vouches for nothing at all rather than guessing which buckets
+   the loss touched.
+
+That leaves exactly two pieces of state, and only one of them per bucket: the set of buckets whose
+pending set this run accounts for, and whether the queue emptied. Both are positive evidence; there
+is no flag anyone must remember to set on a failure path, because every failure is the *absence* of
+evidence. What makes the evidence trustworthy is that **the obligation is raised by the same helper
+that performs the commit** — a cached body cannot land without a marker owing for it. That is the
+invariant to protect: a future write path that commits by some other route and forgets to raise the
+obligation is invisible to every mechanism here, and would produce a clean marker that lies.
+
+**The claim is released last, after the markers are written.** A passive promotes sub-second on
+release, so releasing first lets the new active admit writes to a bucket the old active is still
+about to vouch for; its gate clears the clean marker, but nothing orders that clear against the old
+active's write. Draining before releasing costs failover the drain time, which is whatever the marker
+queue still holds — empty on any ordinary shutdown.
+
+**The recovery scan.** Startup reads and deletes every bucket's clean marker before serving (§6);
+each bucket whose marker was **absent** owes a scan, raised once in the background. Serving is not
+gated on it — a markerless body reads correctly, it is only not yet durable — but **eviction is**
+(§8), and so is the bucket's eligibility for a clean marker at drain. The scan is idempotent, so a
+crash mid-scan just re-runs it next boot. It rebuilds the pending set by triage rather than per-key
+round trips:
+
+1. `ListObjectsV2` over `<data><b>` and over the remote bucket — two flat listings, 1000 keys a
+   call, no per-key requests.
+2. A live body whose key is **absent** from the remote is pending; write its marker. A
+   **delete-tombstone with no marker** is pending regardless of what the remote holds — re-propagating
+   is idempotent, and it also clears a tombstone stranded by a crash between the remote delete and
+   the tombstone clear, which nothing else in the sweep would ever revisit.
+3. A key present in both compares by **length**: a single-part remote object's framed size is the
+   closed form `ciphertext_len(plen) + |trailer|` over the cache body's plaintext length (§6), so
+   every overwrite that changed the plaintext length is caught with no extra request.
+4. Only a same-plaintext-length overwrite survives triage, and only those pay the remote's trailer
+   (one ranged tail GET) to compare `cetag` against the cache body's ETag.
+
+A markerless live body is always single-part — a composite is tombstoned at K with its plaintext in
+the shadow (§6) — so the closed form applies exactly. Eviction tombstones need no examination: an
+evicted body is by definition already on the remote.
+
+**Bounded loss window (cached mode).** The losable set is exactly *acked writes not yet on the
+remote*, and the loss event is exactly **cache-volume loss** — the set is `O(pending)`, dies with the
+volume, and leaves nothing to enumerate afterward. A process crash still loses nothing: acked bodies
+are in the cache, and a write whose marker had not yet landed is rediscovered by the scan above. The
+marker moving off the ack path therefore costs *time to durability* after a crash, never the write —
+the loss event and the losable set are both unchanged. Durable mode has no loss window: its commits
+are remote-side.
 
 **Durability gates GC.** A key with a pending marker is never evicted or tombstoned, and eviction
-independently confirms the remote object exists before overwriting a body (§8). A body only leaves
-local storage once its ciphertext is provably on the remote.
+independently confirms the remote holds *this body's generation* before overwriting it (§8). A body
+only leaves local storage once its own ciphertext is provably on the remote.
 
 ### Background: the restore sweep (both modes)
 
@@ -1122,9 +1282,20 @@ cache, then runs the normal §4 path.
 
 ### Lifecycle
 
-- **Graceful drain.** On SIGTERM: stop accepting, release the active claim (passive promotes
-  sub-second, no fence), best-effort one more reconcile pass to shrink the pending set. Sized
-  into `terminationGracePeriod` + `preStop`.
+- **Startup** (cached mode). Before the listener opens: read and delete every bucket's clean marker
+  (§6), recording which were present, and raise a recovery scan for each that was not. A bucket whose
+  marker cannot be deleted is not served — readiness fails rather than serving a bucket that will
+  skip next run's scan. Sub-second at homelab bucket counts (one HEAD + one DELETE each); the scans
+  themselves run in the background behind it.
+- **Graceful drain.** On SIGTERM: stop accepting → await hyper's connection drain → close the repair
+  queue and let its worker run to `None` → if nothing is left owed, a clean marker (§6) for each
+  bucket this run accounted for and for no other → **release the active claim** (passive promotes sub-second,
+  no fence). The ordering is the
+  quiescence proof of §7, and the release is last for the reason given there. A best-effort final
+  reconcile pass can shrink the pending set anywhere in here — it is an optimization, since a clean
+  marker claims the pending set is *complete*, not that it is empty. Sized into
+  `terminationGracePeriod` + `preStop`; running out of grace period simply leaves the clean markers
+  unwritten and the promoted replica scans.
 - **Remote unavailable** → hot reads fine; tombstoned reads fail cleanly; cached-mode writes
   still ack and markers accumulate; durable-mode writes fail (correctly — they can't be made
   durable).
@@ -1142,16 +1313,34 @@ client path. Each range is self-describing by its `0x01 0x01 m ‖ <upload-id> �
 sweep finds and reclaims it without a side index. In cached mode it additionally evicts under
 pressure:
 
-**Write-awareness: the in-flight ref count.** The PUT path's only in-process state is a per-key
-`Arc<AtomicUsize>` in a swept `DashMap`: `inc` → body write → marker write → `dec`. The window it
-covers — body confirmed, marker not yet visible — is exactly what no cache-side observation could
-catch: eviction there would see a markerless key whose remote HEAD still finds the *previous*
-version present, and tombstone an acked-but-never-uploaded body. The count gates only eviction;
-PUTs never block on it.
+**Write-awareness is a property of the remote, not of process memory.** The hazard is one step:
+tombstoning a body the remote does not hold *in that generation*. It was once guarded by a per-key
+in-flight PUT counter spanning body write → marker write, but that window no longer belongs to a
+single request (§7 — the marker write outlives the ack), and a counter never covered a marker owed
+by a process that has since died. So the guard is entirely cache-and-remote observable: eviction
+confirms the remote's generation against the candidate body itself. One check subsumes three
+hazards — a markerless just-written body, a marker lost to a crash, and the corruption a bare
+presence check would allow, where the remote holds an *older* generation and eviction stamps the
+tombstone with the cache body's facts, so reads return the old plaintext under the new ETag and
+length. The per-key job registry of the transition actor below is consequently the only per-key
+structure GC keeps in memory, and it holds nothing durability depends on.
 
-**The recency ring.** The read path stays write-free: recency is a **Bloom-ring sketch** — one
-filter per **fill window**, fed by GET/HEAD; sealed slices persisted per §6, reloaded on
-promotion, retained k deep. A slice rotates when its distinct-key fill reaches the design point —
+**The recency ring.** Recency is a **Bloom-ring sketch** — one filter per **fill window**; sealed
+slices persisted per §6, reloaded on promotion, retained k deep. Every op that resolves or lands a
+single key feeds it: GET/HEAD/GetObjectAttributes **and the write path** (PUT,
+CompleteMultipartUpload, CopyObject's destination). A touch is an in-memory bit set, never a cache
+write, so neither path pays I/O to record one. LIST is deliberately **not** a feeder — one
+full-bucket listing would mark the entire keyspace hot and collapse the ring into
+protect-everything — and neither is DELETE, which leaves no body to protect.
+
+Writes feed it because a write is the strongest available statement of interest in a key, and a
+read-only ring gets write-hot/read-cold keys exactly backwards: they look maximally cold, so they
+evict first and the reclaimed bytes come straight back on the next PUT, which overwrites the
+tombstone with a live body. The pass under-delivers against its byte target having spent a remote
+HEAD, a twin write, and a CAS per key to do it, and a read arriving in the gap pays a rehydrate the
+write would have made unnecessary.
+
+A slice rotates when its distinct-key fill reaches the design point —
 the insert path counts 0→1 bit flips, so fill is exact and duplicate touches of a hot key don't
 advance it. Rotating on fill bounds each slice's false-positive rate by construction (no read
 rate can silently degrade the ring into protect-everything) and keeps wall time out of the
@@ -1178,28 +1367,72 @@ affirmatively cold key is nearly free in rehydration risk, yet each eviction sti
 remote HEAD, a twin write, and a CAS, hence the bound. Recency is priority only: it never
 overrides the correctness gates below. Eviction of candidate K with version-token ETag `E_v`:
 
-1. **Skip if ref count > 0.**
-2. **Skip if the marker exists** (`HEAD <meta><b>` at bare `K`) — also catches markers from a prior
-   process generation whose ref count died with it.
-3. **Confirm the remote** (`HEAD` remote K); absent ⇒ not durable ⇒ skip.
-4. Under K's lock: delete stale twins, write the fresh twin, then overwrite K with the eviction
+1. **Skip if the marker exists** (`HEAD <meta><b>` at bare `K`) — a cheap local short-circuit that
+   spares the remote round trip, not the correctness gate.
+2. **Confirm the remote generation** (`HEAD` remote K): absent ⇒ not durable ⇒ skip; framed size ≠
+   `ciphertext_len(plen) + |trailer|` for this body ⇒ some other generation ⇒ skip. Only a
+   same-plaintext-length candidate is ambiguous, and only it pays the trailer's `cetag` (one ranged
+   tail GET) to settle it — the same triage the recovery scan runs (§7).
+3. Under K's lock: delete stale twins, write the fresh twin, then overwrite K with the eviction
    sentinel via `PutObject If-Match: E_v` — metadata carrying `cetag`/`plen`/original mtime. The
    tombstone is an atomic in-place replace: a racing GET sees body or tombstone, never 404.
    Twin-before-tombstone means a sentinel always has its twin; a crash between leaves a twin next
    to a live body — ignored by classification (§6), swept later.
 
-A writer landing anywhere between steps 1 and 4 has moved the ETag, so step 4's `If-Match: E_v`
-fails and eviction retries next pass — the layering (ref count → marker → remote HEAD →
-conditional CAS) makes every interleaving auto-healing, never lossy. **Shadow bodies** (§6) are
+A writer landing anywhere between steps 1 and 3 has moved the ETag, so step 3's `If-Match: E_v`
+fails and eviction retries next pass — the layering (marker → remote generation → conditional CAS)
+makes every interleaving auto-healing, never lossy. **Shadow bodies** (§6) are
 evicted from their own reserved-prefix windows: confirm the remote composite (HEAD), then delete
 the shadow — K's tombstone and twin are already in place.
 
-**Rehydrate** (cached mode) is the mirror: fetch + decrypt from the remote under the lock,
-holding the ref count while it runs (the sentinel ETag is constant across generations, so the
-count is what closes the evict → rehydrate → re-evict ABA a constant-ETag CAS can't see). A
+**Rehydrate** (cached mode) is the mirror: fetch + decrypt from the remote under the lock. A
 single-part body lands at K with `If-Match: <evict-sentinel-etag>`, then its twin is deleted —
 K's facts are native again. A composite lands in the shadow body (§6); K's tombstone and twin
 stay untouched.
+
+The eviction sentinel's ETag is constant across generations, so that `If-Match` cannot by itself
+tell one tombstone from the next: a queued rehydrate can sit while K is rewritten, reconciled, and
+evicted afresh, and the CAS would then accept the new tombstone for the old plaintext. The rehydrate
+therefore **re-reads the tombstone's `cetag` under the lock** and abandons the job unless it is still
+the generation the read observed — and since the re-read and the land are both under the lock,
+nothing can move K between them. That same re-read is where the client pass-through metadata comes
+from, so a land can never stamp a superseded generation's metadata either.
+
+**The background-transition actor.** Eviction and rehydrate share a property nothing on the client
+path has: they are **discardable**. The read that raises a rehydrate is already being served from
+the remote, and an eviction abandoned because a client wants the key is an eviction that should not
+have run. Both therefore run as jobs on one bounded queue (`background.concurrency` at a time,
+`background.queue_depth` waiting) rather than as unbounded detached tasks, with three consequences:
+
+- **Deduped by key.** One live job per key, so N concurrent reads of one evicted key raise one
+  transition rather than N that each take the write lock in turn. (The shadow-freshness HEAD still
+  covers the other case — a job raised *after* an earlier one landed that generation.)
+- **Shed under pressure.** A full queue drops new submissions instead of blocking the reads that
+  raised them: the cost of a dropped rehydrate is that the next read of that key fetches from the
+  remote, which is what that read is already doing.
+- **Cancelled by client writes.** A transition holds K's write lock across a whole-object transfer,
+  so a same-key conditional PUT, DELETE, or CompleteMultipartUpload would otherwise park behind it
+  for minutes. Every client write instead cancels K's transition before taking the lock, and the
+  holder abandons it at the next await. This does not weaken the under-lock rule above: a transition
+  that *completes* still performed every step under the lock — it is only ever abandoned wholesale,
+  never half-applied. The cancel needs no acknowledgement, because a job registers its cancel token
+  before it first attempts the lock: a job blocking a client necessarily holds the lock and so is
+  necessarily findable, and a job registering after the cancel has not taken the lock and blocks
+  nobody. The lock handoff is the rendezvous.
+
+The one part of a rehydrate outside the cancellable region is the twin delete that follows a
+single-part land: the land PUT is what drives the transfer, while dropping the twin is a fast local
+pair of calls, and cancelling between the two would leave a live body beside a stale twin — benign
+(classification ignores it, §6) but debris nothing reclaims until the next sweep.
+
+**The walk heals markers forward.** The rotating cursor already visits every live body, so it
+applies the recovery scan's test as it goes (§7) and writes a marker for any body whose generation
+the remote does not hold. The boot scan is what makes that recovery *prompt* after a crash; the walk
+is the standing backstop for anything a mid-run failure leaves behind between boots. **Eviction in a
+bucket waits for that bucket's scan** — before it completes, the pending set on disk is known
+incomplete, and a scavenger reading it as exhaustive is the one way an acked write is lost. The
+generation check (step 2 above) independently refuses those bodies, so the ordering rule is the
+second of two locks on the same door, not the only one.
 
 **Usage from the backend.** The scavenger reads SeaweedFS volume/master metrics (physically
 accurate, sees dead bytes), scavenges from high- to low-water mark, and can drive
@@ -1212,8 +1445,14 @@ accurate, sees dead bytes), scavenges from high- to low-water mark, and can driv
 client buckets pass through prefixed, so deployments share a remote account in disjoint bucket
 namespaces), `mode` (`durable` | `cached`), `auth` (hypha's own
 client credentials for `S3Auth`), `master_passphrase` (the 256-bit random age passphrase, from a Secret; supersedes phase 1's
-`master_identity`), `serving.listen` + `serving.offload_threshold` (§5). Later phases add: reconcile pass
-interval/concurrency, GC water marks / walk window / recency-ring shape (slice size, depth k,
+`master_identity`), `serving.listen` + `serving.offload_threshold` (§5), `reconcile.interval_ms` +
+`reconcile.concurrency` (the §7 sweep's cadence and per-pass fan-out, and the marker queue's write
+fan-out; that queue is deliberately unbounded and so has no depth knob) + the drain budget, which must fit inside the pod's
+`terminationGracePeriod`: overrunning it is safe but withholds every clean marker,
+`background.concurrency` + `background.queue_depth` (the §8 transition actor: whole-object transfers
+in flight, and how many wait before submissions are shed — so `concurrency` sits far below
+`reconcile.concurrency`, since it bounds remote bandwidth rather than request count). Later phases
+add: GC water marks / walk window / recency-ring shape (slice size, depth k,
 rotation fill target) / opportunistic-eviction bound, restore fan-out + hint
 interval, and the §4 fencing block (identity selectors, lease timings, fence-confirm timeout,
 settle delay).
@@ -1248,8 +1487,11 @@ itself stays owned by the `seaweedfs`/`cilium` charts per repo convention.
 
 `tracing` spans per request (op, key, bytes, cache-hit); JSON in-cluster. `metrics` → Prometheus:
 rate/latency by op, cache hit ratio, **pending-marker set size + reconcile pass duration**,
+**`markers_owed` and buckets left dirty at drain** (both should be flat zero — markers owed means the
+cache is refusing small writes, and it is also the queue's only bound, §7),
 remote-upload latency/retries, role + failover count + fence-confirm latency, scavenge throughput
-and usage vs. water marks. `/healthz` + `/readyz` (remote reachable); active/passive is a reported
+and usage vs. water marks. `/healthz` + `/readyz` (remote reachable, and in cached mode every
+bucket's clean marker cleared — §7 *Startup*); active/passive is a reported
 condition, not a readiness gate.
 
 ## 11. Testing strategy
@@ -1276,8 +1518,21 @@ condition, not a readiness gate.
   new active resumes from the marker LIST, no drops, no double-handling, no eviction before
   resolution. Cache-volume wipe ⇒ loss bounded by the pending set.
 - **Eviction vs. writers**: sustained PUTs against a key under eviction; assert the §8 layering
-  (ref-count skip, marker skip, `If-Match` abort) never tombstones an acked-but-unuploaded body,
-  including the prior-generation-marker case.
+  (marker skip, remote-generation confirm, `If-Match` abort) never tombstones an
+  acked-but-unuploaded body, including the prior-generation-marker case and a remote holding an
+  *older* generation of the same key.
+- **Marker obligation & the clean marker**: a marker write that fails leaves the object acked and
+  live, and the queue's retry lands the marker afterwards (fault-injecting cache wrapper — MinIO
+  cannot fail one write selectively). Kill the active without a drain ⇒ no clean marker ⇒ next run
+  scans and rebuilds every missing marker; drain gracefully ⇒ clean marker ⇒ no scan, and a marker
+  owed at drain (the queue still retrying) withholds it. The quiescence ordering is the part
+  worth asserting directly: a write committed but not yet marked must never coexist with a clean
+  marker, so drive a body write concurrent with SIGTERM and assert the marker set and the clean
+  marker cannot disagree. Assert the **default** too, since it is the property a future change is
+  most likely to break: after startup completes, no bucket's marker is present on disk; killing at
+  each step of the drain produces none; and a bucket left dirty by a previous run and untouched by
+  this one is still dirty after this one drains gracefully — it was never scanned, so this run
+  cannot vouch for it.
 - **Twin coherence**: crash-inject every point of twin sequences (delete-stale → write →
   tombstone; rehydrate's body-then-twin-delete); LIST never reports wrong facts — a twin next to
   a non-evict entry is ignored and swept, an evict tombstone with a missing twin HEAD-falls-back,
@@ -1487,11 +1742,24 @@ buckets (`list_buckets_hides_backend_projections`). The reconcile sweep's `O(pen
 is a structural property of the bare-`K` marker range (§6, §7) — it lands with the sweep itself in
 phase 4, where its complexity is asserted directly.
 
-**Phase 4 — cached mode, single replica.** Marker writes + the in-flight ref count on the PUT
-path, the reconcile sweep, cached DELETE propagation, rehydrate (single-part into K + twin
-delete; composite into the shadow body). Deployed with one replica and no fencing — a single writer is trivially single, so this ships the
-default `s3.internal` deployment with correctness intact, only failover seamlessness missing.
-*Exit*: §11 concurrency, marker/reconcile, and eviction-vs-writer suites against real SeaweedFS.
+**Phase 4 — cached mode, single replica. Done (vs. MinIO).** The marker queue behind the write path,
+and the clean marker / recovery scan behind it (§7 — the ack is the body write, so a
+marker that fails is owed and retried rather than turned into an error), the reconcile sweep
+(`replication.rs`, a background duty of
+the active tied to the service's liveness sentinel, listing the `O(pending)` bare-`K` marker range
+past the `0x01` block), cached DELETE propagation (mask-then-propagate, single + batch), and
+rehydrate (single-part into K via `land_rehydrated_single_locked`; composite into the shadow body
+via `land_shadow_locked`, with the read path probing/serving the shadow under a full-digest check).
+The reconcile upload/delete/marker CAS uses the cache's conditional `PutObject`/`DeleteObject`
+(`Backend::delete_if_match`); cached PUT forwards `Content-MD5` to the cache for an atomic
+`BadDigest`. Deployed with one replica and no fencing — a single writer is trivially single, so
+this ships the default `s3.internal` deployment with correctness intact, only failover seamlessness
+missing. *Exit* (met): `hypha/tests/cached.rs` — marker/reconcile upload, cached delete
+propagation, conditional-write linearization (incl. `If-None-Match:*` create contention),
+`Content-MD5` rejection, the marker scan staying `O(pending)` (evicted keys untouched), and
+single-part + composite rehydrate on a tombstoned read. The reconcile CAS's *same-key race*
+guarantee needs the cache to honour conditional DELETE (§9, SeaweedFS ≥ 4.07); the MinIO harness
+exercises only the non-racy paths, which are backend-conditional-agnostic.
 
 **Phase 5 — GC + restore.** Walk cursor, threshold-ratchet eviction, Bloom ring (fill rotation)
 + slice persistence, usage

@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use hypha_core::config::{ClientAuth, Config, Mode, S3Endpoint, Serving};
+use hypha_core::config::{Background, ClientAuth, Config, Mode, Reconcile, S3Endpoint, Serving};
 
 /// Fixed root credentials for the throwaway MinIO (password must be ≥ 8 chars).
 const MINIO_USER: &str = "minioadmin";
@@ -130,12 +130,12 @@ pub struct Hypha {
 
 impl Hypha {
     async fn start(config: &Config) -> Self {
-        let service = hypha::build_service(config).expect("build hypha service");
+        let (service, lifecycle) = hypha::build_service(config).expect("build hypha service");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind hypha");
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            let _ = hypha::serve(listener, service, async {
+            let _ = hypha::serve(listener, service, lifecycle, async {
                 let _ = rx.await;
             })
             .await;
@@ -153,6 +153,14 @@ impl Hypha {
         }
         if let Some(task) = self.task.take() {
             let _ = task.await;
+        }
+    }
+
+    /// Drop the serving task where it stands — no shutdown signal, no drain. Models SIGKILL.
+    fn kill(&mut self) {
+        self.shutdown.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -282,6 +290,14 @@ fn config_env(config: &Config) -> HashMap<String, String> {
         "HYPHA_SERVING__OFFLOAD_THRESHOLD".into(),
         config.serving.offload_threshold.to_string(),
     );
+    env.insert(
+        "HYPHA_RECONCILE__INTERVAL_MS".into(),
+        config.reconcile.interval_ms.to_string(),
+    );
+    env.insert(
+        "HYPHA_RECONCILE__CONCURRENCY".into(),
+        config.reconcile.concurrency.to_string(),
+    );
     env
 }
 
@@ -313,6 +329,12 @@ impl Harness {
     /// A durable-mode deployment: one MinIO backing both roles, hypha in front of it.
     pub async fn durable() -> Self {
         Self::with_mode(Mode::Durable).await
+    }
+
+    /// A cached-mode deployment: writes ack after the cache write, the reconcile sweep trails them to
+    /// the remote (Phase 4).
+    pub async fn cached() -> Self {
+        Self::with_mode(Mode::Cached).await
     }
 
     /// The same deployment with hypha as a real subprocess — for tests that assert on how the
@@ -375,16 +397,33 @@ impl Harness {
     /// Restart hypha against the same MinIO and config — models a process restart (crash/redeploy).
     /// Cache-resident state (mpu records, tombstones) persists on the backend across this.
     pub async fn restart_hypha(&mut self) {
+        self.stop_hypha().await;
+        self.start_hypha().await;
+    }
+
+    /// Stop hypha **gracefully**: signal shutdown and wait out the drain, so cached mode writes its
+    /// clean markers (§7). Leaves the harness without a running server until [`Self::start_hypha`].
+    pub async fn stop_hypha(&mut self) {
         match &mut self.hypha {
-            Server::InProcess(h) => {
-                h.stop().await;
-                self.hypha = Server::InProcess(Hypha::start(&self.config).await);
-            }
-            Server::Child(h) => {
-                h.stop();
-                self.hypha = Server::Child(ChildHypha::start(&self.config).await);
-            }
+            Server::InProcess(h) => h.stop().await,
+            Server::Child(h) => h.stop(),
         }
+    }
+
+    /// Kill hypha **without** a drain — the SIGKILL/crash case, which must leave every clean marker
+    /// absent so the next run rescans.
+    pub async fn kill_hypha(&mut self) {
+        match &mut self.hypha {
+            Server::InProcess(h) => h.kill(),
+            Server::Child(h) => h.stop(),
+        }
+    }
+
+    pub async fn start_hypha(&mut self) {
+        self.hypha = match &self.hypha {
+            Server::InProcess(_) => Server::InProcess(Hypha::start(&self.config).await),
+            Server::Child(_) => Server::Child(ChildHypha::start(&self.config).await),
+        };
     }
 
     /// Create a client bucket (hypha creates the paired cache + remote buckets).
@@ -410,6 +449,13 @@ fn base_config(minio: &Minio, mode: Mode) -> Config {
         },
         master_passphrase: MASTER_PASSPHRASE.to_string(),
         serving: Serving::default(),
+        // A tight reconcile cadence so cached-mode tests observe uploads/propagation promptly rather
+        // than waiting out the production interval.
+        reconcile: Reconcile {
+            interval_ms: 150,
+            concurrency: 8,
+        },
+        background: Background::default(),
     }
 }
 

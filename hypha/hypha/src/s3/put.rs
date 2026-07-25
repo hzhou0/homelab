@@ -11,6 +11,7 @@
 //! The client's `x-amz-meta-*` and storage class ride the cache tombstone written at settle,
 //! namespaced apart from the facts sharing that carrier (§7).
 
+use aws_sdk_s3::primitives::ByteStream;
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
@@ -36,9 +37,21 @@ impl Hypha {
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        if self.mode != Mode::Durable {
-            // Cached (async write-through) path lands in Phase 4.
-            return Err(s3_error!(NotImplemented, "cached-mode PutObject pending"));
+        // Ahead of the mode split, and for the same reason in both: no object hypha writes anywhere
+        // may have a reserved sentinel as its plaintext (§6). Durable mode keeps no plaintext in the
+        // cache, so it has no classifier to spoof today — but the remote object outlives the mode
+        // that wrote it, and a bucket switched to cached rehydrates that plaintext to bare `K`, where
+        // it *is* the classification. Rejecting at ingest is what keeps the (size, ETag) classifier
+        // sound without every later path having to re-derive the hazard.
+        let mut input = input;
+        if input.content_length == Some(16) {
+            if let Some(body) = input.body.take() {
+                input.body = Some(reject_sentinel_body(body).await?);
+            }
+        }
+
+        if self.mode == Mode::Cached {
+            return self.op_put_object_cached(input, bucket, key).await;
         }
 
         // Overlay (§7): serving is never gated — a write to a restoring bucket first materializes K
@@ -68,32 +81,12 @@ impl Hypha {
             .ok_or_else(|| Error::Invalid("PutObject requires a body".into()))?;
 
         // One lock for the whole bracket: precondition → mark → commit → settle (§4).
-        let _guard = self.tier.locks.lock(&key).await;
+        let _guard = self.write_lock(&bucket, &key).await;
 
-        // Resolve the key's *current* client-visible ETag for the conditional-write check: a live
-        // body reports it natively, a tombstone carries it in metadata, an absent key has none,
-        // and a leftover transition mark is repaired first (§7 — the marking writer held this
-        // lock, so a mark seen here is always a crash leftover).
-        let current_etag = match self.data().head(&bucket, &key).await {
-            Ok(head) => {
-                let md = head.metadata.clone().unwrap_or_default();
-                match meta::tomb_kind(&md) {
-                    Some(meta::TombKind::Transit) => self
-                        .tier
-                        .repair_locked(&bucket, &key)
-                        .await?
-                        .map(|f| f.cetag),
-                    Some(meta::TombKind::Evict) => md.get(meta::CETAG).cloned(),
-                    Some(meta::TombKind::Delete) => None,
-                    None => head
-                        .e_tag
-                        .as_deref()
-                        .map(|e| e.trim_matches('"').to_string()),
-                }
-            }
-            Err(Error::NotFound) => None,
-            Err(e) => return Err(e.into()),
-        };
+        // Resolve the key's *current* client-visible ETag for the conditional-write check (§4),
+        // then evaluate. Repairs a leftover transition mark first — the marking writer held this
+        // lock, so a mark seen here is always a crash leftover.
+        let current_etag = self.resolve_current_client_etag(&bucket, &key).await?;
         evaluate_precondition(
             input.if_match.as_ref(),
             input.if_none_match.as_ref(),
@@ -136,6 +129,7 @@ impl Hypha {
                 enc,
                 Some(framed_len as i64),
                 HashMap::new(),
+                None,
                 None,
                 None,
             )
@@ -185,6 +179,162 @@ impl Hypha {
         };
         Ok(S3Response::new(resp))
     }
+
+    /// Resolve K's current client-visible ETag for a conditional write (§4). Caller holds K's write
+    /// lock. A live body reports it natively, a tombstone carries it in metadata, an absent key has
+    /// none, and a leftover transition mark is repaired from the remote first. Shared by the durable
+    /// and cached conditional paths.
+    pub(super) async fn resolve_current_client_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<String>, Error> {
+        match self.data().head(bucket, key).await {
+            Ok(head) => {
+                let md = head.metadata.clone().unwrap_or_default();
+                Ok(match meta::tomb_kind(&md) {
+                    Some(meta::TombKind::Transit) => {
+                        self.tier.repair_locked(bucket, key).await?.map(|f| f.cetag)
+                    }
+                    Some(meta::TombKind::Evict) => md.get(meta::CETAG).cloned(),
+                    Some(meta::TombKind::Delete) => None,
+                    None => head
+                        .e_tag
+                        .as_deref()
+                        .map(|e| e.trim_matches('"').to_string()),
+                })
+            }
+            Err(Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Cached-mode PUT (§7): ack on the cache body write, with the bare-`K` pending marker handed to
+    /// the marker queue behind it; the reconcile sweep uploads to the remote asynchronously. A
+    /// conditional PUT holds K's write lock across resolve → evaluate → commit; an unconditional one
+    /// takes **no** lock — it races on the cache (S3 last-writer-wins) and is fenced against eviction
+    /// by §8's remote-generation confirm, not the lock. The cache computes `MD5(plaintext)` natively
+    /// as the ETag, and validates a forwarded `Content-MD5` (⇒ `BadDigest`) before storing.
+    async fn op_put_object_cached(
+        &self,
+        input: PutObjectInput,
+        bucket: String,
+        key: String,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        // Overlay (§7): a restoring bucket has K materialized from the remote first, so a conditional
+        // eval runs against a correct tombstone and an absent bucket is `NoSuchBucket`.
+        self.prepare_write(&bucket, &key).await?;
+
+        let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
+        // Validate the digest shape up front (bad base64/length ⇒ InvalidDigest), then forward the
+        // raw header to the cache, which validates it against the body atomically.
+        if let Some(h) = input.content_md5.as_deref() {
+            parse_content_md5(h)?;
+        }
+        let content_md5 = input.content_md5.clone();
+
+        let plen = input
+            .content_length
+            .filter(|&n| n >= 0)
+            .ok_or_else(|| Error::Invalid("PutObject requires Content-Length".into()))?
+            as u64;
+        if plen > MAX_INLINE_PLAINTEXT {
+            return Err(s3_error!(
+                EntityTooLarge,
+                "PutObject bodies over 4 GiB must use multipart upload"
+            ));
+        }
+        let body = input
+            .body
+            .ok_or_else(|| Error::Invalid("PutObject requires a body".into()))?;
+        let md = write_metadata(input.metadata.as_ref(), &storage_class);
+
+        let conditional = input.if_match.is_some() || input.if_none_match.is_some();
+        let etag = if conditional {
+            // The lock covers resolve → evaluate → commit → marker (§4), the linearization point.
+            let _guard = self.write_lock(&bucket, &key).await;
+            let current = self.resolve_current_client_etag(&bucket, &key).await?;
+            evaluate_precondition(
+                input.if_match.as_ref(),
+                input.if_none_match.as_ref(),
+                current.as_deref(),
+            )?;
+            self.commit_cached(&bucket, &key, body, plen, md, content_md5)
+                .await?
+        } else {
+            self.commit_cached(&bucket, &key, body, plen, md, content_md5)
+                .await?
+        };
+
+        Ok(S3Response::new(PutObjectOutput {
+            e_tag: Some(ETag::Strong(etag)),
+            ..Default::default()
+        }))
+    }
+
+    /// Land a cached-mode PUT: plaintext body to `<data>` at K (native ETag), which **is** the
+    /// commit — the caller acks on it. The pending marker at bare `K` is then handed to the marker
+    /// queue (§7, [`crate::markers`]) rather than written here: the ack cannot depend on it, because
+    /// a marker failure has no honest error to return once the body is live and client-visible.
+    /// Returns the client ETag.
+    async fn commit_cached(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: StreamingBlob,
+        plen: u64,
+        md: HashMap<String, String>,
+        content_md5: Option<String>,
+    ) -> S3Result<String> {
+        let body = codec::blob_to_bytestream(body);
+
+        let out = self
+            .data()
+            .put(
+                bucket,
+                key,
+                body,
+                Some(plen as i64),
+                md,
+                content_md5,
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                Error::BadDigest => {
+                    s3_error!(BadDigest, "Content-MD5 does not match the request body")
+                }
+                other => other.into(),
+            })?;
+        let etag = out
+            .e_tag()
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
+
+        self.markers.owe(bucket, key, etag.clone());
+        Ok(etag)
+    }
+}
+
+/// Reject a body equal to one of hypha's reserved 16-byte tombstone sentinels (§6), handing the
+/// buffered bytes back as the body otherwise. Those bytes would classify a live object as a
+/// tombstone in every (size, ETag) scan — LIST would hide it, reconcile would skip or reap it. Only
+/// a 16-byte body can collide, so the caller gates on that and nothing larger is ever buffered.
+async fn reject_sentinel_body(body: StreamingBlob) -> S3Result<StreamingBlob> {
+    let bytes = codec::blob_to_bytestream(body)
+        .collect()
+        .await
+        .map_err(|e| Error::Backend(format!("reading PutObject body: {e}")))?
+        .into_bytes();
+    if meta::is_reserved_sentinel(bytes.as_ref()) {
+        return Err(s3_error!(
+            InvalidRequest,
+            "body collides with a reserved hypha sentinel value"
+        ));
+    }
+    Ok(codec::bytestream_to_blob(ByteStream::from(bytes.to_vec())))
 }
 
 /// Decide whether a conditional PUT may proceed against the key's current state (§4).

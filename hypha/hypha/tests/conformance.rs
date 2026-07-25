@@ -1571,3 +1571,41 @@ async fn list_keys(client: &aws_sdk_s3::Client, bucket: &str, prefix: Option<&st
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+/// Durable mode rejects a reserved-sentinel body too, though it keeps no plaintext in the cache and
+/// so has no (size, ETag) classifier of its own to spoof (§6). The remote object outlives the mode
+/// that wrote it: a bucket later switched to cached rehydrates that plaintext to bare `K`, where it
+/// *is* the classification. One rule at ingest, so no later path has to re-derive the hazard.
+#[tokio::test]
+async fn durable_put_rejects_reserved_sentinel_body() {
+    use hypha_core::meta;
+
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+
+    let good = pattern(64);
+    put(&c, B, "s", &good).await;
+
+    for sentinel in [
+        meta::DELETE_SENTINEL,
+        meta::EVICT_SENTINEL,
+        meta::TRANSIT_SENTINEL,
+    ] {
+        let bad = c
+            .put_object()
+            .bucket(B)
+            .key("s")
+            .body(bytes_body(&sentinel))
+            .content_length(16)
+            .send()
+            .await;
+        assert_eq!(
+            sdk_err_code(&bad.unwrap_err()).as_deref(),
+            Some("InvalidRequest"),
+            "a body equal to a reserved sentinel must be rejected"
+        );
+    }
+    // Rejected before the transition bracket opens, so K is not even marked, let alone overwritten.
+    assert_eq!(get_all(&c, B, "s").await, good);
+}

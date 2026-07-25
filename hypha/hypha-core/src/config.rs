@@ -65,6 +65,69 @@ fn default_offload() -> usize {
     1024 * 1024
 }
 
+/// The cached-mode reconcile sweep's cadence (§7, §9). Ignored in durable mode, which has no
+/// pending set to drain.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reconcile {
+    /// Delay between passes. Short enough that the async-lag loss window stays small, long enough
+    /// that an idle cache isn't polled hot.
+    #[serde(default = "default_reconcile_interval_ms")]
+    pub interval_ms: u64,
+    /// Pending keys uploaded/propagated concurrently within one pass.
+    #[serde(default = "default_reconcile_concurrency")]
+    pub concurrency: usize,
+}
+
+fn default_reconcile_interval_ms() -> u64 {
+    5_000
+}
+fn default_reconcile_concurrency() -> usize {
+    16
+}
+
+impl Default for Reconcile {
+    fn default() -> Self {
+        Reconcile {
+            interval_ms: default_reconcile_interval_ms(),
+            concurrency: default_reconcile_concurrency(),
+        }
+    }
+}
+
+/// Bounds on the background-transition actor (§8, §9) — the queue every discardable per-key
+/// transition is dispatched through (rehydrate now; GC eviction in phase 5). Cached mode only:
+/// durable mode never rehydrates and never evicts, so nothing is ever submitted.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Background {
+    /// Transitions running at once. Each is a whole-object fetch + decrypt + cache write, so this
+    /// sits far below `reconcile.concurrency`: the bound is remote bandwidth, not request count.
+    #[serde(default = "default_background_concurrency")]
+    pub concurrency: usize,
+    /// Queued-but-unstarted transitions. A full queue **drops** new submissions instead of blocking
+    /// the read that raised them — a dropped rehydrate costs the next read of that key one remote
+    /// fetch, which is exactly what the read is already doing.
+    #[serde(default = "default_background_queue_depth")]
+    pub queue_depth: usize,
+}
+
+fn default_background_concurrency() -> usize {
+    4
+}
+fn default_background_queue_depth() -> usize {
+    256
+}
+
+impl Default for Background {
+    fn default() -> Self {
+        Background {
+            concurrency: default_background_concurrency(),
+            queue_depth: default_background_queue_depth(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -86,6 +149,14 @@ pub struct Config {
     pub master_passphrase: String,
     #[serde(default)]
     pub serving: Serving,
+    /// Cached-mode reconcile cadence (§7). Present in both modes for config uniformity; the sweep
+    /// only runs when `mode == cached`.
+    #[serde(default)]
+    pub reconcile: Reconcile,
+    /// Bounds on the background-transition actor (§8). Present in both modes for config uniformity;
+    /// only cached mode submits anything.
+    #[serde(default)]
+    pub background: Background,
 }
 
 impl Default for Serving {

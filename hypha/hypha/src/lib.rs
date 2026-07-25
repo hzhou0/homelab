@@ -4,29 +4,36 @@
 //! calls [`serve`]; the tests build the same service in-process and drive it with a real S3 client.
 
 mod auth;
+mod background;
 mod bucket_ctl;
 mod codec;
 mod keylocks;
+mod markers;
+mod replication;
 mod s3;
 mod tier;
 
 use std::error::Error;
 use std::future::Future;
+use std::time::Duration;
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use tokio::net::TcpListener;
 
+use hypha_core::config::Mode;
 use hypha_core::{Backend, Config};
 
 pub use s3::Hypha;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
-/// Build the s3s `S3Service` — hypha's client auth over the `Hypha` app — from a validated config.
-/// The age envelope and trailer key both derive from `master_passphrase` (§6).
-pub fn build_service(config: &Config) -> Result<S3Service, BoxError> {
+/// Build the s3s `S3Service` — hypha's client auth over the `Hypha` app — from a validated config,
+/// alongside the [`Lifecycle`] [`serve`] needs to bracket it: the startup marker clear and the
+/// drain-time quiescence proof (§7). The age envelope and trailer key both derive from
+/// `master_passphrase` (§6).
+pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError> {
     let env = hypha_format::Envelope::new(&config.master_passphrase)
         .map_err(|e| format!("parsing master passphrase: {e}"))?;
     // Trailer authentication key: same master passphrase, distinct KDF domain (§6).
@@ -38,23 +45,93 @@ pub fn build_service(config: &Config) -> Result<S3Service, BoxError> {
     let data = Backend::connect(&config.cache);
     let meta = data.with_prefix(config.cache_meta_prefix.clone());
 
-    let app = Hypha::new(
-        remote,
+    let tier = tier::Reconciler {
         data,
         meta,
-        env,
+        remote,
+        env: std::sync::Arc::new(env),
         trailer_key,
+        locks: keylocks::KeyLocks::default(),
+        upload_locks: keylocks::KeyLocks::default(),
+    };
+
+    // The repair queue's only strong sender goes to `Lifecycle`, so dropping that at drain is what
+    // closes the channel — the proof that every obligation has finished (§7).
+    let (markers, queue, worker) = markers::spawn(
+        tier.clone(),
+        Duration::from_millis(config.reconcile.interval_ms),
+        config.reconcile.concurrency,
+    );
+
+    let app = Hypha::new(
+        tier,
+        markers.clone(),
         config.mode,
         config.serving.offload_threshold,
         config.max_bucket_prefix_len(),
+        config.background,
     );
+
+    // The cached-mode reconcile sweep (§7): a background duty that trails cache writes onto the
+    // remote. It holds only a `Weak` to the app's liveness sentinel, so it stops when the service
+    // drops — no explicit shutdown wiring. Durable mode has no pending set, so no sweep.
+    if config.mode == Mode::Cached {
+        let sweep = replication::Reconcile::new(
+            app.tier.clone(),
+            Duration::from_millis(config.reconcile.interval_ms),
+            config.reconcile.concurrency,
+        );
+        tokio::spawn(sweep.run(app.liveness()));
+    }
 
     let mut b = S3ServiceBuilder::new(app);
     b.set_auth(auth::SingleKeyAuth::new(
         config.auth.access_key.clone(),
         config.auth.secret_key.clone(),
     ));
-    Ok(b.build())
+    let lifecycle = Lifecycle {
+        cached: config.mode == Mode::Cached,
+        markers,
+        queue: Some(queue),
+        worker: tokio::spawn(worker.run()),
+    };
+    Ok((b.build(), lifecycle))
+}
+
+/// The two ends of a run that the object path itself cannot own (§7): the startup clear that makes
+/// every bucket dirty on disk before a write can land, and the drain that proves quiescence before
+/// writing any clean marker back.
+pub struct Lifecycle {
+    cached: bool,
+    markers: markers::Markers,
+    /// The repair queue's only strong sender outside the obligation tasks. Dropping it is the seal.
+    queue: Option<markers::Queue>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl Lifecycle {
+    /// Clear every bucket's clean marker before serving. Fails startup rather than serving around a
+    /// marker that will not delete — that marker would skip next run's recovery scan, by which time
+    /// real orphans exist. Durable mode owes no markers, so there is nothing to clear.
+    pub async fn startup(&self) -> Result<(), BoxError> {
+        if self.cached {
+            self.markers.startup().await?;
+        }
+        Ok(())
+    }
+
+    /// Seal the run: drop the queue so the channel closes once the last obligation finishes, then
+    /// let the worker make its final attempt and write the clean markers. Awaited *before* the
+    /// active claim is released (§7) — a passive that promotes first could take writes into a bucket
+    /// this run is about to vouch for.
+    pub async fn drain(mut self) {
+        if let Some(queue) = self.queue.take() {
+            queue.seal();
+        }
+        if let Err(e) = self.worker.await {
+            tracing::warn!(error = %e, "marker worker did not finish; clean markers withheld");
+        }
+    }
 }
 
 /// Serve `service` on `listener`, accepting connections until `shutdown` resolves, then drain
@@ -63,11 +140,14 @@ pub fn build_service(config: &Config) -> Result<S3Service, BoxError> {
 pub async fn serve<F>(
     listener: TcpListener,
     service: S3Service,
+    lifecycle: Lifecycle,
     shutdown: F,
 ) -> Result<(), BoxError>
 where
     F: Future<Output = ()>,
 {
+    lifecycle.startup().await?;
+
     let http = ConnBuilder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -95,9 +175,22 @@ where
         });
     }
 
+    // Step 1 of the quiescence proof (§7): when this resolves, every handler has returned and no new
+    // one can start, so every marker obligation that will ever exist has been raised. On timeout we
+    // skip the seal entirely — a connection may still commit a write, and the claim a clean marker
+    // makes is about work we can no longer bound.
     tokio::select! {
-        () = graceful.shutdown() => tracing::info!("drained"),
-        () = tokio::time::sleep(std::time::Duration::from_secs(15)) => tracing::warn!("drain timeout"),
+        () = graceful.shutdown() => {
+            tracing::info!("connections drained");
+            lifecycle.drain().await;
+        }
+        () = tokio::time::sleep(DRAIN_TIMEOUT) => {
+            tracing::warn!("drain timeout; clean markers withheld and the next run scans");
+        }
     }
     Ok(())
 }
+
+/// Budget for the connection drain, sized to fit inside the pod's `terminationGracePeriod` (§9).
+/// Overrunning it is safe — it costs the next run a recovery scan — but never silent.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);

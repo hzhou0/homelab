@@ -18,6 +18,10 @@ pub enum Error {
     /// An `If-Match` / `If-None-Match` precondition did not hold.
     #[error("precondition failed")]
     PreconditionFailed,
+    /// A `Content-MD5` did not match the body — surfaced when the cache backend validates a
+    /// forwarded digest on a cached-mode PUT (§7).
+    #[error("content-md5 mismatch")]
+    BadDigest,
     /// Client sent something hypha rejects at admission (bad key byte, oversized part, …).
     #[error("invalid request: {0}")]
     Invalid(String),
@@ -47,6 +51,7 @@ impl Error {
             }
             Some("NoSuchBucket") => Error::NoSuchBucket,
             Some("PreconditionFailed") | Some("412") => Error::PreconditionFailed,
+            Some("BadDigest") | Some("InvalidDigest") => Error::BadDigest,
             _ => Error::Backend(format!("{err:?}")),
         }
     }
@@ -58,6 +63,7 @@ impl From<Error> for S3Error {
             Error::NotFound => S3ErrorCode::NoSuchKey,
             Error::NoSuchBucket => S3ErrorCode::NoSuchBucket,
             Error::PreconditionFailed => S3ErrorCode::PreconditionFailed,
+            Error::BadDigest => S3ErrorCode::BadDigest,
             Error::Invalid(_) => S3ErrorCode::InvalidRequest,
             // A decrypt/authentication failure is a server-side integrity fault, not client error.
             Error::Crypto(_) | Error::Backend(_) | Error::Io(_) => S3ErrorCode::InternalError,

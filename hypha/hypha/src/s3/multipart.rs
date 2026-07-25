@@ -204,6 +204,7 @@ impl Hypha {
                     HashMap::new(),
                     None,
                     None,
+                    None,
                 ),
             )?;
             out
@@ -383,7 +384,8 @@ impl Hypha {
                 codec::bytestream_to_blob(out.body)
             } else {
                 let sub = (!whole).then(|| pt.clone());
-                self.decrypt_remote_body(&src_bucket, &src_key, &facts.cetag, sub)
+                self.tier
+                    .decrypt_remote_body(&src_bucket, &src_key, &facts.cetag, sub)
                     .await?
             };
             self.stream_part(
@@ -440,7 +442,7 @@ impl Hypha {
         }
 
         // The whole bracket runs under K's write lock (§7).
-        let _guard = self.tier.locks.lock(&key).await;
+        let _guard = self.write_lock(&bucket, &key).await;
 
         // The upload record also carries the pass-through metadata + storage class recorded at
         // create (§7); settle stamps them onto the tombstone below.

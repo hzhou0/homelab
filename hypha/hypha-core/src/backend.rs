@@ -131,6 +131,7 @@ impl Backend {
         body: ByteStream,
         content_length: Option<i64>,
         metadata: HashMap<String, String>,
+        content_md5: Option<String>,
         if_match: Option<String>,
         if_none_match: Option<String>,
     ) -> Result<PutObjectOutput> {
@@ -141,6 +142,11 @@ impl Backend {
             .body(body)
             .set_content_length(content_length)
             .set_metadata(Some(metadata))
+            // Client `Content-MD5` forwarded to the cache (cached-mode PUT, §7) so the backend
+            // validates the plaintext and returns `BadDigest` atomically — nothing lands on a bad
+            // digest, and any prior body stays intact. `None` for hypha's own writes (ciphertext,
+            // whose integrity is the trailer's job).
+            .set_content_md5(content_md5)
             .set_if_match(if_match)
             .set_if_none_match(if_none_match)
             .send()
@@ -186,6 +192,23 @@ impl Backend {
             .delete_object()
             .bucket(self.bkt(bucket))
             .key(key)
+            .send()
+            .await
+            .map_err(Error::from_sdk)?;
+        Ok(())
+    }
+
+    /// Conditional DELETE — remove `key` only if its current ETag matches `if_match` (quoted, §8).
+    /// The CAS the reconcile sweep clears its marker and delete-tombstone through: a concurrent
+    /// overwrite moved the ETag, so the delete 412s and the racing writer's state stands (§7). The
+    /// cache must implement conditional DELETE for this (§9, SeaweedFS ≥ 4.07); a backend that
+    /// ignores the condition degrades the same-key reconcile-vs-write race, never a non-racy path.
+    pub async fn delete_if_match(&self, bucket: &str, key: &str, if_match: String) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(self.bkt(bucket))
+            .key(key)
+            .if_match(if_match)
             .send()
             .await
             .map_err(Error::from_sdk)?;

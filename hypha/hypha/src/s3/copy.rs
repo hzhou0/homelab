@@ -137,7 +137,7 @@ impl Hypha {
         // Whole bracket under K_dst's write lock (§7). No destination precondition to resolve, and
         // this copy's mark → commit → settle overwrites K_dst wholesale, so any leftover mark on it
         // is simply superseded — no separate repair needed.
-        let _guard = self.tier.locks.lock(&key).await;
+        let _guard = self.write_lock(&bucket, &key).await;
 
         // The fresh trailer: the source footer with mtime re-minted, re-MAC'd over K_dst; the table
         // (empty for single-part) carries over. Built once — both commit paths preserve body_ct_len.
@@ -308,6 +308,7 @@ impl Hypha {
         trailer: Vec<u8>,
     ) -> Result<(), Error> {
         let plaintext = self
+            .tier
             .decrypt_remote_body(src_bucket, src_key, &facts.cetag, None)
             .await?;
         let (body_len, enc, _etag_rx) =
@@ -323,6 +324,7 @@ impl Hypha {
                 framed,
                 Some(framed_len as i64),
                 HashMap::new(),
+                None,
                 None,
                 None,
             )
