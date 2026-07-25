@@ -59,7 +59,7 @@ sync; hypha drives it over adapters bridged via `spawn_blocking` (§5).
 | Encryption / hashing | `age`, `hmac`+`sha2` (trailer MAC, §6), `md-5`, `hex`                 |
 | Config / errors      | `serde`, `figment`; `thiserror`, `anyhow` (bootstrap)               |
 | Observability        | `tracing`(+`subscriber`); `metrics` + Prometheus exporter (planned) |
-| Concurrency          | `dashmap` (planned: the §8 in-flight-PUT ref count)                 |
+| Concurrency          | `dashmap` (the §4 key-lock table), `arc-swap` (the §7 bucket state) |
 | Testing              | `proptest`, `criterion`, `cargo fuzz`, `testcontainers`             |
 
 ## 3. Module layout
@@ -128,8 +128,10 @@ per-part plaintext MD5s hypha accumulates during the upload (§7).
 
 Serving is **active-passive**: one active replica does all work; the pre-warmed passive
 (stateless — "pre-warmed" just means connections open) promotes instantly. Within the single
-writer, the **per-key async lock table** (`keylocks.rs`) is the serialization primitive. It is
-taken by:
+writer, the **per-key async lock table** (`keylocks.rs`) is the serialization primitive — a sharded
+map (`dashmap`) of weak references to per-key async mutexes, evicted on the last guard's drop, so
+the table holds exactly the held-or-awaited keys and no acquisition serializes against an unrelated
+key's. It is taken by:
 
 - **conditional writes** — the lock covers HEAD → evaluate → write, and is the linearization
   point: hypha resolves the key's *current client-visible ETag* (below), evaluates the

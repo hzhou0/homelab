@@ -59,7 +59,10 @@ pub struct Minio {
 
 impl Minio {
     pub async fn start() -> Self {
-        let _boot = BOOT_GATE.acquire().await.expect("boot gate is never closed");
+        let _boot = BOOT_GATE
+            .acquire()
+            .await
+            .expect("boot gate is never closed");
         let data_dir = tempfile::tempdir().expect("minio data dir");
         let api_port = free_port();
         let console_port = free_port();

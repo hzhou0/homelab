@@ -10,30 +10,36 @@
 //! upgrades a dead `Weak`, gets `None`, and installs a fresh mutex.
 //!
 //! Cleanup is **remove-on-drop**, O(1), not a periodic sweep: when a guard drops it releases the
-//! async mutex, then — under the table lock — removes the key iff it is the sole remaining owner
-//! (`strong_count == 1`, i.e. no other holder or parked waiter). So the table holds exactly the
-//! set of currently held-or-awaited keys, with no dangling entries to sweep. The one backstop for
-//! the essentially-impossible orphan (a `lock` future cancelled between install and acquire — the
+//! async mutex, then removes the key iff it is the sole remaining owner (`strong_count == 1`, i.e.
+//! no other holder or parked waiter). So the table holds exactly the set of currently
+//! held-or-awaited keys, with no dangling entries to sweep. The one backstop for the
+//! essentially-impossible orphan (a `lock` future cancelled between install and acquire — the
 //! fresh-mutex acquire never suspends, so this can't actually happen) is that `mutex_for`
 //! overwrites any dead `Weak` it finds, so a stray entry self-heals on the key's next use.
+//!
+//! `DashMap` rather than one `Mutex<HashMap>`: every write op takes and releases a key lock, so a
+//! single table lock is a process-wide serialization point on the write path — sharding scopes each
+//! acquisition to one of the map's shards. Keys are `Arc<str>` shared with the table entry, so a
+//! second locker of a held key allocates nothing.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-type Table = HashMap<String, Weak<AsyncMutex<()>>>;
+type Table = DashMap<Arc<str>, Weak<AsyncMutex<()>>>;
 
 #[derive(Clone, Default)]
 pub struct KeyLocks {
-    table: Arc<Mutex<Table>>,
+    table: Arc<Table>,
 }
 
 impl KeyLocks {
     /// Acquire the lock for `key`, awaiting any current holder. Hold the returned guard for the
     /// critical section; dropping it releases the lock and evicts the key's now-idle entry.
     pub async fn lock(&self, key: &str) -> Guard {
-        let arc = self.mutex_for(key);
+        let (key, arc) = self.mutex_for(key);
         let inner = arc.clone().lock_owned().await;
         self.guard(key, arc, inner)
     }
@@ -42,35 +48,57 @@ impl KeyLocks {
     /// transition mark opportunistically (§7): a *held* lock means the marking writer is alive
     /// mid-bracket — nothing to repair, and a read must not queue behind it.
     pub fn try_lock(&self, key: &str) -> Option<Guard> {
-        let arc = self.mutex_for(key);
+        let (key, arc) = self.mutex_for(key);
         let inner = arc.clone().try_lock_owned().ok()?;
         Some(self.guard(key, arc, inner))
     }
 
-    fn guard(&self, key: &str, arc: Arc<AsyncMutex<()>>, inner: OwnedMutexGuard<()>) -> Guard {
+    fn guard(&self, key: Arc<str>, arc: Arc<AsyncMutex<()>>, inner: OwnedMutexGuard<()>) -> Guard {
         Guard {
             inner: Some(inner),
             arc,
-            key: key.to_string(),
+            key,
             table: self.table.clone(),
         }
     }
 
     #[cfg(test)]
     fn entries(&self) -> usize {
-        self.table.lock().unwrap().len()
+        self.table.len()
     }
 
-    fn mutex_for(&self, key: &str) -> Arc<AsyncMutex<()>> {
-        let mut table = self.table.lock().unwrap();
-        // Reuse the live mutex if another holder/waiter exists, else install a fresh one —
-        // overwriting a dead `Weak` if one lingers (the remove-on-drop backstop).
-        match table.get(key).and_then(Weak::upgrade) {
-            Some(m) => m,
-            None => {
+    /// The mutex for `key` plus the table's own copy of the key, both under the shard lock: reuse
+    /// the live one if another holder/waiter exists, else install a fresh one — overwriting a dead
+    /// `Weak` if one lingers (the remove-on-drop backstop).
+    fn mutex_for(&self, key: &str) -> (Arc<str>, Arc<AsyncMutex<()>>) {
+        // Fast path — a present entry is resolved (and, if dead, replaced) in place, so the common
+        // case of contending for a held key borrows the table's key instead of allocating one.
+        if let Some(mut entry) = self.table.get_mut(key) {
+            if let Some(m) = entry.value().upgrade() {
+                return (entry.key().clone(), m);
+            }
+            let m = Arc::new(AsyncMutex::new(()));
+            *entry.value_mut() = Arc::downgrade(&m);
+            return (entry.key().clone(), m);
+        }
+        // Absent: only the entry API inserts atomically, and it needs an owned key — the one
+        // allocation, paid once per key per idle period and shared with the guard. A racing
+        // installer is resolved here, not overwritten.
+        match self.table.entry(Arc::from(key)) {
+            Entry::Occupied(mut occupied) => {
+                if let Some(m) = occupied.get().upgrade() {
+                    return (occupied.key().clone(), m);
+                }
                 let m = Arc::new(AsyncMutex::new(()));
-                table.insert(key.to_string(), Arc::downgrade(&m));
-                m
+                let key = occupied.key().clone();
+                occupied.insert(Arc::downgrade(&m));
+                (key, m)
+            }
+            Entry::Vacant(vacant) => {
+                let m = Arc::new(AsyncMutex::new(()));
+                let key = vacant.key().clone();
+                vacant.insert(Arc::downgrade(&m));
+                (key, m)
             }
         }
     }
@@ -84,27 +112,23 @@ pub struct Guard {
     /// guard's own strong ref must be gone for `strong_count == 1` to mean "only us left".
     inner: Option<OwnedMutexGuard<()>>,
     arc: Arc<AsyncMutex<()>>,
-    key: String,
-    table: Arc<Mutex<Table>>,
+    /// Shared with the table's own key, so holding a guard costs a refcount, not an allocation.
+    key: Arc<str>,
+    table: Arc<Table>,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        // Hold the table lock across the whole sequence: it fences out `mutex_for`, so no new
-        // locker can upgrade our `Weak` between the owner count and the remove. Waking a parked
-        // waiter (below) doesn't change the count — it already holds its own `arc` clone.
-        let mut table = self.table.lock().unwrap();
+        // Release first: waking a parked waiter can't change the owner count (it already holds its
+        // own `arc` clone), and our own reference must be gone before the count means anything.
         drop(self.inner.take());
-        if Arc::strong_count(&self.arc) == 1 {
-            // Sole owner: the entry is dead to everyone but us. Remove it — but only if it is
-            // still *our* mutex, never a newer epoch installed under the same key.
-            if table
-                .get(&self.key)
-                .is_some_and(|w| Weak::as_ptr(w) == Arc::as_ptr(&self.arc))
-            {
-                table.remove(&self.key);
-            }
-        }
+        // Both conditions are evaluated under the shard's write lock, so a locker that upgrades our
+        // `Weak` concurrently either gets there first — bumping the count, and we decline — or
+        // finds the entry already gone and installs its own. The pointer check keeps us from
+        // evicting a newer epoch installed under the same key.
+        self.table.remove_if(&self.key, |_, weak| {
+            Arc::strong_count(&self.arc) == 1 && Weak::as_ptr(weak) == Arc::as_ptr(&self.arc)
+        });
     }
 }
 
@@ -170,6 +194,38 @@ mod tests {
         drop(held); // waiter is promoted to holder
         waiter.await.unwrap(); // waiter drops its guard
         assert_eq!(locks.entries(), 0, "last owner evicts the entry");
+    }
+
+    // Many keys across many shards, each contended: exclusion must hold per key, and every entry
+    // must be evicted — the install/evict race is the whole risk of resolving a key under one
+    // shard lock rather than one table lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_keys_stay_exclusive_and_drain() {
+        let locks = KeyLocks::default();
+        let inside: Arc<Vec<AtomicBool>> =
+            Arc::new((0..16).map(|_| AtomicBool::new(false)).collect());
+        let mut handles = Vec::new();
+        for i in 0..128 {
+            let l = locks.clone();
+            let inside = inside.clone();
+            handles.push(tokio::spawn(async move {
+                let k = i % 16;
+                for _ in 0..8 {
+                    let _g = l.lock(&format!("key/{k}")).await;
+                    assert!(!inside[k].swap(true, SeqCst), "two holders on key/{k}");
+                    tokio::task::yield_now().await;
+                    inside[k].store(false, SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            locks.entries(),
+            0,
+            "every key evicted after the last release"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
