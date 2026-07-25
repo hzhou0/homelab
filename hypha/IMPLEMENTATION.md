@@ -378,19 +378,20 @@ positional argument. Twins are written in the same locked sequence as their tomb
 (twin-before-tombstone), and every path that replaces an eviction tombstone passes through a live
 body or a transition mark first.
 
-**Facts encoding.** `{md5(128) ‖ plen(46) ‖ mtime_ms(42) ‖ part-count(14)}` = 230 bits, bit-packed
-(as a 256-bit integer, base-converted by repeated division) and rendered in a **91-symbol**
-printable-ASCII alphabet (`0x21..=0x7E`, 6.51 bits/char) → **36 chars**, fixed width (`91³⁶ > 2²³⁰`;
-the tightest base that still fits is 84, so 91 leaves headroom). The alphabet excludes four bytes,
-each for a round-trip reason: `/` — a `/` in the facts would make a twin roll up under a delimiter
-listing and vanish from the twin cursor (§7); `+` — form-style decoders turn it into a space; **space
-(0x20)** — the converse hazard, since a literal space round-trips through the `encoding-type=url`
-LIST as `+` on some backends, so a space in the facts would corrupt the twin key hypha reads back
-(and then `delete_twins` would miss it); and `;`, kept out only by construction (one packed field
-needs no separator). The part count is 0 for a single-part object (`unpack` rebuilds a bare-MD5
+**Facts encoding.** `{md5(128) ‖ plen(46) ‖ mtime_ms(42) ‖ part-count(14)}` = 230 bits, packed
+big-endian (the top 3 of its 32 bytes are zero) and rendered **base64url, unpadded** — 29 bytes →
+**39 chars**, fixed width, via `base64-simd`. Every char is RFC 3986-unreserved, so a twin key
+never needs percent-encoding or XML escaping, and the historic hazards are absent by construction:
+`/` — a `/` in the facts would make a twin roll up under a delimiter listing and vanish from the
+twin cursor (§7); the `+`/space pair — form-style decoders turn `+` into a space, and a literal
+space round-trips through the `encoding-type=url` LIST as `+` on some backends, corrupting the
+twin key hypha reads back (and then `delete_twins` would miss it); and `\`/`.` — MinIO splits path
+components on `\` as well as `/` and rejects any `.`/`..` segment (`XMinioInvalidResourceName`,
+surfaced as a 500), so either char in the pseudo-random facts made some twin keys unwritable
+there. The part count is 0 for a single-part object (`unpack` rebuilds a bare-MD5
 ETag) and `N ≥ 1` for a composite (rebuilds `<md5>-N`), so the twin needn't carry the `-N` literally.
 
-**Twins are optional per key.** Twin overhead is `2 + 36 = 38` bytes, so a key longer than **986**
+**Twins are optional per key.** Twin overhead is `2 + 39 = 41` bytes, so a key longer than **983**
 bytes gets no twin, and its eviction tombstone resolves through the per-key HEAD fallback that
 already exists for genuinely-missing twins. This is deliberate: the tombstone's metadata is the
 authoritative copy and the twin is only its LIST projection, so a missing twin costs a round trip
@@ -1714,8 +1715,8 @@ bytes.
    create/delete/head lifecycle over three backend buckets, and the remote-as-emptiness-gate delete
    that drains both cache buckets. **Done.**
 2. **`meta` module** — the structural `0x01` ranges replacing `RESERVED_PREFIX`, bit-packed
-   base-91 facts, twin build/parse against the 986-byte threshold, admission relaxed to S3's 1024.
-   **Done.**
+   base64url facts, twin build/parse against the 983-byte threshold, admission relaxed to S3's
+   1024. **Done.**
 3. **Move twins, markers, and mpu state** into `<meta><b>` (`Reconciler` split into `data`/`meta`
    backends); `refresh_twin` / `delete_twins` / the settle and tombstone paths; `shadow_key` helper
    for `sha256(K)` (unwired until phase 4's rehydrate). `drop_mpu_state` moved to single-object
@@ -1731,9 +1732,16 @@ bytes.
 > alphabet (`0x20..=0x7E` minus `/`,`+`,`;`), keeping space. But space is the exact converse of the
 > `+` hazard the spec already guarded: a literal space in a twin key round-trips through the
 > `encoding-type=url` LIST as `+` on MinIO, so `delete_twins` read back a corrupted key and left the
-> real twin behind (caught by `delete_objects_batch`). The alphabet is now **91 symbols** —
-> `0x21..=0x7E` minus `/`,`+`,`;`, space excluded. Still 36 chars (`91³⁶ > 2²³⁰`), so the 986-byte
-> threshold and every other constant are unchanged; only the symbol count moved.
+> real twin behind (caught by `delete_objects_batch`). The alphabet became **91 symbols** —
+> `0x21..=0x7E` minus `/`,`+`,`;`, space excluded.
+>
+> **Second correction, from the phase-4 review (REVIEW.md).** The 91-symbol alphabet still carried
+> `\` and `.`, and MinIO splits path components on `\` as well as `/`, rejecting any `.`/`..`
+> segment (`XMinioInvalidResourceName`, surfaced as a 500) — so a pseudo-random facts field
+> containing `\` + `.`/`..` failed the twin write nondeterministically. Rather than exclude a third
+> pair of chars, the alphabet became **base64url** (64 RFC 3986-unreserved symbols, rendered by
+> `base64-simd`) — 39 chars, threshold 986 → 983 — ending char-driven exclusions by construction,
+> and retiring the hand-rolled bigint base conversion that a non-power-of-two base had required.
 
 *Exit* (met): the v1 pagination test green under twin dilution at several page sizes
 (`list_objects_v1_pagination`); a key above the twin threshold round-tripping PUT → LIST → GET

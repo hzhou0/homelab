@@ -28,7 +28,7 @@ md-5 = "0.10"
 rand = "0.8"           # mpu stash nonces (§6); already in-tree via age
 hex = "0.4"
 percent-encoding = "2"  # decode encoding-type=url LIST keys (§6)
-base64-simd = "0.8"     # Content-MD5 decode; already in the tree via s3s
+base64-simd = "0.8"     # Content-MD5 decode, stash nonces, twin facts; already in the tree via s3s
 s3s = "0.14"
 s3s-aws = "0.14"
 aws-sdk-s3 = "1"

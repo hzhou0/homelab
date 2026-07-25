@@ -422,7 +422,7 @@ pub fn marker_scan_start_after() -> String {
 // twin can never override them. Only eviction tombstones need a twin.
 //
 // The facts live in the *key name* — the one field a raw LIST returns per entry — bit-packed into
-// a fixed 36-char field (below), so a twin is `2 + 36 = 38` bytes longer than its base key. A key
+// a fixed 39-char field (below), so a twin is `2 + 39 = 41` bytes longer than its base key. A key
 // longer than [`TWIN_MAX_KEY_LEN`] therefore gets **no** twin ([`Facts::twin_key`] returns `None`),
 // and its eviction tombstone resolves through the per-key HEAD fallback LIST already runs for a
 // genuinely-missing twin (§6): the tombstone metadata is the authoritative copy, the twin only its
@@ -433,48 +433,19 @@ pub fn marker_scan_start_after() -> String {
 /// previously-written twins across it.
 pub const TWIN_MAX_KEY_LEN: usize = 1024 - 2 - FACTS_CHARS;
 
-/// The packed facts field width. `{md5(128) ‖ plen(46) ‖ mtime_ms(42) ‖ part-count(14)}` = 230
-/// bits, and 36 base-91 chars hold `36·log2(91) ≈ 234.3` bits — the tightest fixed width that fits.
-const FACTS_CHARS: usize = 36;
-const FACTS_BASE: u64 = 91;
-const FACTS_BITS_MD5: u32 = 128;
+/// The packed facts field width: `{md5(128) ‖ plen(46) ‖ mtime_ms(42) ‖ part-count(14)}` = 230
+/// bits fits 29 bytes, base64url-unpadded → 39 chars, fixed width. base64url because every char is
+/// RFC 3986-unreserved — a twin key never needs percent-encoding or XML escaping, and the historic
+/// hazards are absent by construction: `/` (a twin would roll up under a delimiter listing and
+/// vanish from the twin cursor, §7), the `+`/space pair (form-style decoders turn `+` into a
+/// space, and a literal space round-trips through the `encoding-type=url` LIST as `+` on some
+/// backends), and `\`/`.` — MinIO splits path components on `\` as well as `/` and rejects any
+/// `.`/`..` segment (`XMinioInvalidResourceName`), so either char in the pseudo-random facts made
+/// some twin keys unwritable there.
+const FACTS_CHARS: usize = 39;
 const FACTS_BITS_PLEN: u32 = 46;
 const FACTS_BITS_MTIME: u32 = 42;
 const FACTS_BITS_COUNT: u32 = 14;
-
-/// The 91-symbol printable-ASCII alphabet the packed facts render in: `0x21..=0x7E` minus `/` (a
-/// `/` would let a twin roll up under a delimiter listing and vanish from the twin cursor, §7),
-/// `+` (form-style decoders turn it into a space), and `;` (kept out only by construction). **Space
-/// (0x20) is excluded too**: a literal space in a key round-trips through the `encoding-type=url`
-/// LIST as `+` on some backends, so a space in the facts would corrupt the twin key hypha reads
-/// back — every char here percent-encodes unambiguously and never collides with the `+`/space trap.
-const fn facts_alphabet() -> [u8; FACTS_BASE as usize] {
-    let mut a = [0u8; FACTS_BASE as usize];
-    let mut c = 0x21u8;
-    let mut i = 0;
-    while c <= 0x7E {
-        if c != b'/' && c != b'+' && c != b';' {
-            a[i] = c;
-            i += 1;
-        }
-        c += 1;
-    }
-    a
-}
-const FACTS_ALPHABET: [u8; FACTS_BASE as usize] = facts_alphabet();
-
-/// Inverse of [`FACTS_ALPHABET`]: byte → digit value, or `-1` for a byte outside the alphabet.
-const fn facts_rev() -> [i8; 256] {
-    let mut r = [-1i8; 256];
-    let a = FACTS_ALPHABET;
-    let mut i = 0;
-    while i < FACTS_BASE as usize {
-        r[a[i] as usize] = i as i8;
-        i += 1;
-    }
-    r
-}
-const FACTS_REV: [i8; 256] = facts_rev();
 
 /// The facts a twin projects for LIST: exactly what LIST must emit for an evicted key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -499,7 +470,7 @@ impl Facts {
         Some(format!("{c}{base_key}{c}{facts}"))
     }
 
-    /// Bit-pack the facts into their fixed 36-char field, or `None` if the ETag is malformed or a
+    /// Bit-pack the facts into their fixed 39-char field, or `None` if the ETag is malformed or a
     /// field overflows its width.
     fn pack(&self) -> Option<String> {
         // Split the client ETag into its raw MD5 and part count: bare 32-hex ⇒ single-part, count
@@ -522,39 +493,31 @@ impl Facts {
         let hi = ((self.plen as u128) << (FACTS_BITS_MTIME + FACTS_BITS_COUNT))
             | ((self.mtime_ms as u128) << FACTS_BITS_COUNT)
             | count as u128;
-        let mut limbs = [md5 as u64, (md5 >> 64) as u64, hi as u64, (hi >> 64) as u64];
-
-        let mut digits = [0u8; FACTS_CHARS];
-        for d in digits.iter_mut() {
-            *d = FACTS_ALPHABET[divmod_small(&mut limbs, FACTS_BASE) as usize];
-        }
-        digits.reverse(); // most-significant digit first
-        Some(String::from_utf8(digits.to_vec()).expect("alphabet is ASCII"))
+        // The value is < 2^230, so the top 3 of its 32 big-endian bytes are zero and the low 29
+        // encode to exactly 39 unpadded chars.
+        let mut be = [0u8; 32];
+        be[..16].copy_from_slice(&hi.to_be_bytes());
+        be[16..].copy_from_slice(&md5.to_be_bytes());
+        Some(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&be[3..]))
     }
 
-    /// Inverse of [`Self::pack`]: 36 alphabet chars → `Facts`, or `None` if any char is off-alphabet
-    /// or the decoded value exceeds 230 bits (a corrupt twin key).
+    /// Inverse of [`Self::pack`]: 39 chars → `Facts`, or `None` if any char is off-alphabet or the
+    /// decoded value exceeds 230 bits (a corrupt twin key).
     fn unpack(s: &str) -> Option<Facts> {
         if s.len() != FACTS_CHARS {
             return None;
         }
-        let mut limbs = [0u64; 4];
-        for b in s.bytes() {
-            let digit = FACTS_REV[b as usize];
-            if digit < 0 {
-                return None;
-            }
-            mul_add_small(&mut limbs, FACTS_BASE, digit as u64);
-        }
-        // A valid value is < 2^230, so limbs[3] (bits 192..) must be < 2^38.
-        if limbs[3]
-            >> (FACTS_BITS_MD5 + FACTS_BITS_PLEN + FACTS_BITS_MTIME + FACTS_BITS_COUNT - 192)
-            != 0
-        {
+        let raw = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(s.as_bytes())
+            .ok()?;
+        // 29 bytes hold 232 bits; a valid value is < 2^230, so the top 2 bits are zero.
+        if raw.len() != 29 || raw[0] & 0xC0 != 0 {
             return None;
         }
-        let md5 = (limbs[0] as u128) | ((limbs[1] as u128) << 64);
-        let hi = (limbs[2] as u128) | ((limbs[3] as u128) << 64);
+        let mut be = [0u8; 32];
+        be[3..].copy_from_slice(&raw);
+        let hi = u128::from_be_bytes(be[..16].try_into().expect("16 bytes"));
+        let md5 = u128::from_be_bytes(be[16..].try_into().expect("16 bytes"));
         let count = (hi & ((1 << FACTS_BITS_COUNT) - 1)) as u32;
         let mtime_ms = ((hi >> FACTS_BITS_COUNT) & ((1 << FACTS_BITS_MTIME) - 1)) as i64;
         let plen =
@@ -584,28 +547,6 @@ pub fn parse_twin(full_key: &str) -> Option<(&str, Facts)> {
     let sep = rest.find(c)?; // base contains no 0x01 (admission), so this is the separator
     let (base, tail) = rest.split_at(sep);
     Some((base, Facts::unpack(&tail[1..])?))
-}
-
-/// Long-division of the little-endian 256-bit value in `limbs` by a small `d < 2^32`, returning the
-/// remainder. Used to render the packed facts in base 91.
-fn divmod_small(limbs: &mut [u64; 4], d: u64) -> u64 {
-    let mut rem: u128 = 0;
-    for limb in limbs.iter_mut().rev() {
-        let cur = (rem << 64) | *limb as u128;
-        *limb = (cur / d as u128) as u64;
-        rem = cur % d as u128;
-    }
-    rem as u64
-}
-
-/// `limbs = limbs·m + add` over the little-endian 256-bit value — the Horner step decoding base 91.
-fn mul_add_small(limbs: &mut [u64; 4], m: u64, add: u64) {
-    let mut carry: u128 = add as u128;
-    for limb in limbs.iter_mut() {
-        let cur = *limb as u128 * m as u128 + carry;
-        *limb = cur as u64;
-        carry = cur >> 64;
-    }
 }
 
 /// The raw digest half of the composite ETag: `md5(md5₀‖…‖md5ₙ)` over the ordered per-part
@@ -685,12 +626,18 @@ mod tests {
             plen: (1u64 << 46) - 1, // max plen the 46-bit field holds
             mtime_ms: 1,
         };
-        for f in [single, composite] {
+        // Every field at its maximum: the all-ones 230-bit value must still fit the 39-char field.
+        let maxed = Facts {
+            client_etag: format!("{}-{}", "ff".repeat(16), (1u32 << 14) - 1),
+            plen: (1u64 << 46) - 1,
+            mtime_ms: (1i64 << 42) - 1,
+        };
+        for f in [single, composite, maxed] {
             let tk = f.twin_key("dir/obj").unwrap();
             let (base, decoded) = parse_twin(&tk).unwrap();
             assert_eq!(base, "dir/obj");
             assert_eq!(decoded, f);
-            // 0x01 lead + base + 0x01 sep + 36 packed facts chars.
+            // 0x01 lead + base + 0x01 sep + 39 packed facts chars.
             assert_eq!(tk.len(), 1 + "dir/obj".len() + 1 + FACTS_CHARS);
         }
     }
@@ -791,16 +738,25 @@ mod tests {
     }
 
     #[test]
-    fn facts_alphabet_excludes_delimiter_hazards() {
-        assert_eq!(FACTS_ALPHABET.len(), 91);
-        for bad in *b"/+;" {
-            assert!(!FACTS_ALPHABET.contains(&bad));
-            assert!(FACTS_REV[bad as usize] < 0);
-        }
-        // Every alphabet byte round-trips through the reverse table.
-        for (i, &b) in FACTS_ALPHABET.iter().enumerate() {
-            assert_eq!(FACTS_REV[b as usize], i as i8);
-        }
+    fn packed_facts_use_unreserved_chars() {
+        // The rendered field must stay within RFC 3986-unreserved chars — alnum or `-_` — so no
+        // historic hazard (`/`, `+`, space, `\`, `.`) is representable in a twin key.
+        let maxed = Facts {
+            client_etag: format!("{}-{}", "ff".repeat(16), (1u32 << 14) - 1),
+            plen: (1u64 << 46) - 1,
+            mtime_ms: (1i64 << 42) - 1,
+        };
+        let tk = maxed.twin_key("obj").unwrap();
+        let facts = tk.rsplit(CTRL as char).next().unwrap();
+        assert_eq!(facts.len(), FACTS_CHARS);
+        assert!(facts
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        // Off-alphabet chars, a wrong length, or a value ≥ 2^230 (39 chars of `_` = 2²³⁴ − 1)
+        // don't parse — a corrupt twin degrades to the HEAD fallback instead of misreading facts.
+        assert!(Facts::unpack(&"/".repeat(FACTS_CHARS)).is_none());
+        assert!(Facts::unpack(&"A".repeat(FACTS_CHARS - 1)).is_none());
+        assert!(Facts::unpack(&"_".repeat(FACTS_CHARS)).is_none());
     }
 
     #[test]
