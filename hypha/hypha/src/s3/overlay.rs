@@ -66,8 +66,16 @@ impl Hypha {
     /// is seen. A persisted marker this process hadn't observed is adopted into the ready set, so the
     /// probe is paid once per bucket per lifetime.
     pub(super) async fn readiness(&self, bucket: &str) -> S3Result<Readiness> {
-        if self.buckets.is_ready(bucket) {
+        // One atomic load answers both memos. A restore already pending or in flight is a standing
+        // `Restoring` verdict, so the two probes below are paid once per restore rather than by
+        // every op crossing the window; the actor drops that memo when the sweep ends, which is
+        // what re-triggers a failed one.
+        let state = self.buckets.state(bucket);
+        if state.is_ready() {
             return Ok(Readiness::Ready);
+        }
+        if state.is_restoring() {
+            return Ok(Readiness::Restoring);
         }
         match self.meta().head(bucket, &meta::sync_marker_key()).await {
             Ok(_) => {
@@ -151,10 +159,11 @@ impl Hypha {
             Readiness::Restoring => {
                 let _guard = self.tier.locks.lock(key).await;
                 // The background restore provisions the projections and rebuilds the namespace, but
-                // a write can beat it here — ensure the cache buckets exist (idempotent) so K's
-                // materialization lands, then settle K to the remote's current state.
-                crate::bucket_ctl::ensure_cache_bucket(self.data(), bucket).await?;
-                crate::bucket_ctl::ensure_cache_bucket(self.meta(), bucket).await?;
+                // a write can beat it here — have the actor provision on demand so K's
+                // materialization lands, then settle K to the remote's current state. Coalesced
+                // there, so a burst of writes into a lost-volume bucket costs one round, not one
+                // per request.
+                self.buckets.provision(bucket).await?;
                 self.tier.repair_locked(bucket, key).await?;
                 Ok(())
             }

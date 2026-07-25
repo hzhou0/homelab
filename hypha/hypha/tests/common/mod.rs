@@ -44,6 +44,12 @@ const REMOTE_PREFIX: &str = "remote-";
 
 // ── MinIO ────────────────────────────────────────────────────────────────────────────────────
 
+/// Booting a MinIO is the expensive part of a test (process spawn + disk init). With one per test
+/// and the default test parallelism they all land at once and the slowest miss their readiness
+/// budget, so cap how many boot concurrently — running servers are near-idle, only the burst needs
+/// bounding.
+static BOOT_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// A throwaway MinIO server. Killed and its data dir removed on `Drop`.
 pub struct Minio {
     child: Child,
@@ -53,6 +59,7 @@ pub struct Minio {
 
 impl Minio {
     pub async fn start() -> Self {
+        let _boot = BOOT_GATE.acquire().await.expect("boot gate is never closed");
         let data_dir = tempfile::tempdir().expect("minio data dir");
         let api_port = free_port();
         let console_port = free_port();
@@ -92,13 +99,13 @@ impl Minio {
 
     async fn await_ready(&self) {
         let client = self.raw_client();
-        for _ in 0..120 {
+        for _ in 0..240 {
             if client.list_buckets().send().await.is_ok() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        panic!("MinIO at {} did not become ready within 30s", self.endpoint);
+        panic!("MinIO at {} did not become ready within 60s", self.endpoint);
     }
 }
 

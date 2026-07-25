@@ -262,6 +262,121 @@ async fn bucket_cache_volume_loss_restores_from_remote() {
     }
 }
 
+/// Deleting a bucket that was unreconciled must retire every memo the gate keeps about it — a
+/// stale `Restoring` verdict would keep answering from the remote instead of `NoSuchBucket` (§7).
+#[tokio::test]
+async fn delete_of_an_unreconciled_bucket_resolves_absent() {
+    let mut h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    put(&client, B, "obj", &pattern(32)).await;
+
+    let raw = h.raw();
+    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
+        for key in raw_list(&raw, &cache, None).await {
+            raw.delete_object()
+                .bucket(&cache)
+                .key(&key)
+                .send()
+                .await
+                .expect("wipe cache object");
+        }
+    }
+    h.restart_hypha().await;
+    let client = h.client();
+
+    // First op classifies the bucket as restoring (and memoizes it); the delete then has to undo
+    // that, whether or not the sweep has finished by the time it lands.
+    assert_eq!(get_all(&client, B, "obj").await, pattern(32));
+    client
+        .delete_object()
+        .bucket(B)
+        .key("obj")
+        .send()
+        .await
+        .expect("delete obj");
+    client
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect("delete bucket");
+
+    for err in [
+        sdk_err_code(
+            &client
+                .get_object()
+                .bucket(B)
+                .key("obj")
+                .send()
+                .await
+                .unwrap_err(),
+        ),
+        sdk_err_code(&client.list_objects_v2().bucket(B).send().await.unwrap_err()),
+    ] {
+        assert_eq!(
+            err.as_deref(),
+            Some("NoSuchBucket"),
+            "a deleted bucket must not keep answering from a stale readiness memo"
+        );
+    }
+}
+
+/// A burst of writes arriving into a bucket whose cache volume is gone: every one must land, even
+/// though none of them can write until the `<data>`/`<meta>` projections exist. Provisioning is a
+/// control-plane action, so the writers hand it to the bucket actor, which coalesces the burst onto
+/// one round rather than letting each request race to create the same two buckets (§7). The
+/// coalescing itself isn't observable from the client side — this pins the correctness half.
+#[tokio::test]
+async fn concurrent_writes_survive_cache_volume_loss() {
+    let mut h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    put(&client, B, "seed", &pattern(32)).await;
+
+    let raw = h.raw();
+    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
+        for key in raw_list(&raw, &cache, None).await {
+            raw.delete_object()
+                .bucket(&cache)
+                .key(&key)
+                .send()
+                .await
+                .expect("wipe cache object");
+        }
+        raw.delete_bucket()
+            .bucket(&cache)
+            .send()
+            .await
+            .expect("wipe cache bucket");
+    }
+    h.restart_hypha().await;
+
+    // Fired together, before the lazily-triggered restore can provision anything for them.
+    let client = h.client();
+    let bodies: Vec<Vec<u8>> = (0..16u8).map(|i| pattern_seeded(48, i)).collect();
+    let keys: Vec<String> = (0..bodies.len()).map(|i| format!("burst/{i}")).collect();
+    let writes = keys
+        .iter()
+        .zip(&bodies)
+        .map(|(k, body)| put(&client, B, k, body));
+    futures::future::join_all(writes).await;
+
+    for (k, body) in keys.iter().zip(&bodies) {
+        assert_eq!(&get_all(&client, B, k).await, body, "burst write {k} lost");
+    }
+    assert_eq!(get_all(&client, B, "seed").await, pattern(32));
+
+    // The restore still completes over the union of pre-loss and burst keys.
+    wait_for_sync_marker(&h, B).await;
+    let mut rebuilt = raw_list(&raw, &h.cache_bucket(B), None).await;
+    rebuilt.sort();
+    let mut want = keys.clone();
+    want.push("seed".to_string());
+    want.sort();
+    assert_eq!(rebuilt, want, "one tombstone per key after restore");
+}
+
 /// hypha is by assumption the only writer of the remote buckets (§7), so an object whose tail
 /// trailer does not authenticate means that assumption is broken — foreign writes, or the wrong
 /// trailer key. hypha refuses to guess: it logs the object and exits `EXIT_FOREIGN_OBJECT` rather

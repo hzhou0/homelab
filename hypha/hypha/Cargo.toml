@@ -32,6 +32,7 @@ rand = { workspace = true }
 hex = { workspace = true }
 base64-simd = { workspace = true }
 futures = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 # Integration harness (tests/): spawn MinIO as both the cache and the remote backend, drive hypha

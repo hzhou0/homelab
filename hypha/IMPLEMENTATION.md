@@ -918,37 +918,51 @@ cache volume, a pre-restore boot, a partial lifecycle op). By assumption a bucke
 `<meta><b>`) is a trustworthy all-or-nothing readiness signal: marker present ⇒ the projections
 survived intact and the cache is authoritative; marker absent ⇒ the cache is not authoritative and
 the remote is the read source of truth until a restore rebuilds it. All cache-substrate mutations —
-CreateBucket, DeleteBucket, and restore — are funnelled through a **single bucket-control actor** fed
-by a non-blocking unbounded queue, so the actor is the *sole writer* of the cache buckets and their
-serialization is **structural, not lock-based** (no per-bucket locks). The one exception is
-provisioning: the restore overlay's write path may create a missing projection bucket idempotently
-(create-if-absent tolerates a race with the actor) so a write can land ahead of the actor's restore
-— it never deletes. The actor runs
-**per-bucket-serial, cross-bucket-parallel**: a worker drains one bucket's requests in arrival order
-while distinct buckets proceed concurrently, bounded by a global concurrency cap.
+CreateBucket, DeleteBucket, provisioning, and restore — are funnelled through a **single
+bucket-control actor** fed by a non-blocking unbounded queue, so the actor is the *sole writer* of
+the cache buckets and their serialization is **structural, not lock-based** (no per-bucket locks).
+The actor runs **per-bucket-serial, cross-bucket-parallel**: a worker drains one bucket's requests in
+arrival order while distinct buckets proceed concurrently, bounded by a global concurrency cap.
 
-Two request classes ride the queue:
+Three request classes ride the queue:
 
 - **Client CreateBucket / DeleteBucket** — request-reply, serialized per bucket, **never coalesced**:
   each returns the remote's own result, because a double-delete's loser must see `NoSuchBucket` and
   a create must not merge with a same-name delete. The caller pushes (non-blocking) and awaits its
   reply.
+- **Provisioning** — request-reply and **coalesced by waiter list**: the data plane needs the
+  `<data>`/`<meta>` projections to exist before a write to an unreconciled bucket can materialize its
+  key, and after a lost volume they do not. Writers therefore ask the actor rather than each
+  creating the buckets themselves, which would put a head+create pair on the backend per request —
+  the very flood the actor exists to absorb. Concurrent first-callers for a bucket attach to one
+  in-flight round; once it lands, the memoized answer is a set lookup that never reaches the queue.
+  Unlike the other classes this runs *outside* the per-bucket worker, because that worker is
+  occupied by the restore sweep the write is racing and serving is never gated (below). Safe there
+  only because it exclusively creates, idempotently, and only for a bucket the readiness probe has
+  already seen on the remote — bucket *lifecycle* stays the workers' alone.
 - **Restore (repair)** — fire-and-forget and **coalesced by dedup**: the first op to find a bucket
   unreconciled (marker absent, remote present) kicks a `Restore` and resolves itself from the remote
-  meanwhile — no 503, no waiter list. The actor ensures the projections exist, LISTs the remote and
-  rebuilds each object's eviction tombstone + twin from its authenticated tail trailer
+  meanwhile — no 503, no waiter list. That op also memoizes the `Restoring` verdict, so the
+  classification costs two probes *per restore* rather than per request crossing the window; the
+  actor drops the memo when the sweep ends, however it ends, which is what re-triggers a failed
+  sweep (and lets a bucket deleted meanwhile resolve `Absent`) on the next access. A success
+  publishes `Ready` before dropping it, so the gate never sees a bucket as neither. The actor
+  ensures the projections exist, LISTs the remote and rebuilds each object's eviction tombstone +
+  twin from its authenticated tail trailer
   (`Reconciler::restore_bucket`, the per-bucket restore sweep below), then writes the marker to flip
   the bucket cache-authoritative. Idempotent, so a crash mid-sweep resumes by re-running; duplicate
   restores collapse to one.
 
 **The restore overlay** keeps serving ungated while a bucket is unreconciled (one interface,
-`s3/overlay.rs`): a readiness verdict (memoized once the marker is observed) selects each op's source.
+`s3/overlay.rs`): a readiness verdict (memoized in both directions — `Ready` once the marker is
+observed, `Restoring` for as long as a sweep is pending) selects each op's source.
 Reads resolve a key's facts — and a LIST page's entries — from the cache tombstone namespace once
 `Ready`, or straight from the remote (facts off each object's tail trailer, common prefixes and
 pagination passing through the same client keyspace) while `Restoring`; an `UploadPartCopy` source
 resolves as a read of its own bucket. A write to a `Restoring`
-bucket first materializes its key from the remote into the cache under the key lock, so the normal §4
-bracket then runs against a correct tombstone. Restore is **lazy** — triggered on first access, not a
+bucket asks the actor to provision the projections (coalesced, above) and then materializes its key
+from the remote into the cache under the key lock, so the normal §4 bracket runs against a correct
+tombstone. Restore is **lazy** — triggered on first access, not a
 startup scan — so a warm cache pays nothing and only touched buckets are rebuilt. On shutdown the
 actor **drains its queue first** (pending client Create/Delete complete); in-flight restore is soft
 state, re-triggered on the next access.
