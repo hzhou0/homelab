@@ -41,5 +41,4 @@ dashmap = { workspace = true }
 # drop.
 proptest = { workspace = true }
 tempfile = { workspace = true }
-uuid = { workspace = true }
 percent-encoding = { workspace = true }

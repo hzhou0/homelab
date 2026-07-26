@@ -92,7 +92,6 @@ impl Hypha {
         &self,
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        // Confirm existence against the source of truth, then report its backend region.
         self.remote().head_bucket(&req.input.bucket).await?;
         let resp = GetBucketLocationOutput {
             location_constraint: Some(BucketLocationConstraint::from(

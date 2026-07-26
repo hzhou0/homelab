@@ -61,6 +61,26 @@ pub(crate) struct RemoteFacts {
     pub mtime_ms: i64,
 }
 
+impl RemoteFacts {
+    /// A live cache body's facts, off its native HEAD: the cache body is plaintext, so the native
+    /// size/ETag/mtime already are the client-visible facts.
+    pub(crate) fn from_cache_head(head: &HeadObjectOutput) -> Self {
+        RemoteFacts {
+            plen: head.content_length.unwrap_or(0).max(0) as u64,
+            cetag: head
+                .e_tag
+                .as_deref()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+            mtime_ms: head
+                .last_modified
+                .and_then(|t| t.to_millis().ok())
+                .unwrap_or_default(),
+        }
+    }
+}
+
 impl Reconciler {
     // ── The transition bracket (§7) ─────────────────────────────────────────────────────────
 

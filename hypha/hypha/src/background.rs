@@ -124,7 +124,6 @@ impl Background {
     }
 }
 
-/// Spawn the actor and return its handle.
 pub(crate) fn spawn(tier: Reconciler, cfg: config::Background) -> Background {
     let (tx, rx) = mpsc::channel(cfg.queue_depth.max(1));
     let live: Registry = Arc::new(DashMap::new());

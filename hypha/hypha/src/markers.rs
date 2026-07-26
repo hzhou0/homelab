@@ -101,7 +101,6 @@ pub(crate) struct Markers {
     inner: Arc<Inner>,
 }
 
-/// Build the handle, its queue, and the worker.
 pub(crate) fn spawn(
     tier: Reconciler,
     retry: Duration,

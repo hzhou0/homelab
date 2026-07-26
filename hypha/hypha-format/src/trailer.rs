@@ -47,7 +47,7 @@ pub const FACTS_LEN: usize = size_of::<FactsRepr>();
 pub const SINGLE_TRAILER_LEN: usize = FACTS_LEN + TAG_LEN + VERSION_LEN;
 /// The largest possible trailer. One speculative suffix GET of this many bytes always captures
 /// `table ‖ facts ‖ tag ‖ version` for any object, so composite reads never need a second round trip.
-pub const MAX_TAIL_LEN: usize = MAX_TABLE_LEN + FACTS_LEN + TAG_LEN + VERSION_LEN;
+pub const MAX_TAIL_LEN: usize = MAX_TABLE_LEN + SINGLE_TRAILER_LEN;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FooterKind {
@@ -188,7 +188,7 @@ pub fn encode_trailer(
         &table_bytes,
     );
 
-    let mut out = Vec::with_capacity(table_bytes.len() + FACTS_LEN + TAG_LEN + VERSION_LEN);
+    let mut out = Vec::with_capacity(table_bytes.len() + SINGLE_TRAILER_LEN);
     out.extend_from_slice(&table_bytes);
     out.extend_from_slice(facts_bytes);
     out.extend_from_slice(&tag);
@@ -217,7 +217,7 @@ pub fn decode_tail(
     tail: &[u8],
 ) -> Option<Tail> {
     let n = tail.len();
-    if n < FACTS_LEN + TAG_LEN + VERSION_LEN {
+    if n < SINGLE_TRAILER_LEN {
         return None;
     }
     // version ‖ tag ‖ facts sit at fixed offsets from the end.
@@ -240,7 +240,7 @@ pub fn decode_tail(
     }
     let table_bytes = &tail[facts_off - table_len..facts_off];
 
-    let trailer_total = (table_len + FACTS_LEN + TAG_LEN + VERSION_LEN) as u64;
+    let trailer_total = (table_len + SINGLE_TRAILER_LEN) as u64;
     let body_ct_len = object_len.checked_sub(trailer_total)?;
 
     let expect = compute_tag(
@@ -402,7 +402,7 @@ mod tests {
             w.write_all(&plaintext).unwrap();
             w.finish().unwrap();
             let ct_len = ct.len();
-            ct.extend_from_slice(&[0u8; FACTS_LEN + TAG_LEN + VERSION_LEN]);
+            ct.extend_from_slice(&[0u8; SINGLE_TRAILER_LEN]);
 
             let mut out = Vec::new();
             let res = env

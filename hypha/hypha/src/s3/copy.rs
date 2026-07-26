@@ -42,7 +42,7 @@ use hypha_format::{encode_trailer, Footer};
 use super::multipart::{parse_copy_source, MIN_REMOTE_PART};
 use super::overlay::KeyState;
 use super::put::evaluate_precondition;
-use super::{resolve_storage_class, ts_ms, write_metadata, Hypha};
+use super::{copied_part_retag, resolve_storage_class, ts_ms, write_metadata, Hypha};
 use crate::codec;
 use crate::tier::{self, RemoteFacts};
 
@@ -82,22 +82,7 @@ impl Hypha {
         let (facts, src_md) = match self.resolve_key(&src_bucket, &src_key).await? {
             KeyState::Absent => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
             KeyState::Remote { facts, md } => (facts, md),
-            KeyState::CacheBody { head, md } => (
-                RemoteFacts {
-                    plen: head.content_length.unwrap_or(0).max(0) as u64,
-                    cetag: head
-                        .e_tag
-                        .as_deref()
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string(),
-                    mtime_ms: head
-                        .last_modified
-                        .and_then(|t| t.to_millis().ok())
-                        .unwrap_or_default(),
-                },
-                md,
-            ),
+            KeyState::CacheBody { head, md } => (RemoteFacts::from_cache_head(&head), md),
         };
 
         // Copy-source preconditions against the source's current state (§7). ETag conditions reuse
@@ -114,8 +99,7 @@ impl Hypha {
             facts.mtime_ms,
         )?;
 
-        // The metadata the destination tombstone carries (§7): REPLACE takes the request's,
-        // COPY (the default) forwards the source's; the storage class is the request's either way.
+        // The metadata the destination tombstone carries (§7).
         let replace = input
             .metadata_directive
             .as_ref()
@@ -248,12 +232,7 @@ impl Hypha {
                     Some(format!("bytes={}-{}", r.start, r.end - 1)),
                 )
                 .await?;
-            let retag = out
-                .copy_part_result()
-                .and_then(|r| r.e_tag())
-                .ok_or_else(|| Error::Backend("part copy returned no ETag".into()))?
-                .trim_matches('"')
-                .to_string();
+            let retag = copied_part_retag(&out)?;
             parts.push(
                 CompletedPart::builder()
                     .part_number(pn)

@@ -143,14 +143,12 @@ impl Reconcile {
         // reserved sentinel at write time (`meta::is_reserved_sentinel`), so a sentinel classification
         // is always hypha's own tombstone (§6).
         match meta::classify_entry(size, etag) {
-            // A delete-tombstone: propagate the delete to the remote.
             Some(meta::TombKind::Delete) => {
                 self.tier.propagate_delete_locked(bucket, key, m_etag).await
             }
             // Evict/transit with a marker shouldn't occur in cached steady state (GC is Phase 5, and
             // durability gates it): leave the marker for whatever transition owns it.
             Some(_) => Ok(()),
-            // A live body: encrypt and upload, then clear the marker on success.
             None => match self.tier.upload_locked(bucket, key).await? {
                 UploadOutcome::Uploaded | UploadOutcome::Vanished => {
                     self.tier.clear_marker_cas(bucket, key, m_etag).await

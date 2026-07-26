@@ -12,9 +12,7 @@ pub use trailer::{
     MAX_TAIL_LEN, SINGLE_TRAILER_LEN, TAG_LEN, VERSION_LEN,
 };
 
-// The wrapped-error variants are `#[error(transparent)]`: Display and `source()` both delegate to
-// the inner error, so a caller printing the chain doesn't see doubled prefixes. `#[from]` gives the
-// `?`-conversions at call sites (and implies `#[source]`).
+// transparent so a printed error chain doesn't repeat the inner error's prefix.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid age identity: {0}")]

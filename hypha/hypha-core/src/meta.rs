@@ -627,11 +627,7 @@ mod tests {
             mtime_ms: 1,
         };
         // Every field at its maximum: the all-ones 230-bit value must still fit the 39-char field.
-        let maxed = Facts {
-            client_etag: format!("{}-{}", "ff".repeat(16), (1u32 << 14) - 1),
-            plen: (1u64 << 46) - 1,
-            mtime_ms: (1i64 << 42) - 1,
-        };
+        let maxed = maxed_facts();
         for f in [single, composite, maxed] {
             let tk = f.twin_key("dir/obj").unwrap();
             let (base, decoded) = parse_twin(&tk).unwrap();
@@ -741,11 +737,7 @@ mod tests {
     fn packed_facts_use_unreserved_chars() {
         // The rendered field must stay within RFC 3986-unreserved chars — alnum or `-_` — so no
         // historic hazard (`/`, `+`, space, `\`, `.`) is representable in a twin key.
-        let maxed = Facts {
-            client_etag: format!("{}-{}", "ff".repeat(16), (1u32 << 14) - 1),
-            plen: (1u64 << 46) - 1,
-            mtime_ms: (1i64 << 42) - 1,
-        };
+        let maxed = maxed_facts();
         let tk = maxed.twin_key("obj").unwrap();
         let facts = tk.rsplit(CTRL as char).next().unwrap();
         assert_eq!(facts.len(), FACTS_CHARS);
@@ -870,6 +862,15 @@ mod tests {
         }
     }
 
+    /// Every facts field at its maximum — the all-ones 230-bit value.
+    fn maxed_facts() -> Facts {
+        Facts {
+            client_etag: format!("{}-{}", "ff".repeat(16), (1u32 << 14) - 1),
+            plen: (1u64 << 46) - 1,
+            mtime_ms: (1i64 << 42) - 1,
+        }
+    }
+
     #[test]
     fn mpu_part_key_roundtrips_and_rejects_upload_record() {
         let (retag, pmd5): (&'static str, &'static str) =
@@ -897,7 +898,7 @@ mod tests {
         assert_eq!(parse_mpu_part(&ks), Some(stashed));
         assert_eq!(
             mpu_stash_key("up-1", 10_000, "AAAA-nonce_1"),
-            format!("\u{1}\u{1}mup-1\u{1}c10000;AAAA-nonce_1")
+            "\u{1}\u{1}mup-1\u{1}c10000;AAAA-nonce_1"
         );
         // `c` records are not part records, so one LIST separates them by prefix alone.
         assert_eq!(parse_mpu_part(&mpu_stash_key("up-1", 10_000, "n")), None);

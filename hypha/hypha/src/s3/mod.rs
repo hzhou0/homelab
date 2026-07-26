@@ -92,7 +92,7 @@ impl Hypha {
     /// `tier.locks.lock` directly: a rehydrate holds the lock across a whole-object fetch, so
     /// without the cancel a conditional PUT, DELETE, or CompleteMultipartUpload on a hot key would
     /// park behind a multi-minute transfer. The cancel is a map lookup and needs no reply — see
-    /// [`crate::background`] for why the lock handoff is a sufficient rendezvous.
+    /// [`background`] for why the lock handoff is a sufficient rendezvous.
     pub(crate) async fn write_lock(&self, bucket: &str, key: &str) -> Guard {
         self.background.cancel(bucket, key);
         self.tier.locks.lock(key).await
@@ -171,6 +171,19 @@ pub(crate) fn parse_content_md5(header: &str) -> S3Result<[u8; 16]> {
         .map_err(|_| s3_error!(InvalidDigest, "Content-MD5 must decode to 16 bytes"))
 }
 
+/// The ETag a server-side `UploadPartCopy` returned, unquoted. Required — an absent one could
+/// never match this part at complete (§6).
+pub(crate) fn copied_part_retag(
+    out: &aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput,
+) -> Result<String, hypha_core::error::Error> {
+    Ok(out
+        .copy_part_result()
+        .and_then(|r| r.e_tag())
+        .ok_or_else(|| hypha_core::error::Error::Backend("part copy returned no ETag".into()))?
+        .trim_matches('"')
+        .to_string())
+}
+
 #[async_trait::async_trait]
 impl s3s::S3 for Hypha {
     async fn abort_multipart_upload(
@@ -243,18 +256,18 @@ impl s3s::S3 for Hypha {
         self.op_get_bucket_versioning(req).await
     }
 
-    async fn get_object_attributes(
-        &self,
-        req: S3Request<GetObjectAttributesInput>,
-    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        self.op_get_object_attributes(req).await
-    }
-
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         self.op_get_object(req).await
+    }
+
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        self.op_get_object_attributes(req).await
     }
 
     async fn head_bucket(

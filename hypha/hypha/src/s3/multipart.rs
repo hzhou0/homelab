@@ -26,7 +26,9 @@ use hypha_format::offset::{ciphertext_len, plaintext_len_from, HLEN};
 use hypha_format::{encode_trailer, Footer, FooterKind};
 
 use super::overlay::KeyState;
-use super::{resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT};
+use super::{
+    copied_part_retag, resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
+};
 use crate::codec;
 use crate::tier::{self, RemoteFacts};
 
@@ -122,15 +124,7 @@ impl Hypha {
             .ok_or_else(|| Error::Invalid("UploadPart requires a body".into()))?;
 
         // Fail fast if the upload is unknown to us — the eventual complete needs these records.
-        match self
-            .meta()
-            .head(&bucket, &meta::mpu_upload_key(&input.upload_id))
-            .await
-        {
-            Ok(_) => {}
-            Err(Error::NotFound) => return Err(s3_error!(NoSuchUpload, "unknown upload id")),
-            Err(e) => return Err(e.into()),
-        }
+        self.require_upload(&bucket, &input.upload_id).await?;
 
         // Past the byte source, a part is a part: encrypt as a pure age file, stream to the remote,
         // record its facts. The copy path (`op_upload_part_copy`) shares this tail (§7).
@@ -229,6 +223,20 @@ impl Hypha {
         Ok(pmd5)
     }
 
+    /// Fail with `NoSuchUpload` unless the upload's record is in `<meta>` — the eventual complete
+    /// needs these records.
+    async fn require_upload(&self, bucket: &str, upload_id: &str) -> S3Result<()> {
+        match self
+            .meta()
+            .head(bucket, &meta::mpu_upload_key(upload_id))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(Error::NotFound) => Err(s3_error!(NoSuchUpload, "unknown upload id")),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Persist a part's facts in the record KEY (§6): `pmd5` (the plaintext MD5, unknowable to the
     /// remote), `retag` (its last-write-wins token), and the nonce naming any retained ciphertext. A
     /// re-upload writes a new key; the stale one is resolved away at complete by the remote's
@@ -293,15 +301,7 @@ impl Hypha {
         meta::validate_client_key(&src_key).map_err(|e| Error::Invalid(e.to_string()))?;
 
         // The destination upload must be known to us — the eventual complete needs these records.
-        match self
-            .meta()
-            .head(&bucket, &meta::mpu_upload_key(&input.upload_id))
-            .await
-        {
-            Ok(_) => {}
-            Err(Error::NotFound) => return Err(s3_error!(NoSuchUpload, "unknown upload id")),
-            Err(e) => return Err(e.into()),
-        }
+        self.require_upload(&bucket, &input.upload_id).await?;
 
         // Resolve the source's facts + residency through the restore overlay, exactly as a read
         // would (§7): a live cache body reports natively, anything else resolves remote-side —
@@ -309,22 +309,7 @@ impl Hypha {
         let (facts, live) = match self.resolve_key(&src_bucket, &src_key).await? {
             KeyState::Absent => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
             KeyState::Remote { facts, .. } => (facts, false),
-            KeyState::CacheBody { head, .. } => (
-                RemoteFacts {
-                    plen: head.content_length.unwrap_or(0).max(0) as u64,
-                    cetag: head
-                        .e_tag
-                        .as_deref()
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string(),
-                    mtime_ms: head
-                        .last_modified
-                        .and_then(|t| t.to_millis().ok())
-                        .unwrap_or_default(),
-                },
-                true,
-            ),
+            KeyState::CacheBody { head, .. } => (RemoteFacts::from_cache_head(&head), true),
         };
 
         // The copy range over the source's PLAINTEXT: the whole object, or `copy-source-range`.
@@ -365,19 +350,14 @@ impl Hypha {
                     Some(format!("bytes=0-{}", body_ct_len - 1)),
                 )
                 .await?;
-            let retag = out
-                .copy_part_result()
-                .and_then(|r| r.e_tag())
-                .ok_or_else(|| Error::Backend("part copy returned no ETag".into()))?
-                .trim_matches('"')
-                .to_string();
+            let retag = copied_part_retag(&out)?;
             let pmd5 = facts.cetag.clone();
             self.record_part(&bucket, &input.upload_id, part_number, &retag, &pmd5, "")
                 .await?;
             pmd5
         } else {
-            // Re-encrypt path: obtain the source plaintext (whole or ranged), then it's a part like
-            // any other. A live cache body is already plaintext; a remote object decrypts.
+            // Re-encrypt path: obtain the source plaintext (whole or ranged), then it's a part
+            // like any other.
             let plaintext = if live {
                 let range = (!whole).then(|| format!("bytes={}-{}", pt.start, pt.end - 1));
                 let out = self.data().get(&src_bucket, &src_key, range).await?;
@@ -630,7 +610,6 @@ impl Hypha {
             }
             return Err(e.into());
         }
-        // 5. Settle: project the tombstone + twin, drop the mpu state.
         self.tier
             .settle_evict_locked(&bucket, &key, total_plen, &cetag, mtime_ms, carrier)
             .await?;
@@ -712,7 +691,6 @@ impl Hypha {
             key_marker: input.key_marker,
             upload_id_marker: input.upload_id_marker,
             max_uploads: input.max_uploads,
-            // The backend's key-position cursor, forwarded verbatim.
             is_truncated: raw.is_truncated,
             next_key_marker: raw.next_key_marker,
             next_upload_id_marker: raw.next_upload_id_marker,
@@ -742,16 +720,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-
-        match self
-            .meta()
-            .head(&bucket, &meta::mpu_upload_key(&input.upload_id))
-            .await
-        {
-            Ok(_) => {}
-            Err(Error::NotFound) => return Err(s3_error!(NoSuchUpload, "unknown upload id")),
-            Err(e) => return Err(e.into()),
-        }
+        self.require_upload(&bucket, &input.upload_id).await?;
 
         let pmd5_by_part = self.load_part_pmd5s(&bucket, &input.upload_id).await?;
         let mut parts: Vec<Part> = Vec::new();

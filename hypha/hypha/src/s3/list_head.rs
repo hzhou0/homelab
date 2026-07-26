@@ -115,20 +115,19 @@ impl Hypha {
         let objs = raw.contents.unwrap_or_default();
         let prefixes = raw.common_prefixes.unwrap_or_default();
 
-        let (entries, common_prefixes) = if restoring {
-            self.project_remote_page(&bucket, objs, prefixes).await?
-        } else {
-            let page = self
-                .project_page(
-                    &bucket,
-                    input.prefix.as_deref(),
-                    input.delimiter.as_deref(),
-                    objs,
-                    prefixes,
-                )
-                .await?;
-            (page.entries, page.common_prefixes)
-        };
+        let PageView {
+            entries,
+            common_prefixes,
+        } = self
+            .page_view(
+                &bucket,
+                restoring,
+                input.prefix.as_deref(),
+                input.delimiter.as_deref(),
+                objs,
+                prefixes,
+            )
+            .await?;
 
         // KeyCount counts keys and common prefixes alike (S3). It is ≤ MaxKeys but may be strictly
         // less: dropped delete-tombstones leave a short — but honestly truncated — page.
@@ -206,20 +205,19 @@ impl Hypha {
             .max()
             .filter(|_| is_truncated == Some(true));
 
-        let (entries, common_prefixes) = if restoring {
-            self.project_remote_page(&bucket, objs, prefixes).await?
-        } else {
-            let page = self
-                .project_page(
-                    &bucket,
-                    input.prefix.as_deref(),
-                    input.delimiter.as_deref(),
-                    objs,
-                    prefixes,
-                )
-                .await?;
-            (page.entries, page.common_prefixes)
-        };
+        let PageView {
+            entries,
+            common_prefixes,
+        } = self
+            .page_view(
+                &bucket,
+                restoring,
+                input.prefix.as_deref(),
+                input.delimiter.as_deref(),
+                objs,
+                prefixes,
+            )
+            .await?;
 
         let resp = ListObjectsOutput {
             name: Some(bucket),
@@ -234,6 +232,30 @@ impl Hypha {
             ..Default::default()
         };
         Ok(S3Response::new(resp))
+    }
+
+    /// One raw page from whichever source served it — the remote while restoring, else the cache —
+    /// projected into client-visible entries and common prefixes.
+    async fn page_view(
+        &self,
+        bucket: &str,
+        restoring: bool,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
+        objs: Vec<aws_sdk_s3::types::Object>,
+        prefixes: Vec<aws_sdk_s3::types::CommonPrefix>,
+    ) -> S3Result<PageView> {
+        if restoring {
+            let (entries, common_prefixes) =
+                self.project_remote_page(bucket, objs, prefixes).await?;
+            Ok(PageView {
+                entries,
+                common_prefixes,
+            })
+        } else {
+            self.project_page(bucket, prefix, delimiter, objs, prefixes)
+                .await
+        }
     }
 
     /// One `<data>` page → the client-visible entries and common prefixes it projects (§7's

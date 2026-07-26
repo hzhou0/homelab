@@ -99,19 +99,7 @@ impl Hypha {
         // Per-key failures land here; a key absent from the map at the end succeeded.
         let mut failed: HashMap<String, BatchDeleteError> = HashMap::new();
 
-        // Sorted and deduped: overlapping batches acquire their shared keys in the same order, so
-        // two batch deletes can't deadlock, and a key repeated within one request never waits on
-        // the lock it already holds. The reply is still built per *requested* entry.
-        let mut keys: Vec<String> = requested.clone();
-        keys.sort_unstable();
-        keys.dedup();
-        keys.retain(|key| match meta::validate_client_key(key) {
-            Ok(()) => true,
-            Err(why) => {
-                failed.insert(key.clone(), batch_error(key, "InvalidArgument", why));
-                false
-            }
-        });
+        let keys = valid_sorted_keys(&requested, &mut failed);
 
         // Overlay (§7): a restoring bucket has each key materialized from the remote first, so the
         // batch marks/commits against correct tombstones; an absent bucket fails the whole call.
@@ -164,28 +152,7 @@ impl Hypha {
 
         drop(guards);
 
-        let mut deleted = Vec::new();
-        let mut errors = Vec::new();
-        for key in requested {
-            match failed.get(&key) {
-                Some(e) => errors.push(s3s::dto::Error {
-                    code: Some(e.code.clone()),
-                    message: Some(e.message.clone()),
-                    key: Some(key),
-                    version_id: None,
-                }),
-                None if !quiet => deleted.push(DeletedObject {
-                    key: Some(key),
-                    ..Default::default()
-                }),
-                None => {}
-            }
-        }
-        Ok(S3Response::new(DeleteObjectsOutput {
-            deleted: (!deleted.is_empty()).then_some(deleted),
-            errors: (!errors.is_empty()).then_some(errors),
-            ..Default::default()
-        }))
+        Ok(delete_objects_reply(quiet, requested, &failed))
     }
 
     /// Cached-mode DeleteObjects (§7): the remote isn't touched here, so there is nothing to batch —
@@ -200,18 +167,7 @@ impl Hypha {
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let mut failed: HashMap<String, BatchDeleteError> = HashMap::new();
 
-        // Dedup so a key repeated in one request doesn't wait on the lock it already holds; the reply
-        // is still built per *requested* entry. Admission rejects per key, the rest still commit.
-        let mut keys: Vec<String> = requested.clone();
-        keys.sort_unstable();
-        keys.dedup();
-        keys.retain(|key| match meta::validate_client_key(key) {
-            Ok(()) => true,
-            Err(why) => {
-                failed.insert(key.clone(), batch_error(key, "InvalidArgument", why));
-                false
-            }
-        });
+        let keys = valid_sorted_keys(&requested, &mut failed);
 
         for key in &keys {
             self.prepare_write(&bucket, key).await?;
@@ -235,28 +191,7 @@ impl Hypha {
             }
         }
 
-        let mut deleted = Vec::new();
-        let mut errors = Vec::new();
-        for key in requested {
-            match failed.get(&key) {
-                Some(e) => errors.push(s3s::dto::Error {
-                    code: Some(e.code.clone()),
-                    message: Some(e.message.clone()),
-                    key: Some(key),
-                    version_id: None,
-                }),
-                None if !quiet => deleted.push(DeletedObject {
-                    key: Some(key),
-                    ..Default::default()
-                }),
-                None => {}
-            }
-        }
-        Ok(S3Response::new(DeleteObjectsOutput {
-            deleted: (!deleted.is_empty()).then_some(deleted),
-            errors: (!errors.is_empty()).then_some(errors),
-            ..Default::default()
-        }))
+        Ok(delete_objects_reply(quiet, requested, &failed))
     }
 
     /// Cached-mode delete of one key (§7), under its write lock: overwrite K with the delete-tombstone
@@ -347,4 +282,56 @@ fn batch_error(key: &str, code: &str, message: &str) -> BatchDeleteError {
         code: code.to_string(),
         message: message.to_string(),
     }
+}
+
+/// The batch's deduped, sorted, admission-validated keys. Sorted so overlapping batches acquire
+/// their shared keys in the same order (two batch deletes can't deadlock) and deduped so a key
+/// repeated within one request never waits on the lock it already holds; an invalid key fails its
+/// own entry and the rest still commit. The reply is still built per *requested* entry.
+fn valid_sorted_keys(
+    requested: &[String],
+    failed: &mut HashMap<String, BatchDeleteError>,
+) -> Vec<String> {
+    let mut keys: Vec<String> = requested.to_vec();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.retain(|key| match meta::validate_client_key(key) {
+        Ok(()) => true,
+        Err(why) => {
+            failed.insert(key.clone(), batch_error(key, "InvalidArgument", why));
+            false
+        }
+    });
+    keys
+}
+
+/// The per-requested-entry reply: a key in `failed` reports its error, any other reports deleted —
+/// unless `quiet`, which suppresses success entries.
+fn delete_objects_reply(
+    quiet: bool,
+    requested: Vec<String>,
+    failed: &HashMap<String, BatchDeleteError>,
+) -> S3Response<DeleteObjectsOutput> {
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for key in requested {
+        match failed.get(&key) {
+            Some(e) => errors.push(s3s::dto::Error {
+                code: Some(e.code.clone()),
+                message: Some(e.message.clone()),
+                key: Some(key),
+                version_id: None,
+            }),
+            None if !quiet => deleted.push(DeletedObject {
+                key: Some(key),
+                ..Default::default()
+            }),
+            None => {}
+        }
+    }
+    S3Response::new(DeleteObjectsOutput {
+        deleted: (!deleted.is_empty()).then_some(deleted),
+        errors: (!errors.is_empty()).then_some(errors),
+        ..Default::default()
+    })
 }

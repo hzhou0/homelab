@@ -66,7 +66,7 @@ impl Hypha {
     /// Serve an eviction-tombstoned key in cached mode, rehydrating (§8). A composite is probed in the
     /// shadow body first and served on a verified hit; on a miss — or for a single-part object — the
     /// read is served from the remote and a rehydrate is queued on the background actor
-    /// ([`crate::background`]) to land the plaintext (single-part into K, composite into the shadow)
+    /// ([`background`]) to land the plaintext (single-part into K, composite into the shadow)
     /// so the next read is a cache hit. Submitting is a map insert plus a `try_send` and never
     /// blocks: the read owes the client bytes, not a warm cache.
     async fn serve_evicted_cached(
@@ -162,7 +162,6 @@ impl Hypha {
         }
     }
 
-    /// Live plaintext body in the cache.
     async fn serve_cache_body(
         &self,
         bucket: &str,
@@ -277,34 +276,17 @@ impl Hypha {
             return Err(Error::NotFound.into());
         }
 
-        // Same dispatch as HEAD (§7), via the restore overlay: resolve the key's facts and storage
-        // class, or 404. A `Restoring` bucket resolves them from the remote.
         let (facts, md) = match self.resolve_key(&bucket, &key).await? {
             KeyState::Absent => return Err(Error::NotFound.into()),
             KeyState::Remote { facts, md } => (facts, md),
-            KeyState::CacheBody { head, md } => (
-                RemoteFacts {
-                    plen: head.content_length.unwrap_or(0).max(0) as u64,
-                    cetag: head
-                        .e_tag
-                        .as_deref()
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string(),
-                    mtime_ms: head
-                        .last_modified
-                        .and_then(|t| t.to_millis().ok())
-                        .unwrap_or_default(),
-                },
-                md,
-            ),
+            KeyState::CacheBody { head, md } => (RemoteFacts::from_cache_head(&head), md),
         };
         let storage_class = meta::storage_class(&md);
 
         let want = |name: &str| input.object_attributes.iter().any(|a| a.as_str() == name);
 
-        // ObjectParts: composite only, and only when requested. Sizes are the per-part *plaintext*
-        // lengths from the trailer's table (§6); the parts paginate like ListParts.
+        // Sizes are the per-part *plaintext* lengths from the trailer's table (§6); the parts
+        // paginate like ListParts.
         let object_parts =
             if want(ObjectAttributes::OBJECT_PARTS) && meta::is_composite_etag(&facts.cetag) {
                 let Some(tail) = self.tier.read_tail(&bucket, &key).await? else {
@@ -404,7 +386,7 @@ fn range_header(range: &Range) -> String {
             first,
             last: Some(last),
         } => format!("bytes={first}-{last}"),
-        Range::Int { first, last: None } => format!("bytes={first}-"),
+        Range::Int { first, .. } => format!("bytes={first}-"),
         Range::Suffix { length } => format!("bytes=-{length}"),
     }
 }

@@ -348,25 +348,19 @@ pub(super) fn evaluate_precondition(
     if_none_match: Option<&ETagCondition>,
     current_etag: Option<&str>,
 ) -> Result<(), Error> {
+    let satisfied = |cond: &ETagCondition| match cond {
+        ETagCondition::Any => current_etag.is_some(),
+        ETagCondition::ETag(e) => current_etag
+            .map(|c| c.trim_matches('"') == e.value().trim_matches('"'))
+            .unwrap_or(false),
+    };
     if let Some(cond) = if_match {
-        let exists = match cond {
-            ETagCondition::Any => current_etag.is_some(),
-            ETagCondition::ETag(e) => current_etag
-                .map(|c| c.trim_matches('"') == e.value().trim_matches('"'))
-                .unwrap_or(false),
-        };
-        if !exists {
+        if !satisfied(cond) {
             return Err(Error::PreconditionFailed);
         }
     }
     if let Some(cond) = if_none_match {
-        let exists = match cond {
-            ETagCondition::Any => current_etag.is_some(),
-            ETagCondition::ETag(e) => current_etag
-                .map(|c| c.trim_matches('"') == e.value().trim_matches('"'))
-                .unwrap_or(false),
-        };
-        if exists {
+        if satisfied(cond) {
             return Err(Error::PreconditionFailed);
         }
     }

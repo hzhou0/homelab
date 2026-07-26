@@ -12,7 +12,6 @@ pub enum Error {
     /// Object (or the ciphertext body behind a tombstone) is absent on the backend.
     #[error("no such key")]
     NotFound,
-    /// Target bucket does not exist.
     #[error("no such bucket")]
     NoSuchBucket,
     /// An `If-Match` / `If-None-Match` precondition did not hold.

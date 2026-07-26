@@ -103,7 +103,7 @@ pub fn tee(src: ByteStream) -> (ByteStream, ByteStream) {
 /// A stream of `body` followed by `tail`, without buffering `body` — the complete-time trailer
 /// fold (§7), where the retained part may be gigabytes but the trailer is a few dozen KB.
 pub fn append_bytes(body: ByteStream, tail: Vec<u8>) -> ByteStream {
-    let chained = body.into_async_read().chain(std::io::Cursor::new(tail));
+    let chained = body.into_async_read().chain(io::Cursor::new(tail));
     blob_to_bytestream(StreamingBlob::wrap(ReaderStream::new(chained)))
 }
 
@@ -242,7 +242,6 @@ pub async fn encrypt_blob_with_etag(
 
     tokio::task::spawn_blocking(move || {
         let out = SyncIoBridge::new_with_handle(pipe_w, h.clone());
-        // wrap_output writes the age header+nonce straight into the pipe; the reader drains it.
         let w = match env.encrypt(out) {
             Ok(w) => w,
             Err(e) => {
@@ -303,7 +302,7 @@ fn pump_encrypt<W: Write>(
     mut src: impl Read,
 ) -> io::Result<W> {
     io::copy(&mut src, &mut w)?;
-    w.finish() // consumes the writer, returns the inner sink
+    w.finish()
 }
 
 /// A [`Read`] adapter that hashes every byte passing through it, finalized via [`finish`].
