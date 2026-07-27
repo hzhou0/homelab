@@ -1,10 +1,8 @@
 //! Encryptor/Decryptor construction over age's native scrypt recipient (§6).
 //!
-//! File keys are wrapped by `age::scrypt` over a 256-bit random master passphrase with the work
-//! factor **pinned to the minimum** — load-bearing, not an optimization: security lives in the
-//! passphrase's 256 bits, stretching adds nothing, and the crate's default auto-tunes toward
-//! ~1 s and ~256 MiB *per file*, fatal for a small-object namespace. Wholly stock age, so DR is
-//! any age binary + the passphrase.
+//! File keys are wrapped by `age::scrypt` with the work factor **pinned to the minimum** —
+//! load-bearing, not an optimization: the crate's default auto-tunes toward ~1 s and ~256 MiB
+//! *per file*, fatal for a small-object namespace (rationale for why that's safe here is §6).
 
 use std::io::{Read, Write};
 

@@ -1,14 +1,10 @@
 //! Multipart (§7) — one path, both modes. Parts route **around the cache** onto the remote's own
 //! native multipart upload at K: each part is an independent, pure age file (fresh file key ⇒
 //! parallel and re-uploaded parts need no coordination), and the remote concatenates them at
-//! complete. The object's facts **and its parts table** travel as a terminating trailer that is the
-//! object's final bytes — normally its own part above every client part, but folded into the last
-//! client part whenever nothing can follow that part: it is below the backend's 5 MiB minimum (only
-//! the final part is exempt, and a separate trailer part would steal that exemption), or it is part
-//! 10000 (no number is left). Clients keep S3's full 1–10000 range; the trailer never costs one.
-//! Either way it lands in the same native complete, so the commit lands body and facts in one op.
-//! The table is the per-part cumulative ciphertext end-offsets, so reads recover every part boundary
-//! from the trailer alone — no remote part-index calls (§6).
+//! complete. The object's facts and parts table travel as a terminating trailer — its own part
+//! above every client part, or folded into the last client part when nothing can follow it (the
+//! fold decision in `op_complete_multipart_upload` below has the detail). Either way the commit
+//! lands body and facts in one op, and clients keep S3's full 1–10000 part range.
 //!
 //! hypha's own state per upload is minimal and lives in the `<meta>` cache bucket's range A
 //! (`0x01 0x01 m …`, §6): per-part `{pmd5, retag}` facts, needed at complete because an in-progress
@@ -123,7 +119,6 @@ impl Hypha {
             .body
             .ok_or_else(|| Error::Invalid("UploadPart requires a body".into()))?;
 
-        // Fail fast if the upload is unknown to us — the eventual complete needs these records.
         self.require_upload(&bucket, &input.upload_id).await?;
 
         // Past the byte source, a part is a part: encrypt as a pure age file, stream to the remote,
@@ -273,12 +268,11 @@ impl Hypha {
         Ok(())
     }
 
-    /// **UploadPartCopy** (§7): the copy-source is just an alternate byte source for a part. The
-    /// baseline is the **re-encrypt** path — read the (ranged) source plaintext, then it's a part
-    /// like any other (`stream_part`). One fast path: a whole, unranged, single-part, remote-resident
-    /// source is already one age file, so its body range copies **server-side** with `pmd5` = the
-    /// source cetag and no bytes through hypha. Composite sources, any ranged copy, and parts that
-    /// would need complete's fold all re-encrypt.
+    /// **UploadPartCopy** (§7): the copy-source is an alternate byte source for a part. Fast path —
+    /// a whole, unranged, single-part, remote-resident source is one age file, so its body copies
+    /// **server-side** with `pmd5` = the source cetag and no bytes through hypha; everything else
+    /// (composite sources, ranged copies, parts complete's fold would need) re-encrypts via
+    /// `stream_part`.
     pub(super) async fn op_upload_part_copy(
         &self,
         req: S3Request<UploadPartCopyInput>,
@@ -300,7 +294,6 @@ impl Hypha {
         let (src_bucket, src_key) = parse_copy_source(&input.copy_source)?;
         meta::validate_client_key(&src_key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        // The destination upload must be known to us — the eventual complete needs these records.
         self.require_upload(&bucket, &input.upload_id).await?;
 
         // Resolve the source's facts + residency through the restore overlay, exactly as a read
@@ -643,15 +636,11 @@ impl Hypha {
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
-    /// **ListMultipartUploads** (§7): a straight proxy of the remote's own. hypha creates each
-    /// native upload at the client key and returns the remote's upload id verbatim, so a remote
-    /// page already carries `{Key, UploadId, Initiated}` with nothing to translate — and its
-    /// `(key, upload_id)` ordering is what makes `key-marker`/`upload-id-marker` correct, which no
-    /// cache-side record could offer (they are keyed by upload id alone).
-    ///
-    /// Remote-as-truth resolves both crash windows by construction: an upload whose remote create
-    /// landed but whose cache record didn't is real and abortable, so it lists; a cache record whose
-    /// remote upload was aborted or expired externally does not.
+    /// **ListMultipartUploads** (§7): a straight proxy of the remote's own — hypha creates each
+    /// native upload at the client key and returns the remote's id verbatim, so the page needs no
+    /// translation and the remote's own `(key, upload_id)` ordering makes
+    /// `key-marker`/`upload-id-marker` correct, which no cache-side record could offer (they are
+    /// keyed by upload id alone). Remote-as-truth resolves both crash windows by construction (§7).
     pub(super) async fn op_list_multipart_uploads(
         &self,
         req: S3Request<ListMultipartUploadsInput>,

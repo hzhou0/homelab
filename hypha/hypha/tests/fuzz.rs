@@ -120,14 +120,12 @@ async fn run_sequence(h: &Harness, bucket: &str, ops: Vec<(bool, u8, u32)>) -> R
         }
     }
 
-    // LIST equals the model's keyset, in order.
     let listed = list_client_keys(&client, bucket).await;
     let expected: Vec<String> = model.keys().cloned().collect();
     if listed != expected {
         return Err(format!("LIST {listed:?} != model {expected:?}"));
     }
 
-    // Absent keys 404.
     for i in 0..KEYS {
         let key = key_of(i);
         if model.contains_key(&key) {

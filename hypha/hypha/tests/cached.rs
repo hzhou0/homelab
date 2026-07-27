@@ -52,7 +52,6 @@ async fn marker_present(h: &Harness, client_bucket: &str, key: &str) -> bool {
     raw_exists(h, &h.meta_bucket(client_bucket), key).await
 }
 
-/// The remote holds `key`'s ciphertext.
 async fn remote_present(h: &Harness, client_bucket: &str, key: &str) -> bool {
     raw_exists(h, &h.remote_bucket(client_bucket), key).await
 }
@@ -99,7 +98,6 @@ async fn cached_put_serves_from_cache_and_reconciles() {
     );
     assert!(!remote_present(&h, B, "obj").await, "remote trails the ack");
 
-    // The sweep uploads and clears the marker; the cache body stays.
     wait_until(6000, "reconcile uploads and clears the marker", || async {
         remote_present(&h, B, "obj").await && !marker_present(&h, B, "obj").await
     })
@@ -136,7 +134,6 @@ async fn cached_delete_masks_then_propagates() {
         .send()
         .await
         .expect("delete");
-    // Masked at once: 404 to clients, tombstone in the cache, marker rewritten.
     let got = c.get_object().bucket(B).key("d").send().await;
     assert_eq!(
         sdk_err_code(&got.unwrap_err()).as_deref(),
@@ -148,7 +145,6 @@ async fn cached_delete_masks_then_propagates() {
         "delete leaves a pending marker"
     );
 
-    // Reconcile propagates: remote object gone, tombstone and marker cleared.
     wait_until(6000, "delete propagates to the remote", || async {
         !remote_present(&h, B, "d").await
             && !raw_exists(&h, &h.cache_bucket(B), "d").await
@@ -290,7 +286,6 @@ async fn reconcile_scans_pending_only_not_evicted() {
     .twin_key("evicted")
     .unwrap();
 
-    // Let several sweeps run.
     wait_until(6000, "pending key uploaded and cleared", || async {
         remote_present(&h, B, "pending").await && !marker_present(&h, B, "pending").await
     })
@@ -310,7 +305,6 @@ async fn reconcile_scans_pending_only_not_evicted() {
         !marker_present(&h, B, "evicted").await,
         "no marker for an evicted key"
     );
-    // And it still reads correctly (decrypt from remote).
     assert_eq!(get_all(&c, B, "evicted").await, cold);
 }
 
@@ -334,7 +328,6 @@ async fn rehydrate_single_part_on_read() {
     // The tombstoned GET serves from the remote and kicks the rehydrate.
     assert_eq!(get_all(&c, B, "r").await, body);
 
-    // The body is promoted back into K.
     wait_until(6000, "single-part rehydrate lands at K", || async {
         data_class(&h, B, "r").await.is_none()
     })
@@ -483,7 +476,7 @@ async fn composite_overwrite_does_not_serve_stale_shadow() {
     // Generation 2 at the same key — leaves the gen-1 shadow in place.
     let b = two_part_composite(&c, key, 21, 22).await;
 
-    // The read must serve gen-2, never the stale gen-1 shadow (which still carries the old cetag).
+    // The gen-1 shadow still carries the old cetag — a correct read must not hit it.
     assert_eq!(
         get_all(&c, B, key).await,
         b,
@@ -541,7 +534,6 @@ async fn cached_write_supersedes_in_flight_rehydrate() {
     .await;
     plant_eviction_tombstone(&h, "sup", &old).await;
 
-    // The tombstoned read queues the rehydrate; the write immediately after cancels it.
     assert_eq!(get_all(&c, B, "sup").await, old);
     put(&c, B, "sup", &new).await;
     assert_eq!(get_all(&c, B, "sup").await, new);

@@ -111,7 +111,6 @@ async fn no_double_create_under_contention() {
         }
     }
     assert_eq!(wins, 1, "exactly one create may win the race");
-    // The surviving object reads back cleanly.
     let head = h
         .client()
         .head_object()

@@ -15,15 +15,12 @@
 //! - **Cancellable.** §8 has rehydrate hold K's write lock across the whole fetch + decrypt + land,
 //!   which would park a same-key conditional PUT, DELETE, or CompleteMultipartUpload behind a
 //!   multi-minute transfer. Every client write instead cancels K's background transition first (see
-//!   [`crate::s3::Hypha::write_lock`]) and the holder drops the lock at its next await. The spec's
-//!   under-lock invariant is untouched: a rehydrate that *completes* still did every step under the
-//!   lock. It is only ever abandoned wholesale.
-//!
-//! **Why the cancel needs no acknowledgement.** A job registers its token before it ever attempts
-//! the lock, so a job that is blocking a client necessarily holds the lock and necessarily has a
-//! live token — the cancel always finds it. A job that registers *after* the cancel has not taken
-//! the lock yet, so it queues behind the client's own guard and blocks nobody. Either way the lock
-//! handoff is the rendezvous, so `cancel` is a fire-and-forget map lookup on the write path.
+//!   [`crate::s3::Hypha::write_lock`]) and the holder drops the lock at its next await — abandoned
+//!   wholesale, never half-applied, since a completing rehydrate still did every step under the
+//!   lock. The cancel needs no acknowledgement: a job registers its token *before* it ever attempts
+//!   the lock, so a job blocking a client necessarily holds the lock and has a live token to find,
+//!   while a job registering after the cancel hasn't taken the lock yet and blocks nobody — the
+//!   lock handoff is the rendezvous, so `cancel` is a fire-and-forget map lookup on the write path.
 //!
 //! Lifecycle mirrors [`crate::bucket_ctl`]: the task holds a [`Reconciler`], never a `Hypha`, so it
 //! neither keeps the service's liveness sentinel alive nor needs shutdown plumbing — it drains and

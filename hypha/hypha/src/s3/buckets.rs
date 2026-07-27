@@ -23,8 +23,8 @@ impl Hypha {
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let bucket = &req.input.bucket;
-        // The configured prefix is charged against S3's 63-byte cap; reject over-long names up
-        // front rather than as an opaque backend error (§7 *Buckets*).
+        // Reject over-long names up front rather than as an opaque backend error (§7 *Buckets* —
+        // bucket-name budget).
         meta::validate_bucket_name(bucket, self.max_bucket_prefix_len)
             .map_err(|e| s3_error!(InvalidBucketName, "{e}"))?;
         self.buckets.create(bucket).await?;
@@ -73,10 +73,9 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// **GetBucketVersioning** (§7): a benign stub — an empty versioning configuration, no backend
-    /// call. hypha buckets never carry versioning, but `aws s3 sync` / boto / `mc` probe this up
-    /// front and a `501` aborts them where "not enabled" passes; enabling it (`PutBucketVersioning`)
-    /// stays exempt/rejected.
+    /// **GetBucketVersioning** (§7): a benign stub, not a backend call — hypha buckets never carry
+    /// versioning, but common S3 clients probe this up front and a `501` aborts them where "not
+    /// enabled" passes.
     pub(super) async fn op_get_bucket_versioning(
         &self,
         _req: S3Request<GetBucketVersioningInput>,

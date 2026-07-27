@@ -1,43 +1,26 @@
-//! Pending-marker obligations and the clean marker (§6/§7).
-//!
-//! A cached write acks on its **cache body write** — that is the commit. The bare-`K` pending marker
-//! it owes is an *index* over the pending set, not the durability record: what makes a write pending
-//! is a live body whose generation the remote lacks, or a delete-tombstone the remote has not
-//! honoured, both derivable from cache and remote alone. So a marker that cannot be written delays
-//! durability rather than losing the write, and none of the paths here may turn one into a client
-//! error — repairing a write *behind* a returned error would finish a write hypha reported as
-//! failed, which a client relying on that error cannot survive.
+//! Pending-marker obligations and the clean marker (§6/§7 have the full rationale — a marker is an
+//! index over the pending set, not the durability record, so none of the paths here may turn a
+//! failed marker write into a client error).
 //!
 //! Three pieces, in the order a run meets them:
 //!
 //! 1. **Startup** ([`Markers::startup`]) reads and deletes every bucket's clean marker before the
-//!    listener opens, recording which were present. Every bucket therefore starts *dirty on disk*,
-//!    with no bookkeeping of what a run "touched" — a run that has to remember what it touched can
-//!    forget. A bucket whose marker was absent owes a reconcile pass, which this raises on the
-//!    bucket-control actor rather than running here: rebuilding the pending set is the same
-//!    traversal restore runs, and one queue is what keeps the two from becoming two passes over
-//!    independent snapshots (§7, [`crate::bucket_ctl`]).
-//! 2. **The queue** ([`Markers::owe`]) — a write hands its marker over and returns. The handover
-//!    cannot block or fail, because the body is already committed and the ack can neither wait on
-//!    the marker nor be turned into an error by it; that is the whole reason the queue is unbounded.
-//! 3. **The drain** ([`Worker::run`]) writes clean markers, and only for buckets this run accounted
-//!    for — marker present at startup, or a reconcile pass that landed during the run — and only if
-//!    nothing was still owed when it sealed.
+//!    listener opens, recording which were present, and raises a reconcile pass on the
+//!    bucket-control actor for the rest rather than scanning here — rebuilding the pending set is
+//!    the same traversal restore runs, and one queue is what keeps the two from becoming two
+//!    passes over independent snapshots ([`crate::bucket_ctl`]).
+//! 2. **The queue** ([`Markers::owe`]) — a write hands its marker over and returns; the handover
+//!    cannot block or fail, which is the whole reason the queue is unbounded.
+//! 3. **The drain** ([`Worker::run`]) writes clean markers, only for buckets this run accounted
+//!    for, and only if nothing was still owed when it sealed.
 //!
-//! **Quiescence.** The clean marker claims the pending set on disk is complete, so writing one while
-//! a write still owes a marker turns a recoverable gap into a permanent one. Deciding that takes two
-//! things, and neither is an observation of the queue's depth.
-//!
-//! *Ordering*: hyper's connection drain resolves only once every handler has returned and no new one
-//! can start, and every other sender is handler-local — [`Markers::owe`] upgrades the weak handle,
-//! sends, and drops it before returning. So after the drain nothing but [`Queue`] can enqueue, and
-//! the [`Msg::Seal`] it sends is necessarily behind every marker of the run.
-//!
-//! *Intent*: the seal is a **message, not the channel closing**. The serving future owns the
-//! `Lifecycle` that owns the `Queue`, so an aborted or panicking server closes the channel exactly
-//! as a drain would — and a killed process that wrote clean markers on its way out would rob the
-//! next run of the recovery scan that was supposed to catch what it dropped. Closure therefore ends
-//! the worker; only a seal authorizes it to vouch for anything.
+//! **Ordering**, the part not fully spelled out in §7: hyper's connection drain resolves only once
+//! every handler has returned and no new one can start, and every other sender is handler-local —
+//! [`Markers::owe`] upgrades the weak handle, sends, and drops it before returning. So after the
+//! drain nothing but [`Queue`] can enqueue, and the [`Msg::Seal`] it sends is necessarily behind
+//! every marker of the run. The seal is a **message, not the channel closing**: the serving future
+//! owns the `Lifecycle` that owns the `Queue`, so an aborted or panicking server closes the channel
+//! exactly as a drain would, and closure alone must not authorize a clean marker — only a seal does.
 
 use std::collections::HashMap;
 use std::sync::Arc;

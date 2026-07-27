@@ -1,20 +1,13 @@
-//! GET, cache-first, dispatched on K's classification (§7):
+//! GET, cache-first, dispatched on K's classification (§7): live body served straight from the
+//! cache; eviction tombstone decrypted from the remote (durable mode never repopulates — the body
+//! would immediately be tombstoned again); delete tombstone → 404; transition mark → remote-as-truth
+//! (repaired opportunistically if the lock is free, else read through to the writer's in-flight
+//! commit — no hybrid reads either way).
 //!
-//! - **Live body** — plaintext served straight from the cache (ranges forwarded).
-//! - **Eviction tombstone** — facts from its metadata; body decrypted from the remote. Durable
-//!   mode never repopulates the cache (the body would immediately be tombstoned again).
-//! - **Delete tombstone** — client-visible 404.
-//! - **Transition mark** — remote-as-truth: always a crash leftover *or* a commit in flight, so
-//!   facts and bytes both come from the remote (no hybrid reads). If K's lock is free the mark is
-//!   a leftover and is repaired opportunistically; a held lock means the writer is alive and the
-//!   read serves the remote's current state without queuing.
-//!
-//! A composite (client ETag `hash-N`) is a concatenation of pure per-part age files followed by
-//! the terminating trailer part. Its part boundaries and per-part plaintext lengths come from the
-//! **parts table in the object's own trailer** (§6), recovered in the one speculative tail read
-//! that also yields the facts — no remote part-index calls, no per-part header probes. A whole-
-//! object read then decrypts every part from a single `[0, body_ct_len)` GET; a range read fetches
-//! only the parts it touches.
+//! A composite's part boundaries and per-part plaintext lengths come from the **parts table in the
+//! object's own trailer** (§6), recovered in the one speculative tail read that also yields the
+//! facts — no remote part-index calls. A whole-object read decrypts every part from a single
+//! `[0, body_ct_len)` GET; a range read fetches only the parts it touches.
 
 use std::ops::Range as ByteRange;
 
@@ -202,8 +195,8 @@ impl Hypha {
         })
     }
 
-    /// Serve a remote-only object (tombstoned or mid-bracket) by decrypting from the remote (§6).
-    /// No cache repopulation — durable mode never restores.
+    /// Serve a remote-only object (tombstoned or mid-bracket) by decrypting from the remote (§6);
+    /// durable mode never repopulates the cache here.
     async fn serve_remote(
         &self,
         bucket: &str,
@@ -260,11 +253,9 @@ impl Hypha {
         }
     }
 
-    /// **GetObjectAttributes** (§7): a read projection over the *same key-state dispatch as HEAD* —
-    /// live body / eviction tombstone / transition-from-remote — returning only the
-    /// `x-amz-object-attributes` the client asked for. `ObjectParts` for a composite comes straight
-    /// off the trailer's offset table (one bounded MAC-verified tail GET → part count and per-part
-    /// plaintext sizes via the closed form, no remote part index, §6). `Checksum` is deferred (§11).
+    /// **GetObjectAttributes** (§7): a read projection over the same key-state dispatch as HEAD.
+    /// `ObjectParts` for a composite comes straight off the trailer's offset table (one bounded
+    /// MAC-verified tail GET, no remote part index, §6). `Checksum` is deferred (§11).
     pub(super) async fn op_get_object_attributes(
         &self,
         req: S3Request<GetObjectAttributesInput>,
@@ -302,10 +293,9 @@ impl Hypha {
             };
 
         let resp = GetObjectAttributesOutput {
-            // AWS returns this ETag *unquoted* in the GetObjectAttributes body (unlike the quoted
-            // HTTP header), but s3s 0.14.1 quotes every `ETag` DTO value uniformly — an upstream bug
-            // (Nugine/s3s#629, fixed for v0.15.0, unreleased as of this pin). Harmless (every S3
-            // client trims ETag quotes); drop this note when bumping s3s past 0.15.0.
+            // Quoted here though AWS sends this one unquoted: s3s 0.14.1 quotes every ETag DTO value
+            // uniformly, an upstream bug (Nugine/s3s#629, fixed for 0.15.0, §2). Harmless — every S3
+            // client trims quotes — drop this note on the s3s bump.
             e_tag: want(ObjectAttributes::ETAG).then(|| ETag::Strong(facts.cetag.clone())),
             object_size: want(ObjectAttributes::OBJECT_SIZE).then_some(facts.plen as i64),
             storage_class: want(ObjectAttributes::STORAGE_CLASS)

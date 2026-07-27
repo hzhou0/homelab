@@ -1,13 +1,7 @@
-//! The authenticated facts+table trailer at the tail of every remote object (§6).
-//!
-//! S3 offers no slot that lands object facts atomically with a streamed body (user-metadata
-//! travels ahead of the body; `MD5(plaintext)` exists only once the body has streamed; tags are
-//! post-hoc). A trailer *behind* the ciphertext is both atomic and at a knowable offset, so every
-//! commit is self-describing. The trailer is **plaintext, authenticated by a truncated
-//! HMAC-SHA256 tag** keyed off the master passphrase: truncation, tampering, and foreign objects
-//! all fail to verify. Physical tail order is `table ‖ facts ‖ tag(16) ‖ version(2)`; the
-//! fixed-size facts struct sits at a known offset from the end, so its `count` sizes the table and
-//! the 2-byte version dispatches the format.
+//! The authenticated facts+table trailer at the tail of every remote object (§6 — rationale for a
+//! trailer over S3-native metadata/tags is there). Physical tail order is
+//! `table ‖ facts ‖ tag(16) ‖ version(2)`; the fixed-size facts struct sits at a known offset from
+//! the end, so its `count` sizes the table and the 2-byte version dispatches the format.
 //!
 //! The trailer sits **outside** the age envelope(s): age's reader is EOF-delimited, so trailing
 //! bytes would be pulled into the final chunk and fail authentication (`trailing_bytes_break_*`

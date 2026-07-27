@@ -204,34 +204,17 @@ impl Reconciler {
     /// Idempotent, so a crash mid-pass resumes by re-running. Assumes the cache buckets already
     /// exist; the caller writes the sync marker once this returns, which is the only "done" signal.
     ///
-    /// This is **also** the recovery scan (§7): rebuilding the pending-marker index and settling the
-    /// namespace are the same traversal over the same two listings, and both hinge on the same
-    /// question — which side of a divergence at K is the committed one. Splitting them was a bug
-    /// factory: two snapshots of the same state, taken at different moments and acted on
-    /// independently, could disagree, and a scan calling K pending where restore called it stale
-    /// would raise a marker over a key restore had just overwritten (an inert marker no sweep ever
-    /// clears). One pass over one map cannot. So the pass does both jobs at once — `Pending` keys
-    /// get their marker, everything else gets settled — and the two callers differ only in what
-    /// made them ask (see [`crate::bucket_ctl`]).
+    /// This is **also** the recovery scan: same traversal, same [`Self::classify_cache_entry`]
+    /// verdict, for the reason §7 gives (splitting them risks two independent snapshots
+    /// disagreeing and raising a marker over a key the other pass just overwrote) — the two callers
+    /// differ only in what made them ask (see [`crate::bucket_ctl`]).
     ///
-    /// **Bidirectional**, because restore is not only a rebuild-from-nothing. A lost cache volume
-    /// is the easy case — the cache walk finds no entries and every remote key materializes. But
-    /// restore also runs on a bucket whose cache *survived* and whose marker did not: a crash
-    /// mid-sweep, a crash before a clean marker, a `reset_cache` that failed partway. There the
-    /// cache holds committed state the remote has not got yet, and in cached mode the cache write
-    /// **is** the ack — so a remote-wins sweep would settle an acked PUT down to the older remote
-    /// generation and resurrect an acked DELETE as a live object. Both are silent losses of a write
-    /// hypha already told a client had succeeded, which no later pass can detect: the sweep's
-    /// classify sees a well-formed eviction tombstone and the pending marker it can no longer
-    /// explain is cleared as an orphan.
-    ///
-    /// So the pass walks **both** namespaces and settles every key of their union by
-    /// [`Self::classify_cache_entry`]. Cached-mode writes that win keep their body or tombstone
-    /// untouched and have their pending marker re-raised, so the reconcile sweep pushes them out
-    /// once the bucket is ready — this pass hands them back to the normal pending path rather than
-    /// completing them itself. Returns how many markers it raised.
-    ///
-    /// Both listings are resident, bounded by one bucket's key count.
+    /// **Bidirectional**: not just a rebuild-from-nothing, because a bucket whose cache *survived*
+    /// but whose marker did not still holds acked state the remote lacks (cached mode's ack *is*
+    /// the cache write), so a remote-wins sweep would silently roll back an acked PUT or resurrect
+    /// an acked DELETE (§7). Cached-mode writes that win keep their body/tombstone untouched and
+    /// have their pending marker re-raised rather than completed here. Returns how many markers it
+    /// raised. Both listings are resident, bounded by one bucket's key count.
     pub(crate) async fn reconcile_bucket(&self, bucket: &str) -> Result<usize> {
         // Framed sizes, so the merge settles most keys without a per-key remote HEAD: a remote
         // object's framed length is the closed form over its plaintext length, so an overwrite that

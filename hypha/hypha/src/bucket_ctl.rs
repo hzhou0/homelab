@@ -2,10 +2,9 @@
 //! restore (§7 *Buckets*).
 //!
 //! One client bucket is three physical buckets — `<remote><b>` (the source of truth for existence)
-//! plus the `<data><b>`/`<meta><b>` cache projections. The cache runs unreplicated, and — by
-//! assumption — a bucket's cache is lost whole or not at all (never partially). Its per-bucket sync
-//! marker (`meta::sync_marker_key`) records namespace trust: present ⇒ the projections survived
-//! intact and are authoritative; absent ⇒ the remote is the read source of truth until a restore
+//! plus the `<data><b>`/`<meta><b>` cache projections. Its per-bucket sync marker
+//! (`meta::sync_marker_key`) is a trustworthy all-or-nothing readiness signal (§7): present ⇒ the
+//! projections are authoritative; absent ⇒ the remote is the read source of truth until a restore
 //! rebuilds the tombstone namespace and rewrites the marker.
 //!
 //! Rather than guard the three-way divergence with locks, every substrate *mutation* — CreateBucket,

@@ -1648,30 +1648,12 @@ condition, not a readiness gate.
     (`AWS_REQUEST_CHECKSUM_CALCULATION=when_required`) to match the client config in
     `tests/common`.
 
-    First baseline (2026-07) had the in-house tests green but s3s-e2e, exercising the same surface as
-    a black box, was **not** — the gaps that kept phase 3 open. Now (with CopyObject landed) every
-    in-scope s3s-e2e case passes; the only reds left are the deferred/out-of-scope families below.
-    - **Green**: `list_buckets`, `list_objects`, `get_object`, `delete_object`, `head_operations`,
-      `put_object` (tiny + larger + `with_metadata` + `non_ascii_metadata` + `content_checksums`),
-      **`copy_object`**, `list_objects_with_pagination`, presigned PUT/GET.
-    - **Fixed since the baseline (were real gaps in the declared surface):**
-      - *User metadata is dropped.* PUT with `x-amz-meta-*` now passes through PUT→HEAD/GET verbatim
-        under a reserved namespace, RFC 2047 for non-ASCII (`test_put_object_with_metadata`,
-        `..._non_ascii_metadata`).
-      - *`Content-MD5` not validated.* A wrong `Content-MD5` is now rejected with `BadDigest`
-        (`test_put_object_with_content_checksums`).
-      - *Multipart / LIST pagination.* `test_list_objects_with_pagination` is green; the part-count
-        mismatch was resolved with the phase-3 machinery. `test_multipart_upload`'s remaining red is
-        purely its `checksum_crc32` assertion — the deferred flexible-checksum family below, not a
-        multipart defect (hypha's own `multipart.rs` suite is green).
-    - **In scope for phase 3 — done.** The full client surface minus the exempt families, designs in
-      §7: **`CopyObject`** (server-side body reuse via `UploadPartCopy` + re-minted trailer, or the
-      small-body re-encrypt path — `copy.rs` + `tests/copy.rs`), `DeleteObjects` (non-atomic fan-out;
-      durable batches the remote leg), `ListObjects` v1, `ListMultipartUploads`, `ListParts`,
-      client-facing `UploadPartCopy`, `GetObjectAttributes`, the `GetBucketVersioning` stub, and
-      storage-class passthrough. (CopyObject's *destination* `If-[None-]Match` half of §7's
-      precondition split is not reachable: s3s 0.14.1's `CopyObjectInput` predates S3's
-      conditional-copy-on-destination fields, so only the `copy-source-if-*` conditions apply.)
+    Every in-scope case passes (full client surface minus the exempt families, §7); the only reds
+    are the deferred/out-of-scope families below. `test_multipart_upload`'s red is purely its
+    `checksum_crc32` assertion (deferred flexible-checksum family, not a multipart defect — hypha's
+    own `multipart.rs` suite is green). CopyObject's *destination* `If-[None-]Match` half of §7's
+    precondition split is not reachable: s3s 0.14.1's `CopyObjectInput` predates S3's
+    conditional-copy-on-destination fields, so only the `copy-source-if-*` conditions apply.
     - **Deferred, not exempt** — revisit after phase 3: flexible checksums
       (`test_put_object_with_checksum_algorithm`, the `checksum_crc32` asserts) — validate + persist
       inline over plaintext (the `Content-MD5` slot), single-part first, composite checksum-of-
@@ -1710,150 +1692,29 @@ condition, not a readiness gate.
 
 Ordered so every phase ends independently testable — and from phase 2 on, independently
 deployable — with the hardest machinery (cache coherence, fencing) landing last on proven layers.
+Each phase's mechanism is specified in §§1–10 above; this section tracks scope and status only.
 
-**Phase 1 — `hypha-format`. Done.** Envelope, offset math, `RangeReader`, round-trip tests,
-criterion benches (§5 numbers). (The phase-1 grease scare that motivated derived-`hlen` +
-capture-and-measure was later resolved: age can't grease a scrypt sole-stanza, so `HLEN` is a
-constant and that machinery is removed — §6.)
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | `hypha-format`: envelope, offset math, `RangeReader`, round-trip tests, criterion benches (§5) | Done |
+| 2 | Durable serving: `hypha-core` + the s3s surface in durable mode (PUT/DELETE brackets, GET, HEAD/LIST, repair rule, buckets, auth, `Reconciler`+`KeyLocks`) | Done vs. MinIO |
+| 3 | Multipart (native-remote proxy, trailer + parts table, `ListParts` retag-match) and the rest of the client surface (CopyObject, DeleteObjects, ListObjects v1, ListMultipartUploads, ListParts, UploadPartCopy, GetObjectAttributes, GetBucketVersioning stub, storage-class passthrough) | Done vs. MinIO |
+| 3a | The `<data>`/`<meta>` keyspace split (§6) — prerequisite for v1 LIST's `NextMarker` and the twin-suffix headroom | Done vs. MinIO |
+| 4 | Cached mode, single replica: marker queue, clean marker + recovery scan, reconcile sweep (`replication.rs`), cached DELETE propagation, rehydrate | Done vs. MinIO |
+| 5 | GC + restore: walk cursor, threshold-ratchet eviction, Bloom ring, usage source + vacuum, prefix-hint writer, sync marker + restore sweep, debris sweeps | Not started |
+| 6 | `hypha-fence` + active-passive: two-pod StatefulSet, leader-elected controller, lease, fence→confirm→drain→promote | Not started |
+| 7 | `hypha/` chart, dashboards, the two production installs (cached + durable) | Not started |
 
-**Phase 2 — durable serving. Done (vs. MinIO).** `hypha-core`
-(config/backend/meta/error, twins, key admission) and the s3s surface over durable mode: PUT
-(preconditions, inline encrypt + ETag with the §6 facts trailer appended, the §7 mark → commit →
-settle bracket), DELETE
-(same bracket), GET (cache-first, remote decrypt, ranges), HEAD/LIST (single-pass twin pairing
-under the classification gate; transition marks resolve from the remote), the repair rule on the
-read and conditional paths, buckets, auth, `Reconciler` + `KeyLocks`; the slim
-`{cetag, plen, mtime}` twin; the §6 pinned-work-factor scrypt envelope + `master_passphrase`
-(landed before anything writes a real remote, so quantum-exposed headers never accumulate). Note:
-age 0.11.x cannot grease a scrypt sole-stanza header, so `HLEN` is a hardcoded constant (the
-`HLEN` pin test guards it) — capture-and-measure and all dynamic-`hlen` code are removed.
-*Exit*: integration conformance vs. MinIO — **done** (`hypha/tests/conformance.rs` + `fuzz.rs`;
-this pass also caught and fixed a real bug: twin keys carry `0x01`, which XML 1.0 can't represent,
-so `delete_twins` must use single-object `DeleteObject`, never the batch `DeleteObjects` whose body
-would be rejected — it had broken every durable overwrite/delete of an already-written key; the
-carve-out survives the §6 keyspace split, since a twin key still carries `0x01`).
-Remaining: the s3s-e2e black-box pass (§11) later found this surface still drops user
-`x-amz-meta-*` metadata and accepts a wrong `Content-MD5` — both fixes land under phase 3; also
-conformance vs. SeaweedFS as the cache backend, and ZeroFS against the durable endpoint.
+Per-phase exit criteria live with their test suites (§11) rather than restated here; phases 1–4's
+suites are `hypha-format`'s round-trip/bench tests and `hypha/tests/{conformance,fuzz,multipart,
+copy,cached}.rs` plus the s3s-e2e pass (§11). Phase 5's exit is the scavenge/rehydrate and
+cache-wipe → restore-sweep → rehydrate scenarios; phase 6's is the §11 partition harness; phase 7's
+is both endpoints live behind the shared Gateway.
 
-**Phase 3 — multipart + rest of client surface. Done (vs. MinIO).** The s3s-e2e black-box pass
-(§11) had reopened it — dropped user `x-amz-meta-*`, an unvalidated `Content-MD5`, and multipart +
-LIST-pagination reds — all since resolved: metadata pass-through, `BadDigest` on a wrong
-`Content-MD5`, green v1 pagination, and finally **CopyObject** (`copy.rs`), the last in-scope op.
-Every in-scope s3s-e2e case now passes; the remaining reds are the deferred flexible-checksum family
-and the out-of-scope families (§11). Trailer + embedded parts table
-(single-stream composite read, MAC'd trailer) and the mpu-record retag-match via `ListParts`
-(§6/§7) both landed, superseding the original metadata records + completed-object part-index
-approach.
-Native-remote-multipart proxy (§7): per-part encryption + inline `pmd5`, listable mpu records
-(`p{n:05};<retag>;<pmd5>;<nonce>` key-encoded, `pmd5` the sole stored datum) in `<meta><b>`;
-complete resolves the winning part set via the remote's `ListParts` (retag-matched, geometry from
-the remote's sizes), composes the composite ETag, and lands the terminating trailer —
-`table ‖ facts ‖ tag ‖ version` — in the same atomic native complete (self-describing, no records
-or tags, no *completed-object* part index): as its own part above every client part, or **folded
-into the last client part** whenever nothing can follow that part — it is under the backend's 5 MiB
-minimum, or it is part 10000 (this pass added the fold, and generalized it from the first condition
-to both: a separate trailer part would demote a small final part to an illegal non-final one on any
-real S3 backend, and at part 10000 there is no number left to put one at). Clients therefore get
-S3's full 1–10000 range; UploadPart retains the ciphertext of exactly the parts that can end an
-upload, since an in-progress part can't be read back. Plus abort; the 4 GiB part cap;
-single-stream composite full + ranged GET off the table; cleanup via batched multi-object delete. This phase also closes the **rest of the client
-surface** (§7, the full API minus the exempt families): the phase-2 metadata/`Content-MD5`/
-pagination fixes; **CopyObject** on this same machinery (`UploadPartCopy` the source body range +
-a re-minted `K_dst`-bound trailer, or the small-body re-encrypt path; transition bracket in durable,
-cache→cache copy in cached); **DeleteObjects** (non-atomic fan-out — durable widens the bracket to
-mark-all → one native remote `DeleteObjects` → settle-all, cached is per-key tombstone+marker with
-the remote batch deferred to reconcile); **ListObjects v1**, **ListMultipartUploads**,
-**ListParts**, client-facing **UploadPartCopy**, **GetObjectAttributes** (parts off the trailer
-table); and the **GetBucketVersioning** stub + **storage-class** passthrough. Flexible checksums stay
-deferred (§11).
-*Exit*: §11 multipart scenarios — restart-mid-upload, re-upload/concurrent-part resolution
-(including a small final part), the trailer fold, trailer-based restore recovery — plus the surface
-ops: CopyObject (single-part + composite source, `COPY`/`REPLACE`, copy-source preconditions, a
-`K_dst` trailer that verifies where a raw remote copy would not), DeleteObjects (partial-failure
-result, crash mid-batch repair, XML-clean-keys-only remote batch), v1 LIST, multipart list/parts,
-and GetObjectAttributes part geometry — covered in `hypha/tests/multipart.rs`, CopyObject in
-`hypha/tests/copy.rs`, and the s3s-e2e pass against MinIO.
-
-**Phase 3a — the keyspace split (§6), a prerequisite for v1 LIST. Done (vs. MinIO).** Sequenced
-ahead of the remaining phase-3 surface because v1's `NextMarker` is not expressible under the old
-layout at all, and because the twin-suffix headroom it removes is what capped client keys at 900
-bytes.
-
-1. **Config + buckets** — the `<data>`/`<meta>` cache split (the `<meta>` backend is a
-   `Backend::with_prefix` sibling over the one cache endpoint), `cache_meta_prefix` config with the
-   startup prefix-collision invariant, `validate_bucket_name` against the 63-byte budget, the
-   create/delete/head lifecycle over three backend buckets, and the remote-as-emptiness-gate delete
-   that drains both cache buckets. **Done.**
-2. **`meta` module** — the structural `0x01` ranges replacing `RESERVED_PREFIX`, bit-packed
-   base64url facts, twin build/parse against the 983-byte threshold, admission relaxed to S3's
-   1024. **Done.**
-3. **Move twins, markers, and mpu state** into `<meta><b>` (`Reconciler` split into `data`/`meta`
-   backends); `refresh_twin` / `delete_twins` / the settle and tombstone paths; `shadow_key` helper
-   for `sha256(K)` (unwired until phase 4's rehydrate). `drop_mpu_state` moved to single-object
-   deletes — the range-A keys now carry `0x01`, so they inherit the twins' batch-delete carve-out
-   (§11). **Done.**
-4. **LIST merge join** — the `<data>` client cursor plus a `<meta>` twin cursor
-   (`prefix = 0x01 ‖ <client prefix>`, mirrored delimiter, `start_after` past range A), paired by
-   base-key equality, HEAD fallback for missing and over-threshold twins. **Done.**
-5. **v1 pagination** — `NextMarker` = the client cursor's last raw key; `list_objects_v1_pagination`
-   un-ignored and green. **Done.**
-
-> **One spec correction during implementation.** §6 originally specified a **92-symbol** facts
-> alphabet (`0x20..=0x7E` minus `/`,`+`,`;`), keeping space. But space is the exact converse of the
-> `+` hazard the spec already guarded: a literal space in a twin key round-trips through the
-> `encoding-type=url` LIST as `+` on MinIO, so `delete_twins` read back a corrupted key and left the
-> real twin behind (caught by `delete_objects_batch`). The alphabet became **91 symbols** —
-> `0x21..=0x7E` minus `/`,`+`,`;`, space excluded.
->
-> **Second correction, from the phase-4 review (REVIEW.md).** The 91-symbol alphabet still carried
-> `\` and `.`, and MinIO splits path components on `\` as well as `/`, rejecting any `.`/`..`
-> segment (`XMinioInvalidResourceName`, surfaced as a 500) — so a pseudo-random facts field
-> containing `\` + `.`/`..` failed the twin write nondeterministically. Rather than exclude a third
-> pair of chars, the alphabet became **base64url** (64 RFC 3986-unreserved symbols, rendered by
-> `base64-simd`) — 39 chars, threshold 986 → 983 — ending char-driven exclusions by construction,
-> and retiring the hand-rolled bigint base conversion that a non-power-of-two base had required.
-
-*Exit* (met): the v1 pagination test green under twin dilution at several page sizes
-(`list_objects_v1_pagination`); a key above the twin threshold round-tripping PUT → LIST → GET
-through the HEAD fallback (`list_over_threshold_key_head_fallback`); `ListBuckets` not leaking cache
-buckets (`list_buckets_hides_backend_projections`). The reconcile sweep's `O(pending)` marker scan
-is a structural property of the bare-`K` marker range (§6, §7) — it lands with the sweep itself in
-phase 4, where its complexity is asserted directly.
-
-**Phase 4 — cached mode, single replica. Done (vs. MinIO).** The marker queue behind the write path,
-and the clean marker / recovery scan behind it (§7 — the ack is the body write, so a
-marker that fails is owed and retried rather than turned into an error), the reconcile sweep
-(`replication.rs`, a background duty of
-the active tied to the service's liveness sentinel, listing the `O(pending)` bare-`K` marker range
-past the `0x01` block), cached DELETE propagation (mask-then-propagate, single + batch), and
-rehydrate (single-part into K via `land_rehydrated_single_locked`; composite into the shadow body
-via `land_shadow_locked`, with the read path probing/serving the shadow under a full-digest check).
-The reconcile upload/delete/marker CAS uses the cache's conditional `PutObject`/`DeleteObject`
-(`Backend::delete_if_match`); cached PUT forwards `Content-MD5` to the cache for an atomic
-`BadDigest`. Deployed with one replica and no fencing — a single writer is trivially single, so
-this ships the default `s3.internal` deployment with correctness intact, only failover seamlessness
-missing. *Exit* (met): `hypha/tests/cached.rs` — marker/reconcile upload, cached delete
-propagation, conditional-write linearization (incl. `If-None-Match:*` create contention),
-`Content-MD5` rejection, the marker scan staying `O(pending)` (evicted keys untouched), and
-single-part + composite rehydrate on a tombstoned read. The reconcile CAS's *same-key race*
-guarantee needs the cache to honour conditional DELETE (§9, SeaweedFS ≥ 4.07); the MinIO harness
-exercises only the non-racy paths, which are backend-conditional-agnostic.
-
-**Phase 5 — GC + restore.** Walk cursor, threshold-ratchet eviction, Bloom ring (fill rotation)
-+ slice persistence, usage
-source + vacuum, prefix-hint writer, sync marker + parallel restore sweep, debris sweeps (orphan
-twins, orphan shadow bodies, leftover transition marks, and **all mpu record ranges** — abandoned
-uploads *and* the deferred cleanup of completed/aborted ones, §6/§8, replacing the inline
-`drop_mpu_state` fallback). *Exit*:
-scavenge/rehydrate and cache-wipe → restore-sweep → rehydrate scenarios; mpu ranges reclaimed
-without an inline complete/abort delete.
-
-**Phase 6 — `hypha-fence` + active-passive.** Two-pod StatefulSet, leader-elected controller,
-lease, fence→confirm→drain→promote, graceful-release fast path. First step: verify the fence
-primitives on the live cluster (policy-revision observability, established-connection reset).
-*Exit*: the §11 partition harness.
-
-**Phase 7 — chart + operations.** The `hypha/` chart (both workloads, Secrets, `HTTPRoute`, fence
-RBAC, per repo networking conventions), dashboards for §10, then the two production installs
-(cached + durable). *Exit*: both endpoints live behind the shared Gateway.
+Two corrections surfaced during phases 3a/4 and are worth keeping as rationale, since the reasoning
+generalizes beyond the specific bug: the facts alphabet (§6, *Facts encoding*) went through two
+narrowings — literal space (round-trips through `encoding-type=url` LIST as `+` on MinIO) and then
+`\`/`.` (MinIO rejects `.`/`..` path segments) — before landing on base64url, which excludes both
+classes by construction rather than by enumeration. The current alphabet and its rationale are
+described in full in §6; there is no remaining reason to special-case either excluded character
+elsewhere in the code or docs.

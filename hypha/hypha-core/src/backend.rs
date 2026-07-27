@@ -406,10 +406,7 @@ impl Backend {
             .collect())
     }
 
-    // ── Multipart-to-remote primitives (Phase 3) ────────────────────────────────────────────
-    // hypha maps a client multipart upload onto a remote multipart upload at the composite key;
-    // each part it uploads is an independent age file (§6), concatenated by the remote's own
-    // CompleteMultipartUpload.
+    // ── Multipart-to-remote primitives: each part an independent age file (§6/§7) ───────────
 
     pub async fn create_multipart(
         &self,

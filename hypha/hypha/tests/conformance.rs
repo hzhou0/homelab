@@ -533,7 +533,6 @@ async fn ranged_reads() {
         get_range(&client, B, key, 65_530, 65_540).await,
         body[65_530..65_541]
     );
-    // Open-ended `bytes=N-`.
     let out = client
         .get_object()
         .bucket(B)
@@ -544,7 +543,6 @@ async fn ranged_reads() {
         .expect("open-ended range");
     let tail = out.body.collect().await.unwrap().to_vec();
     assert_eq!(tail, body[199_000..]);
-    // Suffix.
     assert_eq!(
         get_suffix(&client, B, key, 128).await,
         body[body.len() - 128..]
@@ -569,7 +567,6 @@ async fn conditional_writes() {
     let client = h.client();
     let key = "cond";
 
-    // If-None-Match:* creates when absent…
     let v1 = pattern_seeded(1000, 1);
     let etag1 = client
         .put_object()
@@ -587,7 +584,6 @@ async fn conditional_writes() {
         .to_string();
     assert_eq!(etag1, md5_hex(&v1));
 
-    // …and refuses to overwrite an existing key (no double-create).
     let dupe = client
         .put_object()
         .bucket(B)
@@ -607,7 +603,6 @@ async fn conditional_writes() {
         "refused write must not mutate"
     );
 
-    // If-Match with the current ETag succeeds (compare-and-swap).
     let v2 = pattern_seeded(2000, 3);
     let etag2 = client
         .put_object()
@@ -626,7 +621,6 @@ async fn conditional_writes() {
     assert_eq!(etag2, md5_hex(&v2));
     assert_eq!(get_all(&client, B, key).await, v2);
 
-    // If-Match with a stale ETag is refused (no lost update).
     let stale = client
         .put_object()
         .bucket(B)
@@ -678,7 +672,6 @@ async fn delete_semantics() {
         "deleted key must not list"
     );
 
-    // Idempotent: deleting an absent key succeeds.
     client
         .delete_object()
         .bucket(B)
@@ -701,7 +694,6 @@ async fn list_objects() {
         put(&client, B, k, &pattern(n)).await;
     }
 
-    // Full listing reports all three with correct plaintext sizes and ETags.
     let out = client
         .list_objects_v2()
         .bucket(B)
@@ -726,10 +718,8 @@ async fn list_objects() {
         );
     }
 
-    // Prefix.
     assert_eq!(list_keys(&client, B, Some("a/")).await, vec!["a/1", "a/2"]);
 
-    // Delimiter → common prefixes, no contents.
     let d = client
         .list_objects_v2()
         .bucket(B)
@@ -749,7 +739,6 @@ async fn list_objects() {
         "delimited list has no direct contents here"
     );
 
-    // Pagination: one key per page walks the whole set.
     let mut seen = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -906,7 +895,6 @@ async fn list_objects_v1() {
     assert_eq!(out.name(), Some(B));
     assert_eq!(out.is_truncated(), Some(false));
 
-    // Prefix.
     let pfx = client
         .list_objects()
         .bucket(B)
@@ -917,7 +905,6 @@ async fn list_objects_v1() {
     let keys: Vec<&str> = pfx.contents().iter().filter_map(|o| o.key()).collect();
     assert_eq!(keys, vec!["a/1", "a/2"]);
 
-    // Delimiter → common prefixes, no direct contents.
     let d = client
         .list_objects()
         .bucket(B)
@@ -1264,7 +1251,6 @@ async fn content_md5_is_validated() {
         .expect_err("wrong Content-MD5 must be rejected");
     assert_eq!(sdk_err_code(&err).as_deref(), Some("BadDigest"));
 
-    // The rejected write must not have replaced (or torn) the object already there.
     assert_eq!(get_all(&client, B, "digest/obj").await, original);
     let head = client
         .head_object()
@@ -1278,7 +1264,6 @@ async fn content_md5_is_validated() {
         original_etag
     );
 
-    // The matching digest goes through.
     client
         .put_object()
         .bucket(B)
@@ -1481,7 +1466,6 @@ async fn get_object_attributes_single_part() {
         out.storage_class(),
         Some(&aws_sdk_s3::types::StorageClass::Standard)
     );
-    // Single-part objects report no ObjectParts.
     assert!(
         out.object_parts().is_none(),
         "single-part has no ObjectParts"
@@ -1521,7 +1505,6 @@ async fn get_bucket_versioning_stub() {
 
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
-/// Batch-delete `keys` through hypha.
 async fn delete_objects(
     client: &aws_sdk_s3::Client,
     bucket: &str,

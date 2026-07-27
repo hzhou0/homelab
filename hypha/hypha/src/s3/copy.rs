@@ -1,30 +1,17 @@
-//! CopyObject (§7). A copy never re-encrypts a large body and never routes plaintext through the
-//! client: the age body ciphertext is **key-independent** (per-file keys, §6), so it is reusable
-//! verbatim across keys — only the trailer, whose MAC binds the object key, is re-minted for the
-//! destination. The durable path is the same mark → commit → settle bracket as PUT, with the body
-//! sourced from the remote:
+//! CopyObject (§7). The age body ciphertext is **key-independent** (per-file keys, §6) and reused
+//! verbatim across keys; only the trailer, MAC-bound to the object key, is re-minted for the
+//! destination. Durable copy is PUT's mark → commit → settle bracket with the body sourced from the
+//! remote instead of the client:
 //!
-//! - **Large body** (source body ciphertext ≥ the backend's 5 MiB part minimum): a native multipart
-//!   at `K_dst` — `UploadPartCopy` the source's body range `[0, body_ct_len)` (trailer excluded) as
-//!   ≥ 5 MiB copy parts, remote→remote, then a freshly built `K_dst`-bound trailer as the sole final
-//!   part, then complete. Single-part and composite sources copy identically: the range excludes the
-//!   trailer, and a composite's offset table is body-relative, so it carries over untouched.
-//! - **Small body** (below the part minimum): a copy part cannot stand as a non-final part and
-//!   cannot absorb the trailer, so re-encrypt — source GET → decrypt → one `PutObject` at `K_dst`
-//!   with the fresh trailer inline. The source is then necessarily one age file (every non-final
-//!   part is ≥ 5 MiB, so a sub-minimum body is single-part or a one-part composite), and age's
-//!   framed length is fixed by the plaintext length, so the re-encrypted body_ct_len — hence the
-//!   fresh trailer's table — matches the source's.
+//! - **Large body** (source body ciphertext ≥ the 5 MiB part minimum): native multipart at `K_dst`
+//!   — `UploadPartCopy` over `[0, body_ct_len)` (trailer excluded), then a fresh `K_dst`-bound
+//!   trailer as the sole final part, then complete.
+//! - **Small body**: a copy part can't stand alone as non-final and can't absorb the trailer, so
+//!   re-encrypt — source GET → decrypt → one `PutObject` at `K_dst` with the trailer inline.
 //!
-//! Preconditions evaluate against the **source's** current client ETag / mtime (`x-amz-copy-source-if-*`).
-//! S3's *destination* `If-[None-]Match` (§7) is not reachable: s3s 0.14.1's `CopyObjectInput`
-//! predates those conditional-copy-on-destination fields, so there is nothing to evaluate.
-//!
-//! The destination ETag is the source client ETag unchanged (content-derived, §4) and `plen` carries
-//! over; only `LastModified` moves to now, and since the trailer is re-minted anyway its `mtime` is
-//! set with it. A mid-copy crash mirrors durable PUT: before the commit lands `K_dst` is untouched
-//! and the dangling native upload is a swept orphan; every remote-side step reads only source
-//! ciphertext, so it never exposes plaintext nor tears the source.
+//! Preconditions evaluate against the **source's** current client ETag / mtime
+//! (`x-amz-copy-source-if-*`) only: s3s 0.14.1's `CopyObjectInput` predates the destination
+//! `If-[None-]Match` fields (§2), so there is nothing to evaluate there yet.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -164,9 +151,8 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// Large-body commit (§7): a native multipart at `K_dst` whose parts are server-side copies of
-    /// the source's body range, capped by a fresh trailer part, then complete. Owns the native
-    /// upload, so any failure aborts it best-effort (a leftover is a sweepable orphan regardless).
+    /// Large-body commit (§7). Owns the native upload, so a failure aborts it best-effort — a
+    /// leftover is a sweepable orphan regardless.
     async fn commit_copy_multipart(
         &self,
         bucket: &str,

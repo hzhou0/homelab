@@ -1,21 +1,14 @@
 //! HEAD and LIST, both cache-served and reporting **plaintext** facts (§7). HEAD reads them off
-//! the `<data>` object (native for a live body, metadata for a tombstone; a transition mark
-//! resolves from the remote). LIST is a **merge join** of two cursors (§6/§7): the client cursor
-//! over `<data><b>` (client bodies + tombstones, so its keys and pagination are clean), and the
-//! twin cursor over `<meta><b>`'s range B, `prefix = 0x01 ‖ <client prefix>`, delimiter mirrored.
-//! Each client entry is classified from its (size, ETag) sentinel pair (§6); an eviction tombstone
-//! takes its facts from the twin matched **by base-key equality**, with a per-key `<data>` HEAD
-//! fallback when the twin is missing (crash window, page straddle, or a key over the §6 twin
-//! threshold). Delete-tombstones are dropped; transition marks resolve from the remote.
+//! the `<data>` object directly. LIST is a **merge join** of two cursors (§6/§7): the client cursor
+//! over `<data><b>`, and the twin cursor over `<meta><b>`'s range B, delimiter mirrored. An eviction
+//! tombstone takes its facts from the twin matched **by base-key equality**, with a per-key `<data>`
+//! HEAD fallback when the twin is missing (crash window, page straddle, or a key over the §6 twin
+//! threshold).
 //!
-//! LIST is a **single page**, forwarded pagination — the client cursor drives it. Delete-tombstones
-//! are dropped, so a page can yield fewer than `MaxKeys` client entries (a short page, valid S3 as
-//! long as `IsTruncated` and the resume position are honest); but with the twins moved out of the
-//! client keyspace, pages are short only where keys were *deleted*, not for every evicted key.
-//! hypha forwards the `<data>` cursor's own continuation token / truncation flag (v2) or last raw
-//! key (v1's `NextMarker`) and deliberately does **not** backfill to fill a page: coalescing pages
-//! would require reusing a backend cursor across requests or resuming by a client-entry count, and
-//! both weaken S3's key-position guarantee under concurrent mutation.
+//! LIST is a **single page**, forwarded pagination — the client cursor drives it, and hypha
+//! deliberately does **not** backfill to fill a page: coalescing pages would require reusing a
+//! backend cursor across requests or resuming by a client-entry count, and both weaken S3's
+//! key-position guarantee under concurrent mutation.
 
 use std::collections::HashMap;
 
@@ -355,7 +348,6 @@ impl Hypha {
             }
         }
 
-        // `<data>` common prefixes are pure client keyspace — no hypha-internal groups to filter.
         let common_prefixes: Vec<CommonPrefix> = raw_prefixes
             .into_iter()
             .map(|cp| CommonPrefix { prefix: cp.prefix })

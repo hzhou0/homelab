@@ -527,7 +527,6 @@ pub const AGE_MAGIC: &[u8] = b"age-encryption.org/v1";
 /// MinIO (like S3) rejects a non-final multipart part smaller than 5 MiB.
 pub const MIN_PART: usize = 5 * 1024 * 1024;
 
-/// Start a multipart upload; returns its upload id.
 pub async fn create_mpu(client: &Client, bucket: &str, key: &str) -> String {
     client
         .create_multipart_upload()

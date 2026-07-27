@@ -113,7 +113,6 @@ async fn multipart_reupload_resolution() {
         "part 2 must be the re-uploaded bytes"
     );
 
-    // All per-upload records (including the superseded one) are dropped at complete.
     // mpu records live in the <meta> bucket's range A (0x01 0x01 m …, §6).
     let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
     assert!(
@@ -511,7 +510,6 @@ async fn list_multipart_uploads_tracks_in_progress() {
         ]
     );
 
-    // Completing removes one; aborting removes another.
     let body = pattern_seeded(MIN_PART, 93);
     let e = upload_part(&client, B, "docs/a", &a, 1, &body).await;
     complete_mpu(&client, B, "docs/a", &a, &[(1, e)]).await;

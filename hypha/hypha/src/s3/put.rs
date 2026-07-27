@@ -37,12 +37,9 @@ impl Hypha {
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        // Ahead of the mode split, and for the same reason in both: no object hypha writes anywhere
-        // may have a reserved sentinel as its plaintext (§6). Durable mode keeps no plaintext in the
-        // cache, so it has no classifier to spoof today — but the remote object outlives the mode
-        // that wrote it, and a bucket switched to cached rehydrates that plaintext to bare `K`, where
-        // it *is* the classification. Rejecting at ingest is what keeps the (size, ETag) classifier
-        // sound without every later path having to re-derive the hazard.
+        // Ahead of the mode split (§6): durable mode has no plaintext to spoof today, but a bucket
+        // later switched to cached would rehydrate this plaintext to bare `K`, where it becomes the
+        // classification — so the check must hold store-wide, not just for the mode that needs it now.
         let mut input = input;
         if input.content_length == Some(16) {
             if let Some(body) = input.body.take() {
@@ -319,9 +316,8 @@ impl Hypha {
 }
 
 /// Reject a body equal to one of hypha's reserved 16-byte tombstone sentinels (§6), handing the
-/// buffered bytes back as the body otherwise. Those bytes would classify a live object as a
-/// tombstone in every (size, ETag) scan — LIST would hide it, reconcile would skip or reap it. Only
-/// a 16-byte body can collide, so the caller gates on that and nothing larger is ever buffered.
+/// buffered bytes back as the body otherwise. Only a 16-byte body can collide, so the caller gates
+/// on that and nothing larger is ever buffered.
 async fn reject_sentinel_body(body: StreamingBlob) -> S3Result<StreamingBlob> {
     let bytes = codec::blob_to_bytestream(body)
         .collect()
