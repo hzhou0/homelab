@@ -38,6 +38,17 @@ Remove — assume the reader knows the tools and can inspect the code:
 Same rule applies to README files: architecture and rationale stay; shell command sequences,
 migration procedures, and explanations of standard tooling go.
 
+The same rule governs **source code** (Go, Rust, scripts) — doc comments included. Keep high-level
+reasoning, architectural notes, and surprising or nuanced behaviour. Remove anything that is:
+- trivially inferrable from the code or the signature,
+- a cross-reference easily found by a code search (it rots as the code moves),
+- an explanation of a variable, field, or function name,
+- a description of what the code does.
+
+**Rename and reorganize before you comment.** When a name needs explaining, the fix is a better
+name (or a clearer structure), not a doc comment. Every construct should be self-documenting; a
+comment is the last resort, for reasoning that cannot live in a name.
+
 ### Networking commentary
 
 Keep networking commentary (LB IPAM/L2, east-west default-deny, gateway L3 allow-list,
