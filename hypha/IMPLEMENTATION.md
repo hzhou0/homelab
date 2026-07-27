@@ -20,7 +20,7 @@ Cargo workspace:
   `meta` (tombstones, sentinels, facts twins, composite ETag, key admission), typed config
   (including the mode), error → `s3s::S3Error` mapping.
 - **`hypha`** — the serving binary: the `s3s::S3` surface, the sync↔async codec bridges, and the
-  shared tiering machinery — `Reconciler` (upload/tombstone primitives over cache + remote) and
+  shared tiering machinery — `Tiering` (upload/tombstone primitives over cache + remote) and
   `KeyLocks` (the per-key lock table). Later phases add the reconcile sweep, the GC scavenger, and
   the restore sweep as background tasks of the active replica. Runs **active-passive** (§4).
 - **`hypha-fence`** — the fencing controller (§4); enters the workspace in phase 6.
@@ -85,7 +85,7 @@ hypha/src/
   auth.rs                S3Auth for hypha's own client credentials
   codec.rs               sync age ⇄ async body bridges; inline encrypt + MD5, trailer framing (§6)
   keylocks.rs            per-key async lock table (§4)
-  tier.rs                Reconciler: upload / tombstone / twin / restore-sweep primitives (§7)
+  tier.rs                Tiering: upload / tombstone / twin / restore-sweep primitives (§7)
   bucket_ctl.rs          bucket-control actor: sole writer of the cache substrate; per-bucket restore (§7)
   background.rs          background-transition actor: bounded, deduped, client-cancellable rehydrate/evict (§8)
   s3/                    the s3s::S3 impl, split by op group
@@ -121,7 +121,7 @@ authenticated facts trailer (§6) so the restore sweep (§7) can rebuild the cac
   rehydrate (§8). Low latency, bounded async-lag loss window.
 
 Durable mode is the cached machinery under three constraints: synchronous upload, always
-tombstone, never restore. Both modes share `Reconciler` and the tombstone/twin/marker structures
+tombstone, never restore. Both modes share `Tiering` and the tombstone/twin/marker structures
 (§6); multipart takes one path regardless of mode (§7).
 
 **Client ETags.** Single-part in cached mode: the cache computes `MD5(plaintext)` natively.
@@ -559,7 +559,7 @@ free by the §8 walk cursor — advisory sharding input for the restore sweep (�
 
 ## 7. Operations
 
-Each client operation, as steps per mode, over `tier.rs`'s `Reconciler` primitives, the §4 lock
+Each client operation, as steps per mode, over `tier.rs`'s `Tiering` primitives, the §4 lock
 discipline, and the §6 structures. Two framing rules make every crash analysis below mechanical:
 
 **The commit point is single and atomic.** In durable mode it is the *remote* operation —
@@ -1041,7 +1041,7 @@ Three request classes ride the queue:
   publishes `Ready` before dropping it, so the gate never sees a bucket as neither. The actor
   ensures the projections exist, then merges the remote and cache namespaces — remote-only objects
   rebuilt as eviction tombstone + twin from their authenticated tail trailer, surviving cache-side
-  writes left standing (`Reconciler::reconcile_bucket`, the per-bucket restore sweep below), then
+  writes left standing (`Tiering::reconcile_bucket`, the per-bucket restore sweep below), then
   writes the marker to flip the bucket cache-authoritative. Idempotent, so a crash mid-sweep resumes
   by re-running; duplicate triggers collapse to one.
 
@@ -1303,7 +1303,7 @@ over the one bucket's keyspace:
    well-formed eviction tombstone plus a pending marker the sweep then clears as an orphan.
 
    So the sweep walks **both** namespaces and settles each key of their union by one verdict
-   (`Reconciler::classify_cache_entry` — the same verdict the pending-set rebuild below runs on,
+   (`Tiering::classify_cache_entry` — the same verdict the pending-set rebuild below runs on,
    since the two are one pass):
 
    - *cache pending* — a live body whose generation the remote lacks, or a delete-tombstone it has
@@ -1697,7 +1697,7 @@ Each phase's mechanism is specified in §§1–10 above; this section tracks sco
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | `hypha-format`: envelope, offset math, `RangeReader`, round-trip tests, criterion benches (§5) | Done |
-| 2 | Durable serving: `hypha-core` + the s3s surface in durable mode (PUT/DELETE brackets, GET, HEAD/LIST, repair rule, buckets, auth, `Reconciler`+`KeyLocks`) | Done vs. MinIO |
+| 2 | Durable serving: `hypha-core` + the s3s surface in durable mode (PUT/DELETE brackets, GET, HEAD/LIST, repair rule, buckets, auth, `Tiering`+`KeyLocks`) | Done vs. MinIO |
 | 3 | Multipart (native-remote proxy, trailer + parts table, `ListParts` retag-match) and the rest of the client surface (CopyObject, DeleteObjects, ListObjects v1, ListMultipartUploads, ListParts, UploadPartCopy, GetObjectAttributes, GetBucketVersioning stub, storage-class passthrough) | Done vs. MinIO |
 | 3a | The `<data>`/`<meta>` keyspace split (§6) — prerequisite for v1 LIST's `NextMarker` and the twin-suffix headroom | Done vs. MinIO |
 | 4 | Cached mode, single replica: marker queue, clean marker + recovery scan, reconcile sweep (`replication.rs`), cached DELETE propagation, rehydrate | Done vs. MinIO |

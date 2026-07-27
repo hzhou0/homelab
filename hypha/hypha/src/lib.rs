@@ -45,7 +45,7 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     let data = Backend::connect(&config.cache);
     let meta = data.with_prefix(config.cache_meta_prefix.clone());
 
-    let tier = tier::Reconciler {
+    let tier = tier::Tiering {
         data,
         meta,
         remote,
@@ -56,16 +56,23 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         cached: config.mode == Mode::Cached,
     };
 
+    // Ordered: the marker machinery reads its per-bucket accounting off the bucket-control actor's
+    // published state, so the actor exists first (the dependency runs one way — `bucket_ctl` knows
+    // nothing of `markers`).
+    let buckets = bucket_ctl::spawn(tier.clone());
+
     // The repair queue's only strong sender goes to `Lifecycle`, so dropping that at drain is what
     // closes the channel — the proof that every obligation has finished (§7).
-    let (markers, queue, worker) = markers::spawn(
+    let (markers, run_seal, marker_actor) = markers::spawn(
         tier.clone(),
+        buckets.clone(),
         Duration::from_millis(config.reconcile.interval_ms),
         config.reconcile.concurrency,
     );
 
     let app = Hypha::new(
         tier,
+        buckets,
         markers.clone(),
         config.mode,
         config.serving.offload_threshold,
@@ -77,15 +84,14 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     // remote. It holds only a `Weak` to the app's liveness sentinel, so it stops when the service
     // drops — no explicit shutdown wiring. Durable mode has no pending set, so no sweep.
     if config.mode == Mode::Cached {
-        let sweep = replication::Reconcile::new(
+        let replication = replication::ReplicationTask::new(
             app.tier.clone(),
             Duration::from_millis(config.reconcile.interval_ms),
             config.reconcile.concurrency,
         );
-        tokio::spawn(sweep.run(app.liveness()));
+        tokio::spawn(replication.run(app.liveness()));
     }
 
-    let buckets = app.buckets.clone();
     let mut b = S3ServiceBuilder::new(app);
     b.set_auth(auth::SingleKeyAuth::new(
         config.auth.access_key.clone(),
@@ -93,10 +99,9 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     ));
     let lifecycle = Lifecycle {
         cached: config.mode == Mode::Cached,
-        buckets,
         markers,
-        queue: Some(queue),
-        worker: tokio::spawn(worker.run()),
+        seal: Some(run_seal),
+        marker_actor: tokio::spawn(marker_actor.run()),
     };
     Ok((b.build(), lifecycle))
 }
@@ -106,13 +111,14 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
 /// writing any clean marker back.
 pub struct Lifecycle {
     cached: bool,
+    /// Holds the bucket-control handle internally: startup owes a reconcile pass for every bucket
+    /// whose clean marker was absent, and the actor is what runs it — so a pass restore already
+    /// wants for the same bucket is one pass, not two.
     markers: markers::Markers,
-    /// Startup owes a reconcile pass for every bucket whose clean marker was absent, and the actor
-    /// is what runs it — so a pass restore already wants for the same bucket is one pass, not two.
-    buckets: bucket_ctl::BucketCtl,
-    /// The repair queue's only strong sender outside the obligation tasks. Dropping it is the seal.
-    queue: Option<markers::Queue>,
-    worker: tokio::task::JoinHandle<()>,
+    /// The repair queue's only strong sender outside the obligation tasks. Sending its one message
+    /// is the seal; *dropping* it only closes the channel, which an abort does too.
+    seal: Option<markers::RunSeal>,
+    marker_actor: tokio::task::JoinHandle<()>,
 }
 
 impl Lifecycle {
@@ -121,21 +127,20 @@ impl Lifecycle {
     /// real orphans exist. Durable mode owes no markers, so there is nothing to clear.
     pub async fn startup(&self) -> Result<(), BoxError> {
         if self.cached {
-            self.markers.startup(&self.buckets).await?;
+            self.markers.startup().await?;
         }
         Ok(())
     }
 
-    /// Seal the run: drop the queue so the channel closes once the last obligation finishes, then
-    /// let the worker make its final attempt and write the clean markers. Awaited *before* the
-    /// active claim is released (§7) — a passive that promotes first could take writes into a bucket
-    /// this run is about to vouch for.
+    /// Seal the run: [`markers::MarkerActor`] then makes its final attempt and writes the clean
+    /// markers. Awaited *before* the active claim is released (§7) — a passive that promotes first
+    /// could take writes into a bucket this run is about to vouch for.
     pub async fn drain(mut self) {
-        if let Some(queue) = self.queue.take() {
-            queue.seal();
+        if let Some(run_seal) = self.seal.take() {
+            run_seal.seal();
         }
-        if let Err(e) = self.worker.await {
-            tracing::warn!(error = %e, "marker worker did not finish; clean markers withheld");
+        if let Err(e) = self.marker_actor.await {
+            tracing::warn!(error = %e, "marker actor did not finish; clean markers withheld");
         }
     }
 }

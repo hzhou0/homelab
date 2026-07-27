@@ -26,14 +26,20 @@ const SCAN_PAGE: i32 = 1000;
 
 /// The framed size a single-part remote object would have for a `plen`-byte plaintext (§6). A
 /// markerless live body is always single-part — a composite is tombstoned at K with its plaintext in
-/// the shadow — so this is exact where [`Reconciler::classify_cache_entry`] applies it.
+/// the shadow — so this is exact where [`Tiering::classify_cache_entry`] applies it.
 fn single_part_framed_len(plen: u64) -> Option<u64> {
     hypha_format::offset::ciphertext_len(plen, hypha_format::offset::HLEN)
         .checked_add(SINGLE_TRAILER_LEN as u64)
 }
 
+/// Every backend a key can move between, plus what it takes to move it: the crypto that frames a
+/// body on its way out, and the two lock tables that decide who may. Three handles, two endpoints —
+/// `data` and `meta` are bucket namespaces on the same cache endpoint (§6), so a write that touches
+/// both is one round trip's worth of connection reuse, not two. Cloned into every task that touches
+/// storage (the S3 ops, `BucketTask`, `TransitionActor`, `ReplicationTask`); each field is itself a
+/// cheap handle, so a clone is refcount bumps.
 #[derive(Clone)]
-pub struct Reconciler {
+pub struct Tiering {
     /// `<data>` cache bucket: client bodies and tombstones at bare `K` (§6).
     pub data: Backend,
     /// `<meta>` cache bucket: facts twins, pending markers, mpu records (§6).
@@ -59,7 +65,7 @@ pub struct Reconciler {
 }
 
 /// What a surviving cache entry at K means once reconciled against the remote (§7) — the shared
-/// verdict driving [`Reconciler::reconcile_bucket`], which both restores an untrusted namespace and
+/// verdict driving [`Tiering::reconcile_bucket`], which both restores an untrusted namespace and
 /// rebuilds a bucket's pending set (§7) — one traversal, because both jobs turn on this one
 /// question.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,7 +76,7 @@ pub(crate) enum CacheVerdict {
     /// Cache and remote already agree. Leave K exactly as it is.
     Agrees,
     /// The cache entry is unresolved, or contradicted by the remote. **Remote wins**: settle K by
-    /// the repair rule ([`Reconciler::repair_locked`]).
+    /// the repair rule ([`Tiering::repair_locked`]).
     Stale,
 }
 
@@ -114,7 +120,7 @@ impl RemoteFacts {
     }
 }
 
-impl Reconciler {
+impl Tiering {
     // ── The transition bracket (§7) ─────────────────────────────────────────────────────────
 
     /// **Mark**: overwrite K's cache entry with the transition tombstone. Readers resolve K from

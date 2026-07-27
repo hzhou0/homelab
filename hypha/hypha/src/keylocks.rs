@@ -4,7 +4,7 @@
 //! the reconcile-only *upload* lock, kept separate so a replication upload only ever excludes other
 //! reconciles of its key, never a client's conditional PUT.
 //!
-//! The table stores **weak** references, so it never keeps a mutex alive: the [`Guard`] returned
+//! The table stores **weak** references, so it never keeps a mutex alive: the [`KeyGuard`] returned
 //! by `lock`/`try_lock` is the only strong owner. Two concurrent lockers of the same key both
 //! upgrade the *same* live `Weak`, so they serialize; a locker arriving after all guards dropped
 //! upgrades a dead `Weak`, gets `None`, and installs a fresh mutex.
@@ -28,17 +28,17 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-type Table = DashMap<Arc<str>, Weak<AsyncMutex<()>>>;
+type LockTable = DashMap<Arc<str>, Weak<AsyncMutex<()>>>;
 
 #[derive(Clone, Default)]
 pub struct KeyLocks {
-    table: Arc<Table>,
+    table: Arc<LockTable>,
 }
 
 impl KeyLocks {
     /// Acquire the lock for `key`, awaiting any current holder. Hold the returned guard for the
     /// critical section; dropping it releases the lock and evicts the key's now-idle entry.
-    pub async fn lock(&self, key: &str) -> Guard {
+    pub async fn lock(&self, key: &str) -> KeyGuard {
         let (key, arc) = self.mutex_for(key);
         let inner = arc.clone().lock_owned().await;
         self.guard(key, arc, inner)
@@ -50,14 +50,19 @@ impl KeyLocks {
     /// is alive mid-bracket, so there is nothing to repair and a read must not queue behind it. The
     /// reconcile sweep coalesces same-key uploads onto the in-flight one the same way
     /// ([`crate::replication`]).
-    pub fn try_lock(&self, key: &str) -> Option<Guard> {
+    pub fn try_lock(&self, key: &str) -> Option<KeyGuard> {
         let (key, arc) = self.mutex_for(key);
         let inner = arc.clone().try_lock_owned().ok()?;
         Some(self.guard(key, arc, inner))
     }
 
-    fn guard(&self, key: Arc<str>, arc: Arc<AsyncMutex<()>>, inner: OwnedMutexGuard<()>) -> Guard {
-        Guard {
+    fn guard(
+        &self,
+        key: Arc<str>,
+        arc: Arc<AsyncMutex<()>>,
+        inner: OwnedMutexGuard<()>,
+    ) -> KeyGuard {
+        KeyGuard {
             inner: Some(inner),
             arc,
             key,
@@ -110,17 +115,17 @@ impl KeyLocks {
 /// Owns a held per-key lock; releasing it (drop) frees the async mutex and evicts the key's table
 /// entry once no other holder or waiter remains. Returned by [`KeyLocks::lock`]/`try_lock`.
 #[must_use = "dropping the guard immediately releases the lock"]
-pub struct Guard {
+pub struct KeyGuard {
     /// `Option` so `drop` can release the async mutex *before* counting owners — the released
     /// guard's own strong ref must be gone for `strong_count == 1` to mean "only us left".
     inner: Option<OwnedMutexGuard<()>>,
     arc: Arc<AsyncMutex<()>>,
     /// Shared with the table's own key, so holding a guard costs a refcount, not an allocation.
     key: Arc<str>,
-    table: Arc<Table>,
+    table: Arc<LockTable>,
 }
 
-impl Drop for Guard {
+impl Drop for KeyGuard {
     fn drop(&mut self) {
         // Release first: waking a parked waiter can't change the owner count (it already holds its
         // own `arc` clone), and our own reference must be gone before the count means anything.

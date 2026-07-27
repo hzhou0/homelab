@@ -9,7 +9,7 @@
 //!
 //! Rather than guard the three-way divergence with locks, every substrate *mutation* — CreateBucket,
 //! DeleteBucket, provisioning, and restore — is funnelled through this one actor, which makes its
-//! serialization structural: per-bucket-serial (one worker drains a bucket's requests in arrival
+//! serialization structural: per-bucket-serial (one task drains a bucket's requests in arrival
 //! order) and cross-bucket-parallel (distinct buckets proceed at once, bounded by
 //! [`MAX_CONCURRENT`]). Reads never enter here; they read the actor's published
 //! [state map](BucketCtl::state) instead, which costs one atomic load and no lock.
@@ -21,7 +21,7 @@
 //!
 //! That dedup is why **both** of §7's rebuild duties enter here — restoring an untrusted namespace
 //! and rebuilding a bucket's pending-marker index at startup. They are one traversal
-//! ([`Reconciler::reconcile_bucket`]), and routing them through one queue is what guarantees they
+//! ([`Tiering::reconcile_bucket`]), and routing them through one queue is what guarantees they
 //! are one *pass*: two passes over the same bucket would take independent snapshots of cache and
 //! remote, and could settle a key on one while the other raised a marker for it. Here they collapse
 //! into a single sweep over a single map before either runs. Only [`Trigger`] distinguishes them.
@@ -36,7 +36,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
-use crate::tier::Reconciler;
+use crate::tier::Tiering;
 
 /// Cap on cache buckets being mutated at once. A slow DeleteBucket drain or a large restore holds a
 /// slot for its duration, so this also bounds the head-of-line a lost-volume restore storm drains
@@ -50,14 +50,21 @@ const MAX_CONCURRENT: usize = 16;
 type BucketStates = Arc<ArcSwap<HashMap<String, BucketState>>>;
 
 /// What the data plane knows about one bucket (§7). Absent from the map ⇒ unclassified: the gate
-/// must probe. Keeping the three facts in one value is what makes a transition a single atomic
-/// publish — `Ready` replacing `Restoring` can't be observed half-applied, and no ordering
-/// convention between separate sets has to be maintained by hand.
+/// must probe. Keeping the facts in one value is what makes a transition a single atomic publish —
+/// `Ready` replacing `Restoring` can't be observed half-applied, and no ordering convention between
+/// separate sets has to be maintained by hand. It is also why [`Self::accounted`] lives here rather
+/// than in [`crate::markers`]: retiring a deleted bucket then drops its accounting for free, instead
+/// of leaving a second structure to remember to clear.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct BucketState {
     phase: Option<Phase>,
     /// Both cache projections are known to exist, so a write can skip asking the actor.
     provisioned: bool,
+    /// This run accounts for the bucket's pending-marker set (§6) — its clean marker was present at
+    /// startup, a reconcile pass rebuilt the set, or this run created the bucket empty. Positive
+    /// evidence only: **absence is the default**, so a bucket left dirty by an earlier crash and
+    /// untouched since simply is not accounted and ends the run dirty.
+    accounted: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,7 +131,17 @@ fn clear_provisioned(state: &mut BucketState) {
     state.provisioned = false;
 }
 
-/// Forget a bucket entirely — it no longer exists, so the next access re-classifies from scratch.
+fn set_accounted(state: &mut BucketState) {
+    state.accounted = true;
+}
+
+fn clear_accounted(state: &mut BucketState) {
+    state.accounted = false;
+}
+
+/// Forget a bucket entirely — it no longer exists, so the next access re-classifies from scratch and
+/// the drain has nothing to vouch for (a clean marker written into a deleted bucket's projection
+/// would resurrect it).
 fn retire(states: &BucketStates, bucket: &str) {
     states.rcu(|current| {
         let mut next = HashMap::clone(current);
@@ -225,12 +242,12 @@ impl BucketCtl {
     /// meanwhile; a closed queue (actor gone at shutdown) is ignored.
     ///
     /// Also memoizes the bucket as restoring, which is what spares every *subsequent* op the gate's
-    /// two-probe classification (§7). The worker clears the memo when the sweep ends — however it
+    /// two-probe classification (§7). The task clears the memo when the sweep ends — however it
     /// ends — so a failed sweep is re-probed and re-triggered by the next access, exactly as it was
     /// when the gate probed every time. `mark_restoring` leaves a `Ready` bucket alone, so an
     /// `Unaccounted` pass over a trusted namespace does not send its reads back to the remote.
     pub fn reconcile(&self, bucket: &str, trigger: Trigger) {
-        // Memoize before sending: the reverse order races a worker that finishes first, and would
+        // Memoize before sending: the reverse order races a task that finishes first, and would
         // leave a memo no sweep will ever clear. A refused send rolls it back for the same reason.
         update(&self.states, bucket, mark_restoring);
         if self
@@ -258,6 +275,31 @@ impl BucketCtl {
         update(&self.states, bucket, mark_ready);
     }
 
+    /// Record that this run accounts for `bucket`'s pending set (§6). Startup calls it for a bucket
+    /// whose clean marker was present; the task calls it for a bucket a pass rebuilt or a create
+    /// established empty.
+    pub(crate) fn account_for(&self, bucket: &str) {
+        update(&self.states, bucket, set_accounted);
+    }
+
+    /// Withdraw the accounting — the run can no longer vouch for the bucket's pending set, so it
+    /// must end dirty. No evidence, no clean marker.
+    pub(crate) fn unaccount(&self, bucket: &str) {
+        update(&self.states, bucket, clear_accounted);
+    }
+
+    /// Every bucket this run accounts for, and no other — the drain's whole condition for writing a
+    /// clean marker ([`crate::markers`]). A bucket deleted mid-run was retired from the map, so it
+    /// cannot appear here.
+    pub(crate) fn accounted(&self) -> Vec<String> {
+        self.states
+            .load()
+            .iter()
+            .filter(|(_, s)| s.accounted)
+            .map(|(bucket, _)| bucket.clone())
+            .collect()
+    }
+
     async fn request(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<()>>) -> BucketMsg,
@@ -273,22 +315,21 @@ impl BucketCtl {
 
 /// Spawn the actor and return its handle. The task runs until every handle is dropped, then drains
 /// whatever is still queued before exiting.
-pub fn spawn(tier: Reconciler, markers: crate::markers::Markers) -> BucketCtl {
+pub fn spawn(tier: Tiering) -> BucketCtl {
     let (tx, rx) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = mpsc::unbounded_channel();
     let (prov_tx, prov_rx) = mpsc::unbounded_channel();
     let states: BucketStates = Arc::new(ArcSwap::from_pointee(HashMap::new()));
-    let actor = Actor {
+    let actor = BucketActor {
         rx,
         done_tx,
         done_rx,
         prov_tx,
         prov_rx,
         tier,
-        markers,
         states: states.clone(),
         sem: Arc::new(Semaphore::new(MAX_CONCURRENT)),
-        slots: HashMap::new(),
+        queued: HashMap::new(),
         running: HashSet::new(),
         provisioning: HashMap::new(),
     };
@@ -296,17 +337,17 @@ pub fn spawn(tier: Reconciler, markers: crate::markers::Markers) -> BucketCtl {
     BucketCtl { tx, states }
 }
 
-/// One bucket's queued-but-undispatched work. `Create`/`Delete` keep arrival order; `reconcile` is
-/// a single slot — repeated triggers for a bucket collapse into one sweep over one map.
+/// `Create`/`Delete` keep arrival order; `reconcile` is a single slot — repeated triggers for a
+/// bucket collapse into one sweep over one map.
 #[derive(Default)]
-struct Slot {
-    pending: VecDeque<Client>,
+struct QueuedWork {
+    requests: VecDeque<LifecycleRequest>,
     reconcile: Option<Trigger>,
 }
 
-impl Slot {
+impl QueuedWork {
     fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.reconcile.is_none()
+        self.requests.is_empty() && self.reconcile.is_none()
     }
 
     fn owe(&mut self, trigger: Trigger) {
@@ -317,42 +358,39 @@ impl Slot {
     }
 }
 
-enum Client {
+enum LifecycleRequest {
     Create(oneshot::Sender<Result<()>>),
     Delete(oneshot::Sender<Result<()>>),
 }
 
-struct Actor {
+struct BucketActor {
     rx: mpsc::UnboundedReceiver<BucketMsg>,
-    /// Workers signal here when they finish a bucket's batch, so the actor can re-dispatch any work
-    /// that arrived mid-drain. Held by the actor too, so it never closes on its own.
+    /// Tasks signal here when they finish a bucket's batch, so any work that arrived mid-drain
+    /// gets re-dispatched. Held here too, so it never closes on its own.
     done_tx: mpsc::UnboundedSender<String>,
     done_rx: mpsc::UnboundedReceiver<String>,
     /// Provisioning tasks report here. Separate from `done_tx` because provisioning deliberately
-    /// runs *outside* the per-bucket worker: the worker for a lost-volume bucket is busy with the
+    /// runs *outside* the per-bucket task: the task for a lost-volume bucket is busy with the
     /// restore sweep, and a write must not queue behind it (§7 — serving is never gated).
     prov_tx: mpsc::UnboundedSender<(String, std::result::Result<(), String>)>,
     prov_rx: mpsc::UnboundedReceiver<(String, std::result::Result<(), String>)>,
-    tier: Reconciler,
-    /// Handed to each worker so a completed pass can record that this run accounts for the bucket's
-    /// pending set (§7) — the pass rebuilds it, so it is the pass that earns the standing.
-    markers: crate::markers::Markers,
+    tier: Tiering,
     states: BucketStates,
     sem: Arc<Semaphore>,
-    slots: HashMap<String, Slot>,
+    queued: HashMap<String, QueuedWork>,
     running: HashSet<String>,
     /// Buckets with provisioning in flight → everyone waiting on it. The entry *is* the coalescing:
     /// only the caller that creates it spawns the backend work.
     provisioning: HashMap<String, Vec<oneshot::Sender<Result<()>>>>,
 }
 
-impl Actor {
+impl BucketActor {
     async fn run(mut self) {
         let mut ext_open = true;
         loop {
             // Shutdown completes only once the queue is fully drained and nothing is in flight.
             if !ext_open
-                && self.slots.is_empty()
+                && self.queued.is_empty()
                 && self.running.is_empty()
                 && self.provisioning.is_empty()
             {
@@ -375,29 +413,29 @@ impl Actor {
     fn enqueue(&mut self, msg: BucketMsg) {
         match msg {
             BucketMsg::Create { bucket, reply } => self
-                .slots
+                .queued
                 .entry(bucket)
                 .or_default()
-                .pending
-                .push_back(Client::Create(reply)),
+                .requests
+                .push_back(LifecycleRequest::Create(reply)),
             BucketMsg::Delete { bucket, reply } => self
-                .slots
+                .queued
                 .entry(bucket)
                 .or_default()
-                .pending
-                .push_back(Client::Delete(reply)),
+                .requests
+                .push_back(LifecycleRequest::Delete(reply)),
             BucketMsg::Provision { bucket, reply } => self.provision(bucket, reply),
             BucketMsg::Reconcile { bucket, trigger } => {
-                self.slots.entry(bucket).or_default().owe(trigger)
+                self.queued.entry(bucket).or_default().owe(trigger)
             }
         }
     }
 
     /// Attach a waiter to the bucket's in-flight provisioning, starting it if this is the first.
-    /// Provisioning bypasses the slot machinery — it neither serializes against the bucket's worker
-    /// nor waits for it — so it is safe only because it exclusively *creates*, idempotently, and
-    /// only for a bucket the readiness probe already saw on the remote. Bucket *lifecycle* (whether
-    /// a bucket should exist at all) stays the workers' alone.
+    /// Provisioning bypasses the queueing machinery — it neither serializes against the bucket's
+    /// task nor waits for it — so it is safe only because it exclusively *creates*,
+    /// idempotently, and only for a bucket the readiness probe already saw on the remote. Bucket
+    /// *lifecycle* (whether a bucket should exist at all) stays the tasks' alone.
     fn provision(&mut self, bucket: String, reply: oneshot::Sender<Result<()>>) {
         if self
             .states
@@ -435,55 +473,57 @@ impl Actor {
         }
     }
 
-    /// Hand each bucket with pending work — and no worker already draining it — to a fresh worker,
-    /// taking the whole batch with it. Work that arrives during the drain accumulates in a new slot
-    /// and is dispatched when the worker signals done, so a bucket is never drained by two workers
+    /// Hand each bucket with pending work — and no task already draining it — to a fresh task,
+    /// taking the whole batch with it. Work that arrives during the drain accumulates in a fresh
+    /// entry
+    /// and is dispatched when the task signals done, so a bucket is never drained by two tasks
     /// at once (per-bucket serialization) and its batches run in arrival order.
     fn dispatch(&mut self) {
         let ready: Vec<String> = self
-            .slots
+            .queued
             .iter()
-            .filter(|(bucket, slot)| !slot.is_empty() && !self.running.contains(*bucket))
+            .filter(|(bucket, work)| !work.is_empty() && !self.running.contains(*bucket))
             .map(|(bucket, _)| bucket.clone())
             .collect();
         for bucket in ready {
-            let slot = self.slots.remove(&bucket).expect("ready bucket has a slot");
+            let work = self
+                .queued
+                .remove(&bucket)
+                .expect("dispatchable bucket has queued work");
             self.running.insert(bucket.clone());
-            let worker = Worker {
+            let task = BucketTask {
                 tier: self.tier.clone(),
-                markers: self.markers.clone(),
                 states: self.states.clone(),
                 sem: self.sem.clone(),
                 done: self.done_tx.clone(),
             };
-            tokio::spawn(worker.run(bucket, slot));
+            tokio::spawn(task.run(bucket, work));
         }
     }
 }
 
-struct Worker {
-    tier: Reconciler,
-    markers: crate::markers::Markers,
+struct BucketTask {
+    tier: Tiering,
     states: BucketStates,
     sem: Arc<Semaphore>,
     done: mpsc::UnboundedSender<String>,
 }
 
-impl Worker {
-    async fn run(self, bucket: String, mut slot: Slot) {
+impl BucketTask {
+    async fn run(self, bucket: String, mut work: QueuedWork) {
         // One permit for the whole batch bounds concurrent buckets, not concurrent backend calls.
         let _permit = self.sem.acquire().await.expect("semaphore is never closed");
-        while let Some(client) = slot.pending.pop_front() {
-            match client {
-                Client::Create(reply) => {
+        while let Some(request) = work.requests.pop_front() {
+            match request {
+                LifecycleRequest::Create(reply) => {
                     let _ = reply.send(self.create(&bucket).await);
                 }
-                Client::Delete(reply) => {
+                LifecycleRequest::Delete(reply) => {
                     let _ = reply.send(self.delete(&bucket).await);
                 }
             }
         }
-        if let Some(trigger) = slot.reconcile {
+        if let Some(trigger) = work.reconcile {
             self.reconcile(&bucket, trigger).await;
         }
         let _ = self.done.send(bucket);
@@ -501,6 +541,12 @@ impl Worker {
                 self.reset_cache(bucket).await?;
                 self.tier.remote.create_bucket(bucket).await?;
                 self.mark_reconciled(bucket).await?;
+                // A bucket this run created starts empty, so every write it can ever hold went
+                // through the marker queue — which the drain proves empty before writing any clean
+                // marker (§6). Accounted by construction, and only on this branch: a duplicate
+                // create of a pre-existing bucket establishes nothing about a pending set that may
+                // predate the run.
+                update(&self.states, bucket, set_accounted);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -563,7 +609,7 @@ impl Worker {
         // The pass rebuilt the pending set from cache and remote, so this run can now vouch for it
         // — the same standing a boot-time recovery scan used to confer (§7). A lazily restored
         // bucket earns it too, which the split implementation never granted.
-        self.markers.account_for(bucket);
+        update(&self.states, bucket, set_accounted);
         tracing::info!(bucket, markers = raised, "bucket reconcile complete");
     }
 
@@ -602,7 +648,7 @@ impl Worker {
 }
 
 /// Create the cache bucket if absent. A concurrent creator racing us is tolerated: a failed create
-/// that nonetheless leaves the bucket present is success — the actor's own workers and its
+/// that nonetheless leaves the bucket present is success — the actor's own tasks and its
 /// provisioning tasks both land here.
 async fn ensure_cache_bucket(backend: &hypha_core::Backend, bucket: &str) -> Result<()> {
     match backend.head_bucket(bucket).await {

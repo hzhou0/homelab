@@ -8,25 +8,26 @@
 //! - **Bounded.** A burst of reads against evicted keys can otherwise spawn an unbounded number of
 //!   whole-object downloads. Here they queue, `background.concurrency` run at once, and a full queue
 //!   sheds new work instead of blocking the reads that raised it.
-//! - **Deduped.** One live job per key. The registry entry *is* the dedup set, so N concurrent reads
-//!   of one evicted key enqueue one transition, not N that each take the write lock in turn.
-//!   ([`Reconciler::shadow_is_current`] still guards the *other* case — a job submitted after an
-//!   earlier one already landed that generation.)
+//! - **Deduped.** One live transition per key. The registry entry *is* the dedup set, so N
+//!   concurrent reads of one evicted key enqueue one transition, not N that each take the write
+//!   lock in turn. ([`Tiering::shadow_is_current`] still guards the *other* case — a transition
+//!   submitted after an earlier one already landed that generation.)
 //! - **Cancellable.** §8 has rehydrate hold K's write lock across the whole fetch + decrypt + land,
 //!   which would park a same-key conditional PUT, DELETE, or CompleteMultipartUpload behind a
 //!   multi-minute transfer. Every client write instead cancels K's background transition first (see
 //!   [`crate::s3::Hypha::write_lock`]) and the holder drops the lock at its next await — abandoned
 //!   wholesale, never half-applied, since a completing rehydrate still did every step under the
-//!   lock. The cancel needs no acknowledgement: a job registers its token *before* it ever attempts
-//!   the lock, so a job blocking a client necessarily holds the lock and has a live token to find,
-//!   while a job registering after the cancel hasn't taken the lock yet and blocks nobody — the
-//!   lock handoff is the rendezvous, so `cancel` is a fire-and-forget map lookup on the write path.
+//!   lock. The cancel needs no acknowledgement: a transition registers its token *before* it ever
+//!   attempts the lock, so a transition blocking a client necessarily holds the lock and has a live
+//!   token to find, while a transition registering after the cancel hasn't taken the lock yet and
+//!   blocks nobody — the lock handoff is the rendezvous, so `cancel` is a fire-and-forget map
+//!   lookup on the write path.
 //!
-//! Lifecycle mirrors [`crate::bucket_ctl`]: the task holds a [`Reconciler`], never a `Hypha`, so it
+//! Lifecycle mirrors [`crate::bucket_ctl`]: the task holds a [`Tiering`], never a `Hypha`, so it
 //! neither keeps the service's liveness sentinel alive nor needs shutdown plumbing — it drains and
 //! exits once the last handle drops.
 //!
-//! Phase 5 adds the GC scavenger's own transitions (evict, shadow-evict) as further [`Job`]
+//! Phase 5 adds the GC scavenger's own transitions (evict, shadow-evict) as further [`Transition`]
 //! variants: they are discardable on exactly the same grounds — an eviction abandoned because a
 //! client wants the key is an eviction that should not have run.
 
@@ -42,13 +43,13 @@ use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
 use crate::codec;
-use crate::tier::Reconciler;
+use crate::tier::Tiering;
 
 /// One queued transition.
-pub(crate) enum Job {
+pub(crate) enum Transition {
     /// Fetch K from the remote and land its plaintext in the cache (§8): a single-part body at K
     /// itself, a composite into K's shadow body. `cetag` names the generation the read observed —
-    /// the job is abandoned if K has moved on by the time it runs.
+    /// the transition is abandoned if K has moved on by the time it runs.
     Rehydrate {
         bucket: String,
         key: String,
@@ -57,10 +58,10 @@ pub(crate) enum Job {
     },
 }
 
-impl Job {
+impl Transition {
     fn registry_key(&self) -> String {
         match self {
-            Job::Rehydrate { bucket, key, .. } => registry_key(bucket, key),
+            Transition::Rehydrate { bucket, key, .. } => registry_key(bucket, key),
         }
     }
 }
@@ -72,33 +73,33 @@ fn registry_key(bucket: &str, key: &str) -> String {
 }
 
 /// Keys with a transition queued or running → its cancel token. Doubles as the dedup set: an
-/// occupied entry means this key already has a job, and a second would duplicate its work.
-type Registry = Arc<DashMap<String, CancellationToken>>;
+/// occupied entry means this key already has a transition, and a second would duplicate its work.
+type LiveTransitions = Arc<DashMap<String, CancellationToken>>;
 
 /// Handle onto the actor. Cloneable and cheap — the queue sender plus the registry — so every
 /// `Hypha` clone shares one actor.
 #[derive(Clone)]
 pub struct Background {
-    tx: mpsc::Sender<(Job, CancellationToken)>,
-    live: Registry,
+    tx: mpsc::Sender<(Transition, CancellationToken)>,
+    live: LiveTransitions,
 }
 
 impl Background {
     /// Queue a transition, unless this key already has one. Never blocks and never fails visibly: a
-    /// full queue (or an actor already gone at shutdown) drops the job, which is the correct load
-    /// response for work whose only value is saving a *future* read a remote fetch.
-    pub(crate) fn submit(&self, job: Job) {
-        let jk = job.registry_key();
+    /// full queue (or an actor already gone at shutdown) drops the transition, which is the correct
+    /// load response for work whose only value is saving a *future* read a remote fetch.
+    pub(crate) fn submit(&self, transition: Transition) {
+        let registered = transition.registry_key();
         let token = CancellationToken::new();
         // Scoped so the shard guard is released before `remove` below can want it.
-        match self.live.entry(jk.clone()) {
+        match self.live.entry(registered.clone()) {
             Entry::Occupied(_) => return,
             Entry::Vacant(vacant) => {
                 vacant.insert(token.clone());
             }
         }
-        if self.tx.try_send((job, token)).is_err() {
-            self.live.remove(&jk);
+        if self.tx.try_send((transition, token)).is_err() {
+            self.live.remove(&registered);
         }
     }
 
@@ -106,8 +107,8 @@ impl Background {
     /// lock without waiting out a whole-object fetch (§8). Fire-and-forget — see the module note on
     /// why no acknowledgement is needed.
     pub(crate) fn cancel(&self, bucket: &str, key: &str) {
-        // A cancelled-but-not-yet-removed entry is re-cancelled harmlessly; the token is per-job, so
-        // this can never poison a *later* transition of the same key.
+        // A cancelled-but-not-yet-removed entry is re-cancelled harmlessly; the token is
+        // per-transition, so this can never poison a *later* transition of the same key.
         if let Some(token) = self.live.get(&registry_key(bucket, key)) {
             token.cancel();
         }
@@ -121,10 +122,10 @@ impl Background {
     }
 }
 
-pub(crate) fn spawn(tier: Reconciler, cfg: config::Background) -> Background {
+pub(crate) fn spawn(tier: Tiering, cfg: config::Background) -> Background {
     let (tx, rx) = mpsc::channel(cfg.queue_depth.max(1));
-    let live: Registry = Arc::new(DashMap::new());
-    let actor = Actor {
+    let live: LiveTransitions = Arc::new(DashMap::new());
+    let actor = TransitionActor {
         rx,
         tier,
         live: live.clone(),
@@ -134,23 +135,23 @@ pub(crate) fn spawn(tier: Reconciler, cfg: config::Background) -> Background {
     Background { tx, live }
 }
 
-struct Actor {
-    rx: mpsc::Receiver<(Job, CancellationToken)>,
-    tier: Reconciler,
-    live: Registry,
+struct TransitionActor {
+    rx: mpsc::Receiver<(Transition, CancellationToken)>,
+    tier: Tiering,
+    live: LiveTransitions,
     sem: Arc<Semaphore>,
 }
 
-impl Actor {
+impl TransitionActor {
     /// Drain the queue until every handle drops. Awaiting a permit here rather than inside the
-    /// spawned job is deliberate: it is what makes the mpsc back up and `submit` shed, instead of
-    /// accumulating parked tasks that each hold a job's worth of state.
+    /// spawned transition is deliberate: it is what makes the mpsc back up and `submit` shed,
+    /// instead of accumulating parked tasks that each hold a transition's worth of state.
     async fn run(mut self) {
-        while let Some((job, token)) = self.rx.recv().await {
-            let jk = job.registry_key();
+        while let Some((transition, token)) = self.rx.recv().await {
+            let registered = transition.registry_key();
             // Cancelled while queued: the client that cancelled is already past us.
             if token.is_cancelled() {
-                self.live.remove(&jk);
+                self.live.remove(&registered);
                 continue;
             }
             let Ok(permit) = self.sem.clone().acquire_owned().await else {
@@ -159,22 +160,27 @@ impl Actor {
             let tier = self.tier.clone();
             let live = self.live.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_job(&tier, &job, &token).await {
-                    tracing::debug!(job = %jk, error = %e, "background transition failed; the key's tombstone stands");
+                if let Err(e) = run_transition(&tier, &transition, &token).await {
+                    tracing::debug!(transition = %registered, error = %e,
+                        "background transition failed; the key's tombstone stands");
                 }
                 // Safe to remove unconditionally: an entry is only ever inserted into a *vacant*
-                // slot and stays occupied for the job's whole life, so no newer token can be sitting
-                // under this key.
-                live.remove(&jk);
+                // slot and stays occupied for the transition's whole life, so no newer token can be
+                // sitting under this key.
+                live.remove(&registered);
                 drop(permit);
             });
         }
     }
 }
 
-async fn run_job(tier: &Reconciler, job: &Job, token: &CancellationToken) -> Result<()> {
-    match job {
-        Job::Rehydrate {
+async fn run_transition(
+    tier: &Tiering,
+    transition: &Transition,
+    token: &CancellationToken,
+) -> Result<()> {
+    match transition {
+        Transition::Rehydrate {
             bucket,
             key,
             cetag,
@@ -188,17 +194,18 @@ async fn run_job(tier: &Reconciler, job: &Job, token: &CancellationToken) -> Res
 /// which case there is nothing to rehydrate.
 ///
 /// A composite rehydrate leaves K tombstoned (the plaintext goes to the shadow), so the tombstone
-/// re-check alone doesn't stop repeated work: without the shadow-freshness check, a job enqueued
-/// after an earlier one landed would re-download the whole object.
+/// re-check alone doesn't stop repeated work: without the shadow-freshness check, a transition
+/// enqueued after an earlier one landed would re-download the whole object.
 ///
-/// **Generation gate.** A job can sit queued while K is written, reconciled, and evicted afresh, and
-/// the land CAS — conditional on a sentinel ETag that is constant across generations, so blind to
-/// the evict → rehydrate → re-evict ABA — would then accept the *new* tombstone for the *old*
+/// **Generation gate.** A transition can sit queued while K is written, reconciled, and evicted
+/// afresh, and the land CAS — conditional on a sentinel ETag that is constant across generations,
+/// so blind to the evict → rehydrate → re-evict ABA — would then accept the *new* tombstone for the
+/// *old*
 /// plaintext. So the tombstone's `cetag` is re-read under the lock and must still be the generation
 /// the read observed. It also makes the client pass-through safe to take from the live tombstone
-/// rather than from the read that raised the job.
+/// rather than from the read that raised the transition.
 async fn rehydrate(
-    tier: &Reconciler,
+    tier: &Tiering,
     bucket: &str,
     key: &str,
     cetag: &str,
@@ -208,7 +215,7 @@ async fn rehydrate(
     let _guard = tier.locks.lock(key).await;
 
     // Cancelled while we were parked on the lock — or while an earlier holder ran. Checked before
-    // any backend call so a cancelled job costs nothing but the lock acquisition.
+    // any backend call so a cancelled transition costs nothing but the lock acquisition.
     if token.is_cancelled() {
         return Ok(());
     }
@@ -269,8 +276,9 @@ async fn rehydrate(
 mod tests {
     use super::*;
 
-    /// A handle whose actor never runs, so queued jobs stay queued and the registry is observable.
-    fn handle(depth: usize) -> (Background, mpsc::Receiver<(Job, CancellationToken)>) {
+    /// A handle whose actor never runs, so queued transitions stay queued and the registry is
+    /// observable.
+    fn handle(depth: usize) -> (Background, mpsc::Receiver<(Transition, CancellationToken)>) {
         let (tx, rx) = mpsc::channel(depth);
         (
             Background {
@@ -281,8 +289,8 @@ mod tests {
         )
     }
 
-    fn job(key: &str) -> Job {
-        Job::Rehydrate {
+    fn transition(key: &str) -> Transition {
+        Transition::Rehydrate {
             bucket: "b".into(),
             key: key.into(),
             cetag: "e".into(),
@@ -293,36 +301,39 @@ mod tests {
     #[tokio::test]
     async fn submit_dedups_by_key() {
         let (bg, mut rx) = handle(8);
-        bg.submit(job("k"));
-        bg.submit(job("k"));
-        bg.submit(job("other"));
+        bg.submit(transition("k"));
+        bg.submit(transition("k"));
+        bg.submit(transition("other"));
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok(), "distinct key must enqueue");
         assert!(
             rx.try_recv().is_err(),
-            "a second job for a live key must be dropped, not queued"
+            "a second transition for a live key must be dropped, not queued"
         );
     }
 
     #[tokio::test]
     async fn full_queue_sheds_and_leaves_no_registry_entry() {
         let (bg, _rx) = handle(1);
-        bg.submit(job("first"));
-        bg.submit(job("shed"));
-        assert!(bg.is_live("b", "first"), "the queued job stays live");
+        bg.submit(transition("first"));
+        bg.submit(transition("shed"));
+        assert!(bg.is_live("b", "first"), "the queued transition stays live");
         assert!(
             !bg.is_live("b", "shed"),
-            "a shed job must not leave a registry entry blocking later submits"
+            "a shed transition must not leave a registry entry blocking later submits"
         );
     }
 
     #[tokio::test]
     async fn cancel_trips_the_queued_jobs_token() {
         let (bg, mut rx) = handle(4);
-        bg.submit(job("k"));
+        bg.submit(transition("k"));
         bg.cancel("b", "k");
-        let (_job, token) = rx.try_recv().expect("job was queued");
-        assert!(token.is_cancelled(), "cancel must reach a still-queued job");
+        let (_t, token) = rx.try_recv().expect("transition was queued");
+        assert!(
+            token.is_cancelled(),
+            "cancel must reach a still-queued transition"
+        );
     }
 
     #[tokio::test]

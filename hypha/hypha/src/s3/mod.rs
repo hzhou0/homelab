@@ -25,16 +25,16 @@ use hypha_core::meta;
 use hypha_core::Backend;
 
 use crate::background::{self, Background};
-use crate::bucket_ctl::{self, BucketCtl};
-use crate::keylocks::Guard;
+use crate::bucket_ctl::BucketCtl;
+use crate::keylocks::KeyGuard;
 use crate::markers::Markers;
-use crate::tier::Reconciler;
+use crate::tier::Tiering;
 
 #[derive(Clone)]
 pub struct Hypha {
     /// Shared tiering machinery: cache + remote backends, the age envelope, and the per-key lock
     /// table. Every data-path op reaches the backends through here.
-    pub tier: Reconciler,
+    pub tier: Tiering,
     /// The bucket-control actor — sole writer of the cache substrate (§7 *Buckets*). Bucket
     /// lifecycle and repair route here; object reads/writes never do, beyond the 503 repair kick.
     pub(crate) buckets: BucketCtl,
@@ -60,14 +60,14 @@ pub struct Hypha {
 
 impl Hypha {
     pub(crate) fn new(
-        tier: Reconciler,
+        tier: Tiering,
+        buckets: BucketCtl,
         markers: Markers,
         mode: Mode,
         offload_threshold: usize,
         max_bucket_prefix_len: usize,
         background_cfg: hypha_core::config::Background,
     ) -> Self {
-        let buckets = bucket_ctl::spawn(tier.clone(), markers.clone());
         let background = background::spawn(tier.clone(), background_cfg);
         Self {
             tier,
@@ -93,7 +93,7 @@ impl Hypha {
     /// without the cancel a conditional PUT, DELETE, or CompleteMultipartUpload on a hot key would
     /// park behind a multi-minute transfer. The cancel is a map lookup and needs no reply — see
     /// [`background`] for why the lock handoff is a sufficient rendezvous.
-    pub(crate) async fn write_lock(&self, bucket: &str, key: &str) -> Guard {
+    pub(crate) async fn write_lock(&self, bucket: &str, key: &str) -> KeyGuard {
         self.background.cancel(bucket, key);
         self.tier.locks.lock(key).await
     }

@@ -11,22 +11,22 @@
 //!    passes over independent snapshots ([`crate::bucket_ctl`]).
 //! 2. **The queue** ([`Markers::owe`]) — a write hands its marker over and returns; the handover
 //!    cannot block or fail, which is the whole reason the queue is unbounded.
-//! 3. **The drain** ([`Worker::run`]) writes clean markers, only for buckets this run accounted
+//! 3. **The drain** ([`MarkerActor::run`]) writes clean markers, only for buckets this run accounted
 //!    for, and only if nothing was still owed when it sealed.
 //!
 //! **Ordering**, the part not fully spelled out in §7: hyper's connection drain resolves only once
 //! every handler has returned and no new one can start, and every other sender is handler-local —
 //! [`Markers::owe`] upgrades the weak handle, sends, and drops it before returning. So after the
-//! drain nothing but [`Queue`] can enqueue, and the [`Msg::Seal`] it sends is necessarily behind
-//! every marker of the run. The seal is a **message, not the channel closing**: the serving future
-//! owns the `Lifecycle` that owns the `Queue`, so an aborted or panicking server closes the channel
-//! exactly as a drain would, and closure alone must not authorize a clean marker — only a seal does.
+//! drain nothing but [`RunSeal`] can enqueue, and the [`MarkerMsg::Seal`] it sends is necessarily
+//! behind every marker of the run. The seal is a **message, not the channel closing**: the serving
+//! future owns the `Lifecycle` that owns the `RunSeal`, so an aborted or panicking server closes the
+//! channel exactly as a drain would, and closure alone must not authorize a clean marker — only a
+//! seal does.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashSet;
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
@@ -34,22 +34,22 @@ use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
 use crate::bucket_ctl::{BucketCtl, Trigger};
-use crate::tier::Reconciler;
+use crate::tier::Tiering;
 
 /// Markers taken off the queue per wake-up.
-const BATCH: usize = 256;
+const DRAIN_BATCH: usize = 256;
 
 /// What the queue carries: markers to write, and the one message that says the run is ending
-/// *gracefully*. Closure alone cannot say that — the serving future owns the [`Queue`], so an
+/// *gracefully*. Closure alone cannot say that — the serving future owns the [`RunSeal`], so an
 /// aborted task drops it and closes the channel exactly like a drain would. Only an explicit seal
 /// distinguishes the two, and FIFO puts it behind every marker enqueued before it.
-enum Msg {
-    Owed(Repair),
+enum MarkerMsg {
+    Owed(OwedMarker),
     Seal,
 }
 
 /// A key owed a pending marker.
-struct Repair {
+struct OwedMarker {
     bucket: String,
     key: String,
     /// The marker payload — a body ETag for a PUT, the delete sentinel's for a cached delete.
@@ -58,56 +58,56 @@ struct Repair {
     payload: String,
 }
 
-impl Repair {
+impl OwedMarker {
     fn dedup_key(&self) -> (String, String) {
         (self.bucket.clone(), self.key.clone())
     }
 }
 
-struct Inner {
-    tier: Reconciler,
+struct MarkerQueue {
+    tier: Tiering,
     /// Weak on purpose: the service must not hold the channel open, or closing it would prove
     /// nothing. Senders are upgraded per write and dropped before the handler returns, so once the
-    /// connections drain the serving loop's [`Queue`] is the only one left.
-    tx: mpsc::WeakUnboundedSender<Msg>,
-    /// The run's only per-bucket state: buckets whose pending set it accounts for, because their
-    /// clean marker was present at startup or the recovery scan rebuilt it. Membership is the
-    /// positive evidence the drain needs; **absence is the default**, so a bucket this run
-    /// established nothing about — including one left dirty by an earlier crash and untouched since
-    /// — simply is not in here and ends the run dirty.
-    scanned: DashSet<String>,
+    /// connections drain the serving loop's [`RunSeal`] is the only one left.
+    tx: mpsc::WeakUnboundedSender<MarkerMsg>,
+    /// Which buckets this run accounts for is per-bucket state, so it lives on the actor that owns
+    /// per-bucket state ([`crate::bucket_ctl::BucketState`]) rather than in a second map here — the
+    /// pass that earns the accounting is the actor's, and retiring a deleted bucket clears it there
+    /// without this module having to know a bucket went away.
+    buckets: BucketCtl,
 }
 
 /// The write path's handle: hand over owed markers, and (at startup) establish the per-bucket state
 /// the drain later decides on.
 #[derive(Clone)]
 pub(crate) struct Markers {
-    inner: Arc<Inner>,
+    queue: Arc<MarkerQueue>,
 }
 
 pub(crate) fn spawn(
-    tier: Reconciler,
+    tier: Tiering,
+    buckets: BucketCtl,
     retry: Duration,
     concurrency: usize,
-) -> (Markers, Queue, Worker) {
+) -> (Markers, RunSeal, MarkerActor) {
     // Unbounded because the enqueue sits on the write path *after* the commit: a bounded queue would
     // either block the ack behind the marker or shed it, and shedding needs a side channel to record
     // the loss — state whose only job is to be remembered on a failure path. An enqueue that cannot
     // fail needs none. Depth is an outage symptom rather than a tunable, and `markers_owed` (§10) is
     // where it shows.
     let (tx, rx) = mpsc::unbounded_channel();
-    let inner = Arc::new(Inner {
+    let queue = Arc::new(MarkerQueue {
         tier,
         tx: tx.downgrade(),
-        scanned: DashSet::new(),
+        buckets,
     });
     (
         Markers {
-            inner: inner.clone(),
+            queue: queue.clone(),
         },
-        Queue(tx),
-        Worker {
-            inner,
+        RunSeal(tx),
+        MarkerActor {
+            queue,
             rx,
             retry: retry.max(Duration::from_millis(1)),
             concurrency: concurrency.max(1),
@@ -128,12 +128,12 @@ pub(crate) fn spawn(
 /// closure alone authorized the clean markers, a killed process would write them on its way out and
 /// the next run would skip its recovery scan. Only the explicit message says the run ended
 /// gracefully.
-pub(crate) struct Queue(mpsc::UnboundedSender<Msg>);
+pub(crate) struct RunSeal(mpsc::UnboundedSender<MarkerMsg>);
 
-impl Queue {
-    /// End the run gracefully: the worker writes clean markers only for a seal it actually received.
+impl RunSeal {
+    /// End the run gracefully: [`MarkerActor`] writes clean markers only for a seal it received.
     pub(crate) fn seal(self) {
-        let _ = self.0.send(Msg::Seal);
+        let _ = self.0.send(MarkerMsg::Seal);
     }
 }
 
@@ -143,27 +143,19 @@ impl Markers {
     /// turned into an error by — anything that happens to the marker. That is what the queue being
     /// unbounded buys, and the only reason it is.
     pub(crate) fn owe(&self, bucket: &str, key: &str, payload: String) {
-        let Some(tx) = self.inner.tx.upgrade() else {
+        let Some(tx) = self.queue.tx.upgrade() else {
             // The channel closes only after every handler has returned (§7), so a live write cannot
             // reach this — but "cannot" is exactly what a clean marker must not assume. Withdrawing
             // the bucket's evidence is the whole remedy: no evidence, no clean marker.
             tracing::error!(bucket, key, "marker queue closed under a live write");
-            self.inner.scanned.remove(bucket);
+            self.queue.buckets.unaccount(bucket);
             return;
         };
-        let _ = tx.send(Msg::Owed(Repair {
+        let _ = tx.send(MarkerMsg::Owed(OwedMarker {
             bucket: bucket.to_string(),
             key: key.to_string(),
             payload,
         }));
-    }
-
-    /// Record that this run accounts for `bucket`'s pending set — the positive evidence the drain
-    /// needs before it may write that bucket's clean marker (§6). Two things establish it: the
-    /// bucket's marker was present at startup, or this run rebuilt the set (a reconcile pass, or
-    /// creating the bucket empty).
-    pub(crate) fn account_for(&self, bucket: &str) {
-        self.inner.scanned.insert(bucket.to_string());
     }
 
     /// Read and delete every bucket's clean marker, then owe a reconcile pass for each that was
@@ -177,39 +169,40 @@ impl Markers {
     /// The pass itself is the bucket-control actor's ([`crate::bucket_ctl`]), not this module's: a
     /// markerless bucket needs its pending set rebuilt from cache and remote, which is the same
     /// traversal restore already runs, and routing both through the actor is what keeps them one
-    /// pass over one map rather than two racing snapshots. The actor records `account_for` when it
-    /// lands. Triggers are fire-and-forget, so startup does not wait on them — a pass that fails
-    /// leaves the bucket dirty and the next run tries again.
-    pub(crate) async fn startup(&self, buckets: &BucketCtl) -> Result<()> {
+    /// pass over one map rather than two racing snapshots. The actor accounts for the bucket when
+    /// the pass lands. Triggers are fire-and-forget, so startup does not wait on them — a pass that
+    /// fails leaves the bucket dirty and the next run tries again.
+    pub(crate) async fn startup(&self) -> Result<()> {
         let clean = meta::clean_marker_key();
-        for (bucket, _) in self.inner.tier.meta.list_buckets().await? {
-            let present = match self.inner.tier.meta.head(&bucket, &clean).await {
+        for (bucket, _) in self.queue.tier.meta.list_buckets().await? {
+            let present = match self.queue.tier.meta.head(&bucket, &clean).await {
                 Ok(_) => {
-                    self.inner.tier.meta.delete(&bucket, &clean).await?;
+                    self.queue.tier.meta.delete(&bucket, &clean).await?;
                     true
                 }
                 Err(Error::NotFound) => false,
                 Err(e) => return Err(e),
             };
             if present {
-                self.account_for(&bucket);
+                self.queue.buckets.account_for(&bucket);
             } else {
-                buckets.reconcile(&bucket, Trigger::Unaccounted);
+                self.queue.buckets.reconcile(&bucket, Trigger::Unaccounted);
             }
         }
         Ok(())
     }
 }
 
-/// Drains the repair queue for the life of the process, then seals.
-pub(crate) struct Worker {
-    inner: Arc<Inner>,
-    rx: mpsc::UnboundedReceiver<Msg>,
+/// Owns the receiving end for the life of the process: writes markers as they arrive and, once a
+/// [`RunSeal`] reaches it, the clean markers.
+pub(crate) struct MarkerActor {
+    queue: Arc<MarkerQueue>,
+    rx: mpsc::UnboundedReceiver<MarkerMsg>,
     retry: Duration,
     concurrency: usize,
 }
 
-impl Worker {
+impl MarkerActor {
     /// Write owed markers as they arrive, retrying failures on `retry`, until the channel closes.
     /// Then one final attempt — never a retry loop, since the drain does not wait out a backoff —
     /// and the clean markers.
@@ -218,21 +211,21 @@ impl Worker {
     /// vouches for *nothing*: the next run rescans every bucket rather than this one guessing which
     /// buckets the loss touched.
     pub(crate) async fn run(mut self) {
-        let mut owed: HashMap<(String, String), Repair> = HashMap::new();
-        let mut batch = Vec::with_capacity(BATCH);
+        let mut owed: HashMap<(String, String), OwedMarker> = HashMap::new();
+        let mut batch = Vec::with_capacity(DRAIN_BATCH);
         let mut sealed = false;
         'outer: loop {
             tokio::select! {
                 // Batched because the queue is every write's path to its marker: one wake-up takes
                 // whatever a burst deposited.
-                n = self.rx.recv_many(&mut batch, BATCH) => {
+                n = self.rx.recv_many(&mut batch, DRAIN_BATCH) => {
                     if n == 0 {
                         break; // dropped rather than sealed — the run did not end gracefully
                     }
                     for msg in batch.drain(..) {
                         match msg {
-                            Msg::Owed(r) => { owed.insert(r.dedup_key(), r); }
-                            Msg::Seal => { sealed = true; }
+                            MarkerMsg::Owed(r) => { owed.insert(r.dedup_key(), r); }
+                            MarkerMsg::Seal => { sealed = true; }
                         }
                     }
                     self.write_all(&mut owed).await;
@@ -259,11 +252,11 @@ impl Worker {
     /// Write every owed marker, dropping the ones that land. Concurrent because a marker is on each
     /// acked write's durability path: serializing them would make the queue the write path's
     /// throughput ceiling.
-    async fn write_all(&self, owed: &mut HashMap<(String, String), Repair>) {
-        let failed: Vec<Repair> = futures::stream::iter(owed.drain().map(|(_, r)| r))
+    async fn write_all(&self, owed: &mut HashMap<(String, String), OwedMarker>) {
+        let failed: Vec<OwedMarker> = futures::stream::iter(owed.drain().map(|(_, r)| r))
             .map(|r| async move {
                 match self
-                    .inner
+                    .queue
                     .tier
                     .raise_marker(&r.bucket, &r.key, &r.payload)
                     .await
@@ -285,15 +278,15 @@ impl Worker {
     }
 
     /// Write the clean marker for each bucket this run accounted for, and for no other. Reached only
-    /// on a graceful drain with nothing owed, so membership in `scanned` is the whole condition — a
-    /// bucket left dirty by an earlier crash and untouched by this run is simply absent, and its
+    /// on a graceful drain with nothing owed, so the accounting is the whole condition — a bucket
+    /// left dirty by an earlier crash and untouched by this run is simply not accounted, and its
     /// orphans stay findable instead of buried.
     async fn mark_clean(&self) {
         let clean = meta::clean_marker_key();
-        for bucket in self.inner.scanned.iter() {
-            let bucket = bucket.key();
+        for bucket in self.queue.buckets.accounted() {
+            let bucket = bucket.as_str();
             if let Err(e) = self
-                .inner
+                .queue
                 .tier
                 .meta
                 .put_small(bucket, &clean, Vec::new(), HashMap::new(), None, None)

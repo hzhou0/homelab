@@ -75,7 +75,7 @@ impl Hypha {
                 return Ok(resp);
             }
         }
-        self.background.submit(background::Job::Rehydrate {
+        self.background.submit(background::Transition::Rehydrate {
             bucket: bucket.to_string(),
             key: key.to_string(),
             cetag: facts.cetag.clone(),

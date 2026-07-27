@@ -10,9 +10,10 @@
 //! LIST** past [`meta::marker_scan_start_after`] enumerates the pending set — `O(pending)`, never
 //! `O(evicted)`. Each key is handled under its **upload** lock (§4), distinct from the write lock a
 //! client PUT takes, so a replication upload never queues a conditional write behind a multi-second
-//! transfer; a key already uploading is skipped, not queued ([`Reconcile::reconcile_key`]). The
-//! marker clear is conditional on the ETag the LIST returned, so a PUT that landed a newer body
-//! mid-pass simply defers that key to the next pass rather than being lost.
+//! transfer; a key already uploading is skipped, not queued
+//! ([`ReplicationTask::reconcile_key`]). The marker clear is conditional on the ETag the LIST
+//! returned, so a PUT that landed a newer body mid-pass simply defers that key to the next pass
+//! rather than being lost.
 //!
 //! Lifecycle is implicit: the task holds a `Weak` to the service's liveness sentinel (§3, `Hypha`)
 //! and exits once the service drops, so no explicit shutdown channel is needed. A process crash
@@ -28,19 +29,19 @@ use futures::StreamExt as _;
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
-use crate::tier::{Reconciler, UploadOutcome};
+use crate::tier::{Tiering, UploadOutcome};
 
 /// One LIST page of pending markers.
 const MARKER_PAGE: i32 = 1000;
 
-pub struct Reconcile {
-    tier: Reconciler,
+pub struct ReplicationTask {
+    tier: Tiering,
     interval: Duration,
     concurrency: usize,
 }
 
-impl Reconcile {
-    pub fn new(tier: Reconciler, interval: Duration, concurrency: usize) -> Self {
+impl ReplicationTask {
+    pub fn new(tier: Tiering, interval: Duration, concurrency: usize) -> Self {
         Self {
             tier,
             interval,
@@ -124,9 +125,9 @@ impl Reconcile {
         Ok(())
     }
 
-    /// Reconcile one pending key, under its upload lock (§7). Classify K's cache body once to pick the
-    /// branch; the branch primitives re-read K under the lock and CAS every mutation, so any write
-    /// that raced in between is either uploaded correctly or deferred, never lost.
+    /// Reconcile one pending key, under its upload lock (§7). Classify K's cache body once to pick
+    /// the branch; the branch primitives re-read K under the lock and CAS every mutation, so any
+    /// write that raced in between is either uploaded correctly or deferred, never lost.
     ///
     /// `try_lock`, so pending passes for K **coalesce onto the in-flight one** instead of queuing
     /// behind it. Waiters would be redundant — the holder re-reads K's body under the lock, so it

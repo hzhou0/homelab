@@ -28,10 +28,6 @@ impl Hypha {
         meta::validate_bucket_name(bucket, self.max_bucket_prefix_len)
             .map_err(|e| s3_error!(InvalidBucketName, "{e}"))?;
         self.buckets.create(bucket).await?;
-        // A bucket this run created starts empty, so every write it can ever hold went through the
-        // marker queue — which the drain proves empty before it writes any clean marker (§7). It is
-        // accounted for by construction, and saying so here is what spares the next run a scan of it.
-        self.markers.account_for(bucket);
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
