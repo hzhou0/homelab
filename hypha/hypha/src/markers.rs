@@ -36,7 +36,6 @@ use hypha_core::meta;
 use crate::bucket_ctl::{BucketCtl, Trigger};
 use crate::tier::Tiering;
 
-/// Markers taken off the queue per wake-up.
 const DRAIN_BATCH: usize = 256;
 
 /// What the queue carries: markers to write, and the one message that says the run is ending
@@ -48,14 +47,12 @@ enum MarkerMsg {
     Seal,
 }
 
-/// A key owed a pending marker.
 struct OwedMarker {
     bucket: String,
     key: String,
-    /// The marker payload — a body ETag for a PUT, the delete sentinel's for a cached delete.
     /// Diagnostic only: the sweep classifies K from the *data* body and CASes on the marker's own
     /// ETag, so any payload is as good as the last (§7).
-    payload: String,
+    body_etag: String,
 }
 
 impl OwedMarker {
@@ -142,7 +139,7 @@ impl Markers {
     /// it must not block or fail: the body is already committed and the ack cannot wait on — or be
     /// turned into an error by — anything that happens to the marker. That is what the queue being
     /// unbounded buys, and the only reason it is.
-    pub(crate) fn owe(&self, bucket: &str, key: &str, payload: String) {
+    pub(crate) fn owe(&self, bucket: &str, key: &str, body_etag: String) {
         let Some(tx) = self.queue.tx.upgrade() else {
             // The channel closes only after every handler has returned (§7), so a live write cannot
             // reach this — but "cannot" is exactly what a clean marker must not assume. Withdrawing
@@ -154,7 +151,7 @@ impl Markers {
         let _ = tx.send(MarkerMsg::Owed(OwedMarker {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            payload,
+            body_etag,
         }));
     }
 
@@ -258,7 +255,7 @@ impl MarkerActor {
                 match self
                     .queue
                     .tier
-                    .raise_marker(&r.bucket, &r.key, &r.payload)
+                    .raise_marker(&r.bucket, &r.key, &r.body_etag)
                     .await
                 {
                     Ok(()) => None,

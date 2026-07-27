@@ -227,8 +227,6 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// One raw page from whichever source served it — the remote while restoring, else the cache —
-    /// projected into client-visible entries and common prefixes.
     async fn page_view(
         &self,
         bucket: &str,

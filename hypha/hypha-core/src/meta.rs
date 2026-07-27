@@ -106,7 +106,6 @@ pub fn tomb_kind(metadata: &std::collections::HashMap<String, String>) -> Option
     }
 }
 
-/// Whether an object's user-metadata marks it a tombstone of any kind.
 pub fn is_tombstone(metadata: &std::collections::HashMap<String, String>) -> bool {
     metadata.contains_key(TOMB)
 }
@@ -160,7 +159,6 @@ pub const USER_PREFIX: &str = "u-";
 /// Non-ASCII needs no entry: `utf8_percent_encode` always escapes bytes above `0x7F`.
 const META_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b' ').add(b'%');
 
-/// Client `x-amz-meta-*` entries → the cache object's namespaced user-metadata.
 pub fn encode_user_metadata(
     client: &std::collections::HashMap<String, String>,
 ) -> impl Iterator<Item = (String, String)> + '_ {
@@ -172,8 +170,7 @@ pub fn encode_user_metadata(
     })
 }
 
-/// The inverse: a cache object's user-metadata → the client `x-amz-meta-*` entries it carries.
-/// hypha's own keys don't carry the prefix, so they drop out.
+/// hypha's own keys don't carry [`USER_PREFIX`], so they drop out.
 pub fn decode_user_metadata(
     stored: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
@@ -352,7 +349,6 @@ pub fn admits_no_successor(part_number: i32, ct_len: u64, min_remote_part: u64) 
     ct_len < min_remote_part || part_number >= MAX_CLIENT_PART
 }
 
-/// Cache (`<meta>`): everything recorded for one upload — dropped at complete/abort.
 pub fn mpu_prefix(upload_id: &str) -> String {
     mpu_range(upload_id)
 }
@@ -374,8 +370,6 @@ pub fn shadow_key(key: &str) -> String {
 /// turning the one catastrophic failure (serving another key's plaintext) into a cache miss.
 pub const SHADOW_KEY_DIGEST: &str = "kd";
 
-/// The full-width digest of K a shadow body stores at [`SHADOW_KEY_DIGEST`] and a rehydrated read
-/// re-derives to confirm the shadow is K's, not a 160-bit collision's.
 pub fn shadow_key_digest(key: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(key.as_bytes()))

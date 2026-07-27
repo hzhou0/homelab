@@ -86,12 +86,11 @@ impl Hypha {
             facts.mtime_ms,
         )?;
 
-        // The metadata the destination tombstone carries (§7).
         let replace = input
             .metadata_directive
             .as_ref()
             .is_some_and(|d| d.as_str() == MetadataDirective::REPLACE);
-        let extra = if replace {
+        let dst_passthrough = if replace {
             write_metadata(input.metadata.as_ref(), &storage_class)
         } else {
             write_metadata(Some(&meta::decode_user_metadata(&src_md)), &storage_class)
@@ -137,7 +136,14 @@ impl Hypha {
         }
 
         self.tier
-            .settle_evict_locked(&bucket, &key, facts.plen, &facts.cetag, mtime_ms, extra)
+            .settle_evict_locked(
+                &bucket,
+                &key,
+                facts.plen,
+                &facts.cetag,
+                mtime_ms,
+                dst_passthrough,
+            )
             .await?;
 
         let resp = CopyObjectOutput {
@@ -190,7 +196,6 @@ impl Hypha {
         result
     }
 
-    /// Copy the source body range into parts, upload the trailer as the final part, complete.
     #[allow(clippy::too_many_arguments)]
     async fn copy_body_parts(
         &self,

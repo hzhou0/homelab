@@ -203,7 +203,7 @@ pub struct BucketCtl {
 }
 
 impl BucketCtl {
-    /// Client CreateBucket: push and await the remote create's own result.
+    /// Answers with the remote create's own result, so a duplicate create surfaces the remote's error.
     pub async fn create(&self, bucket: &str) -> Result<()> {
         self.request(|reply| BucketMsg::Create {
             bucket: bucket.to_string(),
@@ -212,8 +212,8 @@ impl BucketCtl {
         .await
     }
 
-    /// Client DeleteBucket: push and await. The remote delete is the emptiness gate, so a non-empty
-    /// bucket surfaces here as the remote's own error.
+    /// The remote delete is the emptiness gate, so a non-empty bucket surfaces here as the remote's
+    /// own error.
     pub async fn delete(&self, bucket: &str) -> Result<()> {
         self.request(|reply| BucketMsg::Delete {
             bucket: bucket.to_string(),
@@ -463,7 +463,6 @@ impl BucketActor {
         });
     }
 
-    /// Publish one provisioning round's outcome to every caller that coalesced onto it.
     fn finish_provision(&mut self, bucket: String, result: std::result::Result<(), String>) {
         if result.is_ok() {
             update(&self.states, &bucket, set_provisioned);
@@ -629,7 +628,6 @@ impl BucketTask {
         Ok(())
     }
 
-    /// Write the sync marker and record the bucket ready — its namespace matches the remote.
     async fn mark_reconciled(&self, bucket: &str) -> Result<()> {
         self.tier
             .meta
@@ -647,9 +645,8 @@ impl BucketTask {
     }
 }
 
-/// Create the cache bucket if absent. A concurrent creator racing us is tolerated: a failed create
-/// that nonetheless leaves the bucket present is success — the actor's own tasks and its
-/// provisioning tasks both land here.
+/// A concurrent creator racing us is tolerated: a failed create that nonetheless leaves the bucket
+/// present is success — the actor's own tasks and its provisioning tasks both land here.
 async fn ensure_cache_bucket(backend: &hypha_core::Backend, bucket: &str) -> Result<()> {
     match backend.head_bucket(bucket).await {
         Ok(()) => Ok(()),
@@ -661,7 +658,6 @@ async fn ensure_cache_bucket(backend: &hypha_core::Backend, bucket: &str) -> Res
     }
 }
 
-/// Empty a cache bucket then delete it, tolerating the bucket already being gone at either step.
 async fn drain_and_delete_if_exists(backend: &hypha_core::Backend, bucket: &str) -> Result<()> {
     match backend.head_bucket(bucket).await {
         Ok(()) => {}

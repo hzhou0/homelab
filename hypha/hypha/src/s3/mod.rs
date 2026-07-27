@@ -98,11 +98,9 @@ impl Hypha {
         self.tier.locks.lock(key).await
     }
 
-    /// The `<data>` cache bucket: client bodies and tombstones at bare `K` (§6).
     pub(crate) fn data(&self) -> &Backend {
         &self.tier.data
     }
-    /// The `<meta>` cache bucket: twins, pending markers, and mpu records (§6).
     pub(crate) fn meta(&self) -> &Backend {
         &self.tier.meta
     }

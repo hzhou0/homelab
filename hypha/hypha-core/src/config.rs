@@ -205,7 +205,6 @@ impl Config {
     /// `<data>` and `<meta>` prefixes always share the cache endpoint; the remote joins them when it
     /// points at the same endpoint (the integration harness's single MinIO does).
     fn validate(&self) -> Result<(), String> {
-        // (prefix, endpoint) for the three backend buckets.
         let entries = [
             (
                 &self.cache.bucket_prefix,

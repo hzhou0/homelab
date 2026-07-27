@@ -49,14 +49,12 @@ pub struct DigestMismatch;
 /// Resolves once the plaintext body has fully streamed: its hex MD5, or [`DigestMismatch`].
 pub type EtagReceiver = oneshot::Receiver<Result<String, DigestMismatch>>;
 
-/// Adapt an incoming client `StreamingBlob` into an SDK `ByteStream` (e.g. to write the plaintext
-/// straight through to the cache), via s3s-aws's own body bridge. No copy — the bytes stream.
+/// No copy — the bytes stream, via s3s-aws's own body bridge.
 pub fn blob_to_bytestream(blob: StreamingBlob) -> ByteStream {
     try_into_aws(blob).expect("StreamingBlob → ByteStream is Infallible")
 }
 
-/// Adapt an SDK `ByteStream` (e.g. a plaintext cache body) into a `StreamingBlob` to hand back to
-/// the client, via s3s-aws's own body bridge. No copy — the bytes stream.
+/// No copy — the bytes stream, via s3s-aws's own body bridge.
 pub fn bytestream_to_blob(bs: ByteStream) -> StreamingBlob {
     try_from_aws(bs).expect("ByteStream → StreamingBlob is Infallible")
 }
@@ -305,9 +303,8 @@ fn pump_encrypt<W: Write>(
     w.finish()
 }
 
-/// A [`Read`] adapter that hashes every byte passing through it, finalized via [`finish`].
-/// Wraps any `Read` source; hypha uses it to derive the client ETag alongside encryption so
-/// durable-mode PUTs never need a second pass or a cache round-trip.
+/// Derives the client ETag alongside encryption, so durable-mode PUTs never need a second pass or a
+/// cache round-trip.
 struct Md5Reader<R> {
     inner: R,
     hasher: md5::Md5,
@@ -321,7 +318,6 @@ impl<R> Md5Reader<R> {
         }
     }
 
-    /// Consume the reader and return the raw MD5 digest of all bytes seen so far.
     fn finish(self) -> [u8; 16] {
         self.hasher.finalize().into()
     }

@@ -45,7 +45,6 @@ use hypha_core::meta;
 use crate::codec;
 use crate::tier::Tiering;
 
-/// One queued transition.
 pub(crate) enum Transition {
     /// Fetch K from the remote and land its plaintext in the cache (§8): a single-part body at K
     /// itself, a composite into K's shadow body. `cetag` names the generation the read observed —
@@ -66,8 +65,8 @@ impl Transition {
     }
 }
 
-/// Registry key for a `(bucket, key)` pair. Bucket names cannot contain `/`, so the join is
-/// unambiguous — and it costs one allocation per submit/cancel rather than an owned pair.
+/// Bucket names cannot contain `/`, so the join is unambiguous — and it costs one allocation per
+/// submit/cancel rather than an owned pair.
 fn registry_key(bucket: &str, key: &str) -> String {
     format!("{bucket}/{key}")
 }
@@ -114,8 +113,6 @@ impl Background {
         }
     }
 
-    /// Whether `key` has a transition queued or running — tests and, in phase 5, the scavenger's
-    /// skip check.
     #[cfg(test)]
     fn is_live(&self, bucket: &str, key: &str) -> bool {
         self.live.contains_key(&registry_key(bucket, key))

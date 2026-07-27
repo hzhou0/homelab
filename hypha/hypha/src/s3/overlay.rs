@@ -97,7 +97,6 @@ impl Hypha {
         }
     }
 
-    /// Resolve a key's current state from whichever source is authoritative for its bucket right now.
     /// An absent *bucket* is `NoSuchBucket`; an absent *key* is [`KeyState::Absent`].
     pub(super) async fn resolve_key(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
         match self.readiness(bucket).await? {
@@ -107,9 +106,7 @@ impl Hypha {
         }
     }
 
-    /// Resolve a key from the cache tombstone namespace (§7): the classifier every cache-authoritative
-    /// read shares — live body, eviction tombstone, delete tombstone, or a transition mark that
-    /// resolves from the remote.
+    /// The tombstone classifier every cache-authoritative read shares (§7).
     async fn resolve_key_cache(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
         let head = match self.data().head(bucket, key).await {
             Ok(h) => h,
@@ -134,8 +131,8 @@ impl Hypha {
         }
     }
 
-    /// Resolve a key straight from the remote — the read source of truth while the cache restores.
-    /// Facts come off the object's tail trailer; user metadata is empty (the trailer carries none).
+    /// The read source of truth while the cache restores. Facts come off the object's tail trailer;
+    /// user metadata is empty (the trailer carries none).
     async fn resolve_key_remote(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
         match self.remote().head(bucket, key).await {
             Ok(h) => {

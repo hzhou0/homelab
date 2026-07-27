@@ -177,10 +177,8 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// Resolve K's current client-visible ETag for a conditional write (§4). Caller holds K's write
-    /// lock. A live body reports it natively, a tombstone carries it in metadata, an absent key has
-    /// none, and a leftover transition mark is repaired from the remote first. Shared by the durable
-    /// and cached conditional paths.
+    /// Caller holds K's write lock, so a transition mark seen here is always a crash leftover and is
+    /// repaired from the remote before the ETag is read off it (§4).
     pub(super) async fn resolve_current_client_etag(
         &self,
         bucket: &str,
@@ -333,12 +331,8 @@ async fn reject_sentinel_body(body: StreamingBlob) -> S3Result<StreamingBlob> {
     Ok(codec::bytestream_to_blob(ByteStream::from(bytes.to_vec())))
 }
 
-/// Decide whether a conditional PUT may proceed against the key's current state (§4).
-///
-/// `current_etag` is the client-visible ETag of whatever is at K now (`None` ⇒ K is
-/// client-visibly absent). `if_match` / `if_none_match` are s3s's parsed condition:
-/// `ETagCondition::Any` is the `*` wildcard, `ETagCondition::ETag(e)` a specific tag (compare
-/// against `current_etag` via `e.value()`). Return `Err(Error::PreconditionFailed)` to reject.
+/// `current_etag` is the client-visible ETag of whatever is at K now; `None` ⇒ K is client-visibly
+/// absent, which no condition can match (§4).
 pub(super) fn evaluate_precondition(
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,

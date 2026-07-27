@@ -31,7 +31,6 @@ pub fn ciphertext_len(plaintext_len: u64, header_len: u64) -> u64 {
     header_len + PAYLOAD_NONCE + plaintext_len + chunk_count(plaintext_len) * TAG
 }
 
-/// Chunk holding plaintext byte `offset`.
 pub fn chunk_of(offset: u64) -> u64 {
     offset / CHUNK_PLAINTEXT
 }

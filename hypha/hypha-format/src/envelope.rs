@@ -48,7 +48,7 @@ impl Envelope {
     }
 
     /// Decrypting reader over a full-file ciphertext stream. For ranged reads, hand it a
-    /// [`crate::RangeReader`] and use `Seek` (see `stream.rs`).
+    /// [`crate::RangeReader`] and use `Seek`.
     pub fn decrypt<R: Read>(&self, reader: R) -> Result<StreamReader<R>, Error> {
         let mut identity = age::scrypt::Identity::new(self.passphrase.clone());
         identity.set_max_work_factor(self.max_work_factor);

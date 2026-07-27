@@ -134,10 +134,9 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// Encrypt one plaintext part body as its own pure age file, stream it to the remote's native
-    /// upload, and record its facts (§7) — the shared tail of `UploadPart` and the re-encrypt leg of
-    /// `UploadPartCopy`. Returns the part's plaintext MD5 (`pmd5`), computed inline as the body
-    /// streams. `plen` is the part's plaintext length.
+    /// The shared tail of `UploadPart` and the re-encrypt leg of `UploadPartCopy` (§7): one plaintext
+    /// part body becomes its own pure age file on the remote's native upload. Returns the part's
+    /// plaintext MD5, computed inline as the body streams.
     async fn stream_part(
         &self,
         bucket: &str,
@@ -552,7 +551,6 @@ impl Hypha {
             let fold_etag = fout.e_tag().ok_or_else(|| {
                 Error::Backend("folded final part upload returned no ETag".into())
             })?;
-            // The last client part now carries the trailer; point its CompletedPart at the re-upload.
             *remote_parts
                 .last_mut()
                 .expect("requested is non-empty, so remote_parts is too") =

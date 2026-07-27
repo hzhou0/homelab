@@ -21,7 +21,6 @@ use hypha_core::{meta, Backend};
 use crate::codec::{self, PartSegment, SingleTrailer};
 use crate::keylocks::KeyLocks;
 
-/// One LIST page while walking a namespace.
 const SCAN_PAGE: i32 = 1000;
 
 /// The framed size a single-part remote object would have for a `plen`-byte plaintext (§6). A
@@ -139,10 +138,9 @@ impl Tiering {
     /// eviction tombstone carrying the full facts (kind, cetag, plen, original mtime) in its
     /// user-metadata — the authoritative copy; the twin is its LIST projection (§6).
     ///
-    /// `extra` is the pass-through carrier those facts share (§7): the client's namespaced
-    /// `x-amz-meta-*` and the echoed storage class. It is cache-only — the remote's trailer holds
-    /// facts and nothing else — so a rebuild from the remote settles it empty, which is what
-    /// [`Self::repair_locked`] does.
+    /// `client_passthrough` (the client's namespaced `x-amz-meta-*` and echoed storage class) is
+    /// cache-only — the remote's trailer holds facts and nothing else — so a rebuild from the remote
+    /// settles it empty.
     pub(crate) async fn settle_evict_locked(
         &self,
         bucket: &str,
@@ -150,7 +148,7 @@ impl Tiering {
         plen: u64,
         cetag: &str,
         mtime_ms: i64,
-        extra: HashMap<String, String>,
+        client_passthrough: HashMap<String, String>,
     ) -> Result<()> {
         let facts = meta::Facts {
             client_etag: cetag.to_string(),
@@ -159,7 +157,7 @@ impl Tiering {
         };
         self.refresh_twin(bucket, key, &facts).await?;
 
-        let mut md = extra;
+        let mut md = client_passthrough;
         md.insert(meta::TOMB.to_string(), meta::TOMB_EVICT.to_string());
         md.insert(meta::PLEN.to_string(), plen.to_string());
         md.insert(meta::CETAG.to_string(), cetag.to_string());
@@ -286,8 +284,7 @@ impl Tiering {
         Ok(raised)
     }
 
-    /// [`Self::classify_cache_entry`] over a cache entry that may not exist: no entry means K is
-    /// remote-only, which the repair rule materializes.
+    /// No cache entry means K is remote-only, which the repair rule materializes.
     async fn verdict_for(
         &self,
         bucket: &str,
@@ -304,7 +301,6 @@ impl Tiering {
         }
     }
 
-    /// K's `<data>` entry as `(size, ETag)`, or `None` if the cache does not hold one.
     async fn cache_entry(&self, bucket: &str, key: &str) -> Result<Option<(u64, String)>> {
         match self.data.head(bucket, key).await {
             Ok(h) => Ok(Some((
@@ -395,14 +391,19 @@ impl Tiering {
         Ok(tail.footer.client_etag() == etag)
     }
 
-    /// Raise K's pending marker at `payload` (the cache body's ETag). Last writer wins — only the
-    /// marker's own ETag matters to the sweep, which CASes on it — so re-raising one is harmless.
-    pub(crate) async fn raise_marker(&self, bucket: &str, key: &str, payload: &str) -> Result<()> {
+    /// Last writer wins — only the marker's own ETag matters to the sweep, which CASes on it — so
+    /// re-raising one is harmless.
+    pub(crate) async fn raise_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+        body_etag: &str,
+    ) -> Result<()> {
         self.meta
             .put_small(
                 bucket,
                 meta::pending_marker_key(key),
-                payload.as_bytes().to_vec(),
+                body_etag.as_bytes().to_vec(),
                 HashMap::new(),
                 None,
                 None,
@@ -411,7 +412,6 @@ impl Tiering {
             .map(|_| ())
     }
 
-    /// `(key, size, ETag)` for every entry of one flat namespace, paged to exhaustion.
     pub(crate) async fn walk(
         &self,
         backend: &Backend,
@@ -680,7 +680,6 @@ impl Tiering {
                 hypha_core::fatal::foreign_object(bucket, key)
             };
             Ok(match &pt {
-                // Whole object: one GET of the concatenated parts, decrypted part-by-part in-stream.
                 None => {
                     let out = self
                         .remote
@@ -693,7 +692,6 @@ impl Tiering {
                     let part_lens = tail.windows.iter().map(|w| w.end - w.start).collect();
                     codec::decrypt_composite_full(self.env.clone(), out.body, part_lens)
                 }
-                // Range: fetch only the parts it touches.
                 Some(pt) => {
                     let segments = composite_segments(&tail.windows, &tail.plens, pt);
                     codec::decrypt_composite(
@@ -864,10 +862,9 @@ impl Tiering {
     }
 }
 
-/// Total object length from a `Content-Range: bytes <start>-<end>/<total>` header (the response to
-/// a suffix-range GET). `None` if the header is malformed or the size is unknown (`*`).
-fn parse_content_range_total(cr: &str) -> Option<u64> {
-    cr.rsplit_once('/')?.1.trim().parse().ok()
+/// `bytes <start>-<end>/<total>` → `total`; `None` for a malformed header or an unknown (`*`) size.
+fn parse_content_range_total(content_range: &str) -> Option<u64> {
+    content_range.rsplit_once('/')?.1.trim().parse().ok()
 }
 
 /// Whether a shadow body's metadata identifies it as K's *current* composite generation (§6/§8):
@@ -892,36 +889,35 @@ fn composite_segments(
     pt: &ByteRange<u64>,
 ) -> Vec<PartSegment> {
     let mut segs = Vec::new();
-    let mut acc = 0u64;
-    for (w, &p) in windows.iter().zip(plens) {
-        if acc >= pt.end {
+    let mut part_pt_start = 0u64;
+    for (window, &part_plen) in windows.iter().zip(plens) {
+        if part_pt_start >= pt.end {
             break;
         }
-        segs.extend(clip(w, acc, p, pt));
-        acc += p;
+        segs.extend(clip_part_to_range(window, part_pt_start, part_plen, pt));
+        part_pt_start += part_plen;
     }
     segs
 }
 
-/// The segment (if any) part `w` contributes to plaintext range `pt`, given the part's plaintext
-/// starts at `start_pt` and holds `part_plen` bytes.
-fn clip(
-    w: &ByteRange<u64>,
-    start_pt: u64,
+fn clip_part_to_range(
+    part_ct: &ByteRange<u64>,
+    part_pt_start: u64,
     part_plen: u64,
-    pt: &ByteRange<u64>,
+    want: &ByteRange<u64>,
 ) -> Option<PartSegment> {
-    let lo = pt.start.max(start_pt);
-    let hi = pt.end.min(start_pt + part_plen);
+    let part_pt_end = part_pt_start + part_plen;
+    let lo = want.start.max(part_pt_start);
+    let hi = want.end.min(part_pt_end);
     if lo >= hi {
         return None;
     }
-    if lo == start_pt && hi == start_pt + part_plen {
-        Some(PartSegment::Whole(w.clone()))
+    if lo == part_pt_start && hi == part_pt_end {
+        Some(PartSegment::Whole(part_ct.clone()))
     } else {
         Some(PartSegment::Partial {
-            ct: w.clone(),
-            pt: (lo - start_pt)..(hi - start_pt),
+            ct: part_ct.clone(),
+            pt: (lo - part_pt_start)..(hi - part_pt_start),
         })
     }
 }

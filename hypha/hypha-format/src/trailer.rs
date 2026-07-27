@@ -34,7 +34,6 @@ pub const MAX_PARTS: usize = 10_000;
 /// One parts-table entry: a little-endian `u64` cumulative ciphertext end-offset.
 pub const PART_ENTRY_LEN: usize = 8;
 pub const MAX_TABLE_LEN: usize = MAX_PARTS * PART_ENTRY_LEN;
-/// Fixed facts-struct size (the bytemuck wire form).
 pub const FACTS_LEN: usize = size_of::<FactsRepr>();
 /// A single-part object's trailer: no parts table, so the tail is exactly `facts ‖ tag ‖ version`.
 /// Fixed, so a single-part read's envelope length is `content_length − SINGLE_TRAILER_LEN`.
@@ -49,7 +48,7 @@ pub enum FooterKind {
     Composite = 1,
 }
 
-/// Object facts, decoded from (and encoded to) the trailer. `client_etag` projects the S3 ETag.
+/// Object facts, decoded from (and encoded to) the trailer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Footer {
     pub kind: FooterKind,

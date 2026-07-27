@@ -83,15 +83,13 @@ impl Backend {
         &self.region
     }
 
-    /// Backend bucket name for a client bucket: the deployment's bucket prefix keeps deployments
-    /// sharing one remote account in disjoint bucket namespaces.
-    fn bkt(&self, bucket: &str) -> String {
+    fn backend_bucket(&self, bucket: &str) -> String {
         format!("{}{}", self.bucket_prefix, bucket)
     }
 
-    /// The client-visible name for a backend bucket, or `None` if it isn't under this deployment's
-    /// prefix — a sibling deployment's bucket on a shared account, not ours to list.
-    fn strip_bkt<'a>(&self, full: &'a str) -> Option<&'a str> {
+    /// `None` if the bucket isn't under this deployment's prefix — a sibling deployment's bucket on
+    /// a shared account, not ours to list.
+    fn client_bucket<'a>(&self, full: &'a str) -> Option<&'a str> {
         full.strip_prefix(&self.bucket_prefix)
     }
 
@@ -103,7 +101,7 @@ impl Backend {
     ) -> Result<GetObjectOutput> {
         self.client
             .get_object()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .set_range(range)
             .send()
@@ -114,7 +112,7 @@ impl Backend {
     pub async fn head(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput> {
         self.client
             .head_object()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .send()
             .await
@@ -137,7 +135,7 @@ impl Backend {
     ) -> Result<PutObjectOutput> {
         self.client
             .put_object()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .body(body)
             .set_content_length(content_length)
@@ -170,7 +168,7 @@ impl Backend {
         let out = self
             .client
             .put_object()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .body(ByteStream::from(bytes))
             .content_length(len)
@@ -190,7 +188,7 @@ impl Backend {
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<()> {
         self.client
             .delete_object()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .send()
             .await
@@ -206,7 +204,7 @@ impl Backend {
     pub async fn delete_if_match(&self, bucket: &str, key: &str, if_match: String) -> Result<()> {
         self.client
             .delete_object()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .if_match(if_match)
             .send()
@@ -242,7 +240,7 @@ impl Backend {
         let out = self
             .client
             .delete_objects()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .delete(delete)
             .send()
             .await
@@ -293,7 +291,7 @@ impl Backend {
         let mut out = self
             .client
             .list_objects_v2()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .set_prefix(prefix)
             .set_delimiter(delimiter)
             .set_continuation_token(continuation_token)
@@ -327,7 +325,7 @@ impl Backend {
         let mut out = self
             .client
             .list_objects()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .set_prefix(prefix)
             .set_delimiter(delimiter)
             .set_marker(marker)
@@ -352,7 +350,7 @@ impl Backend {
     pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
         self.client
             .create_bucket()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .send()
             .await
             .map_err(Error::from_sdk)?;
@@ -362,7 +360,7 @@ impl Backend {
     pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         self.client
             .delete_bucket()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .send()
             .await
             .map_err(Error::from_sdk)?;
@@ -372,7 +370,7 @@ impl Backend {
     pub async fn head_bucket(&self, bucket: &str) -> Result<()> {
         self.client
             .head_bucket()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .send()
             .await
             // A missing bucket HEADs as a bodyless 404 (`NotFound`); the callers that branch on
@@ -397,7 +395,7 @@ impl Backend {
             .buckets()
             .iter()
             .filter_map(|b| {
-                let name = self.strip_bkt(b.name()?)?;
+                let name = self.client_bucket(b.name()?)?;
                 Some((
                     name.to_string(),
                     b.creation_date().and_then(|d| d.to_millis().ok()),
@@ -416,7 +414,7 @@ impl Backend {
     ) -> Result<CreateMultipartUploadOutput> {
         self.client
             .create_multipart_upload()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .set_metadata(Some(metadata))
             .send()
@@ -436,7 +434,7 @@ impl Backend {
     ) -> Result<UploadPartOutput> {
         self.client
             .upload_part()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
@@ -466,12 +464,12 @@ impl Backend {
     ) -> Result<UploadPartCopyOutput> {
         let copy_source = format!(
             "{}/{}",
-            self.bkt(src_bucket),
+            self.backend_bucket(src_bucket),
             encode_copy_source_key(src_key)
         );
         self.client
             .upload_part_copy()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
@@ -491,7 +489,7 @@ impl Backend {
     ) -> Result<CompleteMultipartUploadOutput> {
         self.client
             .complete_multipart_upload()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .upload_id(upload_id)
             .multipart_upload(parts)
@@ -516,7 +514,7 @@ impl Backend {
             let page = self
                 .client
                 .list_parts()
-                .bucket(self.bkt(bucket))
+                .bucket(self.backend_bucket(bucket))
                 .key(key)
                 .upload_id(upload_id)
                 .max_parts(1000)
@@ -568,7 +566,7 @@ impl Backend {
         let mut out = self
             .client
             .list_multipart_uploads()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .set_prefix(prefix)
             .set_delimiter(delimiter)
             .set_key_marker(key_marker)
@@ -592,7 +590,7 @@ impl Backend {
     pub async fn abort_multipart(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
         self.client
             .abort_multipart_upload()
-            .bucket(self.bkt(bucket))
+            .bucket(self.backend_bucket(bucket))
             .key(key)
             .upload_id(upload_id)
             .send()

@@ -426,7 +426,6 @@ impl Harness {
         };
     }
 
-    /// Create a client bucket (hypha creates the paired cache + remote buckets).
     pub async fn create_bucket(&self, bucket: &str) {
         self.client()
             .create_bucket()
@@ -508,7 +507,6 @@ where
         .map(str::to_string)
 }
 
-/// GET the last `n` bytes (an HTTP suffix range) and return them.
 pub async fn get_suffix(client: &Client, bucket: &str, key: &str, n: u64) -> Vec<u8> {
     let out = client
         .get_object()
@@ -644,7 +642,6 @@ pub fn bytes_body(bytes: &[u8]) -> ByteStream {
     ByteStream::from(bytes.to_vec())
 }
 
-/// GET the whole object through hypha and return its plaintext body.
 pub async fn get_all(client: &Client, bucket: &str, key: &str) -> Vec<u8> {
     let out = client
         .get_object()
@@ -669,7 +666,6 @@ pub async fn get_range(client: &Client, bucket: &str, key: &str, first: u64, las
     out.body.collect().await.expect("collect range").to_vec()
 }
 
-/// PUT a full object through hypha; returns the ETag hypha reports (unquoted).
 pub async fn put(client: &Client, bucket: &str, key: &str, body: &[u8]) -> String {
     let out = client
         .put_object()
@@ -699,7 +695,6 @@ pub async fn raw_remote_object(harness: &Harness, bucket: &str, key: &str) -> Ve
     out.body.collect().await.expect("collect raw").to_vec()
 }
 
-/// List every raw key under a prefix directly from a backend bucket (cache or remote).
 pub async fn raw_list(client: &Client, bucket: &str, prefix: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
     let mut token: Option<String> = None;

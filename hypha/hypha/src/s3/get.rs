@@ -309,8 +309,7 @@ impl Hypha {
     }
 }
 
-/// The trailer-derived `ObjectParts` view for a composite (§7), paginated like `ListParts`: part
-/// *i* is part number `i+1` with plaintext `size = plens[i]`.
+/// Paginated like `ListParts`.
 fn build_object_parts(
     plens: &[u64],
     part_number_marker: Option<i32>,
@@ -369,7 +368,6 @@ pub(super) fn facts_from_tombstone(
     })
 }
 
-/// Reconstruct the HTTP Range header value the client sent, to forward to the cache.
 fn range_header(range: &Range) -> String {
     match *range {
         Range::Int {
@@ -381,7 +379,6 @@ fn range_header(range: &Range) -> String {
     }
 }
 
-/// Resolve an HTTP Range against the plaintext length to a half-open `[start, end)`.
 fn plaintext_range(range: &Range, plen: u64) -> Result<ByteRange<u64>, Error> {
     match *range {
         Range::Int { first, last } => {

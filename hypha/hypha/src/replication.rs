@@ -31,7 +31,6 @@ use hypha_core::meta;
 
 use crate::tier::{Tiering, UploadOutcome};
 
-/// One LIST page of pending markers.
 const MARKER_PAGE: i32 = 1000;
 
 pub struct ReplicationTask {

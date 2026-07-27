@@ -36,8 +36,6 @@ pub struct KeyLocks {
 }
 
 impl KeyLocks {
-    /// Acquire the lock for `key`, awaiting any current holder. Hold the returned guard for the
-    /// critical section; dropping it releases the lock and evicts the key's now-idle entry.
     pub async fn lock(&self, key: &str) -> KeyGuard {
         let (key, arc) = self.mutex_for(key);
         let inner = arc.clone().lock_owned().await;
@@ -113,7 +111,7 @@ impl KeyLocks {
 }
 
 /// Owns a held per-key lock; releasing it (drop) frees the async mutex and evicts the key's table
-/// entry once no other holder or waiter remains. Returned by [`KeyLocks::lock`]/`try_lock`.
+/// entry once no other holder or waiter remains.
 #[must_use = "dropping the guard immediately releases the lock"]
 pub struct KeyGuard {
     /// `Option` so `drop` can release the async mutex *before* counting owners — the released
@@ -162,7 +160,6 @@ mod tests {
     #[tokio::test]
     async fn distinct_keys_dont_block_or_share() {
         let locks = KeyLocks::default();
-        // Acquiring b while holding a must not block (different mutexes).
         let a = locks.lock("a").await;
         let b = locks.lock("b").await;
         assert_eq!(locks.entries(), 2);
@@ -193,14 +190,14 @@ mod tests {
 
         let l2 = locks.clone();
         let waiter = tokio::spawn(async move {
-            let _g = l2.lock("k").await; // parks behind `held`, then acquires
+            let _g = l2.lock("k").await;
         });
         // Let the spawned task reach the parked lock (its `arc` clone is now live).
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(locks.entries(), 1, "waiter and holder share one entry");
 
-        drop(held); // waiter is promoted to holder
-        waiter.await.unwrap(); // waiter drops its guard
+        drop(held);
+        waiter.await.unwrap();
         assert_eq!(locks.entries(), 0, "last owner evicts the entry");
     }
 
