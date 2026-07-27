@@ -53,6 +53,7 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         trailer_key,
         locks: keylocks::KeyLocks::default(),
         upload_locks: keylocks::KeyLocks::default(),
+        cached: config.mode == Mode::Cached,
     };
 
     // The repair queue's only strong sender goes to `Lifecycle`, so dropping that at drain is what
@@ -84,6 +85,7 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         tokio::spawn(sweep.run(app.liveness()));
     }
 
+    let buckets = app.buckets.clone();
     let mut b = S3ServiceBuilder::new(app);
     b.set_auth(auth::SingleKeyAuth::new(
         config.auth.access_key.clone(),
@@ -91,6 +93,7 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     ));
     let lifecycle = Lifecycle {
         cached: config.mode == Mode::Cached,
+        buckets,
         markers,
         queue: Some(queue),
         worker: tokio::spawn(worker.run()),
@@ -104,6 +107,9 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
 pub struct Lifecycle {
     cached: bool,
     markers: markers::Markers,
+    /// Startup owes a reconcile pass for every bucket whose clean marker was absent, and the actor
+    /// is what runs it — so a pass restore already wants for the same bucket is one pass, not two.
+    buckets: bucket_ctl::BucketCtl,
     /// The repair queue's only strong sender outside the obligation tasks. Dropping it is the seal.
     queue: Option<markers::Queue>,
     worker: tokio::task::JoinHandle<()>,
@@ -111,11 +117,11 @@ pub struct Lifecycle {
 
 impl Lifecycle {
     /// Clear every bucket's clean marker before serving. Fails startup rather than serving around a
-    /// marker that will not delete — that marker would skip next run's recovery scan, by which time
+    /// marker that will not delete — that marker would skip next run's reconcile pass, by which time
     /// real orphans exist. Durable mode owes no markers, so there is nothing to clear.
     pub async fn startup(&self) -> Result<(), BoxError> {
         if self.cached {
-            self.markers.startup().await?;
+            self.markers.startup(&self.buckets).await?;
         }
         Ok(())
     }

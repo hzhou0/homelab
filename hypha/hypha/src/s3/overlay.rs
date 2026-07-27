@@ -26,6 +26,7 @@ use hypha_core::meta;
 
 use super::get::facts_from_tombstone;
 use super::{ts_ms, Hypha};
+use crate::bucket_ctl;
 use crate::tier::RemoteFacts;
 
 /// Bounded fan-out for the per-key trailer reads a remote-served LIST page needs (§7).
@@ -85,7 +86,8 @@ impl Hypha {
             // Marker absent, or the `<meta>` bucket itself is gone: the cache is not authoritative.
             Err(Error::NotFound) | Err(Error::NoSuchBucket) => {
                 if self.remote().head_bucket(bucket).await.is_ok() {
-                    self.buckets.restore(bucket);
+                    self.buckets
+                        .reconcile(bucket, bucket_ctl::Trigger::Unreconciled);
                     Ok(Readiness::Restoring)
                 } else {
                     Ok(Readiness::Absent)

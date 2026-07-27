@@ -67,7 +67,7 @@ impl Hypha {
         max_bucket_prefix_len: usize,
         background_cfg: hypha_core::config::Background,
     ) -> Self {
-        let buckets = bucket_ctl::spawn(tier.clone());
+        let buckets = bucket_ctl::spawn(tier.clone(), markers.clone());
         let background = background::spawn(tier.clone(), background_cfg);
         Self {
             tier,

@@ -1,7 +1,7 @@
 //! Per-key async lock table — the shared serialization primitive (§4). Same-key holders never
 //! overlap or reorder while distinct keys run fully in parallel. Instantiated twice: the *write*
 //! lock (conditional writes, the durable finalize, GC tombstone transitions) and — in phase 4 —
-//! the reconcile-only *upload* lock, kept separate so a replication upload only ever blocks other
+//! the reconcile-only *upload* lock, kept separate so a replication upload only ever excludes other
 //! reconciles of its key, never a client's conditional PUT.
 //!
 //! The table stores **weak** references, so it never keeps a mutex alive: the [`Guard`] returned
@@ -44,9 +44,12 @@ impl KeyLocks {
         self.guard(key, arc, inner)
     }
 
-    /// Acquire the lock only if free. Lock-free read paths use this to repair a leftover
-    /// transition mark opportunistically (§7): a *held* lock means the marking writer is alive
-    /// mid-bracket — nothing to repair, and a read must not queue behind it.
+    /// Acquire the lock only if free — for callers whose work is redundant when someone else is
+    /// already doing it, so a `None` is a reason to drop the attempt, not to retry. Lock-free read
+    /// paths repair a leftover transition mark this way (§7): a *held* lock means the marking writer
+    /// is alive mid-bracket, so there is nothing to repair and a read must not queue behind it. The
+    /// reconcile sweep coalesces same-key uploads onto the in-flight one the same way
+    /// ([`crate::replication`]).
     pub fn try_lock(&self, key: &str) -> Option<Guard> {
         let (key, arc) = self.mutex_for(key);
         let inner = arc.clone().try_lock_owned().ok()?;

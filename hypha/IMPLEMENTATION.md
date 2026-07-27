@@ -152,8 +152,18 @@ The **cached-mode reconcile** serializes on a second, dedicated per-key **upload
 same table primitive, separate instance. Same-key reconcile work must not overlap or reorder (an
 unserialized older upload finishing after a newer one leaves the remote stale with an empty
 pending set — §7), but a replication upload mutates no client-visible state, so it must only ever
-block *other reconciles of the same key*, never make a conditional PUT queue behind a multi-second
+exclude *other reconciles of the same key*, never make a conditional PUT queue behind a multi-second
 transfer.
+
+That exclusion is **`try_lock`, and a pass that loses it drops its attempt** — pending same-key
+uploads coalesce onto the in-flight one rather than queuing behind it. A waiter would be redundant:
+the holder re-reads K's body under the lock, so it uploads whatever generation is current when it
+wins, and any write it cannot account for fails its marker CAS and stands for the next pass. A
+waiter is also actively harmful, because unlike a rehydrate — which a client write cancels for free
+via the write lock (§8) — an upload holds no write lock and cannot be cancelled. Queued waiters each
+re-upload in turn, so on a key written faster than it uploads the newest generation's upload starts
+only after the whole redundant queue drains, and the loss window grows without bound. Coalescing
+caps the queue at one in-flight upload per key, so the bound stays one pass plus one transfer.
 
 **Unconditional cached-mode PUTs take no lock** — they race on the cache (S3 last-writer-wins) and
 are fenced against eviction by §8's remote-generation confirmation and conditional tombstones, not
@@ -1022,18 +1032,31 @@ Three request classes ride the queue:
   occupied by the restore sweep the write is racing and serving is never gated (below). Safe there
   only because it exclusively creates, idempotently, and only for a bucket the readiness probe has
   already seen on the remote — bucket *lifecycle* stays the workers' alone.
-- **Restore (repair)** — fire-and-forget and **coalesced by dedup**: the first op to find a bucket
-  unreconciled (marker absent, remote present) kicks a `Restore` and resolves itself from the remote
-  meanwhile — no 503, no waiter list. That op also memoizes the `Restoring` verdict, so the
-  classification costs two probes *per restore* rather than per request crossing the window; the
-  actor drops the memo when the sweep ends, however it ends, which is what re-triggers a failed
+- **Reconcile (restore / repair)** — fire-and-forget and **coalesced by dedup**: the first op to
+  find a bucket unreconciled (marker absent, remote present) kicks a `Reconcile` and resolves itself
+  from the remote meanwhile — no 503, no waiter list. That op also memoizes the `Restoring` verdict,
+  so the classification costs two probes *per restore* rather than per request crossing the window;
+  the actor drops the memo when the sweep ends, however it ends, which is what re-triggers a failed
   sweep (and lets a bucket deleted meanwhile resolve `Absent`) on the next access. A success
   publishes `Ready` before dropping it, so the gate never sees a bucket as neither. The actor
-  ensures the projections exist, LISTs the remote and rebuilds each object's eviction tombstone +
-  twin from its authenticated tail trailer
-  (`Reconciler::restore_bucket`, the per-bucket restore sweep below), then writes the marker to flip
-  the bucket cache-authoritative. Idempotent, so a crash mid-sweep resumes by re-running; duplicate
-  restores collapse to one.
+  ensures the projections exist, then merges the remote and cache namespaces — remote-only objects
+  rebuilt as eviction tombstone + twin from their authenticated tail trailer, surviving cache-side
+  writes left standing (`Reconciler::reconcile_bucket`, the per-bucket restore sweep below), then
+  writes the marker to flip the bucket cache-authoritative. Idempotent, so a crash mid-sweep resumes
+  by re-running; duplicate triggers collapse to one.
+
+  **Both** of §7's rebuild duties ride this class — restoring an untrusted namespace, and rebuilding
+  a bucket's pending-marker index at startup — because they are the same traversal, and routing them
+  through one queue is what makes them one *pass*. Two passes over a bucket would take independent
+  snapshots of cache and remote and could settle a key on one while the other raised a marker for it
+  (an inert marker no sweep ever clears). Here they collapse into a single sweep over a single map
+  before either runs. Only the **trigger** distinguishes them, and only in its precondition:
+  *unreconciled* (sync marker absent) skips a bucket already `Ready`, since someone else's pass got
+  there first; *unaccounted* (clean marker absent at startup) must run even on a `Ready` bucket,
+  because readiness says the namespace is trusted, which is a different claim from the pending index
+  being complete. Merging two triggers for one bucket keeps the weaker precondition, so an
+  *unaccounted* trigger can never be absorbed by an *unreconciled* one that would then skip. A
+  landed pass records the bucket as accounted-for, which a lazily restored bucket now earns too.
 
 **The restore overlay** keeps serving ungated while a bucket is unreconciled (one interface,
 `s3/overlay.rs`): a readiness verdict (memoized in both directions — `Ready` once the marker is
@@ -1070,7 +1093,7 @@ state, re-triggered on the next access.
   restores lazily — but a running active does not self-heal a live volume loss. Revisit if cache
   loss should recover without an operator restart (e.g. invalidate the memo on a cache
   `NoSuchBucket` from a supposedly-`Ready` bucket).
-- **Restore rebuilds object tombstones only, not multipart state.** `restore_bucket` reconstructs
+- **Restore rebuilds object tombstones only, not multipart state.** `reconcile_bucket` reconstructs
   the object namespace from remote objects + trailers; in-flight multipart records (`<meta>` range
   A) are *not* rebuilt, so `ListParts`/`CompleteMultipartUpload` for an upload started before a
   cache loss won't find its records after restore. Remote-as-truth for `ListMultipartUploads` (§7)
@@ -1215,11 +1238,21 @@ active's write. Draining before releasing costs failover the drain time, which i
 queue still holds — empty on any ordinary shutdown.
 
 **The recovery scan.** Startup reads and deletes every bucket's clean marker before serving (§6);
-each bucket whose marker was **absent** owes a scan, raised once in the background. Serving is not
-gated on it — a markerless body reads correctly, it is only not yet durable — but **eviction is**
-(§8), and so is the bucket's eligibility for a clean marker at drain. The scan is idempotent, so a
-crash mid-scan just re-runs it next boot. It rebuilds the pending set by triage rather than per-key
-round trips:
+each bucket whose marker was **absent** owes a rebuild of its pending set. Serving is not gated on it
+— a markerless body reads correctly, it is only not yet durable — but **eviction is** (§8), and so is
+the bucket's eligibility for a clean marker at drain. It is idempotent, so a crash mid-pass just
+re-runs it next boot.
+
+There is no separate scan *implementation*: startup raises an **unaccounted** reconcile trigger on
+the bucket-control actor (§7 *Buckets*) and the ordinary restore pass does the work, because
+rebuilding the pending set and settling the namespace are the same traversal over the same two
+listings. Both hinge on one question — which side of a divergence at K is the committed one
+(`classify_cache_entry`) — and a scan that answered it differently from a restore running
+concurrently would raise a marker over a key that restore had just overwritten, an inert marker no
+sweep ever clears. Sharing the traversal makes disagreement unrepresentable; sharing the actor's
+queue makes the two triggers one pass over one map rather than two racing snapshots.
+
+The pass rebuilds the pending set by triage rather than per-key round trips:
 
 1. `ListObjectsV2` over `<data><b>` and over the remote bucket — two flat listings, 1000 keys a
    call, no per-key requests.
@@ -1261,10 +1294,45 @@ over the one bucket's keyspace:
 
 1. Ensure the bucket's `<data>`/`<meta>` projections exist — a lost volume takes the buckets with it
    — draining any stale orphan first.
-2. For each remote key with no cache entry (a surviving delete-tombstone counts as present, so
-   pending deletes aren't resurrected), write an eviction tombstone + twin. Facts come from the
-   object's authenticated tail trailer — one bounded suffix GET per key, single-part and
-   composite alike (§6). An object whose trailer fails to verify is **fatal**: hypha is by
+2. **Merge** the two namespaces — not a remote-wins rebuild. A lost volume is only the easy case;
+   restore also runs on a bucket whose cache survived and whose marker did not (a crash mid-sweep,
+   or before a clean marker). There the cache holds committed state the remote has not got, and in
+   cached mode the cache write *is* the ack, so overwriting it would settle an acked PUT down to
+   the older remote generation and resurrect an acked DELETE as a live object — silent losses of a
+   write hypha already reported as succeeded, and undetectable afterwards, since what survives is a
+   well-formed eviction tombstone plus a pending marker the sweep then clears as an orphan.
+
+   So the sweep walks **both** namespaces and settles each key of their union by one verdict
+   (`Reconciler::classify_cache_entry` — the same verdict the pending-set rebuild below runs on,
+   since the two are one pass):
+
+   - *cache pending* — a live body whose generation the remote lacks, or a delete-tombstone it has
+     not honoured. **Cache wins**: the entry stands untouched and its pending marker is re-raised,
+     handing it to the reconcile sweep rather than completing it here. In durable mode the remote
+     is the commit point, so the same divergence is instead a stale projection to re-settle.
+   - *agrees* — a live body of the remote's generation, or an eviction tombstone the remote still
+     backs. Left exactly as it is; re-deriving an intact eviction tombstone would erase the
+     client's `x-amz-meta-*` and storage class, which its metadata is the only surviving copy of
+     (the trailer holds facts and nothing else).
+   - *stale* — a transition mark, or anything the remote contradicts. **Remote wins**: settle by
+     the repair rule (§7).
+   - *remote-only* — no cache entry at all: write an eviction tombstone + twin, the from-nothing
+     rebuild.
+
+   Triage keeps the merge to the two flat listings in the common case: a key the remote lacks
+   diverges outright, and for one it holds, a single-part object's framed size is the closed form
+   over the cache body's plaintext length, so any overwrite that changed that length is caught with
+   no extra request. Only a same-length overwrite is ambiguous, and only it pays a tail read.
+
+   Both listings are **snapshots**, and serving is never gated during a restore — a client PUT or
+   DELETE can ack at K in the interval, and in cached mode that ack is the commit. Settling K on
+   stale listing data would destroy it exactly as a remote-wins sweep would, so in cached mode the
+   *stale* arm re-reads K under its key lock and re-decides before overwriting. Only that arm pays
+   the extra HEAD: *pending* re-raises a marker (last writer wins) and *agrees* writes nothing, so
+   neither can lose a racing write.
+
+   Facts come from the object's authenticated tail trailer — one bounded suffix GET per key,
+   single-part and composite alike (§6). An object whose trailer fails to verify is **fatal**: hypha is by
    assumption the only writer of the remote buckets, so a verify failure means either something
    else holds write access or this process carries the wrong trailer key / an unknown format —
    in every case hypha's picture of its own data is wrong. It logs the object and exits
@@ -1276,15 +1344,18 @@ over the one bucket's keyspace:
 Throughput comes from sharding the keyspace — LIST chains are serial per shard — with shard
 boundaries from the prefix-distribution hint (§6); a stale or missing hint degrades to
 `delimiter=/` discovery with `start-after` splits. Hand-rolled over the SDK paginator + a
-semaphore; idempotent (only fills gaps), the marker written only after every shard drains. In
-durable mode this rebuild *is* the steady state being recreated — all tombstones. Serving is
+semaphore; idempotent (it settles each key to what cache and remote already resolve to), the marker
+written only after every shard drains. In durable mode the merge degenerates to the remote-wins
+rebuild — no side can be cache-pending — and that rebuild *is* the steady state being recreated,
+all tombstones. Serving is
 never gated: a conditional write to K mid-sweep first materializes K's remote state into the
 cache, then runs the normal §4 path.
 
 ### Lifecycle
 
 - **Startup** (cached mode). Before the listener opens: read and delete every bucket's clean marker
-  (§6), recording which were present, and raise a recovery scan for each that was not. A bucket whose
+  (§6), recording which were present, and raise an *unaccounted* reconcile trigger for each that was
+  not. A bucket whose
   marker cannot be deleted is not served — readiness fails rather than serving a bucket that will
   skip next run's scan. Sub-second at homelab bucket counts (one HEAD + one DELETE each); the scans
   themselves run in the background behind it.

@@ -16,9 +16,16 @@
 //! [state map](BucketCtl::state) instead, which costs one atomic load and no lock.
 //!
 //! Client Create/Delete are request-reply and never coalesced — each returns the remote's own
-//! result, so a double-delete's loser still sees `NoSuchBucket`. `Restore`s are fire-and-forget and
-//! deduped: the op that triggered one already resolves from the remote meanwhile, so there is no
-//! waiter, and a storm of restores for one bucket collapses to a single sweep.
+//! result, so a double-delete's loser still sees `NoSuchBucket`. `Reconcile`s are fire-and-forget
+//! and deduped: the op that triggered one already resolves from the remote meanwhile, so there is
+//! no waiter, and a storm of triggers for one bucket collapses to a single sweep.
+//!
+//! That dedup is why **both** of §7's rebuild duties enter here — restoring an untrusted namespace
+//! and rebuilding a bucket's pending-marker index at startup. They are one traversal
+//! ([`Reconciler::reconcile_bucket`]), and routing them through one queue is what guarantees they
+//! are one *pass*: two passes over the same bucket would take independent snapshots of cache and
+//! remote, and could settle a key on one while the other raised a marker for it. Here they collapse
+//! into a single sweep over a single map before either runs. Only [`Trigger`] distinguishes them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -140,9 +147,35 @@ enum BucketMsg {
         bucket: String,
         reply: oneshot::Sender<Result<()>>,
     },
-    Restore {
+    Reconcile {
         bucket: String,
+        trigger: Trigger,
     },
+}
+
+/// What made a reconcile pass owed. The pass itself is the same either way — one traversal that
+/// both settles the namespace and rebuilds the pending set — so this only decides the precondition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The sync marker is absent: this bucket's namespace is not authoritative. Skippable if the
+    /// bucket is already `Ready` — someone else's pass got there first.
+    Unreconciled,
+    /// The clean marker was absent at startup (§6): this run has no account of the bucket's pending
+    /// set. **Not** skippable on `Ready` — readiness says the namespace is trusted, which is a
+    /// different claim from the pending index being complete.
+    Unaccounted,
+}
+
+impl Trigger {
+    /// Merge two triggers for one bucket into the pass that satisfies both — the weaker
+    /// precondition wins, so an `Unaccounted` trigger can never be absorbed by an `Unreconciled`
+    /// one that would then skip on `Ready` and drop the accounting.
+    fn merge(self, other: Trigger) -> Trigger {
+        match (self, other) {
+            (Trigger::Unaccounted, _) | (_, Trigger::Unaccounted) => Trigger::Unaccounted,
+            _ => Trigger::Unreconciled,
+        }
+    }
 }
 
 /// Handle onto the actor. Cloneable and cheap — the queue sender plus the published state map — so
@@ -189,21 +222,23 @@ impl BucketCtl {
         .await
     }
 
-    /// Trigger a background restore: fire-and-forget. The caller resolves from the remote meanwhile;
-    /// a closed queue (actor gone at shutdown) is ignored.
+    /// Trigger a background reconcile pass: fire-and-forget. The caller resolves from the remote
+    /// meanwhile; a closed queue (actor gone at shutdown) is ignored.
     ///
     /// Also memoizes the bucket as restoring, which is what spares every *subsequent* op the gate's
     /// two-probe classification (§7). The worker clears the memo when the sweep ends — however it
     /// ends — so a failed sweep is re-probed and re-triggered by the next access, exactly as it was
-    /// when the gate probed every time.
-    pub fn restore(&self, bucket: &str) {
+    /// when the gate probed every time. `mark_restoring` leaves a `Ready` bucket alone, so an
+    /// `Unaccounted` pass over a trusted namespace does not send its reads back to the remote.
+    pub fn reconcile(&self, bucket: &str, trigger: Trigger) {
         // Memoize before sending: the reverse order races a worker that finishes first, and would
         // leave a memo no sweep will ever clear. A refused send rolls it back for the same reason.
         update(&self.states, bucket, mark_restoring);
         if self
             .tx
-            .send(BucketMsg::Restore {
+            .send(BucketMsg::Reconcile {
                 bucket: bucket.to_string(),
+                trigger,
             })
             .is_err()
         {
@@ -239,7 +274,7 @@ impl BucketCtl {
 
 /// Spawn the actor and return its handle. The task runs until every handle is dropped, then drains
 /// whatever is still queued before exiting.
-pub fn spawn(tier: Reconciler) -> BucketCtl {
+pub fn spawn(tier: Reconciler, markers: crate::markers::Markers) -> BucketCtl {
     let (tx, rx) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = mpsc::unbounded_channel();
     let (prov_tx, prov_rx) = mpsc::unbounded_channel();
@@ -251,6 +286,7 @@ pub fn spawn(tier: Reconciler) -> BucketCtl {
         prov_tx,
         prov_rx,
         tier,
+        markers,
         states: states.clone(),
         sem: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         slots: HashMap::new(),
@@ -261,17 +297,24 @@ pub fn spawn(tier: Reconciler) -> BucketCtl {
     BucketCtl { tx, states }
 }
 
-/// One bucket's queued-but-undispatched work. `Create`/`Delete` keep arrival order; `restore` is a
-/// single flag — repeated restore triggers for a bucket collapse into one sweep.
+/// One bucket's queued-but-undispatched work. `Create`/`Delete` keep arrival order; `reconcile` is
+/// a single slot — repeated triggers for a bucket collapse into one sweep over one map.
 #[derive(Default)]
 struct Slot {
     pending: VecDeque<Client>,
-    restore: bool,
+    reconcile: Option<Trigger>,
 }
 
 impl Slot {
     fn is_empty(&self) -> bool {
-        self.pending.is_empty() && !self.restore
+        self.pending.is_empty() && self.reconcile.is_none()
+    }
+
+    fn owe(&mut self, trigger: Trigger) {
+        self.reconcile = Some(match self.reconcile {
+            Some(existing) => existing.merge(trigger),
+            None => trigger,
+        });
     }
 }
 
@@ -292,6 +335,9 @@ struct Actor {
     prov_tx: mpsc::UnboundedSender<(String, std::result::Result<(), String>)>,
     prov_rx: mpsc::UnboundedReceiver<(String, std::result::Result<(), String>)>,
     tier: Reconciler,
+    /// Handed to each worker so a completed pass can record that this run accounts for the bucket's
+    /// pending set (§7) — the pass rebuilds it, so it is the pass that earns the standing.
+    markers: crate::markers::Markers,
     states: BucketStates,
     sem: Arc<Semaphore>,
     slots: HashMap<String, Slot>,
@@ -342,7 +388,9 @@ impl Actor {
                 .pending
                 .push_back(Client::Delete(reply)),
             BucketMsg::Provision { bucket, reply } => self.provision(bucket, reply),
-            BucketMsg::Restore { bucket } => self.slots.entry(bucket).or_default().restore = true,
+            BucketMsg::Reconcile { bucket, trigger } => {
+                self.slots.entry(bucket).or_default().owe(trigger)
+            }
         }
     }
 
@@ -404,6 +452,7 @@ impl Actor {
             self.running.insert(bucket.clone());
             let worker = Worker {
                 tier: self.tier.clone(),
+                markers: self.markers.clone(),
                 states: self.states.clone(),
                 sem: self.sem.clone(),
                 done: self.done_tx.clone(),
@@ -415,6 +464,7 @@ impl Actor {
 
 struct Worker {
     tier: Reconciler,
+    markers: crate::markers::Markers,
     states: BucketStates,
     sem: Arc<Semaphore>,
     done: mpsc::UnboundedSender<String>,
@@ -434,8 +484,8 @@ impl Worker {
                 }
             }
         }
-        if slot.restore {
-            self.restore(&bucket).await;
+        if let Some(trigger) = slot.reconcile {
+            self.reconcile(&bucket, trigger).await;
         }
         let _ = self.done.send(bucket);
     }
@@ -472,11 +522,11 @@ impl Worker {
         Ok(())
     }
 
-    /// Rebuild a bucket's cache from the remote, then flip it authoritative. Skips a bucket the
+    /// Reconcile a bucket's cache with the remote, then flip it authoritative. Skips a bucket the
     /// remote no longer holds (a stray trigger for a deleted bucket). On failure the bucket stays
     /// unready, so the next access re-triggers.
-    async fn restore(&self, bucket: &str) {
-        self.sweep(bucket).await;
+    async fn reconcile(&self, bucket: &str, trigger: Trigger) {
+        self.sweep(bucket, trigger).await;
         // However the sweep ended, it is no longer pending: dropping the memo is what makes the
         // next access re-classify — re-triggering a failed sweep, or resolving `Absent` for a
         // bucket the remote no longer holds. A success already published `Ready`, which this leaves
@@ -484,25 +534,38 @@ impl Worker {
         update(&self.states, bucket, clear_restoring);
     }
 
-    async fn sweep(&self, bucket: &str) {
+    async fn sweep(&self, bucket: &str, trigger: Trigger) {
         // Triggers that arrived while another sweep (or a create) was flipping this bucket ready
-        // would re-run a full sweep over an already-authoritative namespace.
-        if self.states.load().get(bucket).is_some_and(|s| s.is_ready()) {
+        // would re-run a full sweep over an already-authoritative namespace. An `Unaccounted`
+        // trigger runs anyway — see [`Trigger`].
+        if trigger == Trigger::Unreconciled
+            && self.states.load().get(bucket).is_some_and(|s| s.is_ready())
+        {
             return;
         }
         if self.tier.remote.head_bucket(bucket).await.is_err() {
             return;
         }
         if let Err(e) = self.provision(bucket).await {
-            tracing::warn!(bucket, error = %e, "restore could not provision cache; retry on next access");
+            tracing::warn!(bucket, error = %e, "reconcile could not provision cache; retry on next access");
             return;
         }
-        match self.tier.restore_bucket(bucket).await {
-            Ok(()) => update(&self.states, bucket, mark_ready),
+        let raised = match self.tier.reconcile_bucket(bucket).await {
+            Ok(n) => n,
             Err(e) => {
-                tracing::warn!(bucket, error = %e, "bucket restore failed; retry on next access")
+                tracing::warn!(bucket, error = %e, "bucket reconcile failed; retry on next access");
+                return;
             }
+        };
+        if let Err(e) = self.mark_reconciled(bucket).await {
+            tracing::warn!(bucket, error = %e, "sync marker not written; retry on next access");
+            return;
         }
+        // The pass rebuilt the pending set from cache and remote, so this run can now vouch for it
+        // — the same standing a boot-time recovery scan used to confer (§7). A lazily restored
+        // bucket earns it too, which the split implementation never granted.
+        self.markers.account_for(bucket);
+        tracing::info!(bucket, markers = raised, "bucket reconcile complete");
     }
 
     async fn reset_cache(&self, bucket: &str) -> Result<()> {

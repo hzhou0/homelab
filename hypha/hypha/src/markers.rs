@@ -1,4 +1,4 @@
-//! Pending-marker obligations, the clean marker, and the recovery scan (§6/§7).
+//! Pending-marker obligations and the clean marker (§6/§7).
 //!
 //! A cached write acks on its **cache body write** — that is the commit. The bare-`K` pending marker
 //! it owes is an *index* over the pending set, not the durability record: what makes a write pending
@@ -13,13 +13,16 @@
 //! 1. **Startup** ([`Markers::startup`]) reads and deletes every bucket's clean marker before the
 //!    listener opens, recording which were present. Every bucket therefore starts *dirty on disk*,
 //!    with no bookkeeping of what a run "touched" — a run that has to remember what it touched can
-//!    forget. Buckets whose marker was absent owe a [`Markers::recovery_scan`].
+//!    forget. A bucket whose marker was absent owes a reconcile pass, which this raises on the
+//!    bucket-control actor rather than running here: rebuilding the pending set is the same
+//!    traversal restore runs, and one queue is what keeps the two from becoming two passes over
+//!    independent snapshots (§7, [`crate::bucket_ctl`]).
 //! 2. **The queue** ([`Markers::owe`]) — a write hands its marker over and returns. The handover
 //!    cannot block or fail, because the body is already committed and the ack can neither wait on
 //!    the marker nor be turned into an error by it; that is the whole reason the queue is unbounded.
 //! 3. **The drain** ([`Worker::run`]) writes clean markers, and only for buckets this run accounted
-//!    for — marker present at startup, or scanned here — and only if nothing was still owed when it
-//!    sealed.
+//!    for — marker present at startup, or a reconcile pass that landed during the run — and only if
+//!    nothing was still owed when it sealed.
 //!
 //! **Quiescence.** The clean marker claims the pending set on disk is complete, so writing one while
 //! a write still owes a marker turns a recoverable gap into a permanent one. Deciding that takes two
@@ -47,10 +50,8 @@ use tokio::sync::mpsc;
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
+use crate::bucket_ctl::{BucketCtl, Trigger};
 use crate::tier::Reconciler;
-
-/// One LIST page while scanning a namespace.
-const SCAN_PAGE: i32 = 1000;
 
 /// Markers taken off the queue per wake-up.
 const BATCH: usize = 256;
@@ -176,20 +177,27 @@ impl Markers {
 
     /// Record that this run accounts for `bucket`'s pending set — the positive evidence the drain
     /// needs before it may write that bucket's clean marker (§6). Two things establish it: the
-    /// bucket's marker was present at startup, or this run rebuilt the set (a recovery scan, or
+    /// bucket's marker was present at startup, or this run rebuilt the set (a reconcile pass, or
     /// creating the bucket empty).
     pub(crate) fn account_for(&self, bucket: &str) {
         self.inner.scanned.insert(bucket.to_string());
     }
 
-    /// Read and delete every bucket's clean marker, then raise a recovery scan for each that was
+    /// Read and delete every bucket's clean marker, then owe a reconcile pass for each that was
     /// absent. Runs before the listener opens: from the moment hypha can take a write, no bucket on
     /// disk claims to be clean.
     ///
     /// A marker that cannot be deleted fails startup rather than being served around — skipping the
-    /// scan on a marker one then fails to delete would skip it again next run, by which time real
+    /// pass on a marker one then fails to delete would skip it again next run, by which time real
     /// orphans exist.
-    pub(crate) async fn startup(&self) -> Result<()> {
+    ///
+    /// The pass itself is the bucket-control actor's ([`crate::bucket_ctl`]), not this module's: a
+    /// markerless bucket needs its pending set rebuilt from cache and remote, which is the same
+    /// traversal restore already runs, and routing both through the actor is what keeps them one
+    /// pass over one map rather than two racing snapshots. The actor records `account_for` when it
+    /// lands. Triggers are fire-and-forget, so startup does not wait on them — a pass that fails
+    /// leaves the bucket dirty and the next run tries again.
+    pub(crate) async fn startup(&self, buckets: &BucketCtl) -> Result<()> {
         let clean = meta::clean_marker_key();
         for (bucket, _) in self.inner.tier.meta.list_buckets().await? {
             let present = match self.inner.tier.meta.head(&bucket, &clean).await {
@@ -202,157 +210,12 @@ impl Markers {
             };
             if present {
                 self.account_for(&bucket);
-                continue;
-            }
-            let this = self.clone();
-            tokio::spawn(async move {
-                match this.recovery_scan(&bucket).await {
-                    Ok(n) => {
-                        tracing::info!(bucket, markers = n, "recovery scan complete");
-                        this.account_for(&bucket);
-                    }
-                    // No evidence recorded: the bucket ends the run dirty and the next one scans
-                    // again.
-                    Err(e) => tracing::warn!(bucket, error = %e, "recovery scan failed"),
-                }
-            });
-        }
-        Ok(())
-    }
-
-    /// Rebuild one bucket's pending set from cache and remote state, writing a marker for every key
-    /// the remote does not already hold in the cache's generation. Idempotent — a crash mid-scan
-    /// re-runs it next boot — and a marker written over an existing one is harmless (last writer
-    /// wins; only its own ETag matters to the sweep). Returns how many it wrote.
-    ///
-    /// Triage keeps this to two flat listings in the common case: a key the remote lacks is pending
-    /// outright, and for one it holds, a single-part object's framed size is the closed form over
-    /// the cache body's plaintext length — so any overwrite that changed that length is caught with
-    /// no extra request. Only a same-length overwrite is ambiguous, and only it pays a tail read.
-    async fn recovery_scan(&self, bucket: &str) -> Result<usize> {
-        let remote = self.list_remote(bucket).await?;
-        let cache = self.list_cache(bucket).await?;
-
-        let mut written = 0;
-        for (key, size, etag) in cache {
-            let pending = match meta::classify_entry(size as i64, &etag) {
-                // Unpropagated by definition: the sweep's delete branch clears the tombstone and the
-                // marker together, so a surviving tombstone is owed one either way. Re-propagating
-                // is idempotent, and it also frees a tombstone stranded by a crash between the
-                // remote delete and the clear — which nothing else revisits.
-                Some(meta::TombKind::Delete) => true,
-                // The body is on the remote already (evict), or a durable-mode bracket owns K
-                // (transit). Neither is a cached write owing a marker.
-                Some(_) => false,
-                None => match remote.get(&key) {
-                    None => true,
-                    Some(&framed) => match single_part_framed_len(size) {
-                        Some(expect) if expect != framed => true,
-                        // Same framed length: only the trailer can tell the generations apart.
-                        _ => !self.remote_generation_matches(bucket, &key, &etag).await?,
-                    },
-                },
-            };
-            if pending {
-                self.inner
-                    .tier
-                    .meta
-                    .put_small(
-                        bucket,
-                        meta::pending_marker_key(&key),
-                        etag.clone().into_bytes(),
-                        HashMap::new(),
-                        None,
-                        None,
-                    )
-                    .await?;
-                written += 1;
-            }
-        }
-        Ok(written)
-    }
-
-    /// Does the remote's trailer carry the cache body's client ETag?
-    ///
-    /// A trailer that does not authenticate is fatal here as at every other site that reads one
-    /// ([`hypha_core::fatal`]): hypha is the sole writer of these buckets, so the object is not
-    /// stray junk to be tidied away — either something else writes here or this process holds the
-    /// wrong trailer key. Reading it as a plain "no" would be worse than a wrong answer, because
-    /// this answer *authorizes an overwrite*: the marker it owes sends the sweep to upload the
-    /// cache body over the object hypha just failed to identify.
-    async fn remote_generation_matches(&self, bucket: &str, key: &str, etag: &str) -> Result<bool> {
-        let Some(tail) = self.inner.tier.read_tail(bucket, key).await? else {
-            hypha_core::fatal::foreign_object(bucket, key)
-        };
-        Ok(tail.footer.client_etag() == etag)
-    }
-
-    /// Framed sizes of the remote's objects, resident so the cache walk can join against them.
-    async fn list_remote(&self, bucket: &str) -> Result<HashMap<String, u64>> {
-        let mut out = HashMap::new();
-        self.walk(&self.inner.tier.remote, bucket, |k, size, _| {
-            out.insert(k, size);
-        })
-        .await?;
-        Ok(out)
-    }
-
-    /// `(key, plaintext size, ETag)` for every entry in `<data><b>` — bodies and tombstones alike,
-    /// which the caller classifies.
-    async fn list_cache(&self, bucket: &str) -> Result<Vec<(String, u64, String)>> {
-        let mut out = Vec::new();
-        self.walk(&self.inner.tier.data, bucket, |k, size, etag| {
-            out.push((k, size, etag));
-        })
-        .await?;
-        Ok(out)
-    }
-
-    async fn walk(
-        &self,
-        backend: &hypha_core::Backend,
-        bucket: &str,
-        mut each: impl FnMut(String, u64, String),
-    ) -> Result<()> {
-        let mut token = None;
-        loop {
-            let page = backend
-                .list(bucket, None, None, token.take(), None, Some(SCAN_PAGE))
-                .await?;
-            for o in page.contents.unwrap_or_default() {
-                let Some(k) = o.key else { continue };
-                let etag = o.e_tag.unwrap_or_default().trim_matches('"').to_string();
-                each(k, o.size.unwrap_or(0).max(0) as u64, etag);
-            }
-            match page.next_continuation_token {
-                Some(t) => token = Some(t),
-                None => break,
+            } else {
+                buckets.reconcile(&bucket, Trigger::Unaccounted);
             }
         }
         Ok(())
     }
-}
-
-/// The framed size a single-part remote object would have for a `plen`-byte plaintext (§6). A
-/// markerless live body is always single-part — a composite is tombstoned at K with its plaintext in
-/// the shadow — so this is exact where the scan applies it.
-fn single_part_framed_len(plen: u64) -> Option<u64> {
-    hypha_format::offset::ciphertext_len(plen, hypha_format::offset::HLEN)
-        .checked_add(hypha_format::SINGLE_TRAILER_LEN as u64)
-}
-
-async fn write_marker(tier: &Reconciler, r: &Repair) -> Result<()> {
-    tier.meta
-        .put_small(
-            &r.bucket,
-            meta::pending_marker_key(&r.key),
-            r.payload.clone().into_bytes(),
-            HashMap::new(),
-            None,
-            None,
-        )
-        .await
-        .map(|_| ())
 }
 
 /// Drains the repair queue for the life of the process, then seals.
@@ -416,7 +279,12 @@ impl Worker {
     async fn write_all(&self, owed: &mut HashMap<(String, String), Repair>) {
         let failed: Vec<Repair> = futures::stream::iter(owed.drain().map(|(_, r)| r))
             .map(|r| async move {
-                match write_marker(&self.inner.tier, &r).await {
+                match self
+                    .inner
+                    .tier
+                    .raise_marker(&r.bucket, &r.key, &r.payload)
+                    .await
+                {
                     Ok(()) => None,
                     Err(e) => {
                         tracing::warn!(bucket = r.bucket, key = r.key, error = %e, "marker write failed; retrying");

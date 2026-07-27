@@ -10,8 +10,9 @@
 //! LIST** past [`meta::marker_scan_start_after`] enumerates the pending set — `O(pending)`, never
 //! `O(evicted)`. Each key is handled under its **upload** lock (§4), distinct from the write lock a
 //! client PUT takes, so a replication upload never queues a conditional write behind a multi-second
-//! transfer. The marker clear is conditional on the ETag the LIST returned, so a PUT that landed a
-//! newer body mid-pass simply defers that key to the next pass rather than being lost.
+//! transfer; a key already uploading is skipped, not queued ([`Reconcile::reconcile_key`]). The
+//! marker clear is conditional on the ETag the LIST returned, so a PUT that landed a newer body
+//! mid-pass simply defers that key to the next pass rather than being lost.
 //!
 //! Lifecycle is implicit: the task holds a `Weak` to the service's liveness sentinel (§3, `Hypha`)
 //! and exits once the service drops, so no explicit shutdown channel is needed. A process crash
@@ -126,8 +127,18 @@ impl Reconcile {
     /// Reconcile one pending key, under its upload lock (§7). Classify K's cache body once to pick the
     /// branch; the branch primitives re-read K under the lock and CAS every mutation, so any write
     /// that raced in between is either uploaded correctly or deferred, never lost.
+    ///
+    /// `try_lock`, so pending passes for K **coalesce onto the in-flight one** instead of queuing
+    /// behind it. Waiters would be redundant — the holder re-reads K's body under the lock, so it
+    /// carries whatever landed while it ran, and anything it can't account for leaves the marker
+    /// standing for the next pass. They would also be harmful: on a hot key each queued waiter
+    /// re-uploads in turn, so the newest generation's upload starts only once the whole redundant
+    /// queue drains, and a key written faster than it uploads never converges — an unbounded loss
+    /// window. Unlike a rehydrate, an upload holds no write lock, so a client write can't cancel it.
     async fn reconcile_key(&self, bucket: &str, key: &str, m_etag: &str) -> Result<()> {
-        let _up = self.tier.upload_locks.lock(key).await;
+        let Some(_up) = self.tier.upload_locks.try_lock(key) else {
+            return Ok(());
+        };
 
         let head = match self.tier.data.head(bucket, key).await {
             Ok(h) => h,

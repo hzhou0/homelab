@@ -21,6 +21,17 @@ use hypha_core::{meta, Backend};
 use crate::codec::{self, PartSegment, SingleTrailer};
 use crate::keylocks::KeyLocks;
 
+/// One LIST page while walking a namespace.
+const SCAN_PAGE: i32 = 1000;
+
+/// The framed size a single-part remote object would have for a `plen`-byte plaintext (§6). A
+/// markerless live body is always single-part — a composite is tombstoned at K with its plaintext in
+/// the shadow — so this is exact where [`Reconciler::classify_cache_entry`] applies it.
+fn single_part_framed_len(plen: u64) -> Option<u64> {
+    hypha_format::offset::ciphertext_len(plen, hypha_format::offset::HLEN)
+        .checked_add(SINGLE_TRAILER_LEN as u64)
+}
+
 #[derive(Clone)]
 pub struct Reconciler {
     /// `<data>` cache bucket: client bodies and tombstones at bare `K` (§6).
@@ -35,10 +46,32 @@ pub struct Reconciler {
     /// transitions, and rehydrate all serialize on it.
     pub locks: KeyLocks,
     /// The **upload** lock table (§4) — a *second* instance, reconcile-only. Same-key reconcile
-    /// passes serialize here so an unserialized older upload can't finish after a newer one and leave
-    /// the remote stale, while a replication upload never blocks a client's conditional PUT (which
-    /// takes `locks`, not this).
+    /// passes mutually exclude here so an unserialized older upload can't finish after a newer one
+    /// and leave the remote stale, while a replication upload never blocks a client's conditional PUT
+    /// (which takes `locks`, not this). Held via `try_lock`: a pass that finds K busy coalesces onto
+    /// the in-flight upload rather than queuing, so this table never accumulates waiters.
     pub upload_locks: KeyLocks,
+    /// Cached mode (§4). Decides who wins when a surviving cache entry and the remote disagree: in
+    /// cached mode the cache write *is* the commit, so a generation the remote lacks is an acked
+    /// write still owed to it; in durable mode the remote is the commit, so the same divergence is
+    /// a stale projection. See [`Self::classify_cache_entry`].
+    pub cached: bool,
+}
+
+/// What a surviving cache entry at K means once reconciled against the remote (§7) — the shared
+/// verdict driving [`Reconciler::reconcile_bucket`], which both restores an untrusted namespace and
+/// rebuilds a bucket's pending set (§7) — one traversal, because both jobs turn on this one
+/// question.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CacheVerdict {
+    /// The cache holds a committed write the remote lacks — an acked PUT, or a delete it has not
+    /// honoured. **Cache wins**: the entry stands as written, and owes a pending marker.
+    Pending,
+    /// Cache and remote already agree. Leave K exactly as it is.
+    Agrees,
+    /// The cache entry is unresolved, or contradicted by the remote. **Remote wins**: settle K by
+    /// the repair rule ([`Reconciler::repair_locked`]).
+    Stale,
 }
 
 /// What one reconcile upload attempt found at K (§7). The marker is cleared only on a real upload;
@@ -167,44 +200,250 @@ impl Reconciler {
         Ok(Some(facts))
     }
 
-    /// Rebuild a bucket's cache namespace from the remote — the §7 restore sweep, per bucket. LIST
-    /// the remote and materialize each object's eviction tombstone + twin from its authenticated
-    /// tail trailer ([`Self::repair_locked`]), then write the sync marker so the bucket flips
-    /// cache-authoritative. Idempotent (repair only re-settles what a key already resolves to), so a
-    /// crash mid-sweep resumes by re-running — the marker, written last, is the only "done" signal.
-    /// Assumes the cache buckets already exist.
-    pub(crate) async fn restore_bucket(&self, bucket: &str) -> Result<()> {
+    /// Reconcile a bucket's cache namespace with the remote — the §7 restore sweep, per bucket.
+    /// Idempotent, so a crash mid-pass resumes by re-running. Assumes the cache buckets already
+    /// exist; the caller writes the sync marker once this returns, which is the only "done" signal.
+    ///
+    /// This is **also** the recovery scan (§7): rebuilding the pending-marker index and settling the
+    /// namespace are the same traversal over the same two listings, and both hinge on the same
+    /// question — which side of a divergence at K is the committed one. Splitting them was a bug
+    /// factory: two snapshots of the same state, taken at different moments and acted on
+    /// independently, could disagree, and a scan calling K pending where restore called it stale
+    /// would raise a marker over a key restore had just overwritten (an inert marker no sweep ever
+    /// clears). One pass over one map cannot. So the pass does both jobs at once — `Pending` keys
+    /// get their marker, everything else gets settled — and the two callers differ only in what
+    /// made them ask (see [`crate::bucket_ctl`]).
+    ///
+    /// **Bidirectional**, because restore is not only a rebuild-from-nothing. A lost cache volume
+    /// is the easy case — the cache walk finds no entries and every remote key materializes. But
+    /// restore also runs on a bucket whose cache *survived* and whose marker did not: a crash
+    /// mid-sweep, a crash before a clean marker, a `reset_cache` that failed partway. There the
+    /// cache holds committed state the remote has not got yet, and in cached mode the cache write
+    /// **is** the ack — so a remote-wins sweep would settle an acked PUT down to the older remote
+    /// generation and resurrect an acked DELETE as a live object. Both are silent losses of a write
+    /// hypha already told a client had succeeded, which no later pass can detect: the sweep's
+    /// classify sees a well-formed eviction tombstone and the pending marker it can no longer
+    /// explain is cleared as an orphan.
+    ///
+    /// So the pass walks **both** namespaces and settles every key of their union by
+    /// [`Self::classify_cache_entry`]. Cached-mode writes that win keep their body or tombstone
+    /// untouched and have their pending marker re-raised, so the reconcile sweep pushes them out
+    /// once the bucket is ready — this pass hands them back to the normal pending path rather than
+    /// completing them itself. Returns how many markers it raised.
+    ///
+    /// Both listings are resident, bounded by one bucket's key count.
+    pub(crate) async fn reconcile_bucket(&self, bucket: &str) -> Result<usize> {
+        // Framed sizes, so the merge settles most keys without a per-key remote HEAD: a remote
+        // object's framed length is the closed form over its plaintext length, so an overwrite that
+        // changed that length is caught from the listing alone (§6).
+        let mut remote = HashMap::new();
+        self.walk(&self.remote, bucket, |k, size, _| {
+            remote.insert(k, size);
+        })
+        .await?;
+
+        let mut cache = HashMap::new();
+        self.walk(&self.data, bucket, |k, size, etag| {
+            cache.insert(k, (size, etag));
+        })
+        .await?;
+
+        let keys: Vec<String> = cache
+            .keys()
+            .cloned()
+            .chain(remote.keys().filter(|k| !cache.contains_key(*k)).cloned())
+            .collect();
+
+        let mut raised = 0;
+        for key in keys {
+            let remote_framed = remote.get(&key).copied();
+            let _guard = self.locks.lock(&key).await;
+
+            let mut entry = cache.get(&key).cloned();
+            let mut verdict = self
+                .verdict_for(bucket, &key, &entry, remote_framed)
+                .await?;
+
+            // Both walks are snapshots, and serving is never gated during a restore (§7) — a client
+            // PUT or DELETE can have acked at K in the interval, and in cached mode that ack *is*
+            // the commit. Settling K on a stale listing would destroy it exactly as a remote-wins
+            // sweep would. So before the one arm that overwrites, re-read K now that the lock pins
+            // it, and re-decide. Only that arm pays the HEAD: `Pending` re-raises a marker (last
+            // writer wins) and `Agrees` writes nothing, so neither can lose a racing write.
+            if self.cached && verdict == CacheVerdict::Stale {
+                entry = self.cache_entry(bucket, &key).await?;
+                verdict = self
+                    .verdict_for(bucket, &key, &entry, remote_framed)
+                    .await?;
+            }
+
+            match verdict {
+                // The entry stands as written; the marker hands it to the reconcile sweep once the
+                // bucket is ready, rather than this pass completing the write itself. Only a
+                // classified entry is ever `Pending`, so the `None` arm is unreachable.
+                CacheVerdict::Pending => {
+                    if let Some((_, etag)) = &entry {
+                        self.raise_marker(bucket, &key, etag).await?;
+                        raised += 1;
+                    }
+                }
+                CacheVerdict::Agrees => {}
+                CacheVerdict::Stale => {
+                    self.repair_locked(bucket, &key).await?;
+                }
+            }
+        }
+
+        Ok(raised)
+    }
+
+    /// [`Self::classify_cache_entry`] over a cache entry that may not exist: no entry means K is
+    /// remote-only, which the repair rule materializes.
+    async fn verdict_for(
+        &self,
+        bucket: &str,
+        key: &str,
+        entry: &Option<(u64, String)>,
+        remote_framed: Option<u64>,
+    ) -> Result<CacheVerdict> {
+        match entry {
+            Some((size, etag)) => {
+                self.classify_cache_entry(bucket, key, *size, etag, remote_framed)
+                    .await
+            }
+            None => Ok(CacheVerdict::Stale),
+        }
+    }
+
+    /// K's `<data>` entry as `(size, ETag)`, or `None` if the cache does not hold one.
+    async fn cache_entry(&self, bucket: &str, key: &str) -> Result<Option<(u64, String)>> {
+        match self.data.head(bucket, key).await {
+            Ok(h) => Ok(Some((
+                h.content_length().unwrap_or(0).max(0) as u64,
+                h.e_tag().unwrap_or_default().trim_matches('"').to_string(),
+            ))),
+            Err(Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reconcile one surviving cache entry against the remote (§7). `size`/`etag` are K's `<data>`
+    /// entry as listed, `remote_framed` the framed size of the remote object at K if it holds one.
+    /// What makes a cached write pending is a live body whose generation the remote lacks, or a
+    /// delete-tombstone the remote has not honoured — derivable from cache and remote alone, which
+    /// is exactly why a lost pending marker costs durability rather than the write (§7).
+    ///
+    /// Triage keeps this to the two listings in the common case: a key the remote lacks diverges
+    /// outright, and for one it holds, a single-part object's framed size is the closed form over
+    /// the cache body's plaintext length — so any overwrite that changed that length is caught with
+    /// no extra request. Only a same-length overwrite is ambiguous, and only it pays a tail read.
+    pub(crate) async fn classify_cache_entry(
+        &self,
+        bucket: &str,
+        key: &str,
+        size: u64,
+        etag: &str,
+        remote_framed: Option<u64>,
+    ) -> Result<CacheVerdict> {
+        // Who owns a generation the other side lacks. In cached mode the cache write is the commit,
+        // so it is an acked write still owed to the remote; in durable mode the remote is, so the
+        // cache entry is a stale projection to re-settle.
+        let diverged = if self.cached {
+            CacheVerdict::Pending
+        } else {
+            CacheVerdict::Stale
+        };
+
+        Ok(match meta::classify_entry(size as i64, etag) {
+            // Unpropagated by definition: the sweep's delete branch clears the tombstone and the
+            // marker together, so a surviving tombstone is owed one either way. That also frees a
+            // tombstone stranded by a crash between the remote delete and the clear, which nothing
+            // else revisits. A durable delete commits on the remote first, so there the same
+            // tombstone is a half-finished bracket for the repair rule.
+            Some(meta::TombKind::Delete) => diverged,
+            // Already settled from the remote once, and its metadata is the *only* copy of the
+            // client's `x-amz-meta-*` and storage class — the trailer holds facts and nothing else
+            // (§7). So while the remote still backs it, re-deriving it would only erase those;
+            // re-derive exactly when the remote no longer does.
+            Some(meta::TombKind::Evict) if remote_framed.is_some() => CacheVerdict::Agrees,
+            Some(meta::TombKind::Evict) => CacheVerdict::Stale,
+            // A mark is precisely what the repair rule exists to resolve, in either mode.
+            Some(meta::TombKind::Transit) => CacheVerdict::Stale,
+            None => match remote_framed {
+                None => diverged,
+                Some(framed) => match single_part_framed_len(size) {
+                    Some(expect) if expect != framed => diverged,
+                    // Same framed length: only the trailer can tell the generations apart.
+                    _ => {
+                        if self.remote_generation_matches(bucket, key, etag).await? {
+                            CacheVerdict::Agrees
+                        } else {
+                            diverged
+                        }
+                    }
+                },
+            },
+        })
+    }
+
+    /// Does the remote's trailer carry the cache body's client ETag?
+    ///
+    /// A trailer that does not authenticate is fatal here as at every other site that reads one
+    /// ([`hypha_core::fatal`]): hypha is the sole writer of these buckets, so the object is not
+    /// stray junk to be tidied away — either something else writes here or this process holds the
+    /// wrong trailer key. Reading it as a plain "no" would be worse than a wrong answer, because
+    /// this answer *authorizes an overwrite*: the marker it owes sends the sweep to upload the
+    /// cache body over the object hypha just failed to identify.
+    pub(crate) async fn remote_generation_matches(
+        &self,
+        bucket: &str,
+        key: &str,
+        etag: &str,
+    ) -> Result<bool> {
+        let Some(tail) = self.read_tail(bucket, key).await? else {
+            hypha_core::fatal::foreign_object(bucket, key)
+        };
+        Ok(tail.footer.client_etag() == etag)
+    }
+
+    /// Raise K's pending marker at `payload` (the cache body's ETag). Last writer wins — only the
+    /// marker's own ETag matters to the sweep, which CASes on it — so re-raising one is harmless.
+    pub(crate) async fn raise_marker(&self, bucket: &str, key: &str, payload: &str) -> Result<()> {
+        self.meta
+            .put_small(
+                bucket,
+                meta::pending_marker_key(key),
+                payload.as_bytes().to_vec(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// `(key, size, ETag)` for every entry of one flat namespace, paged to exhaustion.
+    pub(crate) async fn walk(
+        &self,
+        backend: &Backend,
+        bucket: &str,
+        mut each: impl FnMut(String, u64, String),
+    ) -> Result<()> {
         let mut token = None;
         loop {
-            let page = self
-                .remote
-                .list(bucket, None, None, token, None, Some(1000))
+            let page = backend
+                .list(bucket, None, None, token.take(), None, Some(SCAN_PAGE))
                 .await?;
-            let keys: Vec<String> = page
-                .contents
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|o| o.key)
-                .collect();
-            for key in keys {
-                let _guard = self.locks.lock(&key).await;
-                self.repair_locked(bucket, &key).await?;
+            for o in page.contents.unwrap_or_default() {
+                let Some(k) = o.key else { continue };
+                let etag = o.e_tag.unwrap_or_default().trim_matches('"').to_string();
+                each(k, o.size.unwrap_or(0).max(0) as u64, etag);
             }
             match page.next_continuation_token {
                 Some(t) => token = Some(t),
                 None => break,
             }
         }
-        self.meta
-            .put_small(
-                bucket,
-                &meta::sync_marker_key(),
-                Vec::new(),
-                HashMap::new(),
-                None,
-                None,
-            )
-            .await?;
         Ok(())
     }
 
@@ -269,14 +508,15 @@ impl Reconciler {
     /// GET response that streams the body, so the framed facts can never disagree with the
     /// uploaded bytes. Assumes the caller holds `key`'s lock.
     ///
-    /// The reconciler serializes same-key passes on the dedicated per-key **upload** lock
+    /// The reconciler excludes same-key passes on the dedicated per-key **upload** lock
     /// ([`Self::upload_locks`]), not the write lock — held across the whole upload + marker CAS.
     /// Unserialized same-key uploads can finish out of order and leave the remote stale with an empty
     /// pending set (§7); the separate instance keeps a conditional PUT from ever queuing behind a
-    /// multi-second transfer.
+    /// multi-second transfer. A pass that finds the lock held drops its attempt rather than waiting
+    /// (see [`crate::replication`]) — this body read is the coalescing point, since it picks up
+    /// whatever generation is current when the lock is won.
     ///
-    /// The cache GET yields `plen`, ETag, and body from **one** response, so the framed facts can't
-    /// disagree with the uploaded bytes. Reconcile takes only the upload lock, so a cached delete
+    /// Reconcile takes only the upload lock, so a cached delete
     /// (which takes the *write* lock) can overwrite K with a tombstone concurrently — hence the
     /// classify guard: a sentinel body is never uploaded as if it were a client object.
     pub(crate) async fn upload_locked(&self, bucket: &str, key: &str) -> Result<UploadOutcome> {
