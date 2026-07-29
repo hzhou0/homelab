@@ -442,7 +442,7 @@ impl Tiering {
     /// again. Deliberately *not* done here: this PUT is what drives the remote fetch, so it is the
     /// long, cancellable half of a rehydrate (§8), while the twin drop must run to completion — a
     /// cancel between the two would leave a live body beside a stale twin (benign, ignored by the
-    /// LIST gate per §6, but debris nothing else reclaims until phase 5).
+    /// LIST gate per §6, but debris only an orphan-twin sweep reclaims).
     pub(crate) async fn land_rehydrated_single_locked(
         &self,
         bucket: &str,
@@ -466,9 +466,8 @@ impl Tiering {
         Ok(())
     }
 
-    /// Whether K's shadow body already holds the current composite generation (its stored digest and
-    /// ETag both match) — a HEAD, no body fetch. Lets a rehydrate skip re-downloading a composite an
-    /// earlier read already landed (§8).
+    /// Whether K's shadow body already holds the current composite generation — a HEAD, no body
+    /// fetch. Lets a rehydrate skip re-downloading a composite an earlier read already landed (§8).
     pub(crate) async fn shadow_is_current(
         &self,
         bucket: &str,
@@ -476,7 +475,7 @@ impl Tiering {
         cetag: &str,
     ) -> Result<bool> {
         match self.meta.head(bucket, &meta::shadow_key(key)).await {
-            Ok(h) => Ok(shadow_matches(h.metadata(), key, cetag)),
+            Ok(h) => Ok(shadow_is_generation(h.metadata(), cetag)),
             Err(Error::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
@@ -547,13 +546,12 @@ impl Tiering {
     }
 
     /// **Rehydrate** a composite into its shadow body (§8): a rehydrated composite's plaintext lives
-    /// at `sha256(K)`-keyed [`meta::shadow_key`] (a point lookup, so K's length can't constrain it),
-    /// with the full-width key digest in metadata for the read-time collision check. K's tombstone
-    /// and twin stay untouched, so composite rehydration is invisible to LIST/HEAD and rewrites no
-    /// twin. Caller holds K's write lock.
+    /// at `sha256(K)`-keyed [`meta::shadow_key`] (a point lookup, so K's length can't constrain it).
+    /// K's tombstone and twin stay untouched, so composite rehydration is invisible to LIST/HEAD and
+    /// rewrites no twin. Caller holds K's write lock.
     ///
     /// The shadow key is deterministic in K, so a later composite at K overwrites the *same* shadow —
-    /// but a same-K key digest doesn't distinguish generations. `cetag` (the rehydrated composite's
+    /// which means the key alone cannot distinguish generations. `cetag` (the rehydrated composite's
     /// client ETag) rides the metadata and is checked against the current tombstone on read, so a
     /// shadow left over from a superseded generation misses and re-rehydrates rather than serving
     /// stale bytes under the new ETag.
@@ -566,11 +564,13 @@ impl Tiering {
         cetag: &str,
     ) -> Result<()> {
         let mut md = HashMap::new();
-        md.insert(
-            meta::SHADOW_KEY_DIGEST.to_string(),
-            meta::shadow_key_digest(key),
-        );
         md.insert(meta::CETAG.to_string(), cetag.to_string());
+        // The back-pointer the digest key cannot provide: without it a shadow whose K was deleted or
+        // overwritten is unreachable *and* unidentifiable, so nothing could ever judge it (§8).
+        md.insert(
+            meta::SHADOW_CLIENT_KEY.to_string(),
+            meta::encode_shadow_client_key(key),
+        );
         self.meta
             .put(
                 bucket,
@@ -592,14 +592,21 @@ impl Tiering {
     /// conditional on its current ETag so a concurrent writer aborts us. Assumes the caller holds
     /// `key`'s lock.
     ///
-    /// `remote_confirmed`: the caller already knows the remote copy is present. Pass `false`
-    /// from the cached-mode GC, which must gate tombstoning on a successful remote HEAD (§7).
-    #[allow(dead_code)] // phase 5: the GC scavenger's eviction transition
+    /// `expected_etag` is the generation the caller judged — the version token §8's `If-Match`
+    /// conditions on. The durability gate is the caller's: this writes the tombstone unconditionally
+    /// once the CAS holds, so whoever calls it must already have confirmed that the remote holds
+    /// *this* generation ([`crate::gc`]). A bare presence check is not that confirmation — the remote
+    /// holding an older generation would have the tombstone stamped with the cache body's facts, and
+    /// reads would return the old plaintext under the new ETag and length.
+    ///
+    /// The fresh HEAD is compared against `expected_etag` before anything is written: the CAS below
+    /// would refuse a superseded generation anyway, but the twin is written first, and a twin built
+    /// from a *different* generation's facts is debris that outlives the failed attempt.
     pub(crate) async fn tombstone_locked(
         &self,
         bucket: &str,
         key: &str,
-        remote_confirmed: bool,
+        expected_etag: &str,
     ) -> Result<()> {
         let head = self.data.head(bucket, key).await?;
         let body_etag = head
@@ -607,16 +614,15 @@ impl Tiering {
             .unwrap_or_default()
             .trim_matches('"')
             .to_string();
+        if body_etag != expected_etag {
+            return Err(Error::PreconditionFailed);
+        }
         let plen = head.content_length().unwrap_or(0).max(0) as u64;
         // Eviction must not move the key's client-visible LastModified (§6).
         let mtime_ms = head
             .last_modified()
             .map(|t| t.to_millis().unwrap_or_default())
             .unwrap_or_else(now_ms);
-        if !remote_confirmed {
-            // Durability-gates-GC (§7): never tombstone a body whose ciphertext isn't on the remote.
-            self.remote.head(bucket, key).await?;
-        }
 
         let facts = meta::Facts {
             client_etag: body_etag.clone(),
@@ -687,18 +693,17 @@ fn parse_content_range_total(content_range: &str) -> Option<u64> {
     content_range.rsplit_once('/')?.1.trim().parse().ok()
 }
 
-/// Whether a shadow body's metadata identifies it as K's *current* composite generation (§6/§8):
-/// the full key digest must match (the shadow key is only a 160-bit prefix) **and** the stored client
-/// ETag must equal `cetag` (the live tombstone's), so a shadow left over from a superseded generation
-/// is treated as a miss.
-pub(crate) fn shadow_matches(
+/// Whether a shadow body is K's *current* composite generation (§6/§8). Only the generation is in
+/// question — the shadow key is the whole digest of K, so a shadow found under it is K's — and a
+/// shadow left over from a superseded generation is treated as a miss.
+pub(crate) fn shadow_is_generation(
     metadata: Option<&HashMap<String, String>>,
-    key: &str,
     cetag: &str,
 ) -> bool {
-    let Some(md) = metadata else { return false };
-    md.get(meta::SHADOW_KEY_DIGEST) == Some(&meta::shadow_key_digest(key))
-        && md.get(meta::CETAG).map(String::as_str) == Some(cetag)
+    metadata
+        .and_then(|md| md.get(meta::CETAG))
+        .map(String::as_str)
+        == Some(cetag)
 }
 
 /// Resolve a plaintext range against a composite's parts (§7): with per-part windows and plaintext

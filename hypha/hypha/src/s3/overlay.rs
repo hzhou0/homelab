@@ -28,6 +28,7 @@ use hypha_core::meta;
 use super::get::facts_from_tombstone;
 use super::{ts_ms, Hypha};
 use crate::bucket::Readiness;
+use crate::gc::Plaintext;
 use crate::tier::RemoteFacts;
 
 /// Bounded fan-out for the per-key trailer reads a remote-served LIST page needs (§7).
@@ -82,8 +83,14 @@ impl Hypha {
         // sources reach the ring by construction, and a future single-key read cannot forget to.
         // LIST resolves pages elsewhere and never lands here, which is exactly the exclusion §8
         // wants. An absent key has no body to protect.
-        if !matches!(state, KeyState::Absent) {
-            self.gc.touch(bucket, key);
+        // Which artifact holds the plaintext decides what the touch protects: a composite's lives in
+        // K's shadow, and K itself holds a tombstone no eviction would take.
+        match &state {
+            KeyState::Absent => {}
+            KeyState::Remote { facts, .. } => {
+                self.gc.touch(bucket, key, Plaintext::of(&facts.cetag))
+            }
+            KeyState::CacheBody { .. } => self.gc.touch(bucket, key, Plaintext::AtKey),
         }
         Ok(state)
     }

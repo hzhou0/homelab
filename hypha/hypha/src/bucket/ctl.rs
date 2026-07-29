@@ -25,6 +25,7 @@ use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
 use super::{rebuild, restore};
+use crate::gc::orphans;
 use crate::halt::{Invariant, Violation};
 use crate::tier::Tiering;
 
@@ -59,6 +60,11 @@ pub(crate) struct BucketState {
     /// evidence only: **absence is the default**, so a bucket left dirty by an earlier crash and
     /// untouched since simply is not accounted and ends the run dirty.
     accounted: bool,
+    /// The same claim for orphaned shadow bodies (§8), tracked separately because the two failures cost
+    /// wildly different recoveries: an unaccounted pending set means a full two-cursor rebuild, an
+    /// unaccounted shadow range means one prefix listing. Folding them together would let a few leaked
+    /// bytes trigger the expensive pass.
+    shadows_accounted: bool,
 }
 
 /// A bucket's source of truth for the data plane, and the whole of what the overlay branches on.
@@ -112,6 +118,14 @@ fn set_accounted(state: &mut BucketState) {
 
 fn clear_accounted(state: &mut BucketState) {
     state.accounted = false;
+}
+
+fn set_shadows_accounted(state: &mut BucketState) {
+    state.shadows_accounted = true;
+}
+
+fn clear_shadows_accounted(state: &mut BucketState) {
+    state.shadows_accounted = false;
 }
 
 /// Forget a bucket entirely — it no longer exists, so the next access re-classifies from scratch and
@@ -260,6 +274,25 @@ impl BucketCtl {
             .collect()
     }
 
+    /// The shadow-range equivalent (§8): its marker was present at startup, or this run's backstop
+    /// sweep judged every shadow in it.
+    pub(crate) fn account_shadows_for(&self, bucket: &str) {
+        update(&self.states, bucket, set_shadows_accounted);
+    }
+
+    pub(crate) fn unaccount_shadows(&self, bucket: &str) {
+        update(&self.states, bucket, clear_shadows_accounted);
+    }
+
+    pub(crate) fn shadows_accounted(&self) -> Vec<String> {
+        self.states
+            .load()
+            .iter()
+            .filter(|(_, s)| s.shadows_accounted)
+            .map(|(bucket, _)| bucket.clone())
+            .collect()
+    }
+
     async fn request(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<()>>) -> BucketMsg,
@@ -289,8 +322,12 @@ impl BucketCtl {
 pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<()> {
     for (bucket, _) in tier.remote.list_buckets().await? {
         let synced = marker_present(tier, &bucket, &meta::sync_marker_key()).await?;
-        // Durable mode has no pending set: it writes no clean markers and reads none back.
-        let accounted = tier.cached && take_clean_marker(tier, &bucket).await?;
+        // Durable mode has neither a pending set nor shadow bodies: it writes no clean markers of
+        // either kind and reads none back.
+        let accounted =
+            tier.cached && take_marker(tier, &bucket, &meta::clean_marker_key()).await?;
+        let shadows_accounted =
+            tier.cached && take_marker(tier, &bucket, &meta::shadow_clean_marker_key()).await?;
 
         if !synced {
             buckets.restore(&bucket);
@@ -301,6 +338,15 @@ pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<(
             buckets.account_for(&bucket);
         } else if tier.cached {
             buckets.rebuild_pending(&bucket);
+        }
+        // Not a `Recovery`: that slot is a single one per bucket, deliberately, so that "never both a
+        // restore and a rebuild" is structural — and a bucket can owe a shadow sweep alongside either.
+        // The sweep needs none of the slot's serialization anyway: it takes no lock, writes only in the
+        // shadow range, and every reclaim it makes is idempotent.
+        if shadows_accounted {
+            buckets.account_shadows_for(&bucket);
+        } else if tier.cached {
+            orphans::dispatch_sweep(tier.clone(), buckets.clone(), bucket);
         }
     }
     Ok(())
@@ -315,15 +361,15 @@ async fn marker_present(tier: &Tiering, bucket: &str, key: &str) -> Result<bool>
     }
 }
 
-/// Read the clean marker and delete it: from the moment hypha can take a write, no bucket on disk
-/// claims to be clean. A marker that will not delete fails startup rather than being served around —
-/// skipping the rebuild on it now would skip it again next run, by which time real orphans exist.
-async fn take_clean_marker(tier: &Tiering, bucket: &str) -> Result<bool> {
-    let clean = meta::clean_marker_key();
-    if !marker_present(tier, bucket, &clean).await? {
+/// Read one of the two clean markers and delete it: from the moment hypha can take a write, no bucket
+/// on disk claims to be clean. A marker that will not delete fails startup rather than being served
+/// around — skipping the recovery on it now would skip it again next run, by which time real orphans
+/// exist.
+async fn take_marker(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
+    if !marker_present(tier, bucket, key).await? {
         return Ok(false);
     }
-    tier.meta.delete(bucket, &clean).await?;
+    tier.meta.delete(bucket, key).await?;
     Ok(true)
 }
 

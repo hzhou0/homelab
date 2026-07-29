@@ -34,6 +34,11 @@ s3s-aws = "0.14"
 aws-sdk-s3 = "1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio"] }
+# The §8 usage source, which is HTTP+JSON rather than S3. No TLS feature: the endpoints it reads are
+# the cache backend's own admin surface, in-cluster and plain HTTP, so pulling a second TLS stack in
+# beside the SDK's would buy nothing.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde_json = "1"
 
 # Config / errors / observability
 serde = { version = "1", features = ["derive"] }

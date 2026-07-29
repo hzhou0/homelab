@@ -35,8 +35,11 @@ futures = { workspace = true }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }
 fastbloom = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 # Integration harness (tests/): spawn MinIO as both the cache and the remote backend, drive hypha
 # in-process over an ephemeral port with a real S3 client. Stateless — every fixture cleans up on
 # drop.

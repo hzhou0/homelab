@@ -26,6 +26,7 @@ use hypha_core::Backend;
 
 use crate::background::{self, Background};
 use crate::bucket::BucketCtl;
+use crate::gc::orphans::Orphans;
 use crate::gc::Gc;
 use crate::keylocks::KeyGuard;
 use crate::markers::Markers;
@@ -39,8 +40,8 @@ pub struct Hypha {
     /// The bucket-control actor — sole writer of the cache substrate (§7 *Buckets*). Bucket
     /// lifecycle and repair route here; object reads/writes never do, beyond the 503 repair kick.
     pub(crate) buckets: BucketCtl,
-    /// The background-transition actor (§8): rehydrate today, GC eviction in phase 5. Client writes
-    /// reach it only through [`Hypha::write_lock`], which cancels K's transition before queuing.
+    /// The background-transition actor (§8) — rehydrate. Client writes reach it only through
+    /// [`Hypha::write_lock`], which cancels K's transition before queuing.
     pub(crate) background: Background,
     /// Pending-marker obligations (§7). A cached write acks on its body write and raises the marker
     /// here; the ack never depends on the marker landing.
@@ -50,6 +51,9 @@ pub struct Hypha {
     /// deliberately do not: a full listing would mark the whole keyspace hot, and a delete leaves no
     /// body to protect.
     pub(crate) gc: Gc,
+    /// Shadow-orphan obligations (§8). Every cached write that could have superseded a composite hands
+    /// its key over; the actor is what decides whether there was a shadow to reclaim.
+    pub(crate) orphans: Orphans,
     pub mode: Mode,
     /// Longest configured bucket prefix, charged against S3's 63-byte cap so the client-visible
     /// bucket-name limit is `63 − this` (§7 *Buckets*). Checked at CreateBucket.
@@ -71,6 +75,7 @@ impl Hypha {
         buckets: BucketCtl,
         markers: Markers,
         gc: Gc,
+        orphans: Orphans,
         mode: Mode,
         offload_threshold: usize,
         max_bucket_prefix_len: usize,
@@ -83,6 +88,7 @@ impl Hypha {
             background,
             markers,
             gc,
+            orphans,
             mode,
             max_bucket_prefix_len,
             offload_threshold,

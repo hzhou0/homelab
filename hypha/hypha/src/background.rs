@@ -27,9 +27,13 @@
 //! neither keeps the service's liveness sentinel alive nor needs shutdown plumbing — it drains and
 //! exits once the last handle drops.
 //!
-//! Phase 5 adds the GC scavenger's own transitions (evict, shadow-evict) as further [`Transition`]
-//! variants: they are discardable on exactly the same grounds — an eviction abandoned because a
-//! client wants the key is an eviction that should not have run.
+//! **Eviction is deliberately not here**, though it is equally discardable. §8's rung 2 makes GC's
+//! own concurrency the bound on per-key eviction work, so that work has to belong to a GC pass or
+//! raising it under pressure would move nothing — and a pass has to count the bytes it reclaimed,
+//! which is the evidence the whole ladder moves on. Eviction needs none of this module's other
+//! properties either: it holds K's write lock across a twin refresh and a 16-byte conditional PUT,
+//! not across a transfer, so a client write simply takes the lock next and the CAS fails the
+//! eviction that lost.
 
 use std::sync::Arc;
 

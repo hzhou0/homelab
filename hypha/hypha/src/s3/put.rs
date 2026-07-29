@@ -25,6 +25,7 @@ use super::{
     parse_content_md5, resolve_storage_class, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
 };
 use crate::codec::{self, SingleTrailer};
+use crate::gc::Plaintext;
 use crate::tier;
 
 impl Hypha {
@@ -168,8 +169,9 @@ impl Hypha {
 
         // The write half of §8's recency feed. A write is the strongest statement of interest a key
         // gets, and a read-only ring would have write-hot/read-cold keys evict first — reclaiming
-        // bytes the next PUT immediately takes back.
-        self.gc.touch(&bucket, &key);
+        // bytes the next PUT immediately takes back. Always `AtKey`: a PUT is single-part, so its
+        // plaintext lives at K whether it stays cached or is rehydrated back there later.
+        self.gc.touch(&bucket, &key, Plaintext::AtKey);
         let resp = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag)),
             ..Default::default()
@@ -258,7 +260,11 @@ impl Hypha {
                 .await?
         };
 
-        self.gc.touch(&bucket, &key);
+        self.gc.touch(&bucket, &key, Plaintext::AtKey);
+        // This write replaced whatever K held; if that was a rehydrated composite, its shadow is now
+        // unreachable (§8). Unconditional here because the unconditional branch above never read K and
+        // so cannot know — the actor resolves it.
+        self.orphans.owe(&bucket, &key);
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(etag)),
             ..Default::default()

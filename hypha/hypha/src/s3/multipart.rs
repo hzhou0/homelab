@@ -26,6 +26,7 @@ use super::{
     copied_part_retag, resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
 };
 use crate::codec;
+use crate::gc::Plaintext;
 use crate::tier::{self, RemoteFacts};
 
 /// A fresh token naming one part's retained ciphertext ([`meta::mpu_stash_key`]). Minted before the
@@ -606,7 +607,13 @@ impl Hypha {
             .await?;
         self.drop_mpu_state(&bucket, &upload_id).await?;
 
-        self.gc.touch(&bucket, &key);
+        // A completed composite is remote-resident with only a tombstone at K, so what a future
+        // eviction could take — and therefore what this write is a statement of interest in — is the
+        // shadow the first read will land (§8).
+        self.gc.touch(&bucket, &key, Plaintext::of(&cetag));
+        // A new composite at K supersedes the previous generation's shadow, which lands at the same
+        // shadow key but under the old generation's ETag and so is unreachable (§8).
+        self.orphans.owe(&bucket, &key);
         let resp = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),
             key: Some(key),

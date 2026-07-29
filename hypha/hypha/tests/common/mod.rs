@@ -491,6 +491,10 @@ fn base_config(minio: &Minio, mode: Mode) -> Config {
                 depth: 3,
                 false_positive_rate: 0.01,
             },
+            // MinIO reports no cache usage, so the harness has no pressure source: passes sweep
+            // debris and never evict. An eviction test supplies its own source.
+            usage: None,
+            ..Gc::default()
         },
         // Tight, so a test that takes a cache volume away mid-run doesn't wait out the production
         // cadence for the watchdog to notice.

@@ -106,8 +106,8 @@ impl Default for Reconcile {
 }
 
 /// Bounds on the background-transition actor (§8, §9) — the queue every discardable per-key
-/// transition is dispatched through (rehydrate now; GC eviction in phase 5). Cached mode only:
-/// durable mode never rehydrates and never evicts, so nothing is ever submitted.
+/// transition is dispatched through — rehydrate; GC eviction runs inside a GC pass instead (§8).
+/// Cached mode only: durable mode never rehydrates, so nothing is ever submitted.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Background {
@@ -145,14 +145,15 @@ impl Default for Background {
 /// escalation ladder may push them before it starts spending the age threshold instead. The bounds
 /// are not tuning: the scavenger shares the remote with the client path and the reconcile sweep, so
 /// `max_concurrency` is what keeps an emergency reclaim from starving the reads it exists to protect.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gc {
     /// Delay between passes with no pressure. Long relative to the reconcile sweep — nothing here is
     /// a durability obligation, so the only cost of a slow pass is reclaimable bytes left unreclaimed.
     #[serde(default = "default_gc_interval_ms")]
     pub interval_ms: u64,
-    /// The floor pressure may shorten the interval to (rung 1). Zero means back-to-back passes.
+    /// The floor pressure may shorten the interval to (rung 1) — its own limit is a continuously
+    /// running walk.
     #[serde(default = "default_gc_min_interval_ms")]
     pub min_interval_ms: u64,
     /// Buckets swept concurrently with no pressure.
@@ -161,8 +162,50 @@ pub struct Gc {
     /// The ceiling pressure may raise concurrency to (rung 2).
     #[serde(default = "default_gc_max_concurrency")]
     pub max_concurrency: usize,
+    /// Usage fraction at which a pass starts evicting.
+    #[serde(default = "default_gc_high_water")]
+    pub high_water: f64,
+    /// Usage fraction a pressured pass reclaims down to — the difference from `high_water` is the
+    /// byte target, so a gap this wide is what stops the scavenger from re-triggering on every pass.
+    #[serde(default = "default_gc_low_water")]
+    pub low_water: f64,
+    /// Pages one probe reads from its random position before moving on (§8). Small on purpose: the
+    /// point of sampling is that scan cost tracks pressure rather than keyspace size.
+    #[serde(default = "default_gc_probe_pages")]
+    pub probe_pages: usize,
+    /// Share of each pass's probes handed out evenly regardless of yield. Pure proportional sampling
+    /// locks onto early winners and never revisits a bucket that went cold later — a scan that learns
+    /// once and then stops learning.
+    #[serde(default = "default_gc_yield_floor")]
+    pub yield_floor: f64,
+    /// Evictions a pass may keep making after its target is met, taking only ring *misses* (§8).
+    /// Over-evicting an affirmatively cold key is nearly free in rehydration risk, but each one still
+    /// costs a remote HEAD, a twin write, and a CAS — hence a bound rather than no limit.
+    #[serde(default = "default_gc_opportunistic_evictions")]
+    pub opportunistic_evictions: usize,
+    /// Where usage is measured. Absent, GC never evicts (§8): with no measure of pressure there is no
+    /// target to evict against, and cached mode warns at boot because its cache will only fill.
+    #[serde(default)]
+    pub usage: Option<Usage>,
     #[serde(default)]
     pub recency: Recency,
+}
+
+/// The cache's usage source (§8). Physical bytes rather than the sum of live object sizes, because
+/// dead bytes awaiting compaction are exactly what makes a cache fill with nobody writing to it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "lowercase")]
+pub enum Usage {
+    /// SeaweedFS: the master's topology names the volume servers, each server's disk status is the
+    /// measurement, and the master's vacuum is the dead-byte reclaim.
+    Seaweedfs {
+        /// Master HTTP base URL, e.g. `http://seaweedfs-master:9333`.
+        master: String,
+        /// Dead-byte fraction a volume must exceed before a vacuum rewrites it. The master applies
+        /// this per volume, so a compaction request costs nothing when nothing is dirty enough.
+        #[serde(default = "default_garbage_threshold")]
+        garbage_threshold: f64,
+    },
 }
 
 /// The shape of §8's recency ring: how much traffic a slice covers, and how far back the ring
@@ -181,7 +224,7 @@ pub struct Recency {
     /// to make a key look old".
     #[serde(default = "default_recency_fill_target")]
     pub fill_target: usize,
-    /// Sealed slices retained behind the current one, so the ring resolves `depth + 1` ages before
+    /// Retired slices kept behind the current one, so the ring resolves `depth + 1` ages before
     /// falling through to *miss*.
     #[serde(default = "default_recency_depth")]
     pub depth: usize,
@@ -223,6 +266,24 @@ fn default_gc_concurrency() -> usize {
 fn default_gc_max_concurrency() -> usize {
     16
 }
+fn default_gc_high_water() -> f64 {
+    0.85
+}
+fn default_gc_low_water() -> f64 {
+    0.70
+}
+fn default_gc_probe_pages() -> usize {
+    5
+}
+fn default_gc_yield_floor() -> f64 {
+    0.2
+}
+fn default_gc_opportunistic_evictions() -> usize {
+    64
+}
+fn default_garbage_threshold() -> f64 {
+    0.3
+}
 
 impl Default for Gc {
     fn default() -> Self {
@@ -231,6 +292,12 @@ impl Default for Gc {
             min_interval_ms: default_gc_min_interval_ms(),
             concurrency: default_gc_concurrency(),
             max_concurrency: default_gc_max_concurrency(),
+            high_water: default_gc_high_water(),
+            low_water: default_gc_low_water(),
+            probe_pages: default_gc_probe_pages(),
+            yield_floor: default_gc_yield_floor(),
+            opportunistic_evictions: default_gc_opportunistic_evictions(),
+            usage: None,
             recency: Recency::default(),
         }
     }
@@ -369,6 +436,33 @@ impl Config {
             return Err(format!(
                 "gc.recency.false_positive_rate ({fpp}) must be in (0, 1) — the slice's bit count \
                  is derived from it"
+            ));
+        }
+        let (high, low) = (self.gc.high_water, self.gc.low_water);
+        if !(0.0..=1.0).contains(&low) || !(0.0..=1.0).contains(&high) {
+            return Err(format!(
+                "gc water marks ({low}, {high}) must be fractions of cache capacity in [0, 1]"
+            ));
+        }
+        // Equal marks are the degenerate case, not a mild one: every pass would trigger and owe a
+        // zero-byte target, so the ladder would ratchet on evidence it can't help but produce.
+        if low >= high {
+            return Err(format!(
+                "gc.low_water ({low}) is not below gc.high_water ({high}) — the gap between them is \
+                 the byte target a pressured pass owes"
+            ));
+        }
+        if self.gc.probe_pages == 0 {
+            return Err(
+                "gc.probe_pages must be non-zero — a probe that reads no pages finds no candidates"
+                    .to_string(),
+            );
+        }
+        if !(0.0..1.0).contains(&self.gc.yield_floor) {
+            return Err(format!(
+                "gc.yield_floor ({}) must be in [0, 1) — at 1 every bucket gets an equal share and \
+                 the yield feedback is switched off",
+                self.gc.yield_floor
             ));
         }
         if self.gc.recency.fill_target == 0 {

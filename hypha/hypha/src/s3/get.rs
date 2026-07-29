@@ -22,7 +22,7 @@ use super::overlay::KeyState;
 use super::{ts_ms, Hypha};
 use crate::background;
 use crate::codec;
-use crate::tier::{shadow_matches, RemoteFacts};
+use crate::tier::{shadow_is_generation, RemoteFacts};
 
 impl Hypha {
     pub(super) async fn op_get_object(
@@ -84,10 +84,10 @@ impl Hypha {
         self.serve_remote(bucket, key, input, facts, md).await
     }
 
-    /// Serve a rehydrated composite from its shadow body, or `None` if there is no verified shadow (a
-    /// miss, or a 160-bit key-digest collision the full digest catches — §6). The shadow holds the
-    /// full plaintext, so a range maps straight through; the client-visible facts (composite ETag,
-    /// plen, mtime, pass-through metadata) come from K's tombstone, not the shadow's native fields.
+    /// Serve a rehydrated composite from its shadow body, or `None` if there is no shadow of this
+    /// generation. The shadow holds the full plaintext, so a range maps straight through; the
+    /// client-visible facts (composite ETag, plen, mtime, pass-through metadata) come from K's
+    /// tombstone, not the shadow's native fields.
     async fn try_serve_shadow(
         &self,
         bucket: &str,
@@ -106,12 +106,11 @@ impl Hypha {
             Err(Error::NotFound) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        // A shadow serves only if it is both K's (full-digest check, since the key is a 160-bit
-        // prefix) *and* the current generation's (its stored ETag equals the live tombstone's cetag).
-        // A superseded shadow — K overwritten by a newer composite — misses here and falls through to
-        // the remote, which re-rehydrates; without the cetag gate it would serve the old bytes under
-        // the new ETag/length.
-        if !shadow_matches(out.metadata(), key, &facts.cetag) {
+        // The shadow key is the whole digest of K, so a hit is K's by construction — only the
+        // generation is in question. A superseded shadow (K overwritten by a newer composite) misses
+        // here and falls through to the remote, which re-rehydrates; without the cetag gate it would
+        // serve the old bytes under the new ETag/length.
+        if !shadow_is_generation(out.metadata(), &facts.cetag) {
             return Ok(None);
         }
 

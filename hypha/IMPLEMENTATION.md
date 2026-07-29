@@ -91,7 +91,7 @@ hypha/src/
   bucket/                the bucket lifecycle (§7) — mod.rs owns marker ⇒ phase ⇒ which recovery:
                          ctl.rs (the actor: sole writer of the cache substrate),
                          restore.rs (R1, remote walk), rebuild.rs (R2, two-cursor join)
-  background.rs          background-transition actor: bounded, deduped, client-cancellable rehydrate/evict (§8)
+  background.rs          background-transition actor: bounded, deduped, client-cancellable rehydrate (§8)
   s3/                    the s3s::S3 impl, split by op group
     put.rs get.rs list_head.rs delete.rs multipart.rs buckets.rs
     overlay.rs           restore overlay: readiness gate + cache-vs-remote source for reads/writes (§7)
@@ -99,7 +99,13 @@ hypha/src/
   volume_watch.rs        the one failure a running process polls for: cache volume loss (§7)
   replication.rs         (phase 4) the cached-mode reconcile sweep (§7)
   gc/                    (phase 5) the GC actor, active-only (§8): mod.rs (the actor — cadence,
-                         recency state, dispatch), ring.rs (the Bloom-ring sketch),
+                         the state it owns, and each pass), ring.rs (the Bloom-ring sketch),
+                         ladder.rs (the pressure ladder as one ordered position),
+                         scan.rs (probes + the learned per-bucket cold yields),
+                         evict.rs (the three eviction gates), orphans.rs (superseded shadow
+                         bodies: the queue, the marker, the backstop),
+                         usage.rs (cache usage +
+                         dead-byte compaction, pluggable per backend),
                          store.rs (GC's own bucket), debris.rs (reclaims with no owner
                          on the client path)
 
@@ -332,7 +338,7 @@ is GC's own, holding the deployment-wide recency ring (§8).
 
 | Range                     | Contents                                              | How it is scanned                                    |
 |---------------------------|-------------------------------------------------------|------------------------------------------------------|
-| `0x01 0x01 ‖ tag ‖ …`     | mpu state, sync + clean markers, recency slices, shadow bodies | prefix scan per tag                         |
+| `0x01 0x01 ‖ tag ‖ …`     | mpu state, sync + clean + shadow-clean markers, shadow bodies | prefix scan per tag                       |
 | `0x01 ‖ K ‖ 0x01 ‖ facts` | facts twins                                           | prefix `0x01 ‖ <client prefix>`, delimiter mirrored  |
 | `K`                       | pending markers, **bare**                             | `start_after` past the `0x01` block                  |
 
@@ -448,19 +454,39 @@ its LIST projection. Eviction never changes a key's client-visible `LastModified
 from the twin, HEAD from the metadata.
 
 **Shadow body** (cached mode): a rehydrated composite's plaintext at
-`0x01 0x01 b ‖ sha256(K)[..160 bits]`. The access pattern is a **point lookup** — "is there a
-rehydrated plaintext for K" — so the key can be a hash, which removes any length condition; the
-eviction path is likewise a point delete driven from K's side. SHA-256 rather than the MD5 already
-in the tree: a shadow collision would serve *another key's plaintext*, the worst failure the system
-has, so the digest must resist deliberate collision, and a second independent digest of K rides the
-shadow's user-metadata to be verified on read (a mismatch is a miss that falls through to the
-remote, turning a corruption risk into a cache miss). K itself cannot ride there — a 1024-byte key
-percent-encodes past S3's 2 KB metadata ceiling. The tombstone and twin at K stay untouched, so
-composite rehydration is invisible to LIST/HEAD and rewrites no twin. Because the shadow key is
-deterministic in K, a *later* composite at K overwrites the same shadow — but the key digest alone
-can't tell generations apart, so the shadow also carries the rehydrated **client ETag** and a read
-serves it only when that equals K's current tombstone `cetag`. A shadow left from a superseded
-generation therefore misses and re-rehydrates rather than serving stale bytes under the new ETag.
+`0x01 0x01 b ‖ base64url(sha256(K))`. The access pattern is a **point lookup** — "is there a
+rehydrated plaintext for K" — so the key can be a digest, which removes any length condition. SHA-256
+rather than the MD5 already in the tree: a shadow collision would serve *another key's plaintext*, the
+worst failure the system has, so the digest must resist deliberate collision. The **whole** digest
+goes in the key, base64url-unpadded — 43 characters, every one control-byte-free and `start-after`-safe
+— which is what makes the collision case go away rather than be *detected*: a truncated digest would
+need a second, wider digest in the shadow's user-metadata, checked on every read, purely so a collision
+degraded to a cache miss. Nothing prefix-scans this key, so its width costs nothing, and the extra 23
+characters buy the deletion of a field and a check. (K itself could not ride in metadata either — a
+1024-byte key percent-encodes past S3's 2 KB ceiling.)
+
+The tombstone and twin at K stay untouched, so composite rehydration is invisible to LIST/HEAD and
+rewrites no twin. Because the shadow key is deterministic in K, a *later* composite at K overwrites the
+same shadow — the key cannot tell generations apart — so the shadow carries the rehydrated **client
+ETag** and a read serves it only when that equals K's current tombstone `cetag`. A shadow left from a
+superseded generation therefore misses and re-rehydrates rather than serving stale bytes under the new
+ETag, and that same ETag is what GC's reclaim conditions on (§8).
+
+The shadow also carries **K itself**, base64url-encoded, as the back-pointer the digest key cannot
+provide. Only §8's orphan backstop reads it, and it is the one thing that makes that pass possible: a
+shadow whose K was deleted or overwritten is unreachable *and* unidentifiable, so there is no way to ask
+K about it from the key side. base64url rather than the percent-encoding the client passthrough uses,
+because the encoding has to be unconditional — percent-encoding a 1024-byte non-ASCII key expands 3×
+and overruns S3's 2 KB user-metadata ceiling, while base64url is a flat 4/3, or 1368 characters at the
+key-length cap. A shadow's metadata is hypha's alone (no client passthrough shares this carrier, unlike
+a tombstone's), so the whole budget is available.
+
+**The shadow-clean marker** (`0x01 0x01 o`, cached mode): present iff no shadow in this bucket has been
+orphaned without being reclaimed. Same positive-evidence discipline and same lifecycle as the pending
+set's clean marker — written only by a graceful drain, deleted at startup before the first request, so a
+running process never has a marker on disk claiming what it can invalidate at any moment. Separate from
+that marker rather than folded into it, because the recoveries their absences trigger differ by orders
+of magnitude (§8).
 
 **The pending marker** (cached mode) lives in `<meta><b>` at **bare `K`** — **one per key**,
 body = the body ETag of the most recently acked PUT. Concurrent PUTs overwrite it; last writer
@@ -1653,9 +1679,79 @@ overrides the correctness gates below. Eviction of candidate K with version-toke
 
 A writer landing anywhere between steps 1 and 3 has moved the ETag, so step 3's `If-Match: E_v`
 fails and eviction retries next pass — the layering (marker → remote generation → conditional CAS)
-makes every interleaving auto-healing, never lossy. **Shadow bodies** (§6) are
-evicted from their own reserved-prefix windows: confirm the remote composite (HEAD), then delete
-the shadow — K's tombstone and twin are already in place.
+makes every interleaving auto-healing, never lossy.
+
+**Shadow bodies** (§6) are the other thing in the cache holding a client's plaintext, so the same scan
+finds them — a prefix probe of `0x01 0x01 b`, since a shadow key is a digest and no client key derives
+one. **K is not recoverable from a shadow key**, and that shapes both halves of the recipe above, in
+opposite directions.
+
+*The gates fall away entirely.* A shadow exists only because a rehydrate fetched that composite from
+the remote and decrypted it, and the land leaves K's tombstone and twin untouched throughout — so the
+remote demonstrably holds the object, K still points at it, and dropping the shadow costs at most a
+re-fetch on the next read. Nothing to gate, nothing to lock (there is no K to lock on anyway), and
+nothing that can be half-applied: one **conditional delete on the shadow's observed ETag**, which is
+there not for correctness but so a rehydrate that landed a newer generation mid-pass isn't thrown away
+seconds after a client waited for it.
+
+*The ordering has to be arranged in advance.* Ages come from a ring keyed by `<bucket>/<key>`, and a
+Bloom filter has no enumerable contents to search backwards through, so a probe holding only a digest
+has nothing to ask — unless the ring was fed that same digest in the first place. It is, and it costs
+nothing: **a touch records whichever artifact actually holds the plaintext**, which the client ETag
+decides. Single-part ⇒ bare K; composite ⇒ K's shadow key, because K then holds a tombstone that is
+never an eviction candidate, so recording K would protect nothing that can be taken. That replaces K's
+touch rather than adding to it, so ring fill is unchanged, and it is exact even for a shadow that does
+not exist yet: the read that raises a rehydrate is precisely the interest the shadow it creates should
+inherit. Rejected as worse: carrying K in the shadow's metadata (reintroduces the key-length condition
+the digest key exists to lift, so long keys would stay unorderable — a partial fix in the worst place),
+and a side index from shadow key back to K (an object and a write per rehydrate, for a mapping the ring
+carries for free).
+
+LastModified deserves a note, because it is the obvious fallback and it is *wrong here*: a shadow's
+mtime records when the shadow landed and no read ever moves it, so a shadow served ten thousand times
+looks exactly as old as one served once — the opposite of the live-body case, where rehydration landing
+a fresh mtime is what makes the tie-break meaningful. It stays the within-age tie-break for want of
+anything better, but the ring is what actually orders shadows. Getting that ordering wrong costs more
+than elsewhere, too: shadows are by construction the *large* objects, so each one returns a lot of bytes
+against a target while its miss is a whole multi-part re-fetch and decrypt.
+
+**Orphaned shadows are a third obligation of the marker shape.** A K that is **deleted**, or
+overwritten by a **single-part body** or by a **newer composite**, leaves its shadow unreachable — a
+read serves one only against K's current tombstone `cetag` — and also *unrankable*, since nothing
+touches it again for the ring to have an opinion about. The pressure scan above eventually takes it as
+a miss, but on a cache that never fills it simply sits. So it gets the same three-piece treatment §7
+gives the pending set, which is what makes the expensive detection conditional on evidence rather than
+standing:
+
+1. **The queue.** Every cached write hands K to an unbounded queue after its commit, so the enqueue can
+   neither block the ack nor fail. **Unconditional, and that is forced**: an unconditional cached PUT
+   takes no lock and never reads K (§7) — it is fenced against eviction by the remote-generation
+   confirm, not by a lock — so it cannot know whether it superseded a composite, exactly as it cannot
+   know whether it owes a pending marker. The actor is what resolves whether an obligation means
+   anything, and one shadow-range listing settles a whole batch: a shadow this run orphaned necessarily
+   existed *before* the write that orphaned it, so a listing taken after the batch arrived is exact for
+   every obligation in it. Shadows exist only for composites something read back after eviction, so for
+   almost every bucket that listing is empty and the batch resolves with no further call. A key that
+   does have one costs a HEAD of K — the reclaim goes ahead unless K still names the shadow's
+   generation, which is also what keeps it from discarding a rehydrate that landed mid-batch.
+2. **The shadow-clean marker** (§6), written at a graceful drain for buckets this run accounted for and
+   only if nothing was still owed. Deliberately a **separate marker** from the pending set's, not a
+   second meaning bolted onto it: a failed shadow reclaim leaks a handful of bytes, and folding the two
+   together would let that withhold the pending-set marker and send the next run into a full two-cursor
+   rebuild. Cheap evidence must not be able to trigger expensive recovery.
+3. **The backstop**, for a bucket whose marker was absent — the only pass that can find an orphan no
+   obligation covered, left by a process that crashed or whose queue never drained. It reads the
+   shadow's **`ck` back-pointer** (§6) to recover K, which is the one place that field is used: a shadow
+   whose K is gone cannot be reached from the key side at all, so there is nowhere else the question can
+   be asked. An unreadable back-pointer is "cannot judge", never "orphan". Not a `Recovery` of the
+   bucket actor — that slot is deliberately a single one per bucket so "never both a restore and a
+   rebuild" is structural, and a bucket can owe a shadow sweep alongside either. The sweep needs none of
+   that serialization: no lock, writes confined to the shadow range, every reclaim idempotent. It is not
+   a readiness gate either, since an orphan is invisible to clients.
+
+A **transition mark** at K counts as *reachable* in both the actor's test and the backstop's: K is
+mid-bracket and its settle may land a tombstone carrying exactly this generation, so reading it as
+unreachable would delete a shadow about to become live again.
 
 **Rehydrate** (cached mode) is the mirror: fetch + decrypt from the remote under the lock. A
 single-part body lands at K with `If-Match: <evict-sentinel-etag>`, then its twin is deleted —
@@ -1670,11 +1766,20 @@ the generation the read observed — and since the re-read and the land are both
 nothing can move K between them. That same re-read is where the client pass-through metadata comes
 from, so a land can never stamp a superseded generation's metadata either.
 
-**The background-transition actor.** Eviction and rehydrate share a property nothing on the client
-path has: they are **discardable**. The read that raises a rehydrate is already being served from
-the remote, and an eviction abandoned because a client wants the key is an eviction that should not
-have run. Both therefore run as jobs on one bounded queue (`background.concurrency` at a time,
-`background.queue_depth` waiting) rather than as unbounded detached tasks, with three consequences:
+**Eviction runs in the pass, not on the transition queue.** Rung 2 is the statement that GC's own
+concurrency is what bounds the per-key eviction work — the remote HEAD, the twin write, the CAS — so
+that work has to be the pass's, or raising `max_concurrency` under pressure would move nothing. It
+does not need the queue's other properties either: an eviction holds K's write lock only across a
+twin refresh and a 16-byte conditional PUT, not across a transfer, so there is nothing for a client
+write to cancel — it simply takes the lock next, and the CAS makes an eviction that lost the race
+fail cleanly. Being *in* the pass is also what lets reclaimed bytes be counted against the target,
+which is the evidence the whole ladder moves on.
+
+**The background-transition actor.** Rehydrate has a property nothing on the client path does: it is
+**discardable**. The read that raised it is already being served from the remote, so abandoning one
+costs the next read of that key a remote fetch and nothing else. It therefore runs as a job on one
+bounded queue (`background.concurrency` at a time, `background.queue_depth` waiting) rather than as
+an unbounded detached task, with three consequences:
 
 - **Deduped by key.** One live job per key, so N concurrent reads of one evicted key raise one
   transition rather than N that each take the write lock in turn. (The shadow-freshness HEAD still
@@ -1721,9 +1826,19 @@ pending set on disk is known incomplete, and a scavenger reading it as exhaustiv
 acked write is lost. The generation check (step 2 above) independently refuses those bodies, so the
 ordering rule is the second of two locks on the same door, not the only one.
 
-**Usage from the backend.** The scavenger reads SeaweedFS volume/master metrics (physically
-accurate, sees dead bytes), scavenges from high- to low-water mark, and can drive
-`volume.vacuum`. Other cache backends plug in their own source.
+**Usage from the backend.** The scavenger scavenges from the high- to the low-water mark, and reads
+usage through a per-backend source rather than from S3 — physical bytes, which is what sees the dead
+bytes and the replication overhead the object sizes cannot. SeaweedFS takes two hops: the master's
+`/dir/status` names the volume servers, each server's `/status` reports its own filesystem totals,
+and the master's `vol/vacuum` is the dead-byte reclaim a pressured pass asks for before it evicts
+anything live (the master applies the garbage threshold per volume, so asking costs nothing when
+nothing is dirty enough). The two response shapes that matters depends on are read tolerantly, so a
+SeaweedFS that renames a field degrades to "usage unknown" — GC keeps sweeping debris and warns —
+rather than reading a missing field as an empty cache.
+
+No source at all is the same degradation made permanent, and it is the right configuration for
+durable mode. In cached mode it means the cache will fill, so it warns at boot: without a measure of
+pressure there is no byte target, and evicting on a guess spends rehydration latency for nothing.
 
 ## 9. Configuration & deployment
 
@@ -1736,18 +1851,26 @@ prefix alone, and no two roles can be configured into overlapping namespaces at 
 client credentials for `S3Auth`), `master_passphrase` (the 256-bit random age passphrase, from a Secret; supersedes phase 1's
 `master_identity`), `serving.listen` + `serving.offload_threshold` (§5), `reconcile.interval_ms` +
 `reconcile.concurrency` (the §7 sweep's cadence and per-pass fan-out, and the marker queue's write
-fan-out; that queue is deliberately unbounded and so has no depth knob) + the drain budget, which must fit inside the pod's
+fan-out; that queue and §8's shadow-orphan queue are both deliberately unbounded and so have no depth
+knob, and `interval_ms` paces the retry of each) + the drain budget, which must fit inside the pod's
 `terminationGracePeriod`: overrunning it is safe but withholds every clean marker,
 `background.concurrency` + `background.queue_depth` (the §8 transition actor: whole-object transfers
 in flight, and how many wait before submissions are shed — so `concurrency` sits far below
-`reconcile.concurrency`, since it bounds remote bandwidth rather than request count). Later phases
-add: GC water marks / probe page budget and yield-weighting floor / the §8 ladder's own bounds (`min_interval_ms`,
-`max_concurrency`, with `interval_ms`/`concurrency` naming the unpressured base) / recency-ring
-shape (rotation fill target, retained depth k, and the per-slice false-positive rate — the slice's
-bit count is *derived* from those two rather than configured, so the pair cannot drift into a
-nominally deep but saturated filter) / opportunistic-eviction bound, restore fan-out + hint
-interval, and the §4 fencing block (identity selectors, lease timings, fence-confirm timeout,
-settle delay).
+`reconcile.concurrency`, since it bounds remote bandwidth rather than request count),
+`gc.high_water`/`gc.low_water` (fractions of cache capacity: where a pass starts evicting and what it
+reclaims down to — the gap between them *is* the byte target, so equal marks are rejected),
+`gc.probe_pages` + `gc.yield_floor` (§8's sampling: pages per probe, and the share of probes handed
+out evenly so the weighting keeps exploring), `gc.opportunistic_evictions` (misses a pass may keep
+taking past a met target), the §8 ladder's own bounds (`gc.min_interval_ms`, `gc.max_concurrency`,
+with `gc.interval_ms`/`gc.concurrency` naming the unpressured base), `gc.recency`'s ring shape
+(rotation fill target, retained depth k, and the per-slice false-positive rate — the slice's bit
+count is *derived* from those two rather than configured, so the pair cannot drift into a nominally
+deep but saturated filter), and `gc.usage`, the tagged usage-source block (today
+`kind = "seaweedfs"` with the master URL and a vacuum `garbage_threshold`). Omitting `gc.usage`
+leaves GC unable to measure pressure, so it sweeps debris and never evicts — a warning at boot in
+cached mode, and the correct configuration for durable mode, which has no bodies to evict. Later
+phases add restore fan-out + hint interval, and the §4 fencing block (identity selectors, lease
+timings, fence-confirm timeout, settle delay).
 
 **Backend requirements.** The **cache** must implement conditional `PutObject`/`DeleteObject` —
 load-bearing for the eviction/rehydrate/reconcile CAS (§7/§8), not for the client write path,
@@ -1949,7 +2072,8 @@ Each phase's mechanism is specified in §§1–10 above; this section tracks sco
 | 3a | The `<data>`/`<meta>` keyspace split (§6) — prerequisite for v1 LIST's `NextMarker` and the twin-suffix headroom | Done vs. MinIO |
 | 4 | Cached mode, single replica: marker queue, clean marker, reconcile sweep (`replication.rs`), cached DELETE propagation, rehydrate | Done vs. MinIO |
 | 4a | The two recoveries split apart (§7): additive R1 (remote walk) + marker-only R2 (two-cursor join), the per-bucket write-mode gate (durable semantics for a restore window), full startup resolution of bucket state + the volume watchdog, invariants I1–I7 and the halt marker (§6) | Done vs. MinIO |
-| 5 | GC: probabilistic scan (random-position probes, yield-weighted bucket choice), the pressure ladder (interval → concurrency → age threshold), Bloom ring, usage source + vacuum, prefix-hint writer, restore sharding, debris sweeps | In progress |
+| 5 | GC: the actor and its passes, Bloom ring + touch feeders + slice persistence, usage source + vacuum and the water marks, probabilistic scan (random-position probes over bodies *and* shadows, yield-weighted bucket choice), the pressure ladder (interval → concurrency → age threshold), threshold eviction — bodies through the three gates, shadows through one conditional delete — the shadow-orphan queue/marker/backstop, mpu-range debris sweep | Done vs. MinIO |
+| 5a | The rest of phase 5: the remaining debris classes (orphan twins, leftover transition marks), §6's prefix-distribution hint writer, restore sharding, §10's metrics | Not started |
 | 6 | `hypha-fence` + active-passive: two-pod StatefulSet, leader-elected controller, lease, fence→confirm→drain→promote | Not started |
 | 7 | `hypha/` chart, dashboards, the two production installs (cached + durable) | Not started |
 

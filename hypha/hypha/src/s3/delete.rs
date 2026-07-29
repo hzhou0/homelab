@@ -213,6 +213,8 @@ impl Hypha {
         // Marker body = the intended cache ETag (the delete sentinel's), mirroring the PUT marker; the
         // reconcile classifies K from the *data* body, so only the marker's own ETag (M_etag) matters.
         self.markers.owe(bucket, key, meta::delete_sentinel_etag());
+        // A deleted K can never name a shadow's generation again, so any shadow it had is orphaned (§8).
+        self.orphans.owe(bucket, key);
         Ok(())
     }
 

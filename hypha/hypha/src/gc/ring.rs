@@ -45,7 +45,6 @@ const HASH_SEED: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835;
 /// Quantized last-access age: the newest slice holding the key. Ordered **coldest-greatest**, which
 /// is what lets eviction take "everything at or above the threshold" as a comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)] // the eviction scan is its only reader (phase 5d)
 pub(super) enum Age {
     /// Slices back from the current window; `Window(0)` is the current one.
     Window(u16),
@@ -129,7 +128,6 @@ impl RecencyRing {
         (self.current.distinct >= self.geometry.fill_target).then(|| self.rotate())
     }
 
-    #[allow(dead_code)] // the eviction scan is its only caller (phase 5d)
     pub(super) fn probe(&self, qualified: &str) -> Age {
         if self.current.filter.contains(qualified) {
             return Age::Window(0);

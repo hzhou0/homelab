@@ -241,6 +241,12 @@ const TAG_CLEAN: char = 'c';
 
 const TAG_HALT: char = 'h';
 
+/// Range-A tag for rehydrated composites' shadow bodies.
+const TAG_SHADOW: char = 'b';
+
+/// Range-A tag for the per-bucket shadow-clean marker.
+const TAG_SHADOW_CLEAN: char = 'o';
+
 /// **Remote** (`<remote><b>`): the halt marker — the record of an invariant violation, written by
 /// the run that observed it and fatal to every run that finds it (`hypha::halt`).
 ///
@@ -299,7 +305,7 @@ pub fn mpu_scan_prefix() -> String {
     format!("{c}{c}{TAG_MPU}", c = CTRL as char)
 }
 
-/// A sealed recency slice in **GC's own bucket** (§8) — not `<meta><b>`, since the ring is global.
+/// A retired recency slice in **GC's own bucket** (§8) — not `<meta><b>`, since the ring is global.
 /// Nothing client-facing shares that bucket, so these keys need none of the control-byte machinery
 /// the `<meta>` ranges are built from.
 ///
@@ -414,25 +420,69 @@ pub fn mpu_prefix(upload_id: &str) -> String {
 }
 
 /// Cache (`<meta>`): a rehydrated composite's plaintext (cached mode, §6). Range-A tag `b`, keyed by
-/// `sha256(K)[..160 bits]` rather than K — the access pattern is a point lookup, so the key can be
-/// a hash, which lifts every length condition. SHA-256 (not the MD5 already in the tree) because a
-/// collision here would serve another key's plaintext; a second independent digest of K rides the
-/// shadow's metadata and is verified on read (§6).
+/// the **whole** SHA-256 of K rather than by K — the access pattern is a point lookup, so the key can
+/// be a digest, which lifts every length condition K would otherwise impose.
+///
+/// Full width, not a prefix: a truncated digest needs a second, wider digest carried in the shadow's
+/// metadata and checked on every read, purely so a collision degrades to a cache miss instead of
+/// serving another key's plaintext. Spending all 256 bits in the key deletes the collision case, the
+/// metadata field, and the check at once — 32 bytes base64url-unpadded is 43 characters, and nothing
+/// prefix-scans this key, so its width costs nothing.
+///
+/// base64url because every character is control-byte-free and `start-after`-safe, the same reason the
+/// twin's packed facts and the mpu stash nonce use it.
 pub fn shadow_key(key: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(key.as_bytes());
-    format!("{c}{c}b{}", hex::encode(&digest[..20]), c = CTRL as char)
+    format!(
+        "{c}{c}{TAG_SHADOW}{}",
+        base64_simd::URL_SAFE_NO_PAD.encode_to_string(Sha256::digest(key.as_bytes())),
+        c = CTRL as char
+    )
 }
 
-/// Metadata key on a shadow body carrying the **full** SHA-256 of K (the shadow key itself is only
-/// the leading 160 bits, §6). Verified on read: a mismatch means the 160-bit key digest collided
-/// with another key's, so the hit is treated as a miss and the read falls through to the remote —
-/// turning the one catastrophic failure (serving another key's plaintext) into a cache miss.
-pub const SHADOW_KEY_DIGEST: &str = "kd";
+/// Every shadow body at once — what §8's shadow probe scans, since it holds no client key to derive
+/// one from.
+pub fn shadow_scan_prefix() -> String {
+    format!("{c}{c}{TAG_SHADOW}", c = CTRL as char)
+}
 
-pub fn shadow_key_digest(key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(key.as_bytes()))
+/// Metadata key on a shadow body carrying **K itself** — the back-pointer the digest key cannot
+/// provide (§8). Only the orphan backstop reads it: a shadow whose K no longer names this generation
+/// is unreachable and unrankable, and there is no other way to ask K about it.
+///
+/// base64url of K's raw bytes rather than the percent-encoding the client passthrough uses. The
+/// encoding has to be unconditional: percent-encoding a 1024-byte non-ASCII key expands 3× and
+/// overruns S3's 2 KB user-metadata ceiling, whereas base64url is a flat 4/3 — 1368 characters at the
+/// key-length cap, which fits beside `cetag` with room to spare. A shadow's metadata is hypha's alone
+/// (no client passthrough shares this carrier, unlike a tombstone's), so the whole budget is available.
+pub const SHADOW_CLIENT_KEY: &str = "ck";
+
+pub fn encode_shadow_client_key(key: &str) -> String {
+    base64_simd::URL_SAFE_NO_PAD.encode_to_string(key.as_bytes())
+}
+
+/// `None` for anything that is not a key this hypha could have written — a truncated value, a foreign
+/// encoding, or bytes that are not UTF-8. The backstop treats that as "cannot judge" and leaves the
+/// shadow alone, which is the only safe reading: the alternative is deleting a live shadow because its
+/// back-pointer was unreadable.
+pub fn decode_shadow_client_key(encoded: &str) -> Option<String> {
+    let raw = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(encoded).ok()?;
+    let key = String::from_utf8(raw).ok()?;
+    validate_client_key(&key).ok().map(|()| key)
+}
+
+/// Cache (`<meta><b>`): the shadow-clean marker (§8). Present iff no shadow body in this bucket has
+/// been orphaned without being reclaimed — the same positive-evidence discipline as the pending set's
+/// clean marker ([`clean_marker_key`]), and deliberately a *separate* marker rather than a second
+/// meaning bolted onto that one: a failed shadow reclaim is a handful of leaked bytes, and folding it
+/// into the clean marker would make it withhold that marker too, sending the next run into a full
+/// pending-set rebuild over a leak. Cheap evidence must not be able to trigger expensive recovery.
+///
+/// Written only by a graceful drain with nothing owed, deleted at startup before the first request,
+/// so a running process — which can orphan a shadow at any moment — never has a marker on disk
+/// claiming otherwise. Presence is the whole signal; the body is empty.
+pub fn shadow_clean_marker_key() -> String {
+    format!("{c}{c}{TAG_SHADOW_CLEAN}", c = CTRL as char)
 }
 
 /// Cache (`<meta><b>`): the pending marker for `key` — **bare K**, range C (§6). Its body is the
@@ -725,6 +775,30 @@ mod tests {
         // A twin never collides with a range-A record, whose doubled 0x01 lead parse_twin rejects.
         assert!(parse_twin(&mpu_upload_key("id")).is_none());
         assert!(parse_twin(&shadow_key("k")).is_none());
+    }
+
+    /// The whole digest in the key is what deletes the collision check — so the key has to actually
+    /// carry all of it, at a fixed width, in an alphabet nothing downstream has to escape.
+    #[test]
+    fn shadow_key_carries_the_whole_digest() {
+        let key = shadow_key("some/client/key");
+        let digest = key.strip_prefix(&shadow_scan_prefix()).expect("prefixed");
+        assert_eq!(
+            base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(digest)
+                .expect("base64url")
+                .len(),
+            32,
+            "a truncated digest would put the collision case back"
+        );
+        assert!(digest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+
+        // Fixed width regardless of K, which is the length condition the digest key exists to lift.
+        let long = shadow_key(&"k".repeat(MAX_KEY_LEN));
+        assert_eq!(long.len(), key.len());
+        assert_ne!(long, key);
     }
 
     #[test]

@@ -22,31 +22,47 @@ const PAGE_KEYS: i32 = 1000;
 /// and therefore before the in-progress snapshot taken below. An upload absent from that snapshot
 /// had already completed or aborted. Asking in the other order would let an upload created between
 /// the two calls look abandoned, and this pass would delete a live upload's parts.
-pub(super) async fn sweep_mpu_ranges(tier: &Tiering, bucket: &str) -> Result<usize> {
+pub(super) async fn sweep_mpu_ranges(tier: &Tiering, bucket: &str) -> Result<Reclaimed> {
     let ranges = cache_ranges(tier, bucket).await?;
     if ranges.is_empty() {
-        return Ok(0);
+        return Ok(Reclaimed::default());
     }
     let live = live_upload_ids(tier, bucket).await?;
 
-    let mut reclaimed = 0;
-    for (upload_id, keys) in ranges {
+    let mut reclaimed = Reclaimed::default();
+    for (upload_id, records) in ranges {
         if live.contains(&upload_id) {
             continue;
         }
         // Record keys carry the `0x01` control byte, which the batch `DeleteObjects` XML body
         // cannot represent — single-object deletes only (§6), as with twins.
-        let deletes = keys.iter().map(|k| tier.meta.delete(bucket, k));
+        let deletes = records.iter().map(|(key, _)| tier.meta.delete(bucket, key));
         futures::future::try_join_all(deletes).await?;
-        reclaimed += 1;
+        reclaimed.uploads += 1;
+        reclaimed.bytes += records.iter().map(|(_, bytes)| bytes).sum::<u64>();
     }
     Ok(reclaimed)
 }
 
-/// Every mpu record in `<meta>`, grouped by the upload it belongs to.
-async fn cache_ranges(tier: &Tiering, bucket: &str) -> Result<HashMap<String, Vec<String>>> {
+/// What one sweep returned. The bytes are what a pressured pass counts against its target (§8, rung
+/// 0) — mostly stashed part ciphertext, since the records themselves are tiny.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Reclaimed {
+    pub(super) uploads: usize,
+    pub(super) bytes: u64,
+}
+
+impl std::ops::AddAssign for Reclaimed {
+    fn add_assign(&mut self, other: Self) {
+        self.uploads += other.uploads;
+        self.bytes += other.bytes;
+    }
+}
+
+/// Every mpu record in `<meta>` with its size, grouped by the upload it belongs to.
+async fn cache_ranges(tier: &Tiering, bucket: &str) -> Result<HashMap<String, Vec<(String, u64)>>> {
     let prefix = meta::mpu_scan_prefix();
-    let mut ranges: HashMap<String, Vec<String>> = HashMap::new();
+    let mut ranges: HashMap<String, Vec<(String, u64)>> = HashMap::new();
     let mut token = None;
     loop {
         let page = tier
@@ -60,16 +76,16 @@ async fn cache_ranges(tier: &Tiering, bucket: &str) -> Result<HashMap<String, Ve
                 Some(PAGE_KEYS),
             )
             .await?;
-        for key in page
-            .contents
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|o| o.key)
-        {
+        for obj in page.contents.unwrap_or_default() {
+            let Some(key) = obj.key else { continue };
             // A malformed key under this prefix has no upload to judge it against, so leaving it is
             // the only safe reading — it is not evidence of an abandoned upload.
             if let Some(id) = meta::parse_mpu_upload_id(&key) {
-                ranges.entry(id.to_string()).or_default().push(key.clone());
+                let bytes = obj.size.unwrap_or(0).max(0) as u64;
+                ranges
+                    .entry(id.to_string())
+                    .or_default()
+                    .push((key.clone(), bytes));
             }
         }
         match page.next_continuation_token {

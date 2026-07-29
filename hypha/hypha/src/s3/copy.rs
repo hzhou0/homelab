@@ -31,6 +31,7 @@ use super::overlay::KeyState;
 use super::put::evaluate_precondition;
 use super::{copied_part_retag, resolve_storage_class, ts_ms, write_metadata, Hypha};
 use crate::codec;
+use crate::gc::Plaintext;
 use crate::tier::{self, RemoteFacts};
 
 /// Ciphertext bytes per server-side copy part: the backend's 5 GiB part cap. A composite body can
@@ -147,8 +148,10 @@ impl Hypha {
             )
             .await?;
 
-        // The destination only; the source fed the ring when it resolved (§8).
-        self.gc.touch(&bucket, &key);
+        // The destination only; the source fed the ring when it resolved (§8). A large copy commits
+        // through native multipart, so the destination can be either shape.
+        self.gc.touch(&bucket, &key, Plaintext::of(&facts.cetag));
+        self.orphans.owe(&bucket, &key);
         let resp = CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(ETag::Strong(facts.cetag.clone())),

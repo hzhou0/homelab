@@ -82,6 +82,16 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         config.reconcile.concurrency,
     );
 
+    // Orphaned shadow bodies (§8), cached mode's third obligation of the marker shape: a write that
+    // supersedes a composite leaves its rehydrated plaintext unreachable, and — unlike an evictable
+    // body — nothing ever touches it again for the recency ring to rank. Same queue/seal/marker
+    // structure as `markers`, and for the same reason: the enqueue sits after the commit.
+    let (orphans, orphan_seal, orphan_actor) = gc::orphans::spawn(
+        tier.clone(),
+        buckets.clone(),
+        Duration::from_millis(config.reconcile.interval_ms),
+    );
+
     // The GC actor (§8), both modes: debris accumulates wherever the client path acked before its
     // cleanup was done, and recency is fed by every op that resolves or lands a key. It owns its own
     // cadence and stops when the last handle — the one `Hypha` holds — drops.
@@ -98,6 +108,7 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         buckets,
         markers.clone(),
         gc,
+        orphans,
         config.mode,
         config.serving.offload_threshold,
         config.max_bucket_prefix_len(),
@@ -138,6 +149,8 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         halt: serve_halt,
         seal: Some(run_seal),
         marker_actor: tokio::spawn(marker_actor.run()),
+        orphan_seal: Some(orphan_seal),
+        orphan_actor: tokio::spawn(orphan_actor.run()),
     };
     Ok((b.build(), lifecycle))
 }
@@ -153,6 +166,10 @@ pub struct Lifecycle {
     /// the seal; *dropping* it only closes the channel, which an abort does too.
     seal: Option<markers::RunSeal>,
     marker_actor: tokio::task::JoinHandle<()>,
+    /// The same pair for the shadow-orphan queue (§8), held separately so a shadow reclaim that never
+    /// lands cannot withhold a *pending-set* clean marker and send the next run into a full rebuild.
+    orphan_seal: Option<gc::orphans::OrphanSeal>,
+    orphan_actor: tokio::task::JoinHandle<()>,
 }
 
 impl Lifecycle {
@@ -169,8 +186,16 @@ impl Lifecycle {
         if let Some(run_seal) = self.seal.take() {
             run_seal.seal();
         }
+        if let Some(orphan_seal) = self.orphan_seal.take() {
+            orphan_seal.seal();
+        }
         if let Err(e) = self.marker_actor.await {
             tracing::warn!(error = %e, "marker actor did not finish; clean markers withheld");
+        }
+        // Awaited after the markers: this one only ever leaks bytes, so it must not delay the
+        // obligation that decides whether the next run rescans for acked writes.
+        if let Err(e) = self.orphan_actor.await {
+            tracing::warn!(error = %e, "shadow actor did not finish; shadow-clean markers withheld");
         }
     }
 }
