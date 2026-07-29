@@ -7,11 +7,14 @@ mod auth;
 mod background;
 mod bucket_ctl;
 mod codec;
+mod halt;
 mod keylocks;
 mod markers;
+mod recovery;
 mod replication;
 mod s3;
 mod tier;
+mod volume_watch;
 
 use std::error::Error;
 use std::future::Future;
@@ -25,6 +28,7 @@ use tokio::net::TcpListener;
 use hypha_core::config::Mode;
 use hypha_core::{Backend, Config};
 
+pub use halt::EXIT_INVARIANT_VIOLATION;
 pub use s3::Hypha;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
@@ -45,6 +49,9 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     let data = Backend::connect(&config.cache);
     let meta = data.with_prefix(config.cache_meta_prefix.clone());
 
+    let halt = halt::Halt::new(remote.clone());
+    let serve_halt = halt.clone();
+
     let tier = tier::Tiering {
         data,
         meta,
@@ -54,12 +61,14 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         locks: keylocks::KeyLocks::default(),
         upload_locks: keylocks::KeyLocks::default(),
         cached: config.mode == Mode::Cached,
+        halt,
     };
 
     // Ordered: the marker machinery reads its per-bucket accounting off the bucket-control actor's
     // published state, so the actor exists first (the dependency runs one way — `bucket_ctl` knows
     // nothing of `markers`).
     let buckets = bucket_ctl::spawn(tier.clone());
+    let (startup_tier, startup_buckets) = (tier.clone(), buckets.clone());
 
     // The repair queue's only strong sender goes to `Lifecycle`, so dropping that at drain is what
     // closes the channel — the proof that every obligation has finished (§7).
@@ -80,6 +89,17 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         config.background,
     );
 
+    // The one failure a running process still has to watch for (§7): its cache volume vanishing
+    // underneath it, which would have a ready bucket answering 404 for objects that exist.
+    tokio::spawn(
+        volume_watch::VolumeWatch::new(
+            app.tier.clone(),
+            app.buckets.clone(),
+            Duration::from_millis(config.volume_watch_interval_ms),
+        )
+        .run(app.liveness()),
+    );
+
     // The cached-mode reconcile sweep (§7): a background duty that trails cache writes onto the
     // remote. It holds only a `Weak` to the app's liveness sentinel, so it stops when the service
     // drops — no explicit shutdown wiring. Durable mode has no pending set, so no sweep.
@@ -98,8 +118,9 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         config.auth.secret_key.clone(),
     ));
     let lifecycle = Lifecycle {
-        cached: config.mode == Mode::Cached,
-        markers,
+        tier: startup_tier,
+        buckets: startup_buckets,
+        halt: serve_halt,
         seal: Some(run_seal),
         marker_actor: tokio::spawn(marker_actor.run()),
     };
@@ -110,25 +131,19 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
 /// every bucket dirty on disk before a write can land, and the drain that proves quiescence before
 /// writing any clean marker back.
 pub struct Lifecycle {
-    cached: bool,
-    /// Holds the bucket-control handle internally: startup owes a reconcile pass for every bucket
-    /// whose clean marker was absent, and the actor is what runs it — so a pass restore already
-    /// wants for the same bucket is one pass, not two.
-    markers: markers::Markers,
-    /// The repair queue's only strong sender outside the obligation tasks. Sending its one message
-    /// is the seal; *dropping* it only closes the channel, which an abort does too.
+    tier: tier::Tiering,
+    buckets: bucket_ctl::BucketCtl,
+    halt: halt::Halt,
+    /// The repair queue's only strong sender outside the marker tasks. Sending its one message is
+    /// the seal; *dropping* it only closes the channel, which an abort does too.
     seal: Option<markers::RunSeal>,
     marker_actor: tokio::task::JoinHandle<()>,
 }
 
 impl Lifecycle {
-    /// Clear every bucket's clean marker before serving. Fails startup rather than serving around a
-    /// marker that will not delete — that marker would skip next run's reconcile pass, by which time
-    /// real orphans exist. Durable mode owes no markers, so there is nothing to clear.
     pub async fn startup(&self) -> Result<(), BoxError> {
-        if self.cached {
-            self.markers.startup().await?;
-        }
+        halt::exit_if_marked(&self.tier.remote).await?;
+        bucket_ctl::resolve_all(&self.tier, &self.buckets).await?;
         Ok(())
     }
 
@@ -162,6 +177,8 @@ where
     let http = ConnBuilder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
+    let halt = lifecycle.halt.clone();
+    let mut halted = false;
 
     loop {
         let (stream, _peer) = tokio::select! {
@@ -170,6 +187,7 @@ where
                 Err(e) => { tracing::error!(error = %e, "accept failed"); continue; }
             },
             () = shutdown.as_mut() => { tracing::info!("shutdown signalled: draining"); break; }
+            () = halt.shutdown_signalled() => { halted = true; break; }
         };
 
         // Disable Nagle: streamed-body responses (GET) write headers then body chunks, and with
@@ -184,6 +202,18 @@ where
                 tracing::debug!(error = %e, "connection ended");
             }
         });
+    }
+
+    // Signal the live connections, but neither await the drain nor return: the handler that raised
+    // the violation is itself in flight and parked on the record write, so the drain could only time
+    // out — and returning would end the process *successfully*, losing the record (`crate::halt`).
+    if halted {
+        tracing::error!(
+            "halted on an invariant violation: closing connections, recording the halt"
+        );
+        tokio::spawn(graceful.shutdown());
+        std::future::pending::<()>().await;
+        unreachable!("`pending` never resolves; the process ends from the halt's record loop")
     }
 
     // Step 1 of the quiescence proof (§7): when this resolves, every handler has returned and no new

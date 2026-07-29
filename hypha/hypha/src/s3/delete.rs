@@ -16,10 +16,10 @@ use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use hypha_core::backend::BatchDeleteError;
-use hypha_core::config::Mode;
 use hypha_core::error::Error;
 use hypha_core::meta;
 
+use super::overlay::WriteMode;
 use super::Hypha;
 
 /// S3's hard cap on one `DeleteObjects` request.
@@ -38,10 +38,7 @@ impl Hypha {
         let key = req.input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        // Overlay (§7): serving is never gated — materialize K from the remote if restoring.
-        self.prepare_write(&bucket, &key).await?;
-
-        if self.mode == Mode::Cached {
+        if let WriteMode::Cached = self.prepare_write(&bucket, &key).await? {
             self.commit_cached_delete(&bucket, &key).await?;
             return Ok(S3Response::new(DeleteObjectOutput::default()));
         }
@@ -90,7 +87,7 @@ impl Hypha {
                 "DeleteObjects takes between 1 and 1000 objects"
             ));
         }
-        if self.mode == Mode::Cached {
+        if let WriteMode::Cached = self.write_mode(&bucket).await? {
             return self
                 .op_delete_objects_cached(bucket, quiet, requested)
                 .await;
@@ -101,8 +98,7 @@ impl Hypha {
 
         let keys = valid_sorted_keys(&requested, &mut failed);
 
-        // Overlay (§7): a restoring bucket has each key materialized from the remote first, so the
-        // batch marks/commits against correct tombstones; an absent bucket fails the whole call.
+        // Each key materialized before any is marked, so the batch runs against correct entries.
         for key in &keys {
             self.prepare_write(&bucket, key).await?;
         }

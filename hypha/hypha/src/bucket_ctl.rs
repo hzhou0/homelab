@@ -19,15 +19,13 @@
 //! and deduped: the op that triggered one already resolves from the remote meanwhile, so there is
 //! no waiter, and a storm of triggers for one bucket collapses to a single sweep.
 //!
-//! That dedup is why **both** of §7's rebuild duties enter here — restoring an untrusted namespace
-//! and rebuilding a bucket's pending-marker index at startup. They are one traversal
-//! ([`Tiering::reconcile_bucket`]), and routing them through one queue is what guarantees they
-//! are one *pass*: two passes over the same bucket would take independent snapshots of cache and
-//! remote, and could settle a key on one while the other raised a marker for it. Here they collapse
-//! into a single sweep over a single map before either runs. Only [`Trigger`] distinguishes them.
+//! That dedup is also what makes §7's two recoveries mutually exclusive per bucket: one queue slot
+//! per bucket, and one task draining it, is why "never both" is structural here rather than a
+//! convention [`crate::recovery`] has to keep.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
@@ -36,6 +34,8 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
+use crate::halt::{Invariant, Violation};
+use crate::recovery;
 use crate::tier::Tiering;
 
 /// Cap on cache buckets being mutated at once. A slow DeleteBucket drain or a large restore holds a
@@ -43,21 +43,25 @@ use crate::tier::Tiering;
 /// against.
 const MAX_CONCURRENT: usize = 16;
 
+/// How long a bucket whose recovery could not run waits before the pass is re-queued. Nothing else
+/// re-triggers one: the state map is resolved once at startup and never re-probed, so a pass that
+/// fails has to own its own retry or the bucket stays non-authoritative for the run.
+const RECOVERY_RETRY: Duration = Duration::from_secs(5);
+
 /// Every bucket this process has classified, published as one immutable map: readers take a single
 /// atomic load, no lock, on a path every request crosses. Mutations are copy-on-write through
 /// [`ArcSwap::rcu`] — a whole-map clone per bucket-lifecycle event, which is the right trade when
 /// the map holds tens of entries and is read once or twice per request.
 type BucketStates = Arc<ArcSwap<HashMap<String, BucketState>>>;
 
-/// What the data plane knows about one bucket (§7). Absent from the map ⇒ unclassified: the gate
-/// must probe. Keeping the facts in one value is what makes a transition a single atomic publish —
-/// `Ready` replacing `Restoring` can't be observed half-applied, and no ordering convention between
-/// separate sets has to be maintained by hand. It is also why [`Self::accounted`] lives here rather
-/// than in [`crate::markers`]: retiring a deleted bucket then drops its accounting for free, instead
-/// of leaving a second structure to remember to clear.
+/// What the data plane knows about one bucket (§7). Keeping the facts in one value is what makes a
+/// transition a single atomic publish — `Ready` replacing `Restoring` can't be observed half-applied,
+/// and no ordering convention between separate sets has to be maintained by hand. It is also why
+/// [`Self::accounted`] lives here rather than in [`crate::markers`]: retiring a deleted bucket then
+/// drops its accounting for free, instead of leaving a second structure to remember to clear.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct BucketState {
-    phase: Option<Phase>,
+pub(crate) struct BucketState {
+    readiness: Readiness,
     /// Both cache projections are known to exist, so a write can skip asking the actor.
     provisioned: bool,
     /// This run accounts for the bucket's pending-marker set (§6) — its clean marker was present at
@@ -67,22 +71,20 @@ pub struct BucketState {
     accounted: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    /// A restore sweep is pending or in flight; the remote is the read source of truth.
+/// A bucket's source of truth for the data plane (§7), and the whole of what the overlay branches on.
+///
+/// `Absent` is a definitive `NoSuchBucket`, not "unclassified": hypha owns both backends outright, so
+/// the map [`resolve_all`] publishes at startup is the complete set of buckets, and a bucket missing
+/// from it does not exist.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum Readiness {
+    #[default]
+    Absent,
+    /// Sync marker absent: a restore is owed or in flight, and the remote is the read source of truth
+    /// until it lands.
     Restoring,
-    /// Sync marker observed: the cache namespace is authoritative.
+    /// Sync marker observed: the cache namespace is authoritative, and an absent key is a 404.
     Ready,
-}
-
-impl BucketState {
-    pub fn is_ready(&self) -> bool {
-        matches!(self.phase, Some(Phase::Ready))
-    }
-
-    pub fn is_restoring(&self) -> bool {
-        matches!(self.phase, Some(Phase::Restoring))
-    }
 }
 
 /// Apply `f` to one bucket's state and publish the result. The closure may run more than once (the
@@ -100,27 +102,14 @@ fn update(states: &BucketStates, bucket: &str, f: impl Fn(&mut BucketState)) {
     });
 }
 
-/// A restore is pending: claim `Restoring` unless the bucket is already `Ready` (a sweep that won
-/// the race must not be walked back).
-fn mark_restoring(state: &mut BucketState) {
-    if !state.is_ready() {
-        state.phase = Some(Phase::Restoring);
-    }
-}
-
-/// The sweep is over. Only an unfinished `Restoring` is cleared — a success has already published
-/// `Ready` in the same value, so this leaves it alone. Dropping to unclassified is what makes the
-/// next access re-probe, and therefore re-trigger a failed sweep.
-fn clear_restoring(state: &mut BucketState) {
-    if state.is_restoring() {
-        state.phase = None;
-    }
+fn set_restoring(state: &mut BucketState) {
+    state.readiness = Readiness::Restoring;
 }
 
 /// The sync marker is present: the cache namespace is authoritative. Supersedes `Restoring` in the
 /// same publish, so no reader can see the bucket as neither.
 fn mark_ready(state: &mut BucketState) {
-    state.phase = Some(Phase::Ready);
+    state.readiness = Readiness::Ready;
 }
 
 fn set_provisioned(state: &mut BucketState) {
@@ -163,35 +152,10 @@ enum BucketMsg {
         bucket: String,
         reply: oneshot::Sender<Result<()>>,
     },
-    Reconcile {
+    Recover {
         bucket: String,
-        trigger: Trigger,
+        pass: Recovery,
     },
-}
-
-/// What made a reconcile pass owed. The pass itself is the same either way — one traversal that
-/// both settles the namespace and rebuilds the pending set — so this only decides the precondition.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Trigger {
-    /// The sync marker is absent: this bucket's namespace is not authoritative. Skippable if the
-    /// bucket is already `Ready` — someone else's pass got there first.
-    Unreconciled,
-    /// The clean marker was absent at startup (§6): this run has no account of the bucket's pending
-    /// set. **Not** skippable on `Ready` — readiness says the namespace is trusted, which is a
-    /// different claim from the pending index being complete.
-    Unaccounted,
-}
-
-impl Trigger {
-    /// Merge two triggers for one bucket into the pass that satisfies both — the weaker
-    /// precondition wins, so an `Unaccounted` trigger can never be absorbed by an `Unreconciled`
-    /// one that would then skip on `Ready` and drop the accounting.
-    fn merge(self, other: Trigger) -> Trigger {
-        match (self, other) {
-            (Trigger::Unaccounted, _) | (_, Trigger::Unaccounted) => Trigger::Unaccounted,
-            _ => Trigger::Unreconciled,
-        }
-    }
 }
 
 /// Handle onto the actor. Cloneable and cheap — the queue sender plus the published state map — so
@@ -238,39 +202,43 @@ impl BucketCtl {
         .await
     }
 
-    /// Trigger a background reconcile pass: fire-and-forget. The caller resolves from the remote
-    /// meanwhile; a closed queue (actor gone at shutdown) is ignored.
+    /// Dispatch **R1** and publish `Restoring`, which is both the readiness answer for the window
+    /// and the record that the bucket exists at all.
     ///
-    /// Also memoizes the bucket as restoring, which is what spares every *subsequent* op the gate's
-    /// two-probe classification (§7). The task clears the memo when the sweep ends — however it
-    /// ends — so a failed sweep is re-probed and re-triggered by the next access, exactly as it was
-    /// when the gate probed every time. `mark_restoring` leaves a `Ready` bucket alone, so an
-    /// `Unaccounted` pass over a trusted namespace does not send its reads back to the remote.
-    pub fn reconcile(&self, bucket: &str, trigger: Trigger) {
-        // Memoize before sending: the reverse order races a task that finishes first, and would
-        // leave a memo no sweep will ever clear. A refused send rolls it back for the same reason.
-        update(&self.states, bucket, mark_restoring);
-        if self
-            .tx
-            .send(BucketMsg::Reconcile {
-                bucket: bucket.to_string(),
-                trigger,
-            })
-            .is_err()
-        {
-            update(&self.states, bucket, clear_restoring);
-        }
+    /// `Restoring` outlives a failed pass deliberately: reads resolve from the remote and writes run
+    /// durable, so the bucket is served correctly the whole time — only the sync marker waits on the
+    /// retry.
+    pub(crate) fn restore(&self, bucket: &str) {
+        update(&self.states, bucket, set_restoring);
+        self.owe(bucket, Recovery::Restore);
     }
 
-    /// This process's current view of a bucket — one atomic load, no lock. The gate reads it once
-    /// and answers both "is the cache authoritative" and "is a restore already pending" from it,
-    /// which is why they are one value rather than two sets (§7).
-    pub fn state(&self, bucket: &str) -> BucketState {
+    /// Dispatch **R2**. The bucket stays `Ready`: its namespace is authoritative and serves from the
+    /// cache throughout — only the pending index is in doubt.
+    pub(crate) fn rebuild_pending(&self, bucket: &str) {
+        self.owe(bucket, Recovery::RebuildPending);
+    }
+
+    fn owe(&self, bucket: &str, pass: Recovery) {
+        // A closed queue means the actor is gone, i.e. shutdown. A bucket left `Restoring` serves
+        // correctly, and the next run resolves it again from scratch.
+        let _ = self.tx.send(BucketMsg::Recover {
+            bucket: bucket.to_string(),
+            pass,
+        });
+    }
+
+    /// This process's current view of a bucket — one atomic load, no lock, on a path every request
+    /// crosses. The overlay's whole classification (§7), with no backend call behind it: the map is
+    /// resolved in full at startup ([`resolve_all`]) and maintained by Create/Delete since.
+    pub fn readiness(&self, bucket: &str) -> Readiness {
+        self.state(bucket).readiness
+    }
+
+    fn state(&self, bucket: &str) -> BucketState {
         self.states.load().get(bucket).copied().unwrap_or_default()
     }
 
-    /// Record a bucket as ready — used by the gate when it discovers a persisted sync marker that
-    /// this process hadn't yet observed.
     pub fn mark_ready(&self, bucket: &str) {
         update(&self.states, bucket, mark_ready);
     }
@@ -278,6 +246,16 @@ impl BucketCtl {
     /// Record that this run accounts for `bucket`'s pending set (§6). Startup calls it for a bucket
     /// whose clean marker was present; the task calls it for a bucket a pass rebuilt or a create
     /// established empty.
+    /// Every bucket currently serving from its cache — the set the volume watchdog polls.
+    pub(crate) fn ready(&self) -> Vec<String> {
+        self.states
+            .load()
+            .iter()
+            .filter(|(_, s)| s.readiness == Readiness::Ready)
+            .map(|(bucket, _)| bucket.clone())
+            .collect()
+    }
+
     pub(crate) fn account_for(&self, bucket: &str) {
         update(&self.states, bucket, set_accounted);
     }
@@ -313,6 +291,66 @@ impl BucketCtl {
     }
 }
 
+/// Resolve every bucket's state before the listener opens, and dispatch the recovery each one needs.
+///
+/// hypha owns both backends outright — nothing else creates a bucket in either — so the remote's
+/// bucket list *is* the set of buckets, and one pass over it replaces the per-bucket probe the read
+/// path used to pay on first touch. Buckets appear afterwards only through `CreateBucket`, which
+/// publishes its own entry.
+///
+/// The two §6 markers answer everything, so the pass is **chosen here rather than re-derived later**:
+/// the *sync* marker says whether the cache namespace is authoritative, the *clean* marker whether
+/// this run inherits a complete account of the bucket's pending set. Reading both in one place is
+/// sound precisely because nothing is being served yet — no marker can move underneath the decision,
+/// and there is no second raiser to reconcile with.
+///
+/// A cache bucket with no remote bucket is not resolved and never served: it is debris from a crash
+/// between `delete`'s remote commit and its cache drain, and a later create of the same name resets
+/// it.
+pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<()> {
+    for (bucket, _) in tier.remote.list_buckets().await? {
+        let synced = marker_present(tier, &bucket, &meta::sync_marker_key()).await?;
+        // Durable mode has no pending set: it writes no clean markers and reads none back.
+        let accounted = tier.cached && take_clean_marker(tier, &bucket).await?;
+
+        if !synced {
+            // Both markers absent lands here too: a bucket with no trustworthy namespace has nothing
+            // for a pending rebuild to work from, and R1 leaves the pending set empty and complete
+            // on its own.
+            buckets.restore(&bucket);
+            continue;
+        }
+        buckets.mark_ready(&bucket);
+        if accounted {
+            buckets.account_for(&bucket);
+        } else if tier.cached {
+            buckets.rebuild_pending(&bucket);
+        }
+    }
+    Ok(())
+}
+
+async fn marker_present(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
+    match tier.meta.head(bucket, key).await {
+        Ok(_) => Ok(true),
+        // `NoSuchBucket`: the whole cache projection is gone — the volume loss R1 exists for.
+        Err(Error::NotFound) | Err(Error::NoSuchBucket) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read the clean marker and delete it: from the moment hypha can take a write, no bucket on disk
+/// claims to be clean. A marker that will not delete fails startup rather than being served around —
+/// skipping the rebuild on it now would skip it again next run, by which time real orphans exist.
+async fn take_clean_marker(tier: &Tiering, bucket: &str) -> Result<bool> {
+    let clean = meta::clean_marker_key();
+    if !marker_present(tier, bucket, &clean).await? {
+        return Ok(false);
+    }
+    tier.meta.delete(bucket, &clean).await?;
+    Ok(true)
+}
+
 /// Spawn the actor and return its handle. The task runs until every handle is dropped, then drains
 /// whatever is still queued before exiting.
 pub fn spawn(tier: Tiering) -> BucketCtl {
@@ -322,6 +360,7 @@ pub fn spawn(tier: Tiering) -> BucketCtl {
     let states: BucketStates = Arc::new(ArcSwap::from_pointee(HashMap::new()));
     let actor = BucketActor {
         rx,
+        tx: tx.clone(),
         done_tx,
         done_rx,
         prov_tx,
@@ -337,25 +376,35 @@ pub fn spawn(tier: Tiering) -> BucketCtl {
     BucketCtl { tx, states }
 }
 
-/// `Create`/`Delete` keep arrival order; `reconcile` is a single slot — repeated triggers for a
-/// bucket collapse into one sweep over one map.
+/// Which recovery a bucket needs (§7). Chosen once, at startup, from the two markers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// R1: the namespace restore.
+    Restore,
+    /// R2: the pending-set rebuild.
+    RebuildPending,
+}
+
+/// `Create`/`Delete` keep arrival order; the recovery is a **single slot**, which is what makes the
+/// two recoveries mutually exclusive per bucket (§7). Nothing is ever merged into it: startup picks
+/// one pass per bucket, and a retry re-queues that same pass.
 #[derive(Default)]
 struct QueuedWork {
     requests: VecDeque<LifecycleRequest>,
-    reconcile: Option<Trigger>,
+    recovery: Option<Recovery>,
 }
 
 impl QueuedWork {
     fn is_empty(&self) -> bool {
-        self.requests.is_empty() && self.reconcile.is_none()
+        self.requests.is_empty() && self.recovery.is_none()
     }
+}
 
-    fn owe(&mut self, trigger: Trigger) {
-        self.reconcile = Some(match self.reconcile {
-            Some(existing) => existing.merge(trigger),
-            None => trigger,
-        });
-    }
+/// Whether a recovery finished with the bucket resolved, or needs re-queueing.
+#[derive(PartialEq, Eq)]
+enum Outcome {
+    Done,
+    Retry,
 }
 
 enum LifecycleRequest {
@@ -365,6 +414,8 @@ enum LifecycleRequest {
 
 struct BucketActor {
     rx: mpsc::UnboundedReceiver<BucketMsg>,
+    /// Handed to each task so a recovery that could not run can re-queue itself.
+    tx: mpsc::UnboundedSender<BucketMsg>,
     /// Tasks signal here when they finish a bucket's batch, so any work that arrived mid-drain
     /// gets re-dispatched. Held here too, so it never closes on its own.
     done_tx: mpsc::UnboundedSender<String>,
@@ -425,8 +476,8 @@ impl BucketActor {
                 .requests
                 .push_back(LifecycleRequest::Delete(reply)),
             BucketMsg::Provision { bucket, reply } => self.provision(bucket, reply),
-            BucketMsg::Reconcile { bucket, trigger } => {
-                self.queued.entry(bucket).or_default().owe(trigger)
+            BucketMsg::Recover { bucket, pass } => {
+                self.queued.entry(bucket).or_default().recovery = Some(pass)
             }
         }
     }
@@ -495,6 +546,7 @@ impl BucketActor {
                 states: self.states.clone(),
                 sem: self.sem.clone(),
                 done: self.done_tx.clone(),
+                requeue: self.tx.clone(),
             };
             tokio::spawn(task.run(bucket, work));
         }
@@ -506,6 +558,7 @@ struct BucketTask {
     states: BucketStates,
     sem: Arc<Semaphore>,
     done: mpsc::UnboundedSender<String>,
+    requeue: mpsc::UnboundedSender<BucketMsg>,
 }
 
 impl BucketTask {
@@ -522,24 +575,46 @@ impl BucketTask {
                 }
             }
         }
-        if let Some(trigger) = work.reconcile {
-            self.reconcile(&bucket, trigger).await;
+        if let Some(pass) = work.recovery {
+            self.recover(&bucket, pass).await;
         }
         let _ = self.done.send(bucket);
     }
 
-    /// The remote create is the sole commit. A brand-new bucket resets the cache substrate first —
-    /// draining any stale orphan from a prior incarnation and provisioning empty projections — then
-    /// marks itself reconciled, since an empty namespace is trivially authoritative. A duplicate
-    /// create of a live bucket returns the remote's result and leaves cache and marker untouched
-    /// (it may be mid-restore). Safe without a lock: the actor is the sole writer (§7).
+    /// The remote create is the sole commit, and the cache work all precedes it: an empty namespace
+    /// is trivially authoritative, so the sync marker can be written before the bucket it vouches for
+    /// exists. Everything published to the state map therefore follows the commit, which is what
+    /// keeps a phase in the map equivalent to a bucket on the remote — a create that dies partway
+    /// leaves cache projections nobody can reach, which the next create of the name resets.
+    ///
+    /// A duplicate create of a live bucket returns the remote's result and leaves cache and marker
+    /// untouched (it may be mid-restore). Safe without a lock: the actor is the sole writer (§7).
     async fn create(&self, bucket: &str) -> Result<()> {
         match self.tier.remote.head_bucket(bucket).await {
+            Ok(()) if self.state(bucket).readiness == Readiness::Absent => {
+                // Invariant I6: hypha is the only writer of either backend, and the startup
+                // resolution accounted for every bucket the remote held, so a remote bucket the map
+                // has no phase for was created by something that is not this deployment.
+                self.tier
+                    .halt
+                    .raise(Violation {
+                        invariant: Invariant::ForeignBucket,
+                        bucket: bucket.to_string(),
+                        key: None,
+                        detail:
+                            "the remote holds a bucket hypha did not create and did not resolve \
+                                 at startup; something other than this deployment is writing the \
+                                 remote"
+                                .to_string(),
+                    })
+                    .await
+            }
             Ok(()) => self.tier.remote.create_bucket(bucket).await,
             Err(Error::NoSuchBucket) => {
                 self.reset_cache(bucket).await?;
+                self.write_sync_marker(bucket).await?;
                 self.tier.remote.create_bucket(bucket).await?;
-                self.mark_reconciled(bucket).await?;
+                update(&self.states, bucket, mark_ready);
                 // A bucket this run created starts empty, so every write it can ever hold went
                 // through the marker queue — which the drain proves empty before writing any clean
                 // marker (§6). Accounted by construction, and only on this branch: a duplicate
@@ -550,6 +625,10 @@ impl BucketTask {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn state(&self, bucket: &str) -> BucketState {
+        self.states.load().get(bucket).copied().unwrap_or_default()
     }
 
     /// The remote delete is the commit and the emptiness gate; cache is drained best-effort after —
@@ -566,50 +645,69 @@ impl BucketTask {
         Ok(())
     }
 
-    /// Reconcile a bucket's cache with the remote, then flip it authoritative. Skips a bucket the
-    /// remote no longer holds (a stray trigger for a deleted bucket). On failure the bucket stays
-    /// unready, so the next access re-triggers.
-    async fn reconcile(&self, bucket: &str, trigger: Trigger) {
-        self.sweep(bucket, trigger).await;
-        // However the sweep ended, it is no longer pending: dropping the memo is what makes the
-        // next access re-classify — re-triggering a failed sweep, or resolving `Absent` for a
-        // bucket the remote no longer holds. A success already published `Ready`, which this leaves
-        // untouched.
-        update(&self.states, bucket, clear_restoring);
+    /// Run `pass`, re-queueing it on the actor's own channel if it could not run.
+    ///
+    /// Re-queueing rather than sleeping in place: a retry that held the bucket's task would also hold
+    /// its concurrency permit and block any Create/Delete behind it. The pass is unchanged on retry —
+    /// the markers it was chosen from cannot have moved, since only this pass rewrites them.
+    async fn recover(&self, bucket: &str, pass: Recovery) {
+        if self.run_recovery(bucket, pass).await == Outcome::Retry {
+            let requeue = self.requeue.clone();
+            let bucket = bucket.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(RECOVERY_RETRY).await;
+                let _ = requeue.send(BucketMsg::Recover { bucket, pass });
+            });
+        }
     }
 
-    async fn sweep(&self, bucket: &str, trigger: Trigger) {
-        // Triggers that arrived while another sweep (or a create) was flipping this bucket ready
-        // would re-run a full sweep over an already-authoritative namespace. An `Unaccounted`
-        // trigger runs anyway — see [`Trigger`].
-        if trigger == Trigger::Unreconciled
-            && self.states.load().get(bucket).is_some_and(|s| s.is_ready())
-        {
-            return;
-        }
+    async fn run_recovery(&self, bucket: &str, pass: Recovery) -> Outcome {
         if self.tier.remote.head_bucket(bucket).await.is_err() {
-            return;
+            // Deleted since startup resolved it. Retiring is what makes the map agree with the remote
+            // again, and turns later requests into `NoSuchBucket` instead of remote reads.
+            retire(&self.states, bucket);
+            return Outcome::Done;
         }
         if let Err(e) = self.provision(bucket).await {
-            tracing::warn!(bucket, error = %e, "reconcile could not provision cache; retry on next access");
-            return;
+            tracing::warn!(bucket, error = %e, "recovery could not provision cache; retrying");
+            return Outcome::Retry;
         }
-        let raised = match self.tier.reconcile_bucket(bucket).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(bucket, error = %e, "bucket reconcile failed; retry on next access");
-                return;
-            }
-        };
+        match pass {
+            Recovery::Restore => self.run_restore(bucket).await,
+            Recovery::RebuildPending => self.run_rebuild_pending(bucket).await,
+        }
+    }
+
+    /// R1: rebuild the cache namespace from the remote, then flip the bucket authoritative.
+    async fn run_restore(&self, bucket: &str) -> Outcome {
+        if let Err(e) = recovery::restore(&self.tier, bucket).await {
+            tracing::warn!(bucket, error = %e, "namespace restore failed; retrying");
+            return Outcome::Retry;
+        }
         if let Err(e) = self.mark_reconciled(bucket).await {
-            tracing::warn!(bucket, error = %e, "sync marker not written; retry on next access");
-            return;
+            tracing::warn!(bucket, error = %e, "sync marker not written; retrying");
+            return Outcome::Retry;
         }
-        // The pass rebuilt the pending set from cache and remote, so this run can now vouch for it
-        // — the same standing a boot-time recovery scan used to confer (§7). A lazily restored
-        // bucket earns it too, which the split implementation never granted.
+        // Writes ran durable for the whole window, so no marker was owed while the pass ran: the
+        // pending set is empty and complete the moment the sync marker lands (§7).
         update(&self.states, bucket, set_accounted);
-        tracing::info!(bucket, markers = raised, "bucket reconcile complete");
+        tracing::info!(bucket, "namespace restore complete");
+        Outcome::Done
+    }
+
+    /// R2: re-derive the pending markers over a namespace that is already authoritative.
+    async fn run_rebuild_pending(&self, bucket: &str) -> Outcome {
+        match recovery::rebuild_pending(&self.tier, bucket).await {
+            Ok(raised) => {
+                update(&self.states, bucket, set_accounted);
+                tracing::info!(bucket, markers = raised, "pending-set rebuild complete");
+                Outcome::Done
+            }
+            Err(e) => {
+                tracing::warn!(bucket, error = %e, "pending-set rebuild failed; retrying");
+                Outcome::Retry
+            }
+        }
     }
 
     async fn reset_cache(&self, bucket: &str) -> Result<()> {
@@ -628,7 +726,7 @@ impl BucketTask {
         Ok(())
     }
 
-    async fn mark_reconciled(&self, bucket: &str) -> Result<()> {
+    async fn write_sync_marker(&self, bucket: &str) -> Result<()> {
         self.tier
             .meta
             .put_small(
@@ -640,6 +738,11 @@ impl BucketTask {
                 None,
             )
             .await?;
+        Ok(())
+    }
+
+    async fn mark_reconciled(&self, bucket: &str) -> Result<()> {
+        self.write_sync_marker(bucket).await?;
         update(&self.states, bucket, mark_ready);
         Ok(())
     }

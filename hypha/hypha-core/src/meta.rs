@@ -239,6 +239,32 @@ const TAG_SYNC: char = 's';
 /// Range-A tag for the per-bucket clean marker.
 const TAG_CLEAN: char = 'c';
 
+const TAG_HALT: char = 'h';
+
+/// **Remote** (`<remote><b>`): the halt marker — the record of an invariant violation, written by
+/// the run that observed it and fatal to every run that finds it (`hypha::halt`).
+///
+/// The only hypha-internal key that lives on the remote rather than in `<meta>`, and deliberately:
+/// a violation says hypha's picture of its own data is wrong, so it has to outlive the cache. The
+/// cache is exactly what a namespace restore rebuilds and a volume loss destroys — a halt marker
+/// there would be erased by the recovery it exists to block.
+///
+/// Being in the client keyspace, it leads with the two control bytes no client key may contain, and
+/// every remote listing filters it out ([`is_reserved_remote_key`]).
+pub fn halt_marker_key() -> String {
+    format!("{c}{c}{TAG_HALT}", c = CTRL as char)
+}
+
+/// Whether a key returned by a **remote** listing is hypha's own rather than a client object.
+///
+/// Client keys cannot contain `0x01` ([`validate_client_key`]), so the leading control byte is a
+/// complete test. Every path that reads the remote as a client keyspace must apply it — a listing
+/// that does not would hand a reserved key to a trailer read, and a reserved key carries no
+/// trailer, which is itself an invariant violation (`hypha::halt`).
+pub fn is_reserved_remote_key(key: &str) -> bool {
+    key.starts_with(CTRL as char)
+}
+
 /// Cache (`<meta><b>`): the sync marker (§6). Present iff this bucket's cache namespace has been
 /// reconciled from the remote and is therefore authoritative; its absence puts reads on the remote
 /// until the restore sweep rewrites it (§7). The presence is the whole signal — the body is empty.
@@ -605,6 +631,21 @@ pub fn validate_bucket_name(name: &str, max_prefix_len: usize) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The remote bucket is client keyspace *plus* the halt marker (§6), and every key that gets
+    /// past this filter goes to a trailer read — so the test that matters is that the filter is
+    /// exactly the control byte no client key may carry, not a name match on the marker.
+    #[test]
+    fn reserved_remote_keys_are_exactly_the_control_byte_prefix() {
+        assert!(is_reserved_remote_key(&halt_marker_key()));
+        for client in ["k", "a/b", "\u{2}leading-control", " ", "\u{7f}"] {
+            assert!(
+                !is_reserved_remote_key(client),
+                "{client:?} is admissible as a client key and must not be filtered"
+            );
+            assert!(validate_client_key(client).is_ok());
+        }
+    }
 
     #[test]
     fn twin_roundtrips() {

@@ -157,6 +157,15 @@ pub struct Config {
     /// only cached mode submits anything.
     #[serde(default)]
     pub background: Background,
+    /// How often to re-check that each `Ready` bucket still has its sync marker (§7). One HEAD per
+    /// ready bucket per tick, so it is cheap at homelab bucket counts; the cost of a slow tick is
+    /// only how long a live volume loss goes unnoticed.
+    #[serde(default = "default_volume_watch_interval_ms")]
+    pub volume_watch_interval_ms: u64,
+}
+
+fn default_volume_watch_interval_ms() -> u64 {
+    30_000
 }
 
 impl Default for Serving {

@@ -1,0 +1,589 @@
+//! The two recoveries (§7) and the invariants they enforce.
+//!
+//! hypha recovers from exactly two failures, one per marker: a lost cache volume (**sync** marker
+//! absent ⇒ namespace restore) and writes acked without their marker landing (**clean** marker
+//! absent ⇒ pending-set rebuild). Their premises are opposites — one may assume nothing about the
+//! cache namespace, the other that it is authoritative — so these tests are mostly about keeping
+//! each pass inside its own premise, and about what happens when the world contradicts one.
+//!
+//! The write-mode gate is the load-bearing piece: a cached deployment runs **durable** semantics for
+//! the whole of a bucket's restore, which is what makes "the cache holds nothing authoritative"
+//! true rather than merely assumed, and what makes the restore safe to be purely additive.
+
+mod common;
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use common::*;
+use futures::StreamExt as _;
+use hypha_core::meta;
+
+const B: &str = "recov";
+
+// ── helpers ───────────────────────────────────────────────────────────────────────────────────
+
+async fn wait_until<F, Fut>(ms: u64, what: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        if cond().await {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after {ms}ms waiting for: {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn raw_exists(h: &Harness, bucket: &str, key: &str) -> bool {
+    h.raw()
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .is_ok()
+}
+
+async fn remote_present(h: &Harness, key: &str) -> bool {
+    raw_exists(h, &h.remote_bucket(B), key).await
+}
+
+async fn marker_present(h: &Harness, key: &str) -> bool {
+    raw_exists(h, &h.meta_bucket(B), key).await
+}
+
+async fn sync_marker_present(h: &Harness) -> bool {
+    raw_exists(h, &h.meta_bucket(B), &meta::sync_marker_key()).await
+}
+
+/// Classify K's `<data>` entry: `None` ⇒ a live plaintext body, `Some(kind)` ⇒ a tombstone (§6).
+/// Panics if K has no entry at all — the callers here all know it does.
+async fn data_class(h: &Harness, key: &str) -> Option<meta::TombKind> {
+    let head = h
+        .raw()
+        .head_object()
+        .bucket(h.cache_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("data head");
+    meta::classify_entry(
+        head.content_length().unwrap_or(0),
+        head.e_tag().unwrap_or_default().trim_matches('"'),
+    )
+}
+
+/// Every `<data>` object with its (size, ETag) — the shape a pass that must not touch client state
+/// has to leave byte-identical.
+async fn data_namespace(h: &Harness) -> HashMap<String, (i64, String)> {
+    let mut out = HashMap::new();
+    for key in raw_list(&h.raw(), &h.cache_bucket(B), None).await {
+        let head = h
+            .raw()
+            .head_object()
+            .bucket(h.cache_bucket(B))
+            .key(&key)
+            .send()
+            .await
+            .expect("data head");
+        out.insert(
+            key,
+            (
+                head.content_length().unwrap_or(0),
+                head.e_tag()
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string(),
+            ),
+        );
+    }
+    out
+}
+
+/// Drop the bucket's sync marker, so the next access classifies the namespace as untrusted and owes
+/// a restore. Models the marker dying with a lost cache volume.
+async fn drop_sync_marker(h: &Harness) {
+    h.raw()
+        .delete_object()
+        .bucket(h.meta_bucket(B))
+        .key(meta::sync_marker_key())
+        .send()
+        .await
+        .expect("drop sync marker");
+}
+
+/// Destroy both cache projections, buckets and all — a cache volume loss.
+///
+/// The buckets go too, not just their objects, and that is what makes the tests below deterministic
+/// rather than racy: startup discovers buckets by listing `<meta>`, so a bucket with no `<meta>`
+/// projection owes no obligation at boot and its restore is triggered by the *first client request*
+/// — which is then guaranteed to be the one that observes the bucket restoring.
+async fn destroy_cache(h: &Harness) {
+    let raw = h.raw();
+    for bucket in [h.cache_bucket(B), h.meta_bucket(B)] {
+        for key in raw_list(&raw, &bucket, None).await {
+            raw.delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .expect("wipe cache object");
+        }
+        raw.delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("drop cache bucket");
+    }
+}
+
+/// Seed `B` with enough remote objects that its restore cannot finish before the test's next
+/// request, then take the cache volume out from under it and restart.
+///
+/// Startup resolves every bucket and queues the restore itself, so the window is no longer opened by
+/// the first request to arrive — it is already open, and closing. Each seeded key costs the restore a
+/// trailer read and two small writes; the tests below all assert something only a write *inside* the
+/// window produces, so a window that closed early fails them loudly rather than passing vacuously.
+async fn open_restore_window(h: &mut Harness) {
+    let c = h.client();
+    // Bounded: the suites run in parallel, and 400 requests in flight at once starves the others.
+    futures::stream::iter((0..WINDOW_KEYS).map(|i| {
+        let c = c.clone();
+        let body = pattern(64);
+        async move { put(&c, B, &format!("seed-{i:04}"), &body).await }
+    }))
+    .buffer_unordered(16)
+    .collect::<Vec<_>>()
+    .await;
+    wait_until(30_000, "the seed reaches the remote", || async {
+        remote_present(h, &format!("seed-{:04}", WINDOW_KEYS - 1)).await
+    })
+    .await;
+
+    // Stopped first: taking the volume from a *live* ready bucket is the one thing the watchdog
+    // halts on (I7), and it is not what these tests are about.
+    h.stop_hypha().await;
+    destroy_cache(h).await;
+    h.start_hypha().await;
+}
+
+/// Sized so the restore takes seconds against a local MinIO, not milliseconds.
+const WINDOW_KEYS: usize = 400;
+
+// ── the write-mode gate ───────────────────────────────────────────────────────────────────────
+
+/// A cached deployment runs **durable** semantics for the whole of a bucket's restore (§7).
+///
+/// This is what makes the restore's premise true rather than hoped-for. A cached write would ack off
+/// the cache and leave committed state in a namespace every reader is being told to ignore and the
+/// restore is about to declare authoritative; a durable one commits on the remote first and settles
+/// its own tombstone, which is exactly what the restore would have materialized.
+#[tokio::test]
+async fn writes_during_a_restore_commit_to_the_remote() {
+    let mut h = Harness::cached().await;
+    h.create_bucket(B).await;
+
+    destroy_cache(&h).await;
+    h.restart_hypha().await;
+    let c = h.client();
+
+    // The PUT is the first request to touch the bucket, so it is the one that classifies the
+    // namespace as untrusted and kicks the restore — and it runs inside the window it opened.
+    let body = pattern(4096);
+    put(&c, B, "k", &body).await;
+
+    // Durable semantics: the remote holds it the instant the client is acked — no reconcile pass
+    // has run, and none is owed.
+    assert!(
+        remote_present(&h, "k").await,
+        "a write taken during a restore must be durable at ack, not owed to the reconcile sweep"
+    );
+    assert_eq!(
+        data_class(&h, "k").await,
+        Some(meta::TombKind::Evict),
+        "a durable write settles an eviction tombstone; a live plaintext body here would be an \
+         acked write inside an untrusted namespace"
+    );
+    assert!(
+        !marker_present(&h, "k").await,
+        "durable writes owe no pending marker"
+    );
+    assert_eq!(get_all(&c, B, "k").await, body);
+}
+
+/// The regression test for the acked-write loss: with the cache untrusted, a *second* write to the
+/// same key must not destroy the first.
+///
+/// The old path settled K from the remote before every write, which for a key the remote did not yet
+/// hold deleted the acked cache body outright, failed the precondition, and left a pending marker
+/// the sweep then reaped as an orphan — an acked write gone with nothing left to show it existed.
+#[tokio::test]
+async fn a_write_during_a_restore_survives_a_later_conditional_write() {
+    let mut h = Harness::cached().await;
+    h.create_bucket(B).await;
+
+    open_restore_window(&mut h).await;
+    let c = h.client();
+
+    let first = pattern(2048);
+    let etag = put(&c, B, "k", &first).await;
+
+    // A conditional write on the generation the client was just given. Under the old behaviour the
+    // preceding settle had already deleted it, so this 412'd *and* took the object with it.
+    let second = pattern_seeded(2048, 9);
+    c.put_object()
+        .bucket(B)
+        .key("k")
+        .if_match(&etag)
+        .body(bytes_body(&second))
+        .send()
+        .await
+        .expect("If-Match on the generation hypha just acked must succeed");
+
+    assert_eq!(get_all(&c, B, "k").await, second);
+    assert!(remote_present(&h, "k").await);
+}
+
+// ── R1: the namespace restore is additive ─────────────────────────────────────────────────────
+
+/// The restore materializes only keys the cache has no entry for, so a delete taken during the
+/// window is not resurrected by the pass that runs after it.
+#[tokio::test]
+async fn restore_does_not_resurrect_a_delete_taken_during_the_window() {
+    let mut h = Harness::cached().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+
+    put(&c, B, "kept", &pattern(512)).await;
+    put(&c, B, "gone", &pattern(512)).await;
+    wait_until(10_000, "both keys reach the remote", || async {
+        remote_present(&h, "kept").await && remote_present(&h, "gone").await
+    })
+    .await;
+
+    // The cache volume dies; the remote objects do not. The delete below runs inside the window.
+    open_restore_window(&mut h).await;
+    let c = h.client();
+
+    assert!(
+        !sync_marker_present(&h).await,
+        "the delete must run inside the restore window, not after it"
+    );
+    c.delete_object()
+        .bucket(B)
+        .key("gone")
+        .send()
+        .await
+        .expect("delete during the restore window");
+
+    wait_until(15_000, "the restore completes", || async {
+        sync_marker_present(&h).await
+    })
+    .await;
+
+    assert!(
+        c.head_object().bucket(B).key("gone").send().await.is_err(),
+        "the restore must not resurrect a key deleted during its own window"
+    );
+    assert!(c.head_object().bucket(B).key("kept").send().await.is_ok());
+}
+
+/// An entry the cache already holds is left exactly as it is — including the client pass-through the
+/// eviction tombstone's metadata is the only surviving copy of (§7: the remote's trailer carries
+/// facts and nothing else). Settling every key from the remote, as the old path did, silently erased
+/// `x-amz-meta-*` and the storage class on every key a restore touched.
+#[tokio::test]
+async fn restore_preserves_client_metadata_on_entries_it_finds() {
+    let mut h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+
+    c.put_object()
+        .bucket(B)
+        .key("k")
+        .metadata("colour", "octarine")
+        .storage_class(aws_sdk_s3::types::StorageClass::StandardIa)
+        .body(bytes_body(&pattern(256)))
+        .send()
+        .await
+        .expect("put with metadata");
+
+    // Trust is gone, the namespace is not — the restore finds an entry at every key.
+    drop_sync_marker(&h).await;
+    h.restart_hypha().await;
+    let c = h.client();
+
+    // Any access re-classifies and kicks the pass.
+    let _ = c.head_object().bucket(B).key("k").send().await;
+    wait_until(15_000, "the restore completes", || async {
+        sync_marker_present(&h).await
+    })
+    .await;
+
+    let head = c
+        .head_object()
+        .bucket(B)
+        .key("k")
+        .send()
+        .await
+        .expect("head after restore");
+    assert_eq!(
+        head.metadata()
+            .and_then(|m| m.get("colour"))
+            .map(String::as_str),
+        Some("octarine"),
+        "an additive restore must not re-derive an entry it found, erasing its pass-through"
+    );
+    assert_eq!(
+        head.storage_class().map(|s| s.as_str()),
+        Some("STANDARD_IA")
+    );
+}
+
+// ── R2: the pending-set rebuild touches markers and nothing else ──────────────────────────────
+
+/// The rebuild's premise is that the namespace is authoritative, so it may re-derive the *index*
+/// and nothing else. Asserted structurally: `<data>` is byte-identical across the pass, and exactly
+/// the keys that owe the remote something gain markers.
+#[tokio::test]
+async fn pending_rebuild_writes_markers_and_never_touches_data() {
+    let mut h = Harness::cached().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+
+    // Settled: uploaded and no longer pending.
+    put(&c, B, "settled", &pattern(512)).await;
+    wait_until(10_000, "the settled key reaches the remote", || async {
+        remote_present(&h, "settled").await
+    })
+    .await;
+
+    // Owed: acked on the cache, with its marker deleted out of band so only a rebuild can find it.
+    // This is precisely the state a crash between the body write and the marker write leaves.
+    put(&c, B, "owed", &pattern(1024)).await;
+    h.raw()
+        .delete_object()
+        .bucket(h.meta_bucket(B))
+        .key("owed")
+        .send()
+        .await
+        .expect("drop the pending marker");
+    let before = data_namespace(&h).await;
+
+    // No clean marker (an ungraceful stop), sync marker intact ⇒ the pending rebuild, not a restore.
+    h.kill_hypha().await;
+    h.start_hypha().await;
+
+    wait_until(
+        15_000,
+        "the rebuild re-raises the missing marker",
+        || async { marker_present(&h, "owed").await || remote_present(&h, "owed").await },
+    )
+    .await;
+    wait_until(
+        15_000,
+        "the re-raised marker drains to the remote",
+        || async { remote_present(&h, "owed").await },
+    )
+    .await;
+
+    let after = data_namespace(&h).await;
+    assert_eq!(
+        before, after,
+        "the pending rebuild may write markers only — `<data>` must come through untouched"
+    );
+}
+
+// ── invariants ────────────────────────────────────────────────────────────────────────────────
+
+/// Poll for the halt marker, which is recorded on the **remote** so it outlives the cache (§6).
+async fn halt_marker_present(h: &Harness) -> bool {
+    raw_exists(h, &h.remote_bucket(B), &meta::halt_marker_key()).await
+}
+
+/// Assert the process ended on an invariant violation, recorded it, and that every run after it
+/// ends the same way without re-deriving anything — the crashloop an operator alerts on.
+async fn assert_halted(h: &mut Harness) {
+    let status = h.child().wait_exit(Duration::from_secs(30)).await;
+    assert_eq!(
+        status.code(),
+        Some(hypha::EXIT_INVARIANT_VIOLATION),
+        "an invariant violation must end the process"
+    );
+    assert!(
+        halt_marker_present(h).await,
+        "the violation must be recorded on the remote before the process exits, or the next run \
+         would serve the same data"
+    );
+    h.start_hypha_expecting_exit();
+    let status = h.child().wait_exit(Duration::from_secs(30)).await;
+    assert_eq!(
+        status.code(),
+        Some(hypha::EXIT_INVARIANT_VIOLATION),
+        "a run that finds a halt marker must exit before serving anything"
+    );
+}
+
+/// **I2** — the remote holds an object a ready bucket's cache has no entry for.
+///
+/// Cache-absent is the authoritative 404 on a ready bucket, and no code path can produce this: every
+/// site that removes a `<data>` entry does so only once the remote object is already gone. So the
+/// two backends disagree about whether an object exists, and continuing would mean answering 404 for
+/// something that is there.
+#[tokio::test]
+async fn remote_only_key_on_a_ready_bucket_halts() {
+    let mut h = Harness::cached_subprocess().await;
+    h.create_bucket(B).await;
+    put(&h.client(), B, "real", &pattern(64)).await;
+
+    // Straight into the remote, behind hypha's back: an object the cache never knew about.
+    h.raw()
+        .put_object()
+        .bucket(h.remote_bucket(B))
+        .key("ghost")
+        .body(bytes_body(b"not in the cache"))
+        .send()
+        .await
+        .expect("plant a remote-only key");
+
+    // Ungraceful stop ⇒ no clean marker ⇒ the next run owes a pending rebuild, which walks both
+    // namespaces and meets the ghost.
+    h.kill_hypha().await;
+    h.start_hypha_expecting_exit();
+    assert_halted(&mut h).await;
+}
+
+/// **I3** — an eviction tombstone whose remote object is gone.
+///
+/// The remote lost bytes hypha reported as committed, and the tombstone is the only surviving record
+/// that they existed. The tombstone here is minted the ordinary way: by a durable-semantics write
+/// taken during a restore window.
+#[tokio::test]
+async fn eviction_tombstone_without_its_remote_object_halts() {
+    let mut h = Harness::cached_subprocess().await;
+    h.create_bucket(B).await;
+
+    // Force the restore window, then write through it — the write commits on the remote and settles
+    // an eviction tombstone in the cache.
+    open_restore_window(&mut h).await;
+    put(&h.client(), B, "k", &pattern(256)).await;
+    assert_eq!(data_class(&h, "k").await, Some(meta::TombKind::Evict));
+    wait_until(15_000, "the restore completes", || async {
+        sync_marker_present(&h).await
+    })
+    .await;
+
+    // The remote loses the object the tombstone stands for.
+    h.raw()
+        .delete_object()
+        .bucket(h.remote_bucket(B))
+        .key("k")
+        .send()
+        .await
+        .expect("drop the remote object");
+
+    h.kill_hypha().await;
+    h.start_hypha_expecting_exit();
+    assert_halted(&mut h).await;
+}
+
+/// **I1**, and the classification rule in one: with *both* markers absent the bucket is classified
+/// as a restore, and a restore may not find a live plaintext body.
+///
+/// A cached write acked into a namespace that is not authoritative is the exact state the write-mode
+/// gate exists to prevent, so one here means the gate leaked. Note what the rebuild would have done
+/// instead — quietly raised a marker — which is why "both markers absent ⇒ restore" is a
+/// classification and not a preference.
+#[tokio::test]
+async fn a_cached_body_in_an_untrusted_namespace_halts() {
+    let mut h = Harness::cached_subprocess().await;
+    h.create_bucket(B).await;
+
+    // A live, acked, not-yet-uploaded cache body — the ordinary cached-mode steady state.
+    put(&h.client(), B, "k", &pattern(256)).await;
+    assert_eq!(data_class(&h, "k").await, None, "a live plaintext body");
+
+    // Now take namespace trust away without taking the body with it, and stop ungracefully so the
+    // clean marker is absent too. Both markers gone ⇒ restore ⇒ the body is inadmissible.
+    h.kill_hypha().await;
+    drop_sync_marker(&h).await;
+    h.start_hypha_expecting_exit();
+
+    // Any access re-classifies the bucket and dispatches the pass.
+    let c = h.client();
+    for _ in 0..40 {
+        if c.head_object().bucket(B).key("k").send().await.is_err() && halt_marker_present(&h).await
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_halted(&mut h).await;
+}
+
+/// **I7** — the cache volume disappears under a *running* process.
+///
+/// Startup resolves a bucket's readiness once and holds it for the run, which is sound only while
+/// the volume stays. A `Ready` bucket whose cache is gone answers 404 for objects that exist, and
+/// says nothing about it — cache-absent *is* the authoritative 404 there. The watchdog is the only
+/// thing still asking, and its answer is a halt: the run cannot re-derive what it already served.
+#[tokio::test]
+async fn a_sync_marker_vanishing_mid_run_halts() {
+    let mut h = Harness::cached_subprocess().await;
+    h.create_bucket(B).await;
+    put(&h.client(), B, "k", &pattern(256)).await;
+
+    // The volume goes, and nothing in the request path would ever notice: reads of `k` still hit a
+    // live cache body, and reads of anything else were 404 before and after.
+    drop_sync_marker(&h).await;
+
+    assert_halted(&mut h).await;
+}
+
+/// hypha's own keys live in the remote bucket alongside client objects (the halt marker, §6), and
+/// every remote key a restore-time LIST emits goes to a trailer read. An unfiltered one would be
+/// reported as a foreign object — hypha halting on its own bookkeeping.
+#[tokio::test]
+async fn reserved_remote_keys_are_invisible_and_harmless() {
+    let mut h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+    put(&c, B, "visible", &pattern(64)).await;
+    wait_until(10_000, "the client key reaches the remote", || async {
+        remote_present(&h, "visible").await
+    })
+    .await;
+
+    // A reserved-prefix key that is not the halt marker: the filter must be the control byte, not a
+    // name match, or the next reserved key added would slip through.
+    let reserved = format!("{c}{c}z", c = meta::CTRL as char);
+    h.raw()
+        .put_object()
+        .bucket(h.remote_bucket(B))
+        .key(&reserved)
+        .body(bytes_body(b"hypha bookkeeping, no trailer"))
+        .send()
+        .await
+        .expect("plant a reserved remote key");
+
+    // Serve the bucket from the remote, where the reserved key is. Durable mode keeps only
+    // tombstones in `<data>`, so dropping trust alone is a legitimate restore here.
+    drop_sync_marker(&h).await;
+    h.restart_hypha().await;
+    let c = h.client();
+
+    let listed = c
+        .list_objects_v2()
+        .bucket(B)
+        .send()
+        .await
+        .expect("LIST while restoring must not choke on hypha's own keys");
+    let keys: Vec<&str> = listed.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, ["visible"], "reserved keys must never reach a client");
+}

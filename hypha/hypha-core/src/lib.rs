@@ -4,7 +4,6 @@
 pub mod backend;
 pub mod config;
 pub mod error;
-pub mod fatal;
 pub mod meta;
 
 pub use backend::Backend;

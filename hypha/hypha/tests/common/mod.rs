@@ -177,8 +177,9 @@ impl Drop for Hypha {
 // ── hypha, as a real subprocess ────────────────────────────────────────────────────────────────
 
 /// hypha run as the shipped binary in its own process, configured through the `HYPHA_` env layer
-/// `Config::load` reads. Needed only where a test asserts *process-level* behaviour — a fatal exit
-/// (`hypha_core::fatal`) would take the test runner down with it in-process.
+/// `Config::load` reads. Needed only where a test asserts *process-level* behaviour — the exit an
+/// invariant violation ends the process with (`hypha::halt`) would take the test runner down with
+/// it in-process.
 pub struct ChildHypha {
     child: Child,
     pub endpoint: String,
@@ -188,6 +189,14 @@ impl ChildHypha {
     /// Spawn the binary against `config` and wait for it to accept requests. `config.serving.listen`
     /// must already name a free port.
     async fn start(config: &Config) -> Self {
+        let hypha = Self::spawn(config);
+        hypha.await_ready().await;
+        hypha
+    }
+
+    /// Spawn without waiting for readiness — for a run expected to exit *before* it can serve, which
+    /// is what a recorded invariant violation makes every subsequent run do (`hypha::halt`).
+    fn spawn(config: &Config) -> Self {
         let listen = config.serving.listen.clone();
         let child = Command::new(env!("CARGO_BIN_EXE_hypha"))
             .envs(config_env(config))
@@ -198,12 +207,10 @@ impl ChildHypha {
             .spawn()
             .expect("spawning the hypha binary");
 
-        let hypha = Self {
+        Self {
             child,
             endpoint: format!("http://{listen}"),
-        };
-        hypha.await_ready().await;
-        hypha
+        }
     }
 
     async fn await_ready(&self) {
@@ -340,8 +347,16 @@ impl Harness {
     /// The same deployment with hypha as a real subprocess — for tests that assert on how the
     /// process itself lives or dies.
     pub async fn durable_subprocess() -> Self {
+        Self::subprocess(Mode::Durable).await
+    }
+
+    pub async fn cached_subprocess() -> Self {
+        Self::subprocess(Mode::Cached).await
+    }
+
+    async fn subprocess(mode: Mode) -> Self {
         let minio = Minio::start().await;
-        let mut config = base_config(&minio, Mode::Durable);
+        let mut config = base_config(&minio, mode);
         config.serving.listen = format!("127.0.0.1:{}", free_port());
         let hypha = Server::Child(ChildHypha::start(&config).await);
         Self {
@@ -426,6 +441,12 @@ impl Harness {
         };
     }
 
+    /// Start a subprocess hypha without waiting for it to serve — the caller is asserting that it
+    /// exits instead ([`ChildHypha::wait_exit`]).
+    pub fn start_hypha_expecting_exit(&mut self) {
+        self.hypha = Server::Child(ChildHypha::spawn(&self.config));
+    }
+
     pub async fn create_bucket(&self, bucket: &str) {
         self.client()
             .create_bucket()
@@ -455,6 +476,9 @@ fn base_config(minio: &Minio, mode: Mode) -> Config {
             concurrency: 8,
         },
         background: Background::default(),
+        // Tight, so a test that takes a cache volume away mid-run doesn't wait out the production
+        // cadence for the watchdog to notice.
+        volume_watch_interval_ms: 200,
     }
 }
 

@@ -105,21 +105,7 @@ async fn bucket_cache_loss_restores_from_remote() {
 
     // Simulate cache-volume loss: wipe both projections' contents — the sync marker, tombstones,
     // and twins — leaving the remote (the source of truth) intact.
-    let raw = h.raw();
-    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
-        for key in raw_list(&raw, &cache, None).await {
-            raw.delete_object()
-                .bucket(&cache)
-                .key(&key)
-                .send()
-                .await
-                .expect("wipe cache object");
-        }
-    }
-
-    // Fresh process: the in-memory ready set is empty, so the missing marker is observed and the
-    // bucket resolves as restoring. GET returns the real body from the remote meanwhile.
-    h.restart_hypha().await;
+    lose_cache_volume(&mut h, false).await;
     let client = h.client();
     for (k, body) in keys.iter().zip(&bodies) {
         let got = client.get_object().bucket(B).key(*k).send().await;
@@ -140,7 +126,7 @@ async fn bucket_cache_loss_restores_from_remote() {
     wait_for_sync_marker(&h, B).await;
 
     // Cache is authoritative again: one rebuilt tombstone per key in <data>, GET still correct.
-    let rebuilt = raw_list(&raw, &h.cache_bucket(B), None).await;
+    let rebuilt = raw_list(&h.raw(), &h.cache_bucket(B), None).await;
     assert_eq!(
         rebuilt.len(),
         keys.len(),
@@ -180,24 +166,7 @@ async fn bucket_cache_volume_loss_restores_from_remote() {
         etags.push(put(&client, B, k, body).await);
     }
 
-    let raw = h.raw();
-    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
-        for key in raw_list(&raw, &cache, None).await {
-            raw.delete_object()
-                .bucket(&cache)
-                .key(&key)
-                .send()
-                .await
-                .expect("wipe cache object");
-        }
-        raw.delete_bucket()
-            .bucket(&cache)
-            .send()
-            .await
-            .expect("wipe cache bucket");
-    }
-
-    h.restart_hypha().await;
+    lose_cache_volume(&mut h, true).await;
     let client = h.client();
 
     // Mid-restore the remote is the read source of truth: GET returns the real bodies, and LIST
@@ -245,7 +214,7 @@ async fn bucket_cache_volume_loss_restores_from_remote() {
 
     wait_for_sync_marker(&h, B).await;
 
-    let mut rebuilt = raw_list(&raw, &h.cache_bucket(B), None).await;
+    let mut rebuilt = raw_list(&h.raw(), &h.cache_bucket(B), None).await;
     rebuilt.sort();
     assert_eq!(
         rebuilt,
@@ -271,18 +240,7 @@ async fn delete_of_an_unreconciled_bucket_resolves_absent() {
     let client = h.client();
     put(&client, B, "obj", &pattern(32)).await;
 
-    let raw = h.raw();
-    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
-        for key in raw_list(&raw, &cache, None).await {
-            raw.delete_object()
-                .bucket(&cache)
-                .key(&key)
-                .send()
-                .await
-                .expect("wipe cache object");
-        }
-    }
-    h.restart_hypha().await;
+    lose_cache_volume(&mut h, false).await;
     let client = h.client();
 
     // First op classifies the bucket as restoring (and memoizes it); the delete then has to undo
@@ -334,23 +292,7 @@ async fn concurrent_writes_survive_cache_volume_loss() {
     let client = h.client();
     put(&client, B, "seed", &pattern(32)).await;
 
-    let raw = h.raw();
-    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
-        for key in raw_list(&raw, &cache, None).await {
-            raw.delete_object()
-                .bucket(&cache)
-                .key(&key)
-                .send()
-                .await
-                .expect("wipe cache object");
-        }
-        raw.delete_bucket()
-            .bucket(&cache)
-            .send()
-            .await
-            .expect("wipe cache bucket");
-    }
-    h.restart_hypha().await;
+    lose_cache_volume(&mut h, true).await;
 
     // Fired together, before the lazily-triggered restore can provision anything for them.
     let client = h.client();
@@ -369,7 +311,7 @@ async fn concurrent_writes_survive_cache_volume_loss() {
 
     // The restore still completes over the union of pre-loss and burst keys.
     wait_for_sync_marker(&h, B).await;
-    let mut rebuilt = raw_list(&raw, &h.cache_bucket(B), None).await;
+    let mut rebuilt = raw_list(&h.raw(), &h.cache_bucket(B), None).await;
     rebuilt.sort();
     let mut want = keys.clone();
     want.push("seed".to_string());
@@ -400,8 +342,12 @@ async fn foreign_remote_object_terminates_hypha() {
         .await
         .expect("put foreign object");
 
-    // Drop the cache (marker included) so the next access to B triggers a restore sweep, and
-    // restart so hypha re-reads readiness instead of trusting its in-memory ready set.
+    // Drop the cache (marker included) so B's namespace is untrusted again. Stopped first, or the
+    // volume watchdog would halt on the live loss instead (§7, I7). Startup resolves every bucket's
+    // state, so the restarted process owes B a restore before it serves anything — no client request
+    // is needed to reach `foreign`, and none can be made, since the process is expected to exit
+    // rather than become ready.
+    h.stop_hypha().await;
     for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
         for key in raw_list(&raw, &cache, None).await {
             raw.delete_object()
@@ -412,12 +358,7 @@ async fn foreign_remote_object_terminates_hypha() {
                 .expect("wipe cache object");
         }
     }
-    h.restart_hypha().await;
-
-    // Kick the restore with a read of the *good* key — it resolves fine off its own trailer, so
-    // only the background sweep can reach `foreign`. Tolerate a failure: the sweep runs
-    // concurrently and may take the process down mid-request.
-    let _ = h.client().get_object().bucket(B).key("mine").send().await;
+    h.start_hypha_expecting_exit();
 
     let status = h
         .child()
@@ -425,8 +366,30 @@ async fn foreign_remote_object_terminates_hypha() {
         .await;
     assert_eq!(
         status.code(),
-        Some(hypha_core::fatal::EXIT_FOREIGN_OBJECT),
-        "hypha should exit EXIT_FOREIGN_OBJECT on an unverifiable remote object"
+        Some(hypha::EXIT_INVARIANT_VIOLATION),
+        "hypha should exit EXIT_INVARIANT_VIOLATION on an unverifiable remote object"
+    );
+
+    // The exit is only half of it: the violation must be *recorded* on the remote, or the next
+    // process would come up and serve the same data (`crate::halt`).
+    raw.head_object()
+        .bucket(h.remote_bucket(B))
+        .key(hypha_core::meta::halt_marker_key())
+        .send()
+        .await
+        .expect("the violation must be recorded on the remote before hypha exits");
+
+    // And every run after it must exit on that record alone, without re-deriving the violation —
+    // which is what makes a halted deployment present as an ordinary crashloop.
+    h.start_hypha_expecting_exit();
+    let status = h
+        .child()
+        .wait_exit(std::time::Duration::from_secs(20))
+        .await;
+    assert_eq!(
+        status.code(),
+        Some(hypha::EXIT_INVARIANT_VIOLATION),
+        "a run that finds a halt marker must exit before serving anything"
     );
 }
 
@@ -1501,6 +1464,35 @@ async fn get_bucket_versioning_stub() {
         .await
         .expect("get bucket versioning");
     assert!(out.status().is_none(), "versioning is never enabled");
+}
+
+/// Simulate cache-volume loss and bring hypha back onto the empty volume.
+///
+/// Stopped before the wipe, deliberately: taking the volume out from under a *live* ready bucket is
+/// a different failure — the one the volume watchdog halts on (§7, I7) — and not what these tests
+/// are about. `drop_buckets` removes the projections themselves too, modelling a volume that came
+/// back bare rather than one that came back empty.
+async fn lose_cache_volume(h: &mut Harness, drop_buckets: bool) {
+    h.stop_hypha().await;
+    let raw = h.raw();
+    for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
+        for key in raw_list(&raw, &cache, None).await {
+            raw.delete_object()
+                .bucket(&cache)
+                .key(&key)
+                .send()
+                .await
+                .expect("wipe cache object");
+        }
+        if drop_buckets {
+            raw.delete_bucket()
+                .bucket(&cache)
+                .send()
+                .await
+                .expect("wipe cache bucket");
+        }
+    }
+    h.start_hypha().await;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────

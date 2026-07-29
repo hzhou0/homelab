@@ -4,11 +4,9 @@
 //!
 //! Three pieces, in the order a run meets them:
 //!
-//! 1. **Startup** ([`Markers::startup`]) reads and deletes every bucket's clean marker before the
-//!    listener opens, recording which were present, and raises a reconcile pass on the
-//!    bucket-control actor for the rest rather than scanning here — rebuilding the pending set is
-//!    the same traversal restore runs, and one queue is what keeps the two from becoming two
-//!    passes over independent snapshots ([`crate::bucket_ctl`]).
+//! 1. **Startup** reads and clears the clean markers, but does it in
+//!    [`crate::bucket_ctl::resolve_all`], which is already reading the other marker of the same pair
+//!    and is the only place that can act on the answer.
 //! 2. **The queue** ([`Markers::owe`]) — a write hands its marker over and returns; the handover
 //!    cannot block or fail, which is the whole reason the queue is unbounded.
 //! 3. **The drain** ([`MarkerActor::run`]) writes clean markers, only for buckets this run accounted
@@ -30,10 +28,9 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
-use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
-use crate::bucket_ctl::{BucketCtl, Trigger};
+use crate::bucket_ctl::BucketCtl;
 use crate::tier::Tiering;
 
 const DRAIN_BATCH: usize = 256;
@@ -87,6 +84,7 @@ pub(crate) fn spawn(
     retry: Duration,
     concurrency: usize,
 ) -> (Markers, RunSeal, MarkerActor) {
+    let cached = tier.cached;
     // Unbounded because the enqueue sits on the write path *after* the commit: a bounded queue would
     // either block the ack behind the marker or shed it, and shedding needs a side channel to record
     // the loss — state whose only job is to be remembered on a failure path. An enqueue that cannot
@@ -108,6 +106,7 @@ pub(crate) fn spawn(
             rx,
             retry: retry.max(Duration::from_millis(1)),
             concurrency: concurrency.max(1),
+            cached,
         },
     )
 }
@@ -154,40 +153,6 @@ impl Markers {
             body_etag,
         }));
     }
-
-    /// Read and delete every bucket's clean marker, then owe a reconcile pass for each that was
-    /// absent. Runs before the listener opens: from the moment hypha can take a write, no bucket on
-    /// disk claims to be clean.
-    ///
-    /// A marker that cannot be deleted fails startup rather than being served around — skipping the
-    /// pass on a marker one then fails to delete would skip it again next run, by which time real
-    /// orphans exist.
-    ///
-    /// The pass itself is the bucket-control actor's ([`crate::bucket_ctl`]), not this module's: a
-    /// markerless bucket needs its pending set rebuilt from cache and remote, which is the same
-    /// traversal restore already runs, and routing both through the actor is what keeps them one
-    /// pass over one map rather than two racing snapshots. The actor accounts for the bucket when
-    /// the pass lands. Triggers are fire-and-forget, so startup does not wait on them — a pass that
-    /// fails leaves the bucket dirty and the next run tries again.
-    pub(crate) async fn startup(&self) -> Result<()> {
-        let clean = meta::clean_marker_key();
-        for (bucket, _) in self.queue.tier.meta.list_buckets().await? {
-            let present = match self.queue.tier.meta.head(&bucket, &clean).await {
-                Ok(_) => {
-                    self.queue.tier.meta.delete(&bucket, &clean).await?;
-                    true
-                }
-                Err(Error::NotFound) => false,
-                Err(e) => return Err(e),
-            };
-            if present {
-                self.queue.buckets.account_for(&bucket);
-            } else {
-                self.queue.buckets.reconcile(&bucket, Trigger::Unaccounted);
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Owns the receiving end for the life of the process: writes markers as they arrive and, once a
@@ -197,6 +162,10 @@ pub(crate) struct MarkerActor {
     rx: mpsc::UnboundedReceiver<MarkerMsg>,
     retry: Duration,
     concurrency: usize,
+    /// Durable mode has no pending set, so it has nothing for a clean marker to vouch for and
+    /// nothing that reads one back (`crate::recovery`) — writing them there would only leave
+    /// per-bucket objects no code path ever consults.
+    cached: bool,
 }
 
 impl MarkerActor {
@@ -279,6 +248,9 @@ impl MarkerActor {
     /// left dirty by an earlier crash and untouched by this run is simply not accounted, and its
     /// orphans stay findable instead of buried.
     async fn mark_clean(&self) {
+        if !self.cached {
+            return;
+        }
         let clean = meta::clean_marker_key();
         for bucket in self.queue.buckets.accounted() {
             let bucket = bucket.as_str();

@@ -1,8 +1,8 @@
 //! The restore overlay: one interface every data op routes through so a bucket mid-restore is served
 //! from the remote instead of its half-rebuilt cache (§7 *Buckets*).
 //!
-//! A bucket's per-bucket sync marker (`meta::sync_marker_key`) records namespace trust. This module
-//! turns that into a [`Readiness`] verdict and, from it, the source every op resolves against:
+//! A bucket's [`Readiness`] — resolved at startup and published by the bucket-control actor, so
+//! reading it costs one atomic load — selects the source every op resolves against:
 //!
 //! - **Reads** ([`Hypha::resolve_key`], [`Hypha::project_remote_page`]) resolve a key's facts — and a
 //!   LIST page's entries — from the cache tombstone namespace once `Ready`, or straight from the
@@ -21,26 +21,33 @@ use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use s3s::dto::*;
 use s3s::S3Result;
 
+use hypha_core::config::Mode;
 use hypha_core::error::Error;
 use hypha_core::meta;
 
 use super::get::facts_from_tombstone;
 use super::{ts_ms, Hypha};
-use crate::bucket_ctl;
+use crate::bucket_ctl::Readiness;
 use crate::tier::RemoteFacts;
 
 /// Bounded fan-out for the per-key trailer reads a remote-served LIST page needs (§7).
 const REMOTE_LIST_FANOUT: usize = 16;
 
-/// Whether a bucket's cache namespace can be trusted right now.
-pub(super) enum Readiness {
-    /// Sync marker present: the cache is authoritative, an absent key is a definitive 404.
-    Ready,
-    /// Marker absent but the remote bucket exists: a restore has been kicked and the remote is the
-    /// read source of truth meanwhile.
-    Restoring,
-    /// No remote bucket — the bucket does not exist.
-    Absent,
+/// Which write semantics an op runs under (§4/§7) — deliberately a property of the *bucket*, not of
+/// the deployment.
+pub(super) enum WriteMode {
+    /// The remote is the commit point: bracket the write, upload inline, ack once durable.
+    ///
+    /// A cached deployment runs this too, for the whole of a bucket's namespace restore. The
+    /// restore's premise is that the cache holds nothing authoritative — that is what lets the
+    /// remote be the read source of truth, and what lets the restore be purely additive — and a
+    /// cached write would falsify it the moment it acked, leaving committed state in a namespace
+    /// every reader is being told to ignore. Running durable for the window is what makes the
+    /// premise true rather than merely hoped for; the cost is remote latency on writes into a
+    /// bucket that is already rebuilding.
+    Durable,
+    /// The cache write is the commit: ack on it, and owe the remote a pending marker (§7).
+    Cached,
 }
 
 /// The resolved state of a key, source-agnostic (§7). `Remote` and `CacheBody` both carry the
@@ -63,43 +70,9 @@ pub(super) enum KeyState {
 }
 
 impl Hypha {
-    /// Classify a bucket, kicking a background restore the first time an unreconciled-but-live bucket
-    /// is seen. A persisted marker this process hadn't observed is adopted into the ready set, so the
-    /// probe is paid once per bucket per lifetime.
-    pub(super) async fn readiness(&self, bucket: &str) -> S3Result<Readiness> {
-        // One atomic load answers both memos. A restore already pending or in flight is a standing
-        // `Restoring` verdict, so the two probes below are paid once per restore rather than by
-        // every op crossing the window; the actor drops that memo when the sweep ends, which is
-        // what re-triggers a failed one.
-        let state = self.buckets.state(bucket);
-        if state.is_ready() {
-            return Ok(Readiness::Ready);
-        }
-        if state.is_restoring() {
-            return Ok(Readiness::Restoring);
-        }
-        match self.meta().head(bucket, &meta::sync_marker_key()).await {
-            Ok(_) => {
-                self.buckets.mark_ready(bucket);
-                Ok(Readiness::Ready)
-            }
-            // Marker absent, or the `<meta>` bucket itself is gone: the cache is not authoritative.
-            Err(Error::NotFound) | Err(Error::NoSuchBucket) => {
-                if self.remote().head_bucket(bucket).await.is_ok() {
-                    self.buckets
-                        .reconcile(bucket, bucket_ctl::Trigger::Unreconciled);
-                    Ok(Readiness::Restoring)
-                } else {
-                    Ok(Readiness::Absent)
-                }
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// An absent *bucket* is `NoSuchBucket`; an absent *key* is [`KeyState::Absent`].
     pub(super) async fn resolve_key(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
-        match self.readiness(bucket).await? {
+        match self.buckets.readiness(bucket) {
             Readiness::Absent => Err(Error::NoSuchBucket.into()),
             Readiness::Ready => self.resolve_key_cache(bucket, key).await,
             Readiness::Restoring => self.resolve_key_remote(bucket, key).await,
@@ -147,24 +120,34 @@ impl Hypha {
         }
     }
 
-    /// Ready a bucket+key for a durable write under the overlay (§7). Serving is never gated: a
-    /// `Restoring` bucket first has K materialized from the remote into the cache — under K's lock so
-    /// it doesn't race the write's own bracket — leaving a correct tombstone for conditional
-    /// evaluation. An absent bucket is `NoSuchBucket`.
-    pub(super) async fn prepare_write(&self, bucket: &str, key: &str) -> S3Result<()> {
-        match self.readiness(bucket).await? {
+    /// The semantics `bucket`'s writes run under right now (§7). Not simply the deployment's
+    /// configured mode — see [`WriteMode::Durable`]. An absent bucket is `NoSuchBucket`.
+    pub(super) async fn write_mode(&self, bucket: &str) -> S3Result<WriteMode> {
+        match self.buckets.readiness(bucket) {
             Readiness::Absent => Err(Error::NoSuchBucket.into()),
-            Readiness::Ready => Ok(()),
+            Readiness::Ready if self.mode == Mode::Cached => Ok(WriteMode::Cached),
+            _ => Ok(WriteMode::Durable),
+        }
+    }
+
+    /// Ready a bucket+key for a write under the overlay, and report the semantics it must run under
+    /// (§7). Serving is never gated: a `Restoring` bucket first has K materialized from the remote
+    /// into the cache — under K's lock so it doesn't race the write's own bracket — leaving a correct
+    /// entry for conditional evaluation.
+    pub(super) async fn prepare_write(&self, bucket: &str, key: &str) -> S3Result<WriteMode> {
+        match self.buckets.readiness(bucket) {
+            Readiness::Absent => Err(Error::NoSuchBucket.into()),
+            Readiness::Ready if self.mode == Mode::Cached => Ok(WriteMode::Cached),
+            Readiness::Ready => Ok(WriteMode::Durable),
             Readiness::Restoring => {
                 let _guard = self.tier.locks.lock(key).await;
                 // The background restore provisions the projections and rebuilds the namespace, but
                 // a write can beat it here — have the actor provision on demand so K's
-                // materialization lands, then settle K to the remote's current state. Coalesced
-                // there, so a burst of writes into a lost-volume bucket costs one round, not one
-                // per request.
+                // materialization lands. Coalesced there, so a burst of writes into a lost-volume
+                // bucket costs one round, not one per request.
                 self.buckets.provision(bucket).await?;
-                self.tier.repair_locked(bucket, key).await?;
-                Ok(())
+                self.tier.materialize_absent_locked(bucket, key).await?;
+                Ok(WriteMode::Durable)
             }
         }
     }
@@ -173,7 +156,7 @@ impl Hypha {
     /// that route around the cache entirely (the multipart part path, §7) and so have no key
     /// state to materialize.
     pub(super) async fn check_bucket(&self, bucket: &str) -> S3Result<()> {
-        match self.readiness(bucket).await? {
+        match self.buckets.readiness(bucket) {
             Readiness::Absent => Err(Error::NoSuchBucket.into()),
             _ => Ok(()),
         }
@@ -189,7 +172,11 @@ impl Hypha {
         objs: Vec<aws_sdk_s3::types::Object>,
         raw_prefixes: Vec<aws_sdk_s3::types::CommonPrefix>,
     ) -> S3Result<(Vec<Object>, Vec<CommonPrefix>)> {
-        let keys: Vec<String> = objs.into_iter().filter_map(|o| o.key).collect();
+        let keys: Vec<String> = objs
+            .into_iter()
+            .filter_map(|o| o.key)
+            .filter(|k| !meta::is_reserved_remote_key(k))
+            .collect();
         let mut entries: Vec<Object> = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(REMOTE_LIST_FANOUT) {
             let batch = futures::future::try_join_all(
@@ -210,7 +197,7 @@ impl Hypha {
     /// the object cannot be dismissed as foreign junk.
     async fn remote_list_entry(&self, bucket: &str, key: &str) -> Result<Object, Error> {
         let Some(tail) = self.tier.read_tail(bucket, key).await? else {
-            hypha_core::fatal::foreign_object(bucket, key)
+            self.tier.halt.foreign_object(bucket, key).await
         };
         Ok(Object {
             key: Some(key.to_string()),

@@ -281,7 +281,7 @@ impl Hypha {
         let object_parts =
             if want(ObjectAttributes::OBJECT_PARTS) && meta::is_composite_etag(&facts.cetag) {
                 let Some(tail) = self.tier.read_tail(&bucket, &key).await? else {
-                    hypha_core::fatal::foreign_object(&bucket, &key)
+                    self.tier.halt.foreign_object(&bucket, &key).await
                 };
                 Some(build_object_parts(
                     &tail.plens,

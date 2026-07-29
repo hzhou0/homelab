@@ -98,9 +98,10 @@ impl Hypha {
 
         // One bounded tail GET of the source's remote trailer (MAC-verified at K_src) fixes the
         // body/trailer boundary and, for a composite, the offset table — both body-relative, so they
-        // carry over to K_dst unchanged. Foreign/unverifiable ⇒ fatal, as on any read (§6).
+        // carry over to K_dst unchanged. Foreign/unverifiable halts the deployment, as on any read
+        // (§6, `crate::halt`).
         let Some(tail) = self.tier.read_tail(&src_bucket, &src_key).await? else {
-            hypha_core::fatal::foreign_object(&src_bucket, &src_key)
+            self.tier.halt.foreign_object(&src_bucket, &src_key).await
         };
         let body_ct_len = tail.body_ct_len;
 

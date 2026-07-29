@@ -1,0 +1,249 @@
+//! Invariant violations, and the halt they put the deployment into.
+//!
+//! Nothing but hypha writes these buckets, and the recovery machinery (§7) rests on a handful of
+//! properties that therefore cannot be false: an eviction tombstone's remote object exists, a
+//! `Ready` bucket's cache namespace accounts for every remote key, a remote object carries a
+//! trailer hypha can authenticate. A violation of one of them does not mean a request failed — it
+//! means hypha's picture of its own data is wrong, so every later answer is suspect and the
+//! recoveries themselves become unsafe to run: a restore would rebuild from a namespace it has just
+//! been told is not the one it thinks, and a pending rebuild would raise markers that send the
+//! reconcile sweep at objects it cannot account for.
+//!
+//! So a violation is not an error to propagate. The order matters:
+//!
+//! 1. the server shuts down, so nothing further is served on data hypha has just declared wrong;
+//! 2. the violation is recorded, retried until it lands — losing the record is the one outcome that
+//!    must not happen, since the next process would silently resume serving the same wrong data.
+//!    Nothing is being served in the meantime, so there is no deadline worth beating;
+//! 3. only then does the process end. Every later run exits from [`exit_if_marked`], so the
+//!    deployment presents as an ordinary crashloop — the failure mode operator tooling already
+//!    alerts on. hypha is active-passive with a single active, so there is no replica to coordinate
+//!    with.
+//!
+//! [`std::process::exit`], not a panic: a panic in a spawned task unwinds that task alone and leaves
+//! the rest of the process serving, which is the state this exists to prevent.
+//!
+//! Clearing is an operator action: delete the marker object and restart. Clearing without fixing
+//! what diverged re-trips on the next pass, which is intended — the marker records a fact about the
+//! data, not about the process.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Notify;
+
+use hypha_core::error::{Error, Result};
+use hypha_core::meta;
+use hypha_core::Backend;
+
+/// Exit status for an invariant violation. Distinct from any conventional status (and from
+/// `sysexits.h`) so a supervisor can tell this apart from an ordinary crash.
+pub const EXIT_INVARIANT_VIOLATION: i32 = 86;
+
+/// How long to wait between attempts at recording a violation. Short, because nothing is being
+/// served until it lands.
+const RECORD_RETRY: Duration = Duration::from_secs(2);
+
+/// Which invariant was violated. The variants are the enumerated properties §7's recoveries assume;
+/// a new one is added only alongside the check that detects it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Invariant {
+    /// A remote object whose tail trailer does not authenticate: either something other than hypha
+    /// writes this bucket, or this process holds the wrong trailer key or an unknown format.
+    ForeignObject,
+    /// A live plaintext body in `<data>` while the bucket's namespace is restoring. Writes run with
+    /// durable semantics for the whole of a restore precisely so this cannot happen, so one means
+    /// the mode gate leaked and an acked write may exist that the restore is about to walk past.
+    PlaintextDuringRestore,
+    /// A `Ready` bucket where the remote holds an object the cache has no entry for. Cache-absent is
+    /// the authoritative 404 on a ready bucket, and no path can produce this: every site that
+    /// removes a `<data>` entry does so only once the remote object is already gone.
+    RemoteOnlyKey,
+    /// An eviction tombstone whose remote object is missing — the remote lost bytes hypha reported
+    /// as committed, and the tombstone is the only remaining record that they existed.
+    RemoteLostObject,
+    /// A `Ready` bucket whose sync marker has disappeared: its cache volume was lost under a
+    /// running process. Nothing removes that marker, and the run has been answering an absent key
+    /// as the object's absence ever since — answers it cannot identify, let alone take back.
+    CacheVolumeLost,
+    /// A remote bucket hypha neither created nor resolved at startup. hypha owns both backends
+    /// outright, so a bucket that appears from nowhere means something else is writing the remote,
+    /// and nothing downstream — least of all a restore that would project it into the cache — can
+    /// assume the objects in it are hypha's.
+    ForeignBucket,
+    /// A pending-set rebuild reached a durable-mode deployment, which has no pending set. A
+    /// programming error rather than a data one, but it means the recovery classification is wrong,
+    /// so the rest of it cannot be trusted either.
+    PendingRebuildInDurableMode,
+}
+
+impl Invariant {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Invariant::ForeignObject => "foreign-object",
+            Invariant::PlaintextDuringRestore => "plaintext-during-restore",
+            Invariant::RemoteOnlyKey => "remote-only-key",
+            Invariant::RemoteLostObject => "remote-lost-object",
+            Invariant::CacheVolumeLost => "cache-volume-lost",
+            Invariant::ForeignBucket => "foreign-bucket",
+            Invariant::PendingRebuildInDurableMode => "pending-rebuild-in-durable-mode",
+        }
+    }
+}
+
+pub(crate) struct Violation {
+    pub invariant: Invariant,
+    pub bucket: String,
+    pub key: Option<String>,
+    /// Free text for the operator: what was observed, not what it means.
+    pub detail: String,
+}
+
+impl Violation {
+    /// The marker body — plain text, because its only consumer is a human deciding what to do about
+    /// it. Bringing in a serialization format for a four-field record would be its own cost.
+    fn render(&self) -> Vec<u8> {
+        format!(
+            "invariant: {}\nbucket: {}\nkey: {}\ndetail: {}\n",
+            self.invariant.as_str(),
+            self.bucket,
+            self.key.as_deref().unwrap_or("-"),
+            self.detail,
+        )
+        .into_bytes()
+    }
+}
+
+/// Held by every component that can observe a violation. It takes the remote alone rather than a
+/// `Tiering`, which is what lets `Tiering` hold one.
+#[derive(Clone)]
+pub(crate) struct Halt {
+    remote: Backend,
+    stop: Arc<Notify>,
+    recording: Arc<AtomicBool>,
+}
+
+impl Halt {
+    pub(crate) fn new(remote: Backend) -> Self {
+        Halt {
+            remote,
+            stop: Arc::new(Notify::new()),
+            recording: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) async fn shutdown_signalled(&self) {
+        self.stop.notified().await
+    }
+
+    /// Diverges, so a detection site is a single statement with nothing to propagate and no error
+    /// path to get wrong.
+    pub(crate) async fn raise(&self, violation: Violation) -> ! {
+        tracing::error!(
+            invariant = violation.invariant.as_str(),
+            bucket = violation.bucket,
+            key = violation.key.as_deref().unwrap_or("-"),
+            detail = violation.detail,
+            "invariant violation: hypha's record of this bucket disagrees with the backends. \
+             Shutting the server down and recording the halt marker; every restart will exit \
+             until an operator resolves the violation and deletes the marker object."
+        );
+        // `notify_one`, not `notify_waiters`: the latter drops the signal if `serve` happens to be
+        // between registrations, and this signal has no second chance.
+        self.stop.notify_one();
+
+        // First violation wins: it describes the actual divergence, and one observed during the
+        // wind-down is most likely its consequence.
+        if self.recording.swap(true, Ordering::SeqCst) {
+            std::future::pending().await
+        }
+
+        let mut attempt: u64 = 0;
+        while let Err(e) = self
+            .remote
+            .put_small(
+                &violation.bucket,
+                &meta::halt_marker_key(),
+                violation.render(),
+                Default::default(),
+                None,
+                None,
+            )
+            .await
+        {
+            attempt += 1;
+            tracing::error!(
+                bucket = violation.bucket, attempt, error = %e,
+                "halt marker not recorded; the server is down and the write is still owed, retrying"
+            );
+            tokio::time::sleep(RECORD_RETRY).await;
+        }
+        tracing::error!(
+            bucket = violation.bucket,
+            invariant = violation.invariant.as_str(),
+            "halt marker recorded; exiting"
+        );
+        std::process::exit(EXIT_INVARIANT_VIOLATION)
+    }
+
+    /// A trailer that does not authenticate, at any of the sites that read one (§6). One helper is
+    /// what keeps every such site on the same footing — none may treat it as a miss.
+    pub(crate) async fn foreign_object(&self, bucket: &str, key: &str) -> ! {
+        self.raise(Violation {
+            invariant: Invariant::ForeignObject,
+            bucket: bucket.to_string(),
+            key: Some(key.to_string()),
+            detail: "remote object carries no verifiable hypha trailer".to_string(),
+        })
+        .await
+    }
+}
+
+/// The other half of the crashloop: the run that *recorded* a violation exits from [`Halt::raise`],
+/// and every run after it exits from here — before the listener opens, so a halted deployment never
+/// serves a single request.
+pub(crate) async fn exit_if_marked(remote: &Backend) -> Result<()> {
+    let key = meta::halt_marker_key();
+    for (bucket, _) in remote.list_buckets().await? {
+        let present = match remote.head(&bucket, &key).await {
+            Ok(_) => true,
+            Err(Error::NotFound) | Err(Error::NoSuchBucket) => false,
+            Err(e) => return Err(e),
+        };
+        if present {
+            tracing::error!(
+                bucket,
+                "halt marker present: this deployment recorded an invariant violation and will not \
+                 serve. Read the marker object for the original violation, resolve it, then delete \
+                 the marker."
+            );
+            std::process::exit(EXIT_INVARIANT_VIOLATION)
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Everything else here ends the process, so it is exercised in the integration tests, which
+    /// can observe the exit status and the recorded marker.
+    #[test]
+    fn rendered_marker_names_the_invariant_and_the_key() {
+        let body = String::from_utf8(
+            Violation {
+                invariant: Invariant::RemoteOnlyKey,
+                bucket: "b".into(),
+                key: Some("k".into()),
+                detail: "d".into(),
+            }
+            .render(),
+        )
+        .unwrap();
+        assert!(body.contains("invariant: remote-only-key"));
+        assert!(body.contains("bucket: b"));
+        assert!(body.contains("key: k"));
+    }
+}

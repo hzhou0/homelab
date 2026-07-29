@@ -17,10 +17,10 @@ use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use std::collections::HashMap;
 
-use hypha_core::config::Mode;
 use hypha_core::error::Error;
 use hypha_core::meta;
 
+use super::overlay::WriteMode;
 use super::{
     parse_content_md5, resolve_storage_class, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
 };
@@ -47,13 +47,9 @@ impl Hypha {
             }
         }
 
-        if self.mode == Mode::Cached {
+        if let WriteMode::Cached = self.prepare_write(&bucket, &key).await? {
             return self.op_put_object_cached(input, bucket, key).await;
         }
-
-        // Overlay (§7): serving is never gated — a write to a restoring bucket first materializes K
-        // from the remote so the conditional-eval below runs against a correct tombstone.
-        self.prepare_write(&bucket, &key).await?;
 
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
         let expect_md5 = input
@@ -204,7 +200,8 @@ impl Hypha {
         }
     }
 
-    /// Cached-mode PUT (§7): ack on the cache body write, with the bare-`K` pending marker handed to
+    /// Cached-mode PUT (§7) — reached only for a bucket whose namespace is ready, since a restoring
+    /// one runs the durable bracket above. Ack on the cache body write, with the bare-`K` pending marker handed to
     /// the marker queue behind it; the reconcile sweep uploads to the remote asynchronously. A
     /// conditional PUT holds K's write lock across resolve → evaluate → commit; an unconditional one
     /// takes **no** lock — it races on the cache (S3 last-writer-wins) and is fenced against eviction
@@ -216,10 +213,6 @@ impl Hypha {
         bucket: String,
         key: String,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        // Overlay (§7): a restoring bucket has K materialized from the remote first, so a conditional
-        // eval runs against a correct tombstone and an absent bucket is `NoSuchBucket`.
-        self.prepare_write(&bucket, &key).await?;
-
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
         // Validate the digest shape up front (bad base64/length ⇒ InvalidDigest), then forward the
         // raw header to the cache, which validates it against the body atomically.

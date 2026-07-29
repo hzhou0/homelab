@@ -19,8 +19,9 @@ use hypha_core::error::Error;
 use hypha_core::meta;
 
 use super::get::facts_from_tombstone;
-use super::overlay::{KeyState, Readiness};
+use super::overlay::KeyState;
 use super::{ts_ms, Hypha};
+use crate::bucket_ctl::Readiness;
 
 /// The client-visible projection of one raw cache page — what both LIST versions put in `Contents`
 /// and `CommonPrefixes`. Pagination is not in here: the versions resume differently.
@@ -82,7 +83,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         // While the cache restores, the remote is the read source of truth (§7); it holds the same
         // client keyspace, so pagination forwards identically.
-        let restoring = match self.readiness(&bucket).await? {
+        let restoring = match self.buckets.readiness(&bucket) {
             Readiness::Absent => return Err(Error::NoSuchBucket.into()),
             Readiness::Ready => false,
             Readiness::Restoring => true,
@@ -152,7 +153,7 @@ impl Hypha {
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
         let bucket = input.bucket.clone();
-        let restoring = match self.readiness(&bucket).await? {
+        let restoring = match self.buckets.readiness(&bucket) {
             Readiness::Absent => return Err(Error::NoSuchBucket.into()),
             Readiness::Ready => false,
             Readiness::Restoring => true,
