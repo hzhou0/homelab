@@ -46,7 +46,9 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn connect(cfg: &S3Endpoint) -> Self {
+    /// The connection alone; the caller names the role prefix it wants with [`Self::with_prefix`],
+    /// since one endpoint carries several ([`crate::config::DATA_ROLE`] and friends).
+    pub fn connect(cfg: &S3Endpoint, bucket_prefix: String) -> Self {
         let creds = Credentials::new(&cfg.access_key, &cfg.secret_key, None, None, "hypha");
         let conf = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
@@ -59,7 +61,7 @@ impl Backend {
         Self {
             client: Client::from_conf(conf),
             region: cfg.region.clone(),
-            bucket_prefix: cfg.bucket_prefix.clone(),
+            bucket_prefix,
         }
     }
 

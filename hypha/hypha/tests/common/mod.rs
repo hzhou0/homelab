@@ -22,7 +22,10 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use hypha_core::config::{Background, ClientAuth, Config, Mode, Reconcile, S3Endpoint, Serving};
+use hypha_core::config::{
+    Background, ClientAuth, Config, Gc, Mode, Recency, Reconcile, S3Endpoint, Serving, DATA_ROLE,
+    META_ROLE, REMOTE_ROLE,
+};
 
 /// Fixed root credentials for the throwaway MinIO (password must be ≥ 8 chars).
 const MINIO_USER: &str = "minioadmin";
@@ -36,11 +39,10 @@ const HYPHA_SECRET: &str = "hyphatestsecretkey";
 /// A random 256-bit-ish passphrase stand-in; any stable string works for a single run (§6).
 const MASTER_PASSPHRASE: &str = "integration-test-master-passphrase-0123456789abcdef";
 
-/// hypha maps one client bucket onto `cache-<b>` and `remote-<b>` on the shared MinIO; the two
-/// prefixes are what keep the cache's tombstones/twins and the remote's ciphertext from colliding.
-const CACHE_PREFIX: &str = "data-";
-const META_PREFIX: &str = "meta-";
-const REMOTE_PREFIX: &str = "remote-";
+/// This deployment's prefix on the shared MinIO. Every backend bucket is `<prefix>-<role>-<b>`
+/// (§9), which is what keeps the cache's tombstones/twins and the remote's ciphertext from
+/// colliding on one endpoint.
+const BUCKET_PREFIX: &str = "hyphatest";
 
 // ── MinIO ────────────────────────────────────────────────────────────────────────────────────
 
@@ -261,15 +263,8 @@ fn config_env(config: &Config) -> HashMap<String, String> {
         env.insert(format!("HYPHA_{role}__REGION"), ep.region.clone());
         env.insert(format!("HYPHA_{role}__ACCESS_KEY"), ep.access_key.clone());
         env.insert(format!("HYPHA_{role}__SECRET_KEY"), ep.secret_key.clone());
-        env.insert(
-            format!("HYPHA_{role}__BUCKET_PREFIX"),
-            ep.bucket_prefix.clone(),
-        );
     }
-    env.insert(
-        "HYPHA_CACHE_META_PREFIX".into(),
-        config.cache_meta_prefix.clone(),
-    );
+    env.insert("HYPHA_BUCKET_PREFIX".into(), config.bucket_prefix.clone());
     env.insert(
         "HYPHA_MODE".into(),
         match config.mode {
@@ -396,17 +391,22 @@ impl Harness {
     }
 
     pub fn remote_bucket(&self, client_bucket: &str) -> String {
-        format!("{REMOTE_PREFIX}{client_bucket}")
+        format!("{}{client_bucket}", self.config.role_prefix(REMOTE_ROLE))
     }
 
     /// The `<data>` cache bucket — client bodies + tombstones (§6).
     pub fn cache_bucket(&self, client_bucket: &str) -> String {
-        format!("{CACHE_PREFIX}{client_bucket}")
+        format!("{}{client_bucket}", self.config.role_prefix(DATA_ROLE))
     }
 
     /// The `<meta>` cache bucket — hypha's twins, markers, and mpu records (§6).
     pub fn meta_bucket(&self, client_bucket: &str) -> String {
-        format!("{META_PREFIX}{client_bucket}")
+        format!("{}{client_bucket}", self.config.role_prefix(META_ROLE))
+    }
+
+    /// GC's own bucket — the recency ring's slices (§8). One per deployment, not per client bucket.
+    pub fn gc_bucket(&self) -> String {
+        self.config.gc_bucket()
     }
 
     /// Restart hypha against the same MinIO and config — models a process restart (crash/redeploy).
@@ -459,9 +459,9 @@ impl Harness {
 
 fn base_config(minio: &Minio, mode: Mode) -> Config {
     Config {
-        remote: endpoint_cfg(&minio.endpoint, REMOTE_PREFIX),
-        cache: endpoint_cfg(&minio.endpoint, CACHE_PREFIX),
-        cache_meta_prefix: META_PREFIX.to_string(),
+        remote: endpoint_cfg(&minio.endpoint),
+        cache: endpoint_cfg(&minio.endpoint),
+        bucket_prefix: BUCKET_PREFIX.to_string(),
         mode,
         auth: ClientAuth {
             access_key: HYPHA_ACCESS.to_string(),
@@ -476,6 +476,22 @@ fn base_config(minio: &Minio, mode: Mode) -> Config {
             concurrency: 8,
         },
         background: Background::default(),
+        // Tight for the same reason as the reconcile cadence: a test asserting a reclaim shouldn't
+        // wait out a production interval that is deliberately measured in minutes. Bounds pinned to
+        // the base so the §8 ladder stays flat — a test that wants it to escalate says so itself,
+        // rather than every unrelated test racing an interval that moves underneath it.
+        gc: Gc {
+            interval_ms: 200,
+            min_interval_ms: 200,
+            concurrency: 4,
+            max_concurrency: 4,
+            // A fill target low enough that a test can rotate the ring with a handful of keys.
+            recency: Recency {
+                fill_target: 16,
+                depth: 3,
+                false_positive_rate: 0.01,
+            },
+        },
         // Tight, so a test that takes a cache volume away mid-run doesn't wait out the production
         // cadence for the watchdog to notice.
         volume_watch_interval_ms: 200,
@@ -500,13 +516,12 @@ pub fn s3_client(endpoint: &str, access: &str, secret: &str) -> Client {
     Client::from_conf(conf)
 }
 
-fn endpoint_cfg(endpoint: &str, prefix: &str) -> S3Endpoint {
+fn endpoint_cfg(endpoint: &str) -> S3Endpoint {
     S3Endpoint {
         endpoint: endpoint.to_string(),
         region: "us-east-1".to_string(),
         access_key: MINIO_USER.to_string(),
         secret_key: MINIO_PASS.to_string(),
-        bucket_prefix: prefix.to_string(),
     }
 }
 

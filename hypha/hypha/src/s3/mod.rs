@@ -26,6 +26,7 @@ use hypha_core::Backend;
 
 use crate::background::{self, Background};
 use crate::bucket::BucketCtl;
+use crate::gc::Gc;
 use crate::keylocks::KeyGuard;
 use crate::markers::Markers;
 use crate::tier::Tiering;
@@ -44,6 +45,11 @@ pub struct Hypha {
     /// Pending-marker obligations (§7). A cached write acks on its body write and raises the marker
     /// here; the ack never depends on the marker landing.
     pub(crate) markers: Markers,
+    /// The GC actor (§8). Every op that resolves or lands a single key touches it — reads *and*
+    /// writes, since a write is the strongest statement of interest a key gets. LIST and DELETE
+    /// deliberately do not: a full listing would mark the whole keyspace hot, and a delete leaves no
+    /// body to protect.
+    pub(crate) gc: Gc,
     pub mode: Mode,
     /// Longest configured bucket prefix, charged against S3's 63-byte cap so the client-visible
     /// bucket-name limit is `63 − this` (§7 *Buckets*). Checked at CreateBucket.
@@ -59,10 +65,12 @@ pub struct Hypha {
 }
 
 impl Hypha {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tier: Tiering,
         buckets: BucketCtl,
         markers: Markers,
+        gc: Gc,
         mode: Mode,
         offload_threshold: usize,
         max_bucket_prefix_len: usize,
@@ -74,6 +82,7 @@ impl Hypha {
             buckets,
             background,
             markers,
+            gc,
             mode,
             max_bucket_prefix_len,
             offload_threshold,

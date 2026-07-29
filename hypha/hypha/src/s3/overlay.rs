@@ -72,11 +72,20 @@ pub(super) enum KeyState {
 impl Hypha {
     /// An absent *bucket* is `NoSuchBucket`; an absent *key* is [`KeyState::Absent`].
     pub(super) async fn resolve_key(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
-        match self.buckets.readiness(bucket) {
-            Readiness::Absent => Err(Error::NoSuchBucket.into()),
-            Readiness::Ready => self.resolve_key_cache(bucket, key).await,
-            Readiness::Restoring => self.resolve_key_remote(bucket, key).await,
+        let state = match self.buckets.readiness(bucket) {
+            Readiness::Absent => return Err(Error::NoSuchBucket.into()),
+            Readiness::Ready => self.resolve_key_cache(bucket, key).await?,
+            Readiness::Restoring => self.resolve_key_remote(bucket, key).await?,
+        };
+        // The read half of §8's recency feed, here rather than at each caller because *this* is what
+        // "an op that resolves a single key" means — GET, HEAD, GetObjectAttributes, and both copy
+        // sources reach the ring by construction, and a future single-key read cannot forget to.
+        // LIST resolves pages elsewhere and never lands here, which is exactly the exclusion §8
+        // wants. An absent key has no body to protect.
+        if !matches!(state, KeyState::Absent) {
+            self.gc.touch(bucket, key);
         }
+        Ok(state)
     }
 
     /// The tombstone classifier every cache-authoritative read shares (§7).

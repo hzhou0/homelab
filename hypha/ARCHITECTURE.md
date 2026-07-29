@@ -312,7 +312,7 @@ pluggable *usage source* (below) — against a high-water and low-water mark:
 - Recency is tracked by an in-memory **Bloom-ring sketch** (one filter per fill window — a slice
   rotates when enough distinct keys have been touched — fed by reads *and* writes: GET/HEAD and
   PUT/complete/copy, but never LIST, which would mark a whole bucket hot;
-  sealed slices persisted to the cache). The newest slice containing a key quantizes its
+  retired slices persisted to the cache). The newest slice containing a key quantizes its
   last-access age, so eviction works coldest-first: keys the ring has no memory of, then
   progressively younger age buckets until the target is met, LastModified breaking ties within a
   bucket. If the sketch is lost or absent (first boot), every key falls into one bucket and

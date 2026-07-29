@@ -293,6 +293,40 @@ pub fn mpu_upload_key(upload_id: &str) -> String {
     format!("{}u", mpu_range(upload_id))
 }
 
+/// Every upload's records at once — what the §8 debris sweep scans, since no upload id is known to
+/// it in advance.
+pub fn mpu_scan_prefix() -> String {
+    format!("{c}{c}{TAG_MPU}", c = CTRL as char)
+}
+
+/// A sealed recency slice in **GC's own bucket** (§8) — not `<meta><b>`, since the ring is global.
+/// Nothing client-facing shares that bucket, so these keys need none of the control-byte machinery
+/// the `<meta>` ranges are built from.
+///
+/// Zero-padded hex so the listing's lexicographic order **is** seal order — the whole of what a
+/// reload needs to rebuild the ring newest-first, and the reason the sequence is a counter rather
+/// than a timestamp (§8 keeps wall clock out of the mechanism; naming it would invite reading age
+/// off the key).
+pub fn recency_slice_key(seq: u64) -> String {
+    format!("{RECENCY_PREFIX}{seq:016x}")
+}
+
+pub const RECENCY_PREFIX: &str = "recency/";
+
+pub fn parse_recency_seq(key: &str) -> Option<u64> {
+    u64::from_str_radix(key.strip_prefix(RECENCY_PREFIX)?, 16).ok()
+}
+
+/// The upload a record belongs to. Upload ids cannot contain `0x01` (the remote's own ids are
+/// base64/hex), which is what makes the trailing separator an unambiguous terminator.
+pub fn parse_mpu_upload_id(key: &str) -> Option<&str> {
+    let c = CTRL as char;
+    key.strip_prefix(&format!("{c}{c}{TAG_MPU}"))?
+        .split(c)
+        .next()
+        .filter(|id| !id.is_empty())
+}
+
 /// The facts an mpu part record carries in its key (§6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MpuPart<'a> {

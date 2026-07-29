@@ -28,9 +28,11 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
+use hypha_core::error::Error;
 use hypha_core::meta;
 
-use crate::bucket::BucketCtl;
+use crate::bucket::{BucketCtl, Readiness};
+use crate::halt::{Invariant, Violation};
 use crate::tier::Tiering;
 
 const DRAIN_BATCH: usize = 256;
@@ -218,6 +220,19 @@ impl MarkerActor {
     /// Write every owed marker, dropping the ones that land. Concurrent because a marker is on each
     /// acked write's durability path: serializing them would make the queue the write path's
     /// throughput ceiling.
+    ///
+    /// A marker whose bucket is **gone** is dropped rather than retried. It can never land — its
+    /// `<meta>` projection was drained by the DeleteBucket (§7) — and there is nothing left for it to
+    /// index. Retrying it forever would be worse than useless: one permanently owed marker withholds
+    /// the clean marker of *every* bucket at drain, so a single deleted bucket would send the next
+    /// run into a full rebuild of buckets it had no reason to doubt.
+    ///
+    /// **Which is only true if the bucket really is gone**, so the backend's answer is checked
+    /// against what this process believes. `DeleteBucket` retires the bucket from the state map
+    /// *before* draining its projections (§7), so in a real delete the map has already caught up by
+    /// the time a marker write can see the 404. A map that still calls the bucket live means the
+    /// `<meta>` projection vanished underneath it — the cache volume loss of invariant **I7** — and
+    /// dropping the marker there would silently shorten a pending set the run still vouches for.
     async fn write_all(&self, owed: &mut HashMap<(String, String), OwedMarker>) {
         let failed: Vec<OwedMarker> = futures::stream::iter(owed.drain().map(|(_, r)| r))
             .map(|r| async move {
@@ -228,6 +243,31 @@ impl MarkerActor {
                     .await
                 {
                     Ok(()) => None,
+                    Err(Error::NoSuchBucket) => {
+                        if self.queue.buckets.readiness(&r.bucket) != Readiness::Absent {
+                            self.queue
+                                .tier
+                                .halt
+                                .raise(Violation {
+                                    invariant: Invariant::CacheVolumeLost,
+                                    bucket: r.bucket.clone(),
+                                    key: Some(r.key.clone()),
+                                    detail: "an owed marker's <meta> projection is gone while the \
+                                             bucket is still live: the cache volume was lost under \
+                                             a running process, so an acked write's marker can \
+                                             never land and the pending set is short an entry the \
+                                             run still vouches for"
+                                        .to_string(),
+                                })
+                                .await
+                        }
+                        tracing::info!(
+                            bucket = r.bucket,
+                            key = r.key,
+                            "marker dropped; its bucket was deleted"
+                        );
+                        None
+                    }
                     Err(e) => {
                         tracing::warn!(bucket = r.bucket, key = r.key, error = %e, "marker write failed; retrying");
                         Some(r)

@@ -49,3 +49,6 @@ tempfile = "3"
 futures = "0.3"
 arc-swap = "1.9"
 dashmap = "6"
+# `rand` off: it only picks the hasher's seed, and the §8 ring pins its own so a slice sealed by one
+# process still means something to the next. Drops the `rand` tree; foldhash covers what remains.
+fastbloom = { version = "0.17", default-features = false, features = ["std"] }

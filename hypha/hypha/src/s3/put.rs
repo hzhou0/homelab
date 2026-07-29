@@ -166,6 +166,10 @@ impl Hypha {
             )
             .await?;
 
+        // The write half of §8's recency feed. A write is the strongest statement of interest a key
+        // gets, and a read-only ring would have write-hot/read-cold keys evict first — reclaiming
+        // bytes the next PUT immediately takes back.
+        self.gc.touch(&bucket, &key);
         let resp = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag)),
             ..Default::default()
@@ -254,6 +258,7 @@ impl Hypha {
                 .await?
         };
 
+        self.gc.touch(&bucket, &key);
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(etag)),
             ..Default::default()

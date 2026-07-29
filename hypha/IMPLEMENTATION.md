@@ -63,6 +63,7 @@ sync; hypha drives it over adapters bridged via `spawn_blocking` (§5).
 | Config / errors      | `serde`, `figment`; `thiserror`, `anyhow` (bootstrap)               |
 | Observability        | `tracing`(+`subscriber`); `metrics` + Prometheus exporter (planned) |
 | Concurrency          | `dashmap` (the §4 key-lock table), `arc-swap` (the §7 bucket state) |
+| GC                   | `fastbloom` (the §8 recency ring; `rand` off, seed pinned so slices survive a restart) |
 | Testing              | `proptest`, `criterion`, `cargo fuzz`, `testcontainers`             |
 
 ## 3. Module layout
@@ -87,17 +88,20 @@ hypha/src/
   halt.rs                invariant violations: shut the server down, record on the remote, exit (§7)
   keylocks.rs            per-key async lock table (§4)
   tier.rs                Tiering: upload / tombstone / twin / restore-sweep primitives (§7)
-  bucket_ctl.rs          bucket-control actor: sole writer of the cache substrate; per-bucket restore (§7)
+  bucket/                the bucket lifecycle (§7) — mod.rs owns marker ⇒ phase ⇒ which recovery:
+                         ctl.rs (the actor: sole writer of the cache substrate),
+                         restore.rs (R1, remote walk), rebuild.rs (R2, two-cursor join)
   background.rs          background-transition actor: bounded, deduped, client-cancellable rehydrate/evict (§8)
   s3/                    the s3s::S3 impl, split by op group
     put.rs get.rs list_head.rs delete.rs multipart.rs buckets.rs
     overlay.rs           restore overlay: readiness gate + cache-vs-remote source for reads/writes (§7)
   markers.rs             pending-marker obligations and the clean marker (§6/§7)
   volume_watch.rs        the one failure a running process polls for: cache volume loss (§7)
-  recovery/              the two recoveries (§7), dispatched by name at startup:
-                         restore.rs (R1, remote walk), rebuild.rs (R2, two-cursor join)
   replication.rs         (phase 4) the cached-mode reconcile sweep (§7)
-  gc/                    (phase 5) scavenger task, active-only (§8)
+  gc/                    (phase 5) the GC actor, active-only (§8): mod.rs (the actor — cadence,
+                         recency state, dispatch), ring.rs (the Bloom-ring sketch),
+                         store.rs (GC's own bucket), debris.rs (reclaims with no owner
+                         on the client path)
 
 hypha-fence/src/         (phase 6) fencing controller (§4)
 ```
@@ -315,7 +319,10 @@ tail parses directly for facts and boundaries.
 
 **Two cache buckets, and the client keyspace is clean.** Every deployment maps one client bucket
 onto **four** backend buckets (§2): `<data><b>` and `<meta><b>` on the cache, `<remote><b>` on the
-remote — the fourth being the client bucket name itself, which never leaves hypha.
+remote — the fourth being the client bucket name itself, which never leaves hypha. Each backend name
+is `<prefix>-<role>-<b>`, the role a fixed single character (§9), so the three cannot overlap however
+the deployment prefix is set. One further bucket, `<prefix>-g`, is not per client bucket at all: it
+is GC's own, holding the deployment-wide recency ring (§8).
 
 - **`<data><b>`** holds *only* client objects: a body at `K`, or a tombstone overwriting `K` in
   place, so a racing GET sees one or the other and never a 404. Nothing hypha-internal lives here.
@@ -577,8 +584,11 @@ Clearing is an operator action: delete the marker object and let the process res
 fixing what diverged re-trips on the next pass, which is the intent — the marker records a fact about
 the data, not about the process.
 
-**Recency slices**: sealed Bloom filters under `0x01 0x01 r ‖ …`, the persisted form of
-the §8 recency ring.
+**Recency slices** live in GC's own bucket (`<prefix>-g`), not in `<meta><b>`: the §8 ring is one
+sketch for the whole deployment, keyed by fully qualified `<bucket>/<key>`, so there is no client
+bucket it belongs to. Nothing client-facing shares that bucket, which is also why these keys need
+none of the control-byte machinery the `<meta>` ranges are built from — a plain `recency/<seq>`,
+zero-padded so the listing's order is rotation order.
 
 ### Remote objects
 
@@ -596,7 +606,8 @@ out of the closed form against the constant `HLEN` — hypha never reads the rem
 index, so a part-index-less remote is unrestricted (§9).
 
 **Prefix-distribution hint**: approximate per-prefix key counts at a reserved key, refreshed for
-free by the §8 walk cursor — advisory sharding input for the namespace restore (§7).
+free by the §8 scan — advisory sharding input for the namespace restore (§7), and what corrects the
+scan's own sampling bias toward regions behind large key gaps.
 
 ## 7. Operations
 
@@ -1476,9 +1487,13 @@ state into the cache, then runs the normal §4 path.
 - **Cache volume loss** → discard and restart: the sync marker is gone, the namespace restore
   rebuilds; the only loss is the cached-mode pending set.
 
-## 8. Tiering / GC — the scavenger task
+## 8. Tiering / GC — the scavenger actor
 
-A single background task of the active (the passive never scavenges), phase 5. In durable mode
+A single actor of the active (the passive never scavenges), phase 5, owning everything GC
+remembers — the recency ring, and the yields and pressure rung below. Its loop never awaits I/O:
+it decides *when*, and dispatches each pass and each slice persist as their own task, because a
+listing-heavy pass run inline would stall the touch queue and shed exactly the traffic GC most wants
+to remember. The rest of the process reaches it through one call, `touch`. In durable mode
 there are no bodies to evict — the task only sweeps debris: orphan twins, leftover transition
 marks (repaired per §7), and **all mpu record ranges** — both those of uploads abandoned without
 complete/abort *and* the leftovers of completed/aborted uploads, whose inline drop is deferred here
@@ -1499,11 +1514,14 @@ tombstone with the cache body's facts, so reads return the old plaintext under t
 length. The per-key job registry of the transition actor below is consequently the only per-key
 structure GC keeps in memory, and it holds nothing durability depends on.
 
-**The recency ring.** Recency is a **Bloom-ring sketch** — one filter per **fill window**; sealed
+**The recency ring.** Recency is a **Bloom-ring sketch** — one filter per **fill window**; retired
 slices persisted per §6, reloaded on promotion, retained k deep. Every op that resolves or lands a
 single key feeds it: GET/HEAD/GetObjectAttributes **and the write path** (PUT,
-CompleteMultipartUpload, CopyObject's destination). A touch is an in-memory bit set, never a cache
-write, so neither path pays I/O to record one. LIST is deliberately **not** a feeder — one
+CompleteMultipartUpload, CopyObject's destination). The ring is state **inside the GC actor**, so a
+touch is one send and a request pays no I/O, no lock, and never the rotation its own touch happened
+to trigger: the bit set, the rotation and the encode of the retired slice all run on GC's task, and
+the persist of the retired slice is dispatched off it. A full touch queue sheds rather than blocks
+(§8 *advisory, never incorrect*). LIST is deliberately **not** a feeder — one
 full-bucket listing would mark the entire keyspace hot and collapse the ring into
 protect-everything — and neither is DELETE, which leaves no body to protect.
 
@@ -1526,19 +1544,96 @@ than everything the ring remembers. Advisory only — a lost or cold ring (first
 without a persisted ring) collapses every key into one bucket and ordering degrades to
 LastModified for one churnier cycle, never to incorrectness.
 
-**Target-driven eviction — the threshold ratchet.** A pressure-triggered pass owes a byte
+**Target-driven eviction — the pressure ladder.** A pressure-triggered pass owes a byte
 target: reclaim from current usage down to the low-water mark. The scavenger walks the keyspace
-by rotating cursor, window by window, evicting only candidates at or above the current **age
-threshold**, which starts at *miss* — the keys the ring affirmatively vouches nothing has
-touched. If the target is unmet when the cursor completes a full loop, the threshold ratchets
-one bucket younger and the walk continues — globally coldest-first without buffering the
-keyspace, paying extra loops only under the pressure that justifies them, and converging on the
-target whenever evictable bytes exist instead of stalling because too much looks recent.
-LastModified is the tie-break within a bucket (rehydration lands a fresh mtime, so a
-just-restored body sorts young). A pass that meets its target never ratchets younger, but may
-keep taking *misses* the walk still encounters, bounded per pass — over-evicting an
-affirmatively cold key is nearly free in rehydration risk, yet each eviction still costs a
-remote HEAD, a twin write, and a CAS, hence the bound. Recency is priority only: it never
+by **probabilistic scan**, evicting only candidates at or above the current **age threshold**, which
+starts at *miss* — the keys the ring affirmatively vouches nothing has touched. LastModified is the
+tie-break within a bucket (rehydration lands a fresh mtime, so a just-restored body sorts young).
+
+**Sampling, not a walk.** A *probe* lists from a random position in a bucket and reads at most five
+pages. Nothing tracks a cursor, and the position is fresh every probe: a rotating cursor makes
+eviction pressure correlate with key name — keys early in the keyspace examined on every boot, keys
+late in it only under sustained pressure — and has both replicas sweep in lockstep after a failover.
+Sampling also stops the scan cost from scaling with the keyspace rather than with the pressure, which
+is what a full loop over a cold, mostly-untouched bucket spends its round trips on.
+
+`start-after` takes a key, so a random position is a random *key-shaped string*, which lands the
+probe at the first key at or after it. That is uniform over the keyspace, not over keys, so it
+favours regions behind large gaps — corrected two ways: the yield feedback below, and (once §6's
+prefix-distribution hint exists) sampling prefixes in proportion to their key counts. The hint is
+refreshed by these probes, the same way it was going to be refreshed by the walk.
+
+**Where to probe is learned.** Each bucket carries a running **cold yield** — evictable candidates
+per page — and buckets are sampled in proportion to it, so a bucket that is mostly working set stops
+consuming probes that a mostly-cold one can use. The weighting keeps a **floor**: pure proportional
+sampling locks onto early winners and never revisits a bucket that went cold later, which would be a
+scan that learns once and then stops learning.
+
+**The escalation ladder — cheapest response first.** Pressure has four answers, and the order they
+are spent in is the design. How *often* the scavenger passes, how *wide* each pass runs, and only
+then how *warm* a key it will take:
+
+- **Rung 0 — debris.** A pressured pass sweeps debris (below) *before* it evicts, and those bytes
+  count against the target. This is reclaim at zero rehydration risk — nobody was ever going to read
+  an abandoned upload's parts — so a target met from debris alone evicts nothing at all.
+- **Rung 1 — the interval.** Shorten toward `min_interval_ms`, whose floor is a continuously running
+  walk. This is the answer when candidates *do* exist at the current threshold and the walk is
+  simply too slow to reach them; it also accelerates the ladder itself, since loops complete sooner.
+- **Rung 2 — the concurrency.** Raise toward `max_concurrency`. The answer when the per-key work — a
+  remote HEAD, a twin write, a CAS — is the bottleneck rather than the cadence.
+- **Rung 3 — the age threshold.** One bucket younger, per the rules below.
+
+Rungs 1 and 2 spend nothing but **work**: round trips, bandwidth, and CPU the deployment already
+has, all of it recovered the moment pressure drops. Rung 3 spends the **quality of the decision** — a
+warmer key is likelier to be wanted back, so it is paid for later, by a client, as rehydration
+latency and (cached mode) a re-upload. Hence the order: exhaust what costs work before spending what
+costs the client.
+
+Their bounds are not tuning. The scavenger shares the remote with the client path and the reconcile
+sweep, so `max_concurrency` is the promise that an emergency reclaim cannot starve the reads it is
+supposed to be protecting.
+
+The threshold moves **in both directions, one rung per completed pass** — a pass being one round of
+probes across the sampled buckets, which is the unit of evidence a sampling scan can offer. The same
+unit governs the whole ladder, so it is one control law rather than three:
+
+- **up a rung** when a pass completes with the target unmet: interval first, then concurrency, and
+  the threshold **younger** only once both are at their bounds — approximately coldest-first without
+  buffering the keyspace, paying extra passes only under the pressure that justifies them, and
+  converging on the target whenever evictable bytes exist instead of stalling because too much looks
+  recent. *Approximately*, because a sampling scan sees a sample: it evicts the coldest of what it
+  found, not the coldest that exists, and the yield weighting is what keeps the sample worth taking;
+- **down a rung, LIFO**, when a pass completes with the target met: the most recently taken rung is
+  the first surrendered, so the threshold moves **older** before any cheap rung is given back and the
+  expensive one is never held longer than the evidence supports. The threshold therefore tracks
+  *sustained* pressure rather than the worst moment the process ever saw. Without this the mechanism
+  is a ratchet: one burst leaves it evicting warm keys forever, which is protect-nothing — the mirror
+  of the protect-everything failure the ring's fill-driven rotation exists to prevent;
+- **reset to base** when usage falls below the low-water mark: interval and concurrency to their
+  configured values, threshold to *miss*, since with no pressure at all nothing justifies evicting a
+  key the ring still vouches for.
+
+Capping movement at one rung per pass is what damps the control: nothing can move faster than the
+scan can observe what the previous setting actually yielded. Deliberately not a proportional map from
+pressure onto a rung — that would pick an aggressive threshold on a spike even when the keyspace is
+full of *miss* keys that would have met the target on their own, spending rehydration risk it never
+had to.
+
+**One exception, and only for the reversible rungs.** A cache filling faster than a pass completes
+never reaches rung 1, because the evidence never arrives. So usage climbing *while a pass is in
+flight* sends rungs 1 and 2 straight to their bounds without waiting for one — they cost only work
+and are given back the moment a loop meets its target, which is exactly what makes jumping them safe.
+The threshold never jumps: its cost is not the deployment's to take back.
+
+The ladder **clamps at its top**: a target still unmet with the interval at its floor, the
+concurrency at its ceiling, and the threshold at its youngest bucket means the cache is undersized
+for its working set, and the choice is thrashing or running out of space. It keeps evicting —
+refusing is the worse failure — but this is the one GC condition that **warns** (§10) rather than
+passing silently, because it is the only one an operator must act on.
+
+A pass that meets its target may still keep taking *misses* the walk encounters, bounded per pass —
+over-evicting an affirmatively cold key is nearly free in rehydration risk, yet each eviction still
+costs a remote HEAD, a twin write, and a CAS, hence the bound. Recency is priority only: it never
 overrides the correctness gates below. Eviction of candidate K with version-token ETag `E_v`:
 
 1. **Skip if the marker exists** (`HEAD <meta><b>` at bare `K`) — a cheap local short-circuit that
@@ -1546,7 +1641,10 @@ overrides the correctness gates below. Eviction of candidate K with version-toke
 2. **Confirm the remote generation** (`HEAD` remote K): absent ⇒ not durable ⇒ skip; framed size ≠
    `ciphertext_len(plen) + |trailer|` for this body ⇒ some other generation ⇒ skip. Only a
    same-plaintext-length candidate is ambiguous, and only it pays the trailer's `cetag` (one ranged
-   tail GET) to settle it — the same triage the pending-set rebuild runs (§7).
+   tail GET) to settle it — the same triage the pending-set rebuild runs (§7). A skip here **raises
+   the key's pending marker** on the way out: this HEAD has just established the one thing a marker
+   records, and step 1 already established there is none, so the reconcile sweep would otherwise
+   never learn about a body only this path can see (below).
 3. Under K's lock: delete stale twins, write the fresh twin, then overwrite K with the eviction
    sentinel via `PutObject If-Match: E_v` — metadata carrying `cetag`/`plen`/original mtime. The
    tombstone is an atomic in-place replace: a racing GET sees body or tombstone, never 404.
@@ -1599,15 +1697,29 @@ single-part land: the land PUT is what drives the transfer, while dropping the t
 pair of calls, and cancelling between the two would leave a live body beside a stale twin — benign
 (classification ignores it, §6) but debris nothing reclaims until the next sweep.
 
-**The walk heals markers forward.** The rotating cursor already visits every live body, so it
-applies the pending-set rebuild's test as it goes (§7) and writes a marker for any body whose generation
-the remote does not hold. The boot-time pending-set rebuild is what makes that recovery *prompt*
-after a crash; the walk
-is the standing backstop for anything a mid-run failure leaves behind between boots. **Eviction in a
-bucket waits for that bucket's pending-set rebuild** — before it completes, the pending set on disk is known
-incomplete, and a scavenger reading it as exhaustive is the one way an acked write is lost. The
-generation check (step 2 above) independently refuses those bodies, so the ordering rule is the
-second of two locks on the same door, not the only one.
+**Marker healing is not a duty of the scan.** An earlier design had the walk apply the pending-set
+rebuild's test to every live body it passed. That is redundant against the paths that can actually
+leave a body markerless, all of which end the same way: the marker queue retries for the life of the
+process, and anything still owed at drain withholds the clean marker of *every* bucket, which sends
+the next run into an exhaustive R2 before it serves a request (§7). A crash, a closed queue under a
+live write, a death between the body write and the enqueue — each one is already covered twice, and
+neither cover is probabilistic.
+
+Making the scan re-derive it would also mean opening a second cursor on the remote at each probe's
+position, and bounding the pass to where the two pages overlap — R2's whole machinery, carried by a
+job that never asks R2's question. Sharing it was the same mistake §13 records one level down.
+
+What remains is not a failure but a *bug*: a write path that forgets to owe a marker drains
+gracefully, writes a clean marker, and is never rebuilt — leaving a body that is cache-only
+indefinitely, never uploaded and never evicted. That one is caught where the evidence is already
+paid for. Step 2 above HEADs the remote for every eviction candidate, and today a body the remote
+does not hold is simply skipped; it **raises the marker on the way past** instead. No extra round
+trip, and it lands on cold keys — precisely the ones no future write would have re-owed.
+
+**Eviction in a bucket waits for that bucket's pending-set rebuild** — before it completes, the
+pending set on disk is known incomplete, and a scavenger reading it as exhaustive is the one way an
+acked write is lost. The generation check (step 2 above) independently refuses those bodies, so the
+ordering rule is the second of two locks on the same door, not the only one.
 
 **Usage from the backend.** The scavenger reads SeaweedFS volume/master metrics (physically
 accurate, sees dead bytes), scavenges from high- to low-water mark, and can drive
@@ -1616,9 +1728,11 @@ accurate, sees dead bytes), scavenges from high- to low-water mark, and can driv
 ## 9. Configuration & deployment
 
 `figment` (TOML + `HYPHA_`-prefixed env, `__` nesting), validated at boot. Current surface
-(`config.rs`): `remote` and `cache` endpoints (endpoint/region/credentials/**bucket prefix** —
-client buckets pass through prefixed, so deployments share a remote account in disjoint bucket
-namespaces), `mode` (`durable` | `cached`), `auth` (hypha's own
+(`config.rs`): `remote` and `cache` endpoints (endpoint/region/credentials), one
+**`bucket_prefix`** for the whole deployment — every backend bucket is `<prefix>-<role>-<b>` with the
+role fixed per §6, so deployments share an account in disjoint namespaces by differing in the
+prefix alone, and no two roles can be configured into overlapping namespaces at all,
+`mode` (`durable` | `cached`), `auth` (hypha's own
 client credentials for `S3Auth`), `master_passphrase` (the 256-bit random age passphrase, from a Secret; supersedes phase 1's
 `master_identity`), `serving.listen` + `serving.offload_threshold` (§5), `reconcile.interval_ms` +
 `reconcile.concurrency` (the §7 sweep's cadence and per-pass fan-out, and the marker queue's write
@@ -1627,8 +1741,11 @@ fan-out; that queue is deliberately unbounded and so has no depth knob) + the dr
 `background.concurrency` + `background.queue_depth` (the §8 transition actor: whole-object transfers
 in flight, and how many wait before submissions are shed — so `concurrency` sits far below
 `reconcile.concurrency`, since it bounds remote bandwidth rather than request count). Later phases
-add: GC water marks / walk window / recency-ring shape (slice size, depth k,
-rotation fill target) / opportunistic-eviction bound, restore fan-out + hint
+add: GC water marks / probe page budget and yield-weighting floor / the §8 ladder's own bounds (`min_interval_ms`,
+`max_concurrency`, with `interval_ms`/`concurrency` naming the unpressured base) / recency-ring
+shape (rotation fill target, retained depth k, and the per-slice false-positive rate — the slice's
+bit count is *derived* from those two rather than configured, so the pair cannot drift into a
+nominally deep but saturated filter) / opportunistic-eviction bound, restore fan-out + hint
 interval, and the §4 fencing block (identity selectors, lease timings, fence-confirm timeout,
 settle delay).
 
@@ -1664,8 +1781,10 @@ itself stays owned by the `seaweedfs`/`cilium` charts per repo convention.
 rate/latency by op, cache hit ratio, **pending-marker set size + reconcile pass duration**,
 **`markers_owed` and buckets left dirty at drain** (both should be flat zero — markers owed means the
 cache is refusing small writes, and it is also the queue's only bound, §7),
-remote-upload latency/retries, role + failover count + fence-confirm latency, scavenge throughput
-and usage vs. water marks. An invariant violation needs no metric of its own — the process shuts
+remote-upload latency/retries, role + failover count + fence-confirm latency, scavenge throughput,
+usage vs. water marks, and the **rung of §8's escalation ladder currently engaged** — which is what
+tells an operator whether GC is coping, and whose top with the target still unmet is the
+cache-undersized signal, the one GC condition that warns. An invariant violation needs no metric of its own — the process shuts
 down and exits, so it shows up as a crashloop and as the halt marker on the remote
 (§6) — but the exit code (`86`) is distinct from any other so a supervisor can tell it apart. `/healthz` + `/readyz` (remote reachable, and in cached mode every
 bucket's clean marker cleared — §7 *Startup*); active/passive is a reported
@@ -1718,7 +1837,13 @@ condition, not a readiness gate.
   live, and the queue's retry lands the marker afterwards (fault-injecting cache wrapper — MinIO
   cannot fail one write selectively). Kill the active without a drain ⇒ no clean marker ⇒ next run
   scans and rebuilds every missing marker; drain gracefully ⇒ clean marker ⇒ no scan, and a marker
-  owed at drain (the queue still retrying) withholds it. The quiescence ordering is the part
+  owed at drain (the queue still retrying) withholds it. **A marker owed to a deleted bucket is
+  dropped, not retried** — its `<meta>` projection is gone, so it can never land, and retrying it
+  would withhold every *other* bucket's clean marker for the rest of the run; assert that deleting a
+  bucket with a marker in flight still leaves the surviving buckets clean at drain. The drop is
+  gated on the state map agreeing the bucket is gone, so assert the other side too: a `<meta>`
+  projection removed underneath a *live* bucket raises **I7** rather than quietly shortening a
+  pending set the run still vouches for. The quiescence ordering is the part
   worth asserting directly: a write committed but not yet marked must never coexist with a clean
   marker, so drive a body write concurrent with SIGTERM and assert the marker set and the clean
   marker cannot disagree. Assert the **default** too, since it is the property a future change is
@@ -1751,7 +1876,7 @@ condition, not a readiness gate.
   old active's writes refused at the backend before the new active writes; graceful path too.
 - **Integration** (`hypha/tests/`, built): an in-process harness drives hypha over an ephemeral
   port with a real `aws-sdk-s3` client against a throwaway **MinIO** serving as *both* cache and
-  remote (kept disjoint by each backend's `bucket_prefix`); every fixture is stateless and tears
+  remote (kept disjoint by the per-role bucket names under one `bucket_prefix`); every fixture is stateless and tears
   down its MinIO + data dir on drop. Covers the durable S3 conformance surface incl. twin-diluted
   **LIST pagination** (`conformance.rs`),
   the multipart scenarios above including the small-final-part **trailer fold** (`multipart.rs`),
@@ -1824,7 +1949,7 @@ Each phase's mechanism is specified in §§1–10 above; this section tracks sco
 | 3a | The `<data>`/`<meta>` keyspace split (§6) — prerequisite for v1 LIST's `NextMarker` and the twin-suffix headroom | Done vs. MinIO |
 | 4 | Cached mode, single replica: marker queue, clean marker, reconcile sweep (`replication.rs`), cached DELETE propagation, rehydrate | Done vs. MinIO |
 | 4a | The two recoveries split apart (§7): additive R1 (remote walk) + marker-only R2 (two-cursor join), the per-bucket write-mode gate (durable semantics for a restore window), full startup resolution of bucket state + the volume watchdog, invariants I1–I7 and the halt marker (§6) | Done vs. MinIO |
-| 5 | GC: walk cursor, threshold-ratchet eviction, Bloom ring, usage source + vacuum, prefix-hint writer, restore sharding, debris sweeps | Not started |
+| 5 | GC: probabilistic scan (random-position probes, yield-weighted bucket choice), the pressure ladder (interval → concurrency → age threshold), Bloom ring, usage source + vacuum, prefix-hint writer, restore sharding, debris sweeps | In progress |
 | 6 | `hypha-fence` + active-passive: two-pod StatefulSet, leader-elected controller, lease, fence→confirm→drain→promote | Not started |
 | 7 | `hypha/` chart, dashboards, the two production installs (cached + durable) | Not started |
 

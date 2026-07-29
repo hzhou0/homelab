@@ -7,6 +7,7 @@ mod auth;
 mod background;
 mod bucket;
 mod codec;
+mod gc;
 mod halt;
 mod keylocks;
 mod markers;
@@ -24,7 +25,7 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use tokio::net::TcpListener;
 
-use hypha_core::config::Mode;
+use hypha_core::config::{Mode, DATA_ROLE, META_ROLE, REMOTE_ROLE};
 use hypha_core::{Backend, Config};
 
 pub use halt::EXIT_INVARIANT_VIOLATION;
@@ -42,11 +43,14 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     // Trailer authentication key: same master passphrase, distinct KDF domain (§6).
     let trailer_key = hypha_format::TrailerKey::derive(&config.master_passphrase);
 
-    let remote = Backend::connect(&config.remote);
-    // The cache is two buckets on one endpoint (§6): <data> holds client bodies + tombstones,
-    // <meta> holds hypha's twins, markers, and mpu records.
-    let data = Backend::connect(&config.cache);
-    let meta = data.with_prefix(config.cache_meta_prefix.clone());
+    let remote = Backend::connect(&config.remote, config.role_prefix(REMOTE_ROLE));
+    // The cache carries three roles on one endpoint (§6, §8): <data> holds client bodies +
+    // tombstones, <meta> hypha's twins/markers/mpu records, and GC's own bucket the recency ring.
+    let data = Backend::connect(&config.cache, config.role_prefix(DATA_ROLE));
+    let meta = data.with_prefix(config.role_prefix(META_ROLE));
+    // A whole bucket name, not a prefix — nothing is appended to it — so the backend it goes
+    // through must not prepend one either.
+    let gc_backend = data.with_prefix(String::new());
 
     let halt = halt::Halt::new(remote.clone());
     let serve_halt = halt.clone();
@@ -78,10 +82,22 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
         config.reconcile.concurrency,
     );
 
+    // The GC actor (§8), both modes: debris accumulates wherever the client path acked before its
+    // cleanup was done, and recency is fed by every op that resolves or lands a key. It owns its own
+    // cadence and stops when the last handle — the one `Hypha` holds — drops.
+    let gc = gc::spawn(
+        tier.clone(),
+        buckets.clone(),
+        gc_backend,
+        config.gc_bucket(),
+        &config.gc,
+    );
+
     let app = Hypha::new(
         tier,
         buckets,
         markers.clone(),
+        gc,
         config.mode,
         config.serving.offload_threshold,
         config.max_bucket_prefix_len(),

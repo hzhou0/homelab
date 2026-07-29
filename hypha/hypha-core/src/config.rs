@@ -28,11 +28,21 @@ pub struct S3Endpoint {
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
-    /// Prepended to every client bucket name (architecture § *Two modes*), so deployments sharing
-    /// one remote account land in disjoint bucket namespaces. Empty for a dedicated account.
-    #[serde(default)]
-    pub bucket_prefix: String,
 }
+
+/// The role each backend bucket plays, as the fixed segment between the deployment's own prefix and
+/// the client bucket name — `<prefix>-d-<b>`, `<prefix>-m-<b>`, `<prefix>-r-<b>`.
+///
+/// Fixed rather than configured: three independently settable prefixes could be made to overlap (one
+/// a prefix of another on a shared endpoint), which had to be caught at boot and meant nothing good
+/// if it ever slipped through. Deriving them from one prefix makes disjointness structural, and the
+/// deployment-sharing the prefixes existed for is still served by varying the one prefix.
+pub const DATA_ROLE: &str = "d";
+pub const META_ROLE: &str = "m";
+pub const REMOTE_ROLE: &str = "r";
+/// GC's own bucket (§8). Not per client bucket — one bucket for the whole deployment, since the
+/// recency ring is global and its slices are keyed by fully qualified `<bucket>/<key>`.
+pub const GC_ROLE: &str = "g";
 
 fn default_region() -> String {
     "us-east-1".to_string()
@@ -128,19 +138,115 @@ impl Default for Background {
     }
 }
 
+/// The scavenger (§8, §9). Both modes: durable mode evicts nothing but still accumulates the debris
+/// every mode produces.
+///
+/// `interval_ms`/`concurrency` are the **unpressured base**, and the two bounds are how far §8's
+/// escalation ladder may push them before it starts spending the age threshold instead. The bounds
+/// are not tuning: the scavenger shares the remote with the client path and the reconcile sweep, so
+/// `max_concurrency` is what keeps an emergency reclaim from starving the reads it exists to protect.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Gc {
+    /// Delay between passes with no pressure. Long relative to the reconcile sweep — nothing here is
+    /// a durability obligation, so the only cost of a slow pass is reclaimable bytes left unreclaimed.
+    #[serde(default = "default_gc_interval_ms")]
+    pub interval_ms: u64,
+    /// The floor pressure may shorten the interval to (rung 1). Zero means back-to-back passes.
+    #[serde(default = "default_gc_min_interval_ms")]
+    pub min_interval_ms: u64,
+    /// Buckets swept concurrently with no pressure.
+    #[serde(default = "default_gc_concurrency")]
+    pub concurrency: usize,
+    /// The ceiling pressure may raise concurrency to (rung 2).
+    #[serde(default = "default_gc_max_concurrency")]
+    pub max_concurrency: usize,
+    #[serde(default)]
+    pub recency: Recency,
+}
+
+/// The shape of §8's recency ring: how much traffic a slice covers, and how far back the ring
+/// remembers.
+///
+/// The slice's **bit count is derived**, not configured — it follows from `fill_target` and
+/// `false_positive_rate`, which are the two properties an operator can actually reason about. A
+/// directly configured size would let the two drift into a filter that is nominally k deep but
+/// saturated, and a saturated slice reports every key as recent, which is the protect-everything
+/// failure the fill-driven rotation exists to prevent.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Recency {
+    /// Distinct keys a slice absorbs before it rotates. This — not a duration — is what recency is
+    /// denominated in (§8), so it is really the question "how much competing traffic should it take
+    /// to make a key look old".
+    #[serde(default = "default_recency_fill_target")]
+    pub fill_target: usize,
+    /// Sealed slices retained behind the current one, so the ring resolves `depth + 1` ages before
+    /// falling through to *miss*.
+    #[serde(default = "default_recency_depth")]
+    pub depth: usize,
+    /// Per-slice false-positive rate at the fill target. A false positive makes a cold key look
+    /// warmer than it is, costing one deferred eviction — hence a rate this loose.
+    #[serde(default = "default_recency_fpp")]
+    pub false_positive_rate: f64,
+}
+
+fn default_recency_fill_target() -> usize {
+    100_000
+}
+fn default_recency_depth() -> usize {
+    7
+}
+fn default_recency_fpp() -> f64 {
+    0.01
+}
+
+impl Default for Recency {
+    fn default() -> Self {
+        Recency {
+            fill_target: default_recency_fill_target(),
+            depth: default_recency_depth(),
+            false_positive_rate: default_recency_fpp(),
+        }
+    }
+}
+
+fn default_gc_interval_ms() -> u64 {
+    300_000
+}
+fn default_gc_min_interval_ms() -> u64 {
+    1_000
+}
+fn default_gc_concurrency() -> usize {
+    4
+}
+fn default_gc_max_concurrency() -> usize {
+    16
+}
+
+impl Default for Gc {
+    fn default() -> Self {
+        Gc {
+            interval_ms: default_gc_interval_ms(),
+            min_interval_ms: default_gc_min_interval_ms(),
+            concurrency: default_gc_concurrency(),
+            max_concurrency: default_gc_max_concurrency(),
+            recency: Recency::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub remote: S3Endpoint,
     /// Required in both modes: the cache is the ETag/namespace source of truth even for the
-    /// `durable` deployment, where it holds only tombstones (unified tiering design). Its
-    /// `bucket_prefix` names the `<data>` bucket (client bodies + tombstones, §6).
+    /// `durable` deployment, where it holds only tombstones (unified tiering design).
     pub cache: S3Endpoint,
-    /// Prefix for the cache's `<meta>` bucket (§6): hypha's own object-side state — facts twins,
-    /// pending markers, mpu records — lives in `<meta><b>`, kept disjoint from the `<data><b>`
-    /// client bodies by this prefix. Distinct from, and not a prefix of, the `<data>`/remote
-    /// prefixes (validated at boot).
-    pub cache_meta_prefix: String,
+    /// This deployment's own prefix, ahead of the fixed role segment ([`DATA_ROLE`] and friends) on
+    /// every backend bucket it touches. Two deployments sharing one account stay in disjoint
+    /// namespaces by differing here, and it is charged against S3's 63-byte bucket-name cap.
+    pub bucket_prefix: String,
     pub mode: Mode,
     pub auth: ClientAuth,
     /// The 256-bit random passphrase age's scrypt recipient wraps every file key to (§6),
@@ -157,6 +263,9 @@ pub struct Config {
     /// only cached mode submits anything.
     #[serde(default)]
     pub background: Background,
+    /// The scavenger's cadence (§8). Runs in both modes.
+    #[serde(default)]
+    pub gc: Gc,
     /// How often to re-check that each `Ready` bucket still has its sync marker (§7). One HEAD per
     /// ready bucket per tick, so it is cheap at homelab bucket counts; the cost of a slow tick is
     /// only how long a live volume loss goes unnoticed.
@@ -196,46 +305,78 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The longest of the three configured bucket prefixes — charged against S3's 63-byte
-    /// bucket-name cap, so the client-visible cap is `63 − this` (§7 *Buckets*).
-    pub fn max_bucket_prefix_len(&self) -> usize {
-        self.remote
-            .bucket_prefix
-            .len()
-            .max(self.cache.bucket_prefix.len())
-            .max(self.cache_meta_prefix.len())
+    /// The prefix every backend bucket of `role` carries: this deployment's prefix, the role, and
+    /// the separator the client bucket name follows. Disjointness across roles is structural — the
+    /// role segment is fixed and single-character, so no two can overlap however the deployment
+    /// prefix is set, and all four may share one endpoint (the integration harness's single MinIO
+    /// does).
+    pub fn role_prefix(&self, role: &str) -> String {
+        format!("{}-{role}-", self.bucket_prefix)
     }
 
-    /// Startup bucket-prefix invariants (§7 *Buckets*, §9). One client bucket maps to three backend
-    /// buckets — `<data>`/`<meta>` on the cache, `<remote>` on the remote — each distinguished only
-    /// by its prefix. So no two prefixes that share an endpoint may collide: neither may be a prefix
-    /// of the other (which subsumes the empty-prefix case, since `""` is a prefix of everything),
-    /// or `ListBuckets`' strip-and-filter would misclassify and client buckets leak or vanish. The
-    /// `<data>` and `<meta>` prefixes always share the cache endpoint; the remote joins them when it
-    /// points at the same endpoint (the integration harness's single MinIO does).
+    /// GC's single bucket (§8) — a whole bucket name, not a prefix, since nothing is appended.
+    pub fn gc_bucket(&self) -> String {
+        format!("{}-{GC_ROLE}", self.bucket_prefix)
+    }
+
+    /// Charged against S3's 63-byte bucket-name cap, so the client-visible cap is `63 − this`
+    /// (§7 *Buckets*). Every role prefix is the same length, so one answer covers them all.
+    pub fn max_bucket_prefix_len(&self) -> usize {
+        self.role_prefix(DATA_ROLE).len()
+    }
+
     fn validate(&self) -> Result<(), String> {
-        let entries = [
-            (
-                &self.cache.bucket_prefix,
-                &self.cache.endpoint,
-                "cache <data>",
-            ),
-            (
-                &self.cache_meta_prefix,
-                &self.cache.endpoint,
-                "cache <meta>",
-            ),
-            (&self.remote.bucket_prefix, &self.remote.endpoint, "remote"),
-        ];
-        for (i, (pa, ea, na)) in entries.iter().enumerate() {
-            for (pb, eb, nb) in entries.iter().skip(i + 1) {
-                if ea == eb && (pa.starts_with(pb.as_str()) || pb.starts_with(pa.as_str())) {
-                    return Err(format!(
-                        "bucket prefixes for {na} ({pa:?}) and {nb} ({pb:?}) share an endpoint and \
-                         one is a prefix of the other — they cannot occupy disjoint bucket namespaces"
-                    ));
-                }
-            }
+        // Empty would put the role segment at the head of every bucket name, where `d-`/`m-`/`r-`
+        // are plausible client bucket names — and `ListBuckets` strips this prefix to recover the
+        // client name, so a deployment sharing an account would start answering for another's
+        // buckets.
+        if self.bucket_prefix.is_empty() {
+            return Err(
+                "bucket_prefix must be non-empty: it is what separates this deployment's \
+                        backend buckets from another's on a shared account"
+                    .to_string(),
+            );
+        }
+        if !self
+            .bucket_prefix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(format!(
+                "bucket_prefix ({:?}) must be lowercase alphanumeric or '-' — it is part of an S3 \
+                 bucket name",
+                self.bucket_prefix
+            ));
+        }
+        // An inverted bound doesn't degrade the §8 ladder, it reverses it: escalating would slow the
+        // scavenger down and reach the age threshold having spent nothing cheap first.
+        if self.gc.min_interval_ms > self.gc.interval_ms {
+            return Err(format!(
+                "gc.min_interval_ms ({}) exceeds gc.interval_ms ({}) — pressure would lengthen the \
+                 interval it is supposed to shorten",
+                self.gc.min_interval_ms, self.gc.interval_ms
+            ));
+        }
+        if self.gc.max_concurrency < self.gc.concurrency {
+            return Err(format!(
+                "gc.max_concurrency ({}) is below gc.concurrency ({}) — pressure would narrow the \
+                 pass it is supposed to widen",
+                self.gc.max_concurrency, self.gc.concurrency
+            ));
+        }
+        let fpp = self.gc.recency.false_positive_rate;
+        if !(f64::EPSILON..1.0).contains(&fpp) {
+            return Err(format!(
+                "gc.recency.false_positive_rate ({fpp}) must be in (0, 1) — the slice's bit count \
+                 is derived from it"
+            ));
+        }
+        if self.gc.recency.fill_target == 0 {
+            return Err(
+                "gc.recency.fill_target must be non-zero — a slice that rotates on every \
+                        insert remembers nothing"
+                    .to_string(),
+            );
         }
         Ok(())
     }

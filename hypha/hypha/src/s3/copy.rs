@@ -147,6 +147,8 @@ impl Hypha {
             )
             .await?;
 
+        // The destination only; the source fed the ring when it resolved (§8).
+        self.gc.touch(&bucket, &key);
         let resp = CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(ETag::Strong(facts.cetag.clone())),

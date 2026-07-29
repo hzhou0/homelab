@@ -606,6 +606,7 @@ impl Hypha {
             .await?;
         self.drop_mpu_state(&bucket, &upload_id).await?;
 
+        self.gc.touch(&bucket, &key);
         let resp = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),
             key: Some(key),
