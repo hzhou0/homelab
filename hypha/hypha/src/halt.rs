@@ -1,20 +1,17 @@
 //! Invariant violations, and the halt they put the deployment into.
 //!
-//! Nothing but hypha writes these buckets, and the recovery machinery (§7) rests on a handful of
-//! properties that therefore cannot be false: an eviction tombstone's remote object exists, a
-//! `Ready` bucket's cache namespace accounts for every remote key, a remote object carries a
-//! trailer hypha can authenticate. A violation of one of them does not mean a request failed — it
-//! means hypha's picture of its own data is wrong, so every later answer is suspect and the
-//! recoveries themselves become unsafe to run: a restore would rebuild from a namespace it has just
-//! been told is not the one it thinks, and a pending rebuild would raise markers that send the
-//! reconcile sweep at objects it cannot account for.
+//! Nothing but hypha writes these buckets, and the recovery machinery (§7) rests on properties that
+//! therefore cannot be false. A violation of one does not mean a request failed — it means hypha's
+//! picture of its own data is wrong, so every later answer is suspect and the recoveries themselves
+//! become unsafe to run: a restore would rebuild from a namespace it has just been told is not the
+//! one it thinks.
 //!
 //! So a violation is not an error to propagate. The order matters:
 //!
 //! 1. the server shuts down, so nothing further is served on data hypha has just declared wrong;
-//! 2. the violation is recorded, retried until it lands — losing the record is the one outcome that
-//!    must not happen, since the next process would silently resume serving the same wrong data.
-//!    Nothing is being served in the meantime, so there is no deadline worth beating;
+//! 2. the violation is recorded, retried until it lands — losing the record would let the next
+//!    process silently resume serving the same wrong data. Nothing is being served in the meantime,
+//!    so there is no deadline worth beating;
 //! 3. only then does the process end. Every later run exits from [`exit_if_marked`], so the
 //!    deployment presents as an ordinary crashloop — the failure mode operator tooling already
 //!    alerts on. hypha is active-passive with a single active, so there is no replica to coordinate
@@ -37,28 +34,27 @@ use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 use hypha_core::Backend;
 
-/// Exit status for an invariant violation. Distinct from any conventional status (and from
-/// `sysexits.h`) so a supervisor can tell this apart from an ordinary crash.
+/// Distinct from any conventional status (and from `sysexits.h`) so a supervisor can tell this
+/// apart from an ordinary crash.
 pub const EXIT_INVARIANT_VIOLATION: i32 = 86;
 
-/// How long to wait between attempts at recording a violation. Short, because nothing is being
-/// served until it lands.
+/// Short, because nothing is being served until the record lands.
 const RECORD_RETRY: Duration = Duration::from_secs(2);
 
-/// Which invariant was violated. The variants are the enumerated properties §7's recoveries assume;
-/// a new one is added only alongside the check that detects it.
+/// The enumerated properties §7's recoveries assume; a variant is added only alongside the check
+/// that detects its violation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Invariant {
     /// A remote object whose tail trailer does not authenticate: either something other than hypha
     /// writes this bucket, or this process holds the wrong trailer key or an unknown format.
     ForeignObject,
-    /// A live plaintext body in `<data>` while the bucket's namespace is restoring. Writes run with
-    /// durable semantics for the whole of a restore precisely so this cannot happen, so one means
-    /// the mode gate leaked and an acked write may exist that the restore is about to walk past.
+    /// A live plaintext body in `<data>` while the bucket's namespace is restoring. Writes run
+    /// durable for the whole of a restore precisely so this cannot happen, so one means the mode
+    /// gate leaked and an acked write may exist that the restore is about to walk past.
     PlaintextDuringRestore,
-    /// A `Ready` bucket where the remote holds an object the cache has no entry for. Cache-absent is
-    /// the authoritative 404 on a ready bucket, and no path can produce this: every site that
-    /// removes a `<data>` entry does so only once the remote object is already gone.
+    /// A `Ready` bucket where the remote holds an object the cache has no entry for. No path can
+    /// produce this: every site that removes a `<data>` entry does so only once the remote object
+    /// is already gone.
     RemoteOnlyKey,
     /// An eviction tombstone whose remote object is missing — the remote lost bytes hypha reported
     /// as committed, and the tombstone is the only remaining record that they existed.
@@ -68,8 +64,8 @@ pub(crate) enum Invariant {
     /// as the object's absence ever since — answers it cannot identify, let alone take back.
     CacheVolumeLost,
     /// A remote bucket hypha neither created nor resolved at startup. hypha owns both backends
-    /// outright, so a bucket that appears from nowhere means something else is writing the remote,
-    /// and nothing downstream — least of all a restore that would project it into the cache — can
+    /// outright, so one that appears from nowhere means something else is writing the remote, and
+    /// nothing downstream — least of all a restore that would project it into the cache — can
     /// assume the objects in it are hypha's.
     ForeignBucket,
     /// A pending-set rebuild reached a durable-mode deployment, which has no pending set. A
@@ -101,8 +97,8 @@ pub(crate) struct Violation {
 }
 
 impl Violation {
-    /// The marker body — plain text, because its only consumer is a human deciding what to do about
-    /// it. Bringing in a serialization format for a four-field record would be its own cost.
+    /// Plain text: the only consumer is a human deciding what to do about it, and a serialization
+    /// format for a four-field record would be its own cost.
     fn render(&self) -> Vec<u8> {
         format!(
             "invariant: {}\nbucket: {}\nkey: {}\ndetail: {}\n",
@@ -115,8 +111,7 @@ impl Violation {
     }
 }
 
-/// Held by every component that can observe a violation. It takes the remote alone rather than a
-/// `Tiering`, which is what lets `Tiering` hold one.
+/// Takes the remote alone rather than a `Tiering`, which is what lets `Tiering` hold one.
 #[derive(Clone)]
 pub(crate) struct Halt {
     remote: Backend,
@@ -187,8 +182,8 @@ impl Halt {
         std::process::exit(EXIT_INVARIANT_VIOLATION)
     }
 
-    /// A trailer that does not authenticate, at any of the sites that read one (§6). One helper is
-    /// what keeps every such site on the same footing — none may treat it as a miss.
+    /// One helper is what keeps every trailer-reading site (§6) on the same footing — none may
+    /// treat a trailer that does not authenticate as a miss.
     pub(crate) async fn foreign_object(&self, bucket: &str, key: &str) -> ! {
         self.raise(Violation {
             invariant: Invariant::ForeignObject,
@@ -201,8 +196,8 @@ impl Halt {
 }
 
 /// The other half of the crashloop: the run that *recorded* a violation exits from [`Halt::raise`],
-/// and every run after it exits from here — before the listener opens, so a halted deployment never
-/// serves a single request.
+/// every run after it exits from here. Must run before the listener opens, so a halted deployment
+/// never serves a single request.
 pub(crate) async fn exit_if_marked(remote: &Backend) -> Result<()> {
     let key = meta::halt_marker_key();
     for (bucket, _) in remote.list_buckets().await? {
@@ -228,8 +223,8 @@ pub(crate) async fn exit_if_marked(remote: &Backend) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Everything else here ends the process, so it is exercised in the integration tests, which
-    /// can observe the exit status and the recorded marker.
+    /// Everything else here ends the process, so it is left to the integration tests, which can
+    /// observe the exit status and the recorded marker.
     #[test]
     fn rendered_marker_names_the_invariant_and_the_key() {
         let body = String::from_utf8(

@@ -1,13 +1,11 @@
-//! **R1 — the namespace restore** (§7): rebuild a bucket's cache projection when its sync marker is
-//! absent, i.e. after the cache volume was lost.
+//! **R1 — the namespace restore** (§7): rebuild a bucket's cache projection from the remote.
 //!
 //! **Additive, and only additive.** A key the cache *does* hold is left untouched, because during a
 //! restore there are only two ways for it to have one, and both are current:
 //!
 //! - a tombstone this restore — or an earlier, crashed run of it — already settled from the remote;
-//! - the settle of a write committed during the window. Writes run with **durable semantics** for
-//!   the whole restore, so a committed write has already recorded itself in the cache and an
-//!   uncommitted one has not.
+//! - the settle of a write committed during the window. Writes run durable for the whole restore, so
+//!   a committed write has already recorded itself in the cache and an uncommitted one has not.
 //!
 //! That is what makes the pass idempotent across crashes and safe to run while the bucket is served,
 //! and why the absence check needs no cache listing to correlate against — it is made under K's own
@@ -25,25 +23,24 @@ use hypha_core::meta;
 use crate::halt::{Invariant, Violation};
 use crate::tier::Tiering;
 
-/// Keys per remote LIST page.
-const PAGE: i32 = 1000;
+const PAGE_KEYS: i32 = 1000;
 
-/// Keys materialized at once. Each is a trailer read plus two small writes, so this bounds remote
-/// fan-out; the keys are independent, so serializing them would only make a restore slower.
+/// Each materialization is a trailer read plus two small writes, so this bounds remote fan-out; the
+/// keys are independent, so serializing them would only make a restore slower.
 const CONCURRENCY: usize = 16;
 
 const PROBE_KEYS: i32 = 1000;
 
 /// The caller writes the sync marker once this returns — that write is the only "done" signal, so a
 /// pass that fails part-way simply re-runs.
-pub(crate) async fn restore(tier: &Tiering, bucket: &str) -> Result<()> {
+pub(super) async fn namespace(tier: &Tiering, bucket: &str) -> Result<()> {
     probe_for_native_objects(tier, bucket).await?;
 
     let mut token: Option<String> = None;
     loop {
         let page = tier
             .remote
-            .list(bucket, None, None, token.take(), None, Some(PAGE))
+            .list(bucket, None, None, token.take(), None, Some(PAGE_KEYS))
             .await?;
         let keys: Vec<String> = page
             .contents

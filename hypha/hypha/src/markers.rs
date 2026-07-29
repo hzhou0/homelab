@@ -5,7 +5,7 @@
 //! Three pieces, in the order a run meets them:
 //!
 //! 1. **Startup** reads and clears the clean markers, but does it in
-//!    [`crate::bucket_ctl::resolve_all`], which is already reading the other marker of the same pair
+//!    [`crate::bucket::resolve_all`], which is already reading the other marker of the same pair
 //!    and is the only place that can act on the answer.
 //! 2. **The queue** ([`Markers::owe`]) — a write hands its marker over and returns; the handover
 //!    cannot block or fail, which is the whole reason the queue is unbounded.
@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 
 use hypha_core::meta;
 
-use crate::bucket_ctl::BucketCtl;
+use crate::bucket::BucketCtl;
 use crate::tier::Tiering;
 
 const DRAIN_BATCH: usize = 256;
@@ -65,9 +65,9 @@ struct MarkerQueue {
     /// connections drain the serving loop's [`RunSeal`] is the only one left.
     tx: mpsc::WeakUnboundedSender<MarkerMsg>,
     /// Which buckets this run accounts for is per-bucket state, so it lives on the actor that owns
-    /// per-bucket state ([`crate::bucket_ctl::BucketState`]) rather than in a second map here — the
-    /// pass that earns the accounting is the actor's, and retiring a deleted bucket clears it there
-    /// without this module having to know a bucket went away.
+    /// per-bucket state ([`crate::bucket`]) rather than in a second map here — the pass that earns
+    /// the accounting is the actor's, and retiring a deleted bucket clears it there without this
+    /// module having to know a bucket went away.
     buckets: BucketCtl,
 }
 
@@ -163,7 +163,7 @@ pub(crate) struct MarkerActor {
     retry: Duration,
     concurrency: usize,
     /// Durable mode has no pending set, so it has nothing for a clean marker to vouch for and
-    /// nothing that reads one back (`crate::recovery`) — writing them there would only leave
+    /// nothing that reads one back (`crate::bucket`) — writing them there would only leave
     /// per-bucket objects no code path ever consults.
     cached: bool,
 }

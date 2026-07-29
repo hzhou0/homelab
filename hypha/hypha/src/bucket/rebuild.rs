@@ -1,10 +1,10 @@
-//! **R2 — the pending-set rebuild** (§7): re-derive a bucket's pending markers when its clean marker
-//! is absent, i.e. when a run ended without proving it had indexed every acked write.
+//! **R2 — the pending-set rebuild** (§7): re-derive a bucket's pending markers by walking the
+//! namespace it can already trust.
 //!
-//! The namespace here is **authoritative** — that is the whole difference from a restore — so this
-//! pass writes nothing but markers. It never materializes a key from the remote (on a ready bucket,
-//! cache-absent *is* the client's 404, and rebuilding one would resurrect a deleted object) and
-//! never settles a cache entry from a listing (which is what would roll an acked write back).
+//! That the namespace is **authoritative** is the whole difference from a restore, and it is what
+//! confines this pass to writing markers. It never materializes a key from the remote (rebuilding
+//! one would resurrect a deleted object) and never settles a cache entry from a listing (which is
+//! what would roll an acked write back).
 //!
 //! **No key locks.** Raising a marker is last-writer-wins and the sweep clears one by CAS-ing on the
 //! marker's own ETag, so a marker raised beside a concurrent upload costs at most one redundant
@@ -30,8 +30,7 @@ use hypha_core::{meta, Backend};
 use crate::halt::{Invariant, Violation};
 use crate::tier::Tiering;
 
-/// Keys per backend LIST page.
-const PAGE: i32 = 1000;
+const PAGE_KEYS: i32 = 1000;
 
 /// Bounds resident memory and how far the walk runs ahead of the work it has dispatched.
 const BATCH: usize = 256;
@@ -41,10 +40,8 @@ const BATCH: usize = 256;
 const CONCURRENCY: usize = 16;
 
 /// Returns how many markers it raised.
-pub(crate) async fn rebuild_pending(tier: &Tiering, bucket: &str) -> Result<usize> {
+pub(super) async fn pending_set(tier: &Tiering, bucket: &str) -> Result<usize> {
     if !tier.cached {
-        // Invariant I4. Not a data fault, but it means the recovery classification is wrong, and a
-        // wrong classification is not something to keep serving through.
         tier.halt
             .raise(Violation {
                 invariant: Invariant::PendingRebuildInDurableMode,
@@ -89,8 +86,6 @@ pub(crate) async fn rebuild_pending(tier: &Tiering, bucket: &str) -> Result<usiz
 /// holds: a live body (is it *this* generation?) and an eviction (is it still backed?).
 async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result<bool> {
     let (key, size, etag, remote_framed) = match sighting {
-        // Invariant I2: every site that removes a `<data>` entry does so only once the remote
-        // object is already gone, so a remote-only key cannot arise.
         Sighting::RemoteOnly { key } => {
             confirm_remote_only(tier, bucket, &key).await?;
             return Ok(false);
@@ -224,15 +219,15 @@ async fn remote_has_object(tier: &Tiering, bucket: &str, key: &str) -> Result<bo
 
 /// What the two listings say about one key.
 enum Sighting {
-    /// The cache holds an entry — a body or a tombstone. `remote_framed` is the framed length of the
-    /// remote object, when the remote holds one.
+    /// The cache entry is a body or a tombstone; `size` and `etag` are what tell them apart.
     Cached {
         key: String,
         size: u64,
         etag: String,
         remote_framed: Option<u64>,
     },
-    /// Only the remote holds the key.
+    /// Invariant I2 says this cannot arise: nothing removes a `<data>` entry until the remote
+    /// object is already gone.
     RemoteOnly { key: String },
 }
 
@@ -304,7 +299,14 @@ impl<'a> Cursor<'a> {
         while self.buf.is_empty() && !self.exhausted {
             let page = self
                 .backend
-                .list(self.bucket, None, None, self.token.take(), None, Some(PAGE))
+                .list(
+                    self.bucket,
+                    None,
+                    None,
+                    self.token.take(),
+                    None,
+                    Some(PAGE_KEYS),
+                )
                 .await?;
             for o in page.contents.unwrap_or_default() {
                 let Some(key) = o.key else { continue };

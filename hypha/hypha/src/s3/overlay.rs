@@ -1,8 +1,8 @@
 //! The restore overlay: one interface every data op routes through so a bucket mid-restore is served
 //! from the remote instead of its half-rebuilt cache (§7 *Buckets*).
 //!
-//! A bucket's [`Readiness`] — resolved at startup and published by the bucket-control actor, so
-//! reading it costs one atomic load — selects the source every op resolves against:
+//! A bucket's [`Readiness`] ([`crate::bucket`]) selects the source every op resolves against, at the
+//! cost of one atomic load:
 //!
 //! - **Reads** ([`Hypha::resolve_key`], [`Hypha::project_remote_page`]) resolve a key's facts — and a
 //!   LIST page's entries — from the cache tombstone namespace once `Ready`, or straight from the
@@ -27,7 +27,7 @@ use hypha_core::meta;
 
 use super::get::facts_from_tombstone;
 use super::{ts_ms, Hypha};
-use crate::bucket_ctl::Readiness;
+use crate::bucket::Readiness;
 use crate::tier::RemoteFacts;
 
 /// Bounded fan-out for the per-key trailer reads a remote-served LIST page needs (§7).

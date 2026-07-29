@@ -23,7 +23,7 @@
 //!   blocks nobody — the lock handoff is the rendezvous, so `cancel` is a fire-and-forget map
 //!   lookup on the write path.
 //!
-//! Lifecycle mirrors [`crate::bucket_ctl`]: the task holds a [`Tiering`], never a `Hypha`, so it
+//! Lifecycle mirrors [`crate::bucket`]: the task holds a [`Tiering`], never a `Hypha`, so it
 //! neither keeps the service's liveness sentinel alive nor needs shutdown plumbing — it drains and
 //! exits once the last handle drops.
 //!

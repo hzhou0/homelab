@@ -5,12 +5,11 @@
 
 mod auth;
 mod background;
-mod bucket_ctl;
+mod bucket;
 mod codec;
 mod halt;
 mod keylocks;
 mod markers;
-mod recovery;
 mod replication;
 mod s3;
 mod tier;
@@ -65,9 +64,9 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     };
 
     // Ordered: the marker machinery reads its per-bucket accounting off the bucket-control actor's
-    // published state, so the actor exists first (the dependency runs one way — `bucket_ctl` knows
+    // published state, so the actor exists first (the dependency runs one way — `bucket::ctl` knows
     // nothing of `markers`).
-    let buckets = bucket_ctl::spawn(tier.clone());
+    let buckets = bucket::spawn(tier.clone());
     let (startup_tier, startup_buckets) = (tier.clone(), buckets.clone());
 
     // The repair queue's only strong sender goes to `Lifecycle`, so dropping that at drain is what
@@ -132,7 +131,7 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
 /// writing any clean marker back.
 pub struct Lifecycle {
     tier: tier::Tiering,
-    buckets: bucket_ctl::BucketCtl,
+    buckets: bucket::BucketCtl,
     halt: halt::Halt,
     /// The repair queue's only strong sender outside the marker tasks. Sending its one message is
     /// the seal; *dropping* it only closes the channel, which an abort does too.
@@ -143,7 +142,7 @@ pub struct Lifecycle {
 impl Lifecycle {
     pub async fn startup(&self) -> Result<(), BoxError> {
         halt::exit_if_marked(&self.tier.remote).await?;
-        bucket_ctl::resolve_all(&self.tier, &self.buckets).await?;
+        bucket::resolve_all(&self.tier, &self.buckets).await?;
         Ok(())
     }
 

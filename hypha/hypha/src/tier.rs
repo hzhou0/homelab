@@ -2,7 +2,7 @@
 //! encrypt-and-upload of a cache body, and tombstoning once ciphertext is durable on the remote.
 //! All of it serializes on the per-key lock ([`KeyLocks`]); the durable path calls these inline
 //! while holding the key lock, and the cached path's background reconcile, the two recoveries
-//! ([`crate::recovery`]), and GC call the same primitives.
+//! ([`crate::bucket`]), and GC call the same primitives.
 
 use std::collections::HashMap;
 use std::ops::Range as ByteRange;
@@ -25,7 +25,7 @@ use crate::keylocks::KeyLocks;
 /// The framed size a single-part remote object would have for a `plen`-byte plaintext (§6). A
 /// markerless live body is always single-part — a composite is tombstoned at K with its plaintext in
 /// the shadow — so this is exact where the pending-set rebuild applies it
-/// ([`crate::recovery`]).
+/// ([`crate::bucket`]).
 pub(crate) fn single_part_framed_len(plen: u64) -> Option<u64> {
     hypha_format::offset::ciphertext_len(plen, hypha_format::offset::HLEN)
         .checked_add(SINGLE_TRAILER_LEN as u64)

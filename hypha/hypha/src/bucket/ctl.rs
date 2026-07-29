@@ -1,27 +1,17 @@
-//! The bucket-control actor: the sole writer of the cache substrate and the owner of per-bucket
-//! restore (§7 *Buckets*).
-//!
-//! One client bucket is three physical buckets — `<remote><b>` (the source of truth for existence)
-//! plus the `<data><b>`/`<meta><b>` cache projections. Its per-bucket sync marker
-//! (`meta::sync_marker_key`) is a trustworthy all-or-nothing readiness signal (§7): present ⇒ the
-//! projections are authoritative; absent ⇒ the remote is the read source of truth until a restore
-//! rebuilds the tombstone namespace and rewrites the marker.
+//! The bucket-control actor: the sole writer of the cache substrate, and where a bucket's phase
+//! ([`super`]) is decided and published.
 //!
 //! Rather than guard the three-way divergence with locks, every substrate *mutation* — CreateBucket,
-//! DeleteBucket, provisioning, and restore — is funnelled through this one actor, which makes its
+//! DeleteBucket, provisioning, and recovery — is funnelled through this one actor, which makes its
 //! serialization structural: per-bucket-serial (one task drains a bucket's requests in arrival
 //! order) and cross-bucket-parallel (distinct buckets proceed at once, bounded by
 //! [`MAX_CONCURRENT`]). Reads never enter here; they read the actor's published
 //! [state map](BucketCtl::state) instead, which costs one atomic load and no lock.
 //!
 //! Client Create/Delete are request-reply and never coalesced — each returns the remote's own
-//! result, so a double-delete's loser still sees `NoSuchBucket`. `Reconcile`s are fire-and-forget
-//! and deduped: the op that triggered one already resolves from the remote meanwhile, so there is
-//! no waiter, and a storm of triggers for one bucket collapses to a single sweep.
-//!
-//! That dedup is also what makes §7's two recoveries mutually exclusive per bucket: one queue slot
-//! per bucket, and one task draining it, is why "never both" is structural here rather than a
-//! convention [`crate::recovery`] has to keep.
+//! result, so a double-delete's loser still sees `NoSuchBucket`. Recoveries are fire-and-forget and
+//! deduped: the op that triggered one already resolves from the remote meanwhile, so there is no
+//! waiter, and a storm of triggers for one bucket collapses to a single pass.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -34,8 +24,8 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
+use super::{rebuild, restore};
 use crate::halt::{Invariant, Violation};
-use crate::recovery;
 use crate::tier::Tiering;
 
 /// Cap on cache buckets being mutated at once. A slow DeleteBucket drain or a large restore holds a
@@ -71,19 +61,15 @@ pub(crate) struct BucketState {
     accounted: bool,
 }
 
-/// A bucket's source of truth for the data plane (§7), and the whole of what the overlay branches on.
-///
-/// `Absent` is a definitive `NoSuchBucket`, not "unclassified": hypha owns both backends outright, so
-/// the map [`resolve_all`] publishes at startup is the complete set of buckets, and a bucket missing
-/// from it does not exist.
+/// A bucket's source of truth for the data plane, and the whole of what the overlay branches on.
+/// Each phase is a claim the rest of the crate relies on; [`super`] states them.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Readiness {
     #[default]
     Absent,
-    /// Sync marker absent: a restore is owed or in flight, and the remote is the read source of truth
-    /// until it lands.
+    /// Sync marker absent: a restore is owed or in flight.
     Restoring,
-    /// Sync marker observed: the cache namespace is authoritative, and an absent key is a 404.
+    /// Sync marker observed.
     Ready,
 }
 
@@ -202,19 +188,15 @@ impl BucketCtl {
         .await
     }
 
-    /// Dispatch **R1** and publish `Restoring`, which is both the readiness answer for the window
-    /// and the record that the bucket exists at all.
-    ///
-    /// `Restoring` outlives a failed pass deliberately: reads resolve from the remote and writes run
-    /// durable, so the bucket is served correctly the whole time — only the sync marker waits on the
-    /// retry.
+    /// Publishing `Restoring` is both the readiness answer for the window and the record that the
+    /// bucket exists at all.
     pub(crate) fn restore(&self, bucket: &str) {
         update(&self.states, bucket, set_restoring);
         self.owe(bucket, Recovery::Restore);
     }
 
-    /// Dispatch **R2**. The bucket stays `Ready`: its namespace is authoritative and serves from the
-    /// cache throughout — only the pending index is in doubt.
+    /// The bucket stays `Ready` — its namespace is authoritative throughout, and only the pending
+    /// index is in doubt.
     pub(crate) fn rebuild_pending(&self, bucket: &str) {
         self.owe(bucket, Recovery::RebuildPending);
     }
@@ -243,9 +225,6 @@ impl BucketCtl {
         update(&self.states, bucket, mark_ready);
     }
 
-    /// Record that this run accounts for `bucket`'s pending set (§6). Startup calls it for a bucket
-    /// whose clean marker was present; the task calls it for a bucket a pass rebuilt or a create
-    /// established empty.
     /// Every bucket currently serving from its cache — the set the volume watchdog polls.
     pub(crate) fn ready(&self) -> Vec<String> {
         self.states
@@ -256,6 +235,9 @@ impl BucketCtl {
             .collect()
     }
 
+    /// Record that this run accounts for `bucket`'s pending set (§6). Startup calls it for a bucket
+    /// whose clean marker was present; the task calls it for a bucket a pass rebuilt or a create
+    /// established empty.
     pub(crate) fn account_for(&self, bucket: &str) {
         update(&self.states, bucket, set_accounted);
     }
@@ -298,11 +280,8 @@ impl BucketCtl {
 /// path used to pay on first touch. Buckets appear afterwards only through `CreateBucket`, which
 /// publishes its own entry.
 ///
-/// The two §6 markers answer everything, so the pass is **chosen here rather than re-derived later**:
-/// the *sync* marker says whether the cache namespace is authoritative, the *clean* marker whether
-/// this run inherits a complete account of the bucket's pending set. Reading both in one place is
-/// sound precisely because nothing is being served yet — no marker can move underneath the decision,
-/// and there is no second raiser to reconcile with.
+/// Reading both markers in one place is sound precisely because nothing is being served yet — no
+/// marker can move underneath the decision, and there is no second raiser to reconcile with.
 ///
 /// A cache bucket with no remote bucket is not resolved and never served: it is debris from a crash
 /// between `delete`'s remote commit and its cache drain, and a later create of the same name resets
@@ -314,9 +293,6 @@ pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<(
         let accounted = tier.cached && take_clean_marker(tier, &bucket).await?;
 
         if !synced {
-            // Both markers absent lands here too: a bucket with no trustworthy namespace has nothing
-            // for a pending rebuild to work from, and R1 leaves the pending set empty and complete
-            // on its own.
             buckets.restore(&bucket);
             continue;
         }
@@ -376,18 +352,15 @@ pub fn spawn(tier: Tiering) -> BucketCtl {
     BucketCtl { tx, states }
 }
 
-/// Which recovery a bucket needs (§7). Chosen once, at startup, from the two markers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Recovery {
-    /// R1: the namespace restore.
     Restore,
-    /// R2: the pending-set rebuild.
     RebuildPending,
 }
 
-/// `Create`/`Delete` keep arrival order; the recovery is a **single slot**, which is what makes the
-/// two recoveries mutually exclusive per bucket (§7). Nothing is ever merged into it: startup picks
-/// one pass per bucket, and a retry re-queues that same pass.
+/// `Create`/`Delete` keep arrival order; the recovery is a **single slot**, which is what makes
+/// "never both" structural. Nothing is ever merged into it: startup picks one pass per bucket, and
+/// a retry re-queues that same pass.
 #[derive(Default)]
 struct QueuedWork {
     requests: VecDeque<LifecycleRequest>,
@@ -678,9 +651,11 @@ impl BucketTask {
         }
     }
 
-    /// R1: rebuild the cache namespace from the remote, then flip the bucket authoritative.
+    /// The sync marker is the commit: it is written only once the namespace is rebuilt, and the
+    /// accounting rides along with it — a restore leaves the pending set empty and complete by
+    /// construction ([`restore`]).
     async fn run_restore(&self, bucket: &str) -> Outcome {
-        if let Err(e) = recovery::restore(&self.tier, bucket).await {
+        if let Err(e) = restore::namespace(&self.tier, bucket).await {
             tracing::warn!(bucket, error = %e, "namespace restore failed; retrying");
             return Outcome::Retry;
         }
@@ -688,16 +663,13 @@ impl BucketTask {
             tracing::warn!(bucket, error = %e, "sync marker not written; retrying");
             return Outcome::Retry;
         }
-        // Writes ran durable for the whole window, so no marker was owed while the pass ran: the
-        // pending set is empty and complete the moment the sync marker lands (§7).
         update(&self.states, bucket, set_accounted);
         tracing::info!(bucket, "namespace restore complete");
         Outcome::Done
     }
 
-    /// R2: re-derive the pending markers over a namespace that is already authoritative.
     async fn run_rebuild_pending(&self, bucket: &str) -> Outcome {
-        match recovery::rebuild_pending(&self.tier, bucket).await {
+        match rebuild::pending_set(&self.tier, bucket).await {
             Ok(raised) => {
                 update(&self.states, bucket, set_accounted);
                 tracing::info!(bucket, markers = raised, "pending-set rebuild complete");

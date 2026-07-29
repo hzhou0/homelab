@@ -4,7 +4,7 @@
 //! state (bodies, tombstones, twins, mpu records) has somewhere to live, so it is created/deleted
 //! alongside but is never the authority.
 //!
-//! Lifecycle (Create/Delete) is owned by the bucket-control actor (`bucket_ctl.rs`), the sole
+//! Lifecycle (Create/Delete) is owned by the bucket-control actor ([`crate::bucket`]), the sole
 //! writer of the cache substrate: these ops validate, then hand off and await the remote's own
 //! result. The remote create/delete is the commit; the cache projections are provisioned/drained
 //! around it. The client's bucket passes through, mapped under each backend's own prefix

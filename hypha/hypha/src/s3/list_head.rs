@@ -21,7 +21,7 @@ use hypha_core::meta;
 use super::get::facts_from_tombstone;
 use super::overlay::KeyState;
 use super::{ts_ms, Hypha};
-use crate::bucket_ctl::Readiness;
+use crate::bucket::Readiness;
 
 /// The client-visible projection of one raw cache page — what both LIST versions put in `Contents`
 /// and `CommonPrefixes`. Pagination is not in here: the versions resume differently.
