@@ -1,10 +1,10 @@
-//! The cached-mode reconcile sweep (§7) — the upload path for acked cache writes, a continual duty
-//! of the active replica. A cached PUT acks on the cache body write and owes a bare-`K` pending
-//! marker ([`crate::markers`]); this task trails behind, enumerating those markers and pushing each
-//! key's current cache state to the remote:
+//! The cached-mode reconcile sweep (§7) — the remote propagation path for acked cache writes, a
+//! continual duty of the active replica. A cached PUT or DELETE commits in the cache and owes a
+//! bare-`K` pending marker ([`crate::markers`]); this task trails behind, executing the operation
+//! encoded by each marker:
 //!
-//! - a **live body** → encrypt + PUT to the remote, then clear the marker (CAS on its ETag);
-//! - a **delete-tombstone** → remote `DeleteObject`, clear the tombstone and the marker.
+//! - **PUT** → encrypt the current cache body and PUT it to the remote;
+//! - **DELETE** → HEAD the remote generation and delete it with `If-Match`.
 //!
 //! The markers are the range-C tail of `<meta><b>` (bare `K`, above the `0x01` block), so **one flat
 //! LIST** past [`meta::marker_scan_start_after`] enumerates the pending set — `O(pending)`, never
@@ -27,7 +27,7 @@ use futures::StreamExt as _;
 
 use tokio_util::sync::CancellationToken;
 
-use hypha_core::error::{Error, Result};
+use hypha_core::error::Result;
 use hypha_core::meta;
 
 use crate::tier::{Tiering, UploadOutcome};
@@ -141,9 +141,8 @@ impl ReplicationTask {
         Ok(seen)
     }
 
-    /// Reconcile one pending key, under its upload lock (§7). Classify K's cache body once to pick
-    /// the branch; the branch primitives re-read K under the lock and CAS every mutation, so any
-    /// write that raced in between is either uploaded correctly or deferred, never lost.
+    /// Reconcile one pending key under its upload lock (§7). The marker ETag selects the operation
+    /// and remains its completion CAS, so a marker overwritten mid-pass is never cleared.
     ///
     /// `try_lock`, so pending passes for K **coalesce onto the in-flight one** instead of queuing
     /// behind it. Waiters would be redundant — the holder re-reads K's body under the lock, so it
@@ -162,37 +161,37 @@ impl ReplicationTask {
         outcome
     }
 
-    /// The branch itself, split out so the timing above brackets the whole transition — including the
-    /// classify HEAD, which is part of what one pending key costs.
     async fn transition_key(&self, bucket: &str, key: &str, m_etag: &str) -> Result<()> {
-        let head = match self.tier.data.head(bucket, key).await {
-            Ok(h) => h,
-            // The body is gone (a delete already cleared it, or the volume was reset): the marker is
-            // an orphan — clear it (CAS-guarded, so a concurrent rewrite is left alone).
-            Err(Error::NotFound) => return self.tier.clear_marker_cas(bucket, key, m_etag).await,
-            Err(e) => return Err(e),
-        };
-        let size = head.content_length().unwrap_or(0);
-        let etag = head.e_tag().unwrap_or_default().trim_matches('"');
+        if m_etag == meta::delete_marker_etag() {
+            return self.tier.propagate_delete_locked(bucket, key, m_etag).await;
+        }
 
-        // A client body can't masquerade as a sentinel here: cached PUT rejects any body equal to a
-        // reserved sentinel at write time (`meta::is_reserved_sentinel`), so a sentinel classification
-        // is always hypha's own tombstone (§6).
-        match meta::classify_entry(size, etag) {
-            Some(meta::TombKind::Delete) => {
-                self.tier.propagate_delete_locked(bucket, key, m_etag).await
+        match self.tier.upload_locked(bucket, key).await? {
+            UploadOutcome::Uploaded => self.tier.clear_marker_cas(bucket, key, m_etag).await,
+            // An eviction tombstone is only ever written after its gates confirmed the remote holds
+            // that generation (§8), and it replaced every generation before it — so whichever this
+            // marker names, the obligation is discharged and nothing will ever discharge it again.
+            // The CAS is what makes that safe to act on: a marker raised *since* the listing is a
+            // different ETag, so it survives and this pass takes no view of it.
+            UploadOutcome::SkippedTombstone(meta::TombKind::Evict) => {
+                self.tier.clear_marker_cas(bucket, key, m_etag).await
             }
-            // Evict/transit with a marker shouldn't occur in cached steady state (GC is Phase 5, and
-            // durability gates it): leave the marker for whatever transition owns it.
-            Some(_) => Ok(()),
-            None => match self.tier.upload_locked(bucket, key).await? {
-                UploadOutcome::Uploaded | UploadOutcome::Vanished => {
-                    self.tier.clear_marker_cas(bucket, key, m_etag).await
-                }
-                // A cached delete raced K to a tombstone between our classify and the upload's GET;
-                // it rewrote the marker, so the delete branch handles it on a later pass.
-                UploadOutcome::SkippedTombstone => Ok(()),
-            },
+            // The bracket owns K and will raise its own marker on commit, so this one is superseded
+            // rather than stranded — the one arm here that is routine.
+            UploadOutcome::SkippedTombstone(meta::TombKind::Transit) => {
+                tracing::debug!(bucket, key, "key is mid-bracket; marker left to its commit");
+                Ok(())
+            }
+            // The generation this marker names no longer exists to upload, so its obligation is
+            // undischargeable rather than pending, and nothing reads a PUT marker at an absent K.
+            // Clearing it is what the CAS makes safe: the delete that removed K owes the marker that
+            // supersedes this one, and if that marker has already landed the ETag has moved and the
+            // CAS declines. A delete interrupted before its marker is recovered by R2 from the
+            // remote-only sighting, which never consulted this marker either.
+            UploadOutcome::Vanished => {
+                tracing::debug!(bucket, key, "pending key vanished before its upload");
+                self.tier.clear_marker_cas(bucket, key, m_etag).await
+            }
         }
     }
 }

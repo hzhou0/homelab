@@ -133,7 +133,7 @@ async fn projects_a_key(tier: &Tiering, bucket: &str, base: &str, twin_key: &str
         // A mark is mid-bracket: its settle may land a tombstone carrying exactly these facts, and
         // whatever it lands refreshes the twin anyway. Left to `sweep_stale_marks` either way.
         Some(meta::TombKind::Transit) => Ok(true),
-        Some(meta::TombKind::Delete) | None => Ok(false),
+        None => Ok(false),
     }
 }
 

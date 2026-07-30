@@ -66,15 +66,16 @@ pub struct Tiering {
     pub(crate) halt: Halt,
 }
 
-/// What one reconcile upload attempt found at K (§7). The marker is cleared only on a real upload;
-/// the other two arms leave it for the pass that owns that transition.
+/// What one reconcile upload attempt found at K (§7). Only a real upload completes a PUT marker.
 pub(crate) enum UploadOutcome {
     /// A live client body was encrypted and PUT to the remote.
     Uploaded,
-    /// K is a tombstone — a cached delete raced in under the write lock. The delete branch (driven by
-    /// the marker that delete rewrote) propagates it; this pass leaves the marker be.
-    SkippedTombstone,
-    /// K is gone from the cache entirely: the marker is an orphan to clear.
+    /// K is a tombstone owned by another state transition. The kind decides what becomes of the
+    /// marker, so it is carried out: a transition tombstone's bracket will raise its own, while an
+    /// eviction tombstone certifies the remote already holds K (§8) and so discharges this one.
+    SkippedTombstone(meta::TombKind),
+    /// K was deleted after this marker was raised, so the generation it names can no longer be
+    /// uploaded from anywhere — the obligation is undischargeable, not pending.
     Vanished,
 }
 
@@ -235,25 +236,62 @@ impl Tiering {
         Ok(tail.footer.client_etag() == etag)
     }
 
-    /// Last writer wins — only the marker's own ETag matters to the sweep, which CASes on it — so
-    /// re-raising one is harmless.
+    /// Last writer wins — for the operation's **own** writer, which knows what it just did. A
+    /// speculative raiser must use [`Self::raise_marker_if_absent`] instead.
+    ///
+    /// The body encodes an upload or DELETE operation; the marker object's own ETag is its branch
+    /// discriminator and completion CAS.
     pub(crate) async fn raise_marker(
         &self,
         bucket: &str,
         key: &str,
-        body_etag: &str,
+        marker_body: &str,
     ) -> Result<()> {
         self.meta
             .put_small(
                 bucket,
                 meta::pending_marker_key(key),
-                body_etag.as_bytes().to_vec(),
+                marker_body.as_bytes().to_vec(),
                 HashMap::new(),
                 None,
                 None,
             )
             .await
             .map(|_| ())
+    }
+
+    /// Fill an **absent** marker, for the raisers that reconstruct an obligation from an observation
+    /// rather than from having performed the operation (eviction's durability gate, R2). `Ok(false)`
+    /// ⇒ a marker was already there.
+    ///
+    /// Create-only because the body now carries the *operation*: these raisers only ever infer an
+    /// upload, so overwriting an existing marker could retype a client's acked DELETE into a PUT,
+    /// and the sweep would then find K absent, decline, and leave the remote object standing forever
+    /// — a delete that never propagates and resurrects on the next restore. Whatever marker is
+    /// already there was written by the operation that owns it, which is by definition the newer
+    /// judgement.
+    pub(crate) async fn raise_marker_if_absent(
+        &self,
+        bucket: &str,
+        key: &str,
+        marker_body: &str,
+    ) -> Result<bool> {
+        match self
+            .meta
+            .put_small(
+                bucket,
+                meta::pending_marker_key(key),
+                marker_body.as_bytes().to_vec(),
+                HashMap::new(),
+                None,
+                Some("*".to_string()),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(Error::PreconditionFailed) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Resolve a remote object's plaintext facts from its tail trailer (§6): **one speculative tail
@@ -325,9 +363,8 @@ impl Tiering {
     /// (see [`crate::replication`]) — this body read is the coalescing point, since it picks up
     /// whatever generation is current when the lock is won.
     ///
-    /// Reconcile takes only the upload lock, so a cached delete
-    /// (which takes the *write* lock) can overwrite K with a tombstone concurrently — hence the
-    /// classify guard: a sentinel body is never uploaded as if it were a client object.
+    /// Reconcile takes only the upload lock, so a transition may replace K concurrently; the
+    /// classify guard keeps its internal sentinel from being uploaded as a client body.
     pub(crate) async fn upload_locked(&self, bucket: &str, key: &str) -> Result<UploadOutcome> {
         let out = match self.data.get(bucket, key, None).await {
             Ok(o) => o,
@@ -340,12 +377,10 @@ impl Tiering {
             .unwrap_or_default()
             .trim_matches('"')
             .to_string();
-        // A tombstone sentinel raced in (a concurrent cached delete under the write lock): body and
-        // ETag are the compiled sentinel, classifiable with no metadata read (§6). Don't upload it. A
-        // *client* body can't spoof this: cached PUT rejects any body equal to a sentinel at write
-        // time (`meta::is_reserved_sentinel`), so a sentinel here is always hypha's own tombstone.
-        if meta::classify_entry(plen as i64, &cetag).is_some() {
-            return Ok(UploadOutcome::SkippedTombstone);
+        // An internal tombstone raced in. A client body cannot spoof this classification because
+        // cached PUT reserves the sentinel bodies.
+        if let Some(kind) = meta::classify_entry(plen as i64, &cetag) {
+            return Ok(UploadOutcome::SkippedTombstone(kind));
         }
         // Single-part client ETag == the cache's own MD5 (composites route around this path, §7);
         // the trailer recomputes it from the streamed body, so validating the shape here suffices.
@@ -383,38 +418,51 @@ impl Tiering {
         Ok(UploadOutcome::Uploaded)
     }
 
-    /// **Delete branch** of the reconcile sweep (§7), under K's upload lock. A cached delete left a
-    /// delete-tombstone + a rewritten marker; propagate it: remote `DeleteObject` (the commit),
-    /// clear the delete-tombstone (conditional on the delete sentinel — a concurrent create moved the
-    /// ETag, so its 412 leaves the new body), then clear the marker (conditional on `M_etag`). The
-    /// remote delete must be serialized against same-key uploads or a stale in-flight upload could
-    /// land bytes *after* the delete and resurrect K at the next restore sweep — which the shared
-    /// upload lock ensures.
+    /// **DELETE branch** of the reconcile sweep (§7), under K's upload lock. Confirm the listed
+    /// marker is still current, then bind the delete to the remote generation returned by HEAD.
+    /// Either CAS moving leaves the marker for the operation that superseded this one.
     pub(crate) async fn propagate_delete_locked(
         &self,
         bucket: &str,
         key: &str,
         m_etag: &str,
     ) -> Result<()> {
-        match self.remote.delete(bucket, key).await {
-            Ok(()) | Err(Error::NotFound) => {}
+        let current_marker = match self.meta.head(bucket, meta::pending_marker_key(key)).await {
+            Ok(head) => head
+                .e_tag()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+            Err(Error::NotFound) => return Ok(()),
             Err(e) => return Err(e),
+        };
+        if current_marker != m_etag {
+            return Ok(());
         }
+
+        let remote_etag = match self.remote.head(bucket, key).await {
+            Ok(head) => head
+                .e_tag()
+                .ok_or_else(|| Error::Backend(format!("remote HEAD for {key:?} had no ETag")))?
+                .trim_matches('"')
+                .to_string(),
+            Err(Error::NotFound) => return self.clear_marker_cas(bucket, key, m_etag).await,
+            Err(e) => return Err(e),
+        };
         match self
-            .data
-            .delete_if_match(bucket, key, quote(&meta::delete_sentinel_etag()))
+            .remote
+            .delete_if_match(bucket, key, quote(&remote_etag))
             .await
         {
-            Ok(()) | Err(Error::PreconditionFailed) | Err(Error::NotFound) => {}
+            Ok(()) | Err(Error::NotFound) => {}
+            Err(Error::PreconditionFailed) => return Ok(()),
             Err(e) => return Err(e),
         }
         self.clear_marker_cas(bucket, key, m_etag).await
     }
 
-    /// Clear the pending marker at bare `K`, conditional on its `M_etag` (§7). A PUT that landed a
-    /// newer body mid-pass rewrote the marker, so the CAS 412s and the next pass uploads that
-    /// version — the remote is transiently one version behind, never stale with an empty pending set.
-    /// A 404 (already cleared) is equally fine.
+    /// Clear the pending marker at bare `K`, conditional on its `M_etag` (§7). A newer operation
+    /// rewrites the marker, so a 412 leaves that obligation for the next pass. A 404 is equally fine.
     pub(crate) async fn clear_marker_cas(
         &self,
         bucket: &str,
@@ -631,7 +679,10 @@ impl Tiering {
         };
         self.refresh_twin(bucket, key, &facts).await?;
 
-        let mut md = HashMap::new();
+        // The tombstone is where a `x-amz-meta-*` pass-through and the storage class live while the
+        // body is remote-only — the remote object carries neither (§6: the trailer holds facts, not
+        // client metadata), so anything dropped here is unrecoverable.
+        let mut md = meta::passthrough_metadata(&head.metadata.unwrap_or_default());
         md.insert(meta::TOMB.to_string(), meta::TOMB_EVICT.to_string());
         md.insert(meta::PLEN.to_string(), plen.to_string());
         md.insert(meta::CETAG.to_string(), body_etag.clone());

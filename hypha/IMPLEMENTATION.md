@@ -193,8 +193,9 @@ by the lock.
 The cache's own ETag is the **version token**, but not always the client-visible ETag (tombstones
 carry a sentinel ETag; the client ETag rides their metadata — §6). A
 conditional write resolves by key state: **live body** → native cache ETag;
-**eviction-tombstoned** → `cetag` from tombstone metadata; **delete-tombstoned / absent** →
-client-visibly absent (`If-Match` 412s; creates proceed); **transition-marked** (always a crash
+**eviction-tombstoned** → `cetag` from tombstone metadata; **absent** → client-visibly absent
+(`If-Match` 412s; creates proceed);
+**transition-marked** (always a crash
 leftover — the writer that marked it held this lock) → repair from the remote first (§7), then
 resolve.
 
@@ -333,8 +334,8 @@ is `<prefix>-<role>-<b>`, the role a fixed single character (§9), so the three 
 the deployment prefix is set. One further bucket, `<prefix>-g`, is not per client bucket at all: it
 is GC's own, holding the deployment-wide recency ring (§8).
 
-- **`<data><b>`** holds *only* client objects: a body at `K`, or a tombstone overwriting `K` in
-  place, so a racing GET sees one or the other and never a 404. Nothing hypha-internal lives here.
+- **`<data><b>`** holds *only* client state: a body at `K`, an eviction/transition tombstone
+  overwriting `K`, or no entry for a deleted key. Nothing hypha-internal lives here.
 - **`<meta><b>`** holds everything hypha keeps *about* objects, in three contiguous,
   prefix-separable ranges (below) — the two lowest byte values are inadmissible in client keys,
   which is what makes the split structural rather than probabilistic.
@@ -358,10 +359,11 @@ rediscover what it would have named (§7).
 
 **The marker is an index, not the source of truth.** What makes a cached write pending is a state of
 the world, not a record hypha keeps: a live body at `K` whose generation the remote does not hold,
-or a delete-tombstone at `K` the remote has not yet honoured. Both are derivable from the cache and
-the remote alone. The marker's only job is to make that set enumerable in `O(pending)` instead of
-`O(keyspace)` — which is why losing one delays durability rather than losing the write, and why the
-pending-set rebuild (§7) can re-derive the entire set from first principles.
+or cache-authoritative absence at `K` while the remote still holds it. Both are derivable from the
+cache and remote alone. The marker records PUT or DELETE so the steady-state sweep can execute the
+operation without inferring it from an independently changing namespace; its job is to make the set
+enumerable in `O(pending)` instead of `O(keyspace)`. Losing one delays durability rather than losing
+the write, because the pending-set rebuild (§7) re-derives both operations from first principles.
 
 Splitting markers into a bucket of their own would cost a third: markers and twins are
 non-colliding but **interleave**, and the reconcile sweep's `O(pending)` flat LIST (§7) would
@@ -372,9 +374,14 @@ evicted key. Prefixing the twins keeps both scans contiguous in one bucket.
 Both cache buckets live on the **same volume**: markers and bodies must survive a process crash
 together and die together on volume loss, which is what bounds the cached-mode loss window (§7).
 
-**Tombstones** carry fixed 16-byte sentinel bodies, compiled in, one per kind — **eviction** (body
-is remote-only, facts in metadata/twin), **delete** (client-visibly absent), and **transition** (K
-is mid-bracket, §7; cache facts are distrusted and readers resolve K from the remote). The values
+**Tombstones** carry fixed 16-byte sentinel bodies, compiled in, for **eviction** (body is
+remote-only, facts in metadata/twin) and **transition** (K is mid-bracket, §7; cache facts are
+distrusted and readers resolve K from the remote). There is deliberately **no delete tombstone**: a
+cached delete is native absence, and its pending remote delete is carried by the marker instead. A
+sentinel at K would be an object in `<data>`, so it would surface as a phantom entry — and, under a
+delimiter, a phantom common prefix — in every LIST that reached it. A cache written before that
+change must be drained: its leftover delete sentinels classify as live 16-byte client bodies.
+The values
 are **random** (CSPRNG-generated once, then fixed), not readable markers: each kind gets a
 deterministic (size==16, ETag) pair, so a plain LIST classifies every key with no HEAD, and each
 sentinel's constant ETag doubles as a CAS token. Random 16-byte values so no client body collides
@@ -491,11 +498,10 @@ running process never has a marker on disk claiming what it can invalidate at an
 that marker rather than folded into it, because the recoveries their absences trigger differ by orders
 of magnitude (§8).
 
-**The pending marker** (cached mode) lives in `<meta><b>` at **bare `K`** — **one per key**,
-body = the body ETag of the most recently acked PUT. Concurrent PUTs overwrite it; last writer
-wins — the write-coalescing point: however many PUTs raced, the pending set holds one entry for K
-and reconcile uploads the latest cache body. The marker's own S3 ETag (`M_etag`) changes on each
-overwrite and is the reconciler's CAS handle.
+**The pending marker** (cached mode) lives in `<meta><b>` at **bare `K`** — **one per key**.
+Its body is the most recently acked PUT's body ETag or a reserved DELETE generation token.
+The marker object's own S3 ETag identifies the branch and is also the reconciler's CAS handle
+(`M_etag`). Concurrent operations overwrite the single marker last-writer-wins.
 
 The marker gets the bare keyspace because it is the one structure here that is a **durability
 signal rather than an optimization**: a twin or a shadow that cannot be written costs a round trip,
@@ -670,7 +676,7 @@ request/response system — never a hybrid read, never a wrongly-absent key.
 **Durable** — all under K's write lock:
 
 1. Resolve K's current client ETag from the cache (live-body ETag / tombstone `cetag` /
-   delete-tombstone or absent ⇒ none; leftover mark ⇒ repair first) and evaluate
+   absent ⇒ none; leftover mark ⇒ repair first) and evaluate
    `If-Match` / `If-None-Match`.
 2. **Mark**: transition tombstone at K.
 3. **Commit**: one streaming `PutObject` at K — the request body encrypted (ct length computed
@@ -728,13 +734,16 @@ everywhere; repair removes the entry.
 
 **Cached**:
 
-1. *(under the write lock)* **Commit**: overwrite K with the **delete-tombstone** — GET/HEAD
-   answer 404 and LIST omits K immediately. **Ack.**
-2. Hand K to the marker queue (its pending op is now a delete). Reconcile propagates below; the mask
-   is what keeps a crash from resurrecting K from the remote before the delete propagates.
+1. *(under the write lock)* **Commit**: delete K from `<data>` — GET/HEAD answer 404 and LIST,
+   including delimiter grouping, loses K immediately. **Ack.**
+2. Hand `(K, delete-token)` to the marker queue. Reconcile verifies that marker is still current,
+   HEADs the remote object, and deletes it with `If-Match` on the observed remote ETag. If a crash
+   loses the marker, the missing clean marker dispatches R2; with the sync marker intact, R2 may
+   trust cache absence and recreate the DELETE marker.
 
-Same ack rule and same reason as the cached PUT: the tombstone is the commit, and a delete-tombstone
-the remote has not yet honoured is self-describing without its marker.
+Same ack rule and same reason as cached PUT: the cache mutation is the commit and the marker is only
+its asynchronous index. An unacked delete may take effect if the process dies after the local
+delete, as with any indeterminate S3 write.
 
 ### DeleteObjects — non-atomic batch
 
@@ -769,10 +778,9 @@ PUT path can appear in neither the client's request nor hypha's batch — it is 
 only).
 
 **Cached** — the remote isn't touched here, so there is nothing to batch: per key, under its write
-lock, overwrite K with the delete-tombstone and overwrite its marker (as single `DeleteObject`).
-Reconcile propagates below and is where the remote batching opportunity lives — a sweep coalesces
-its pending *delete* markers into native remote `DeleteObjects` calls (same XML-safe argument,
-client keys only).
+lock, remove K and owe its marker (as single `DeleteObject`). Reconcile derives deletion from
+absence. A future remote batching optimization belongs there (same XML-safe argument, client keys
+only).
 
 ### Multipart — one path, both modes
 
@@ -1029,26 +1037,13 @@ twin cursor's shape tracks the client cursor's, and no scan runs past a rolled-u
    native facts (any twin is stale — ignored); **eviction tombstone** → its twin's
    `{cetag, plen, mtime}`, matched from the twin cursor **by key equality**, with a per-key cache
    HEAD fallback when the twin is missing (crash window, page straddle, or a key over the §6
-   twin threshold); **delete-tombstone** → omitted; **transition tombstone** → per-key *remote*
-   HEAD (the one classification that leaves the cache).
-2. **Single page, forwarded pagination.** Delete-tombstones are dropped, so a page can still return
-   **fewer** than `MaxKeys` client entries — a short page, valid S3 as long as `IsTruncated` and the
-   resume position are honest. hypha forwards the client cursor's **own** truncation flag, and
-   `KeyCount` reports the entries actually emitted. LIST deliberately does **not** coalesce pages to
-   fill `MaxKeys`: any such backfill would resume either by reusing a backend cursor across requests
-   or by a client-entry count, and both weaken S3's key-position guarantee — a concurrent
-   insert/delete in the re-listed range could dup or drop an untouched key. Short pages are the
-   accepted cost; a client follows the position until `IsTruncated` is false.
-
-   Dilution is gone with the twins: pages are short only where keys were *deleted*, not for every
-   evicted key, so the effect is now the exception rather than the norm.
-
-> **Follow-up — delimiter prefixes over cached deletes.** The backend applies `delimiter` before
-> hypha sees the page, so a subtree containing only delete tombstones arrives as a `CommonPrefix`
-> with no content entries left to classify. Hypha currently forwards that prefix until reconcile
-> removes the tombstones. Filtering it soundly requires either an undelimited probe through the
-> subtree or moving delete masks out of the client-key namespace; keep the transient artifact until
-> one of those costs is justified.
+   twin threshold); **transition tombstone** → per-key *remote* HEAD (the one classification that
+   leaves the cache).
+2. **Single page, forwarded pagination.** hypha forwards the client cursor's own truncation flag,
+   and `KeyCount` reports the entries actually emitted. LIST does not coalesce pages to fill
+   `MaxKeys`: any such backfill would resume either by reusing a backend cursor across requests or
+   by a client-entry count, and both weaken S3's key-position guarantee — a concurrent insert/delete
+   in the re-listed range could duplicate or drop an untouched key.
 
 **ListObjects (v1)** reuses the classifier and the two-cursor merge verbatim (s3s does not translate
 v1→v2, so it is its own method); only the pagination shell differs — request `marker`, response
@@ -1135,7 +1130,7 @@ Three request classes ride the queue:
 under exactly one assumption: that the cache volume does not vanish underneath a live process. That is
 the one thing a running hypha still checks — a background task re-HEADs each `Ready` bucket's sync
 marker every `volume_watch_interval_ms` (default 30 s, one HEAD per ready bucket per tick). Its
-disappearance is invariant **I7** and halts the deployment. Nothing else needs polling: every other
+disappearance is invariant **I6** and halts the deployment. Nothing else needs polling: every other
 divergence is either impossible while hypha owns both backends, or is caught by the pass that would
 act on it. A backend that cannot answer is not a loss — only a definitive absence is — and a
 `DeleteBucket` race is told apart by re-reading the state map after the failed HEAD, since delete
@@ -1163,7 +1158,7 @@ cache volume was lost is restored because the process started, not because someo
 
 The map stays complete because `CreateBucket` publishes its entry only *after* the remote create
 commits, and `DeleteBucket` retires it only after the remote delete does. A remote bucket the map has
-no entry for therefore cannot arise, and is invariant **I6**.
+no entry for therefore cannot arise, and is invariant **I5**.
 
 **The restore overlay** keeps serving ungated while a bucket is unreconciled (one interface,
 `s3/overlay.rs`): the readiness verdict selects each op's source.
@@ -1261,8 +1256,8 @@ The upload path for acked cache writes — a continual duty of the active (phase
    bare-`K` range above it, so this is one entry per pending key, `O(pending)` over local NVMe and
    never `O(evicted)`; each yields K directly from the key name and the marker's own ETag `M_etag`
    (the CAS handle).
-2. Dispatch on the cache body at K: delete-sentinel ⇒ **delete branch**, anything else ⇒
-   **upload branch**.
+2. Dispatch from `M_etag`: the reserved DELETE marker ETag selects the **delete branch**; every PUT
+   marker selects the **upload branch**.
 3. **Upload branch**, under K's *upload* lock (§4 — reconcile-only, so client PUTs never queue
    behind it): GET the cache at K — `plen`, ETag `E_n`, and the body come from the *same
    response*, so the framed facts can never disagree with the uploaded bytes — encrypt
@@ -1271,19 +1266,32 @@ The upload path for acked cache writes — a continual duty of the active (phase
    412s and the next pass uploads it — the remote is transiently one version behind, never left
    stale with an empty pending set. **The body stays in the cache**: reconcile marks durability
    by deleting the marker; only GC (§8) tombstones, under pressure.
-4. **Delete branch**, under the same upload lock (a delete propagation overlapping an in-flight
-   upload of a prior version could otherwise land stale bytes *after* the remote delete,
-   resurrecting the object at the next namespace restore): remote `DeleteObject`, clear the
-   delete-tombstone with `If-Match: <delete-sentinel-etag>`, delete the marker with
-   `If-Match: M_etag`. A concurrent create races the clear benignly (either order yields the same
-   client-visible semantics).
+
+   Three things can stand where the client body was expected, and each decides the marker's fate —
+   two of them by the same `If-Match: M_etag` delete that a completed upload uses. An **eviction
+   tombstone** discharges the marker: the gates that wrote it confirmed the remote holds that
+   generation, and it replaced every generation before it, so whichever generation the marker names
+   is on the remote. An **absent** K discharges it too, for the opposite reason — the generation it
+   names no longer exists to upload, so the obligation is undischargeable rather than pending, and
+   nothing reads a PUT marker at an absent K. The delete that removed K owes the marker that
+   supersedes this one, and a delete interrupted before its marker is recovered by R2 from the
+   remote-only sighting, which never consulted this marker either. A **transition tombstone** is the
+   one that keeps it: the bracket owns K and raises its own marker on commit.
+
+   In every case the CAS is what licenses acting on a listing that may already be stale. A marker
+   raised since the LIST has a different ETag, so it survives untouched and the pass takes no view
+   of it.
+4. **Delete branch**, under the same upload lock: HEAD the marker to reject a stale LIST result,
+   HEAD the remote object for its current ETag, then `DeleteObject If-Match: R_etag`. A remote
+   overwrite between those calls returns 412 and leaves the marker to retry. On success, delete the
+   marker with `If-Match: M_etag`; a concurrent create that rewrote it leaves its upload obligation
+   standing.
 
 **The marker queue.** Every acked cached write hands its marker here (§7, *PutObject*) and a single
-worker writes them, coalesced per key and retried for the life of the process. Order between markers
-for one key does not matter — the sweep classifies K from the *data* body and CASes on the marker's
-own ETag, so a marker's payload is diagnostic and any of them is as good as the last — but the writes
-do run concurrently, since a marker sits on every acked write's path to durability and serializing
-them would make the queue the write path's throughput ceiling.
+worker writes them, coalesced per key and retried for the life of the process. FIFO preserves
+same-key operation order into the coalescing map; different keys write concurrently, since a marker
+sits on every acked write's path to durability and serializing them would make the queue the write
+path's throughput ceiling.
 
 It is **unbounded**, which follows from where the hand-off sits rather than being a choice: it
 happens on the write path after the commit, so a bounded queue would either block the ack behind the
@@ -1351,10 +1359,9 @@ The pass rebuilds the pending set by triage rather than per-key round trips:
 
 1. A streaming merge-join of `<data><b>` and the remote bucket — both return keys in order, so one
    page per side stays resident however large the keyspace is, and there are no per-key requests.
-2. A live body whose key is **absent** from the remote is pending; write its marker. A
-   **delete-tombstone with no marker** is pending regardless of what the remote holds — re-propagating
-   is idempotent, and it also clears a tombstone stranded by a crash between the remote delete and
-   the tombstone clear, which nothing else in the sweep would ever revisit.
+2. A live body whose key is **absent** from the remote is pending; write its marker. A remote-only
+   key is a cached delete whose marker did not land before the crash; after a fresh under-lock check
+   rules out cursor skew, write its DELETE marker.
 3. A key present in both compares by **length**: a single-part remote object's framed size is the
    closed form `ciphertext_len(plen) + |trailer|` over the cache body's plaintext length (§6), so
    every overwrite that changed the plaintext length is caught with no extra request.
@@ -1364,7 +1371,7 @@ The pass rebuilds the pending set by triage rather than per-key round trips:
 A markerless live body is always single-part — a composite is tombstoned at K with its plaintext in
 the shadow (§6) — so the closed form applies exactly. An eviction tombstone owes nothing by
 definition, since an evicted body is already on the remote; the pass therefore checks only that the
-remote still holds it, which is invariant **I3**.
+remote still holds it, which is invariant **I2**.
 
 **Bounded loss window (cached mode).** The losable set is exactly *acked writes not yet on the
 remote*, and the loss event is exactly **cache-volume loss** — the set is `O(pending)`, dies with the
@@ -1403,10 +1410,10 @@ for a pending rebuild to work from, and R1 leaves the pending set empty and comp
 alone**: the check that decides its mutation is made under K's own lock, so a cache listing could
 only ever be a stale hint about the same question. R2 needs both sides **correlated** — its question
 per cache entry is *does the remote hold this generation*, which a listing answers from §6's closed
-form but would otherwise cost a HEAD per key, and invariant I2 is only expressible as *remote keys
-the cache has no entry for*. So R2 carries a streaming merge-join (one page resident per side,
-whatever the keyspace size) and R1 carries a plain paginated walk. A common traversal would mean each
-pass hauling the other's machinery.
+form but would otherwise cost a HEAD per key, while pending deletes are expressible only as *remote
+keys the cache has no entry for*. So R2 carries a streaming merge-join (one page resident per side,
+whatever the keyspace size) and R1 carries a plain paginated walk. A common traversal would mean
+each pass hauling the other's machinery.
 
 Both filter hypha's own keys out of the remote listing (§6, `is_reserved_remote_key`): the remote
 bucket is client keyspace *plus* the halt marker, and every key that survives that filter goes to a
@@ -1456,17 +1463,20 @@ unbalanced and the pass ends when its unluckiest one does. Fanning out from one 
 construction, and it removes the join a sharded pass would have to make before writing the marker.
 
 **R2 — the pending-set rebuild.** The namespace is authoritative here, which is the whole difference,
-so the pass re-derives the *index* and nothing else: walk `<data>`, classify each entry against the
-remote, raise a marker wherever the cache holds a generation the remote lacks — a live body it has
-never held, or a delete-tombstone it has not honoured. It never materializes a key from the remote
-(on a ready bucket cache-absent *is* the client's 404, so rebuilding one would resurrect a deleted
-object) and never settles an entry from a listing (which is what would roll an acked write back).
+so the pass re-derives the *index* and nothing else: merge `<data>` with the remote, raising a marker
+wherever they differ — a cache body the remote lacks or supersedes, or a remote-only key the
+authoritative cache has deleted. It never materializes a key from the remote (on a ready bucket
+cache-absent *is* the client's 404, so rebuilding one would resurrect a deleted object) and never
+settles an entry from a listing (which is what would roll an acked write back).
 
-It takes **no per-key locks**. Raising a marker is last-writer-wins and the sweep clears one by
-CAS-ing on the marker's own ETag, so a marker raised beside a concurrent upload costs at most one
-redundant upload and never a lost write. The only locks it takes are on the two paths about to
-declare an invariant violation, where a stale snapshot must not be allowed to halt a healthy
-deployment.
+The comparisons themselves are lock-free, but **every marker the pass raises is raised under K's
+lock, off a re-read of K** — as is each of the two paths about to declare an invariant violation. The
+bucket keeps serving throughout, so a cursor page is a snapshot of a moving keyspace, and a marker
+records an *operation*: a PUT marker inferred from a sighting the client has since deleted would
+retype that delete, and the sweep, finding K absent, would decline and leave both the remote object
+and the marker standing. The re-read makes the inference current at the moment it is written; a
+sighting whose generation has moved is dropped, since the operation that moved it owes its own
+marker. The sweep's CAS on the marker's own ETag then keeps a merely redundant marker harmless.
 
 Triage keeps the pass to the two listings in the common case: a key the remote lacks diverges
 outright, and for one it holds, a single-part object's framed size is the closed form over the cache
@@ -1482,18 +1492,17 @@ halt marker*).
 | | invariant | detected by |
 |---|---|---|
 | **I1** | no live plaintext body in `<data>` while the namespace is restoring — the write-mode gate makes one impossible, so one here means the gate leaked | R1, one bounded `<data>` page before the walk |
-| **I2** | no remote-only key on a `Ready` bucket — cache-absent is the authoritative 404 there, and no path can produce this: every site that removes a `<data>` entry does so only once the remote object is gone (the delete propagation deletes the remote *first*) | R2 |
-| **I3** | no eviction tombstone whose remote object is missing — the remote lost bytes hypha reported as committed, and the tombstone is the only surviving record they existed | R2 |
-| **I4** | no pending-set rebuild in durable mode — a data-clean fault, but it means the classification is wrong, and the rest of it cannot be trusted either | dispatch |
-| **I5** | every remote object carries a trailer that authenticates | every trailer read |
-| **I6** | no remote bucket hypha did not create — it owns both backends outright, and startup resolved every bucket the remote held | `CreateBucket`, against the resolved map |
-| **I7** | a `Ready` bucket's sync marker does not disappear — nothing removes it, so its absence is the cache volume dying under a live process | the volume watchdog, every `volume_watch_interval_ms` |
+| **I2** | no eviction tombstone whose remote object is missing — the remote lost bytes hypha reported as committed, and the tombstone is the only surviving record they existed | R2 |
+| **I3** | no pending-set rebuild in durable mode — a data-clean fault, but it means the classification is wrong, and the rest of it cannot be trusted either | dispatch |
+| **I4** | every remote object carries a trailer that authenticates | every trailer read |
+| **I5** | no remote bucket hypha did not create — it owns both backends outright, and startup resolved every bucket the remote held | `CreateBucket`, against the resolved map |
+| **I6** | a `Ready` bucket's sync marker does not disappear — nothing removes it, so its absence is the cache volume dying under a live process | the volume watchdog, every `volume_watch_interval_ms` |
 
-I2 and I3 are re-read under K's lock before being called violations. R2's two cursors are snapshots
-taken at different moments and the benign interleavings are ordinary — the cache listing runs, a
-client writes K, the sweep uploads it, and the remote listing then sees a key the cache listing could
-not. A halt is a deployment-wide outage, so it may only ever be raised on state that is still true at
-the moment the process says so.
+I2 is re-read under K's lock before being called a violation. R2's two cursors are snapshots taken
+at different moments and the benign interleavings are ordinary — the cache listing runs, a client
+writes K, the sweep uploads it, and the remote listing then sees a key the cache listing could not.
+The same fresh check turns genuine cache absence into a delete marker rather than acting on the
+snapshot alone.
 
 **I1 is deliberately a sample, not a proof.** It is a bug detector rather than a correctness gate, so
 it costs one `<data>` page before the walk instead of a second cursor correlated across the whole
@@ -1737,22 +1746,30 @@ overrides the correctness gates below. Eviction of candidate K with version-toke
 
 1. **Skip if the marker exists** (`HEAD <meta><b>` at bare `K`) — a cheap local short-circuit that
    spares the remote round trip, not the correctness gate.
+Steps 2 and 3 run **under K's lock**, and it is taken on a re-read of K that confirms `E_v` is still
+the live body: step 2 writes, and a marker records an *operation*, so inferring one from a listing
+entry that has since been overwritten or deleted would misdescribe what the key is owed.
+
 2. **Confirm the remote generation** (`HEAD` remote K): absent ⇒ not durable ⇒ skip; framed size ≠
    `ciphertext_len(plen) + |trailer|` for this body ⇒ some other generation ⇒ skip. Only a
    same-plaintext-length candidate is ambiguous, and only it pays the trailer's `cetag` (one ranged
    tail GET) to settle it — the same triage the pending-set rebuild runs (§7). A skip here **raises
-   the key's pending marker** on the way out: this HEAD has just established the one thing a marker
-   records, and step 1 already established there is none, so the reconcile sweep would otherwise
-   never learn about a body only this path can see (below).
-3. Under K's lock: delete stale twins, write the fresh twin, then overwrite K with the eviction
-   sentinel via `PutObject If-Match: E_v` — metadata carrying `cetag`/`plen`/original mtime. The
-   tombstone is an atomic in-place replace: a racing GET sees body or tombstone, never 404.
-   Twin-before-tombstone means a sentinel always has its twin; a crash between leaves a twin next
-   to a live body — ignored by classification (§6), swept later.
+   the key's pending marker** on the way out, `If-None-Match: *`: this HEAD has just established the
+   one thing a marker records, and step 1 already established there is none, so the reconcile sweep
+   would otherwise never learn about a body only this path can see (below). Create-only despite the
+   lock, because the lock cannot order this against a marker — markers are written asynchronously
+   (§7), so a delete that committed before the lock may still owe its marker to the queue. That
+   interleaving is safe, since the queue's write lands second and wins; the reverse would overwrite
+   an acked DELETE with a PUT, and `If-None-Match` is what forbids it.
+3. Delete stale twins, write the fresh twin, then overwrite K with the eviction sentinel via
+   `PutObject If-Match: E_v` — metadata carrying `cetag`/`plen`/original mtime. The tombstone is an
+   atomic in-place replace: a racing GET sees body or tombstone, never 404. Twin-before-tombstone
+   means a sentinel always has its twin; a crash between leaves a twin next to a live body — ignored
+   by classification (§6), swept later.
 
-A writer landing anywhere between steps 1 and 3 has moved the ETag, so step 3's `If-Match: E_v`
-fails and eviction retries next pass — the layering (marker → remote generation → conditional CAS)
-makes every interleaving auto-healing, never lossy.
+A writer landing between step 1 and the lock has moved the ETag, so the re-read declines and eviction
+retries next pass; one landing after it cannot interleave at all — the layering (marker → remote
+generation → conditional CAS) makes every interleaving auto-healing, never lossy.
 
 **Shadow bodies** (§6) are the other thing in the cache holding a client's plaintext, so the same scan
 finds them — a prefix probe of `0x01 0x01 b`, since a shadow key is a digest and no client key derives
@@ -1949,7 +1966,7 @@ meaningful only against the pod's `terminationGracePeriod`, which has to cover t
 — two knobs that must move together are better as one constant and a deployment note.
 
 **Backend requirements.** The **cache** must implement conditional `PutObject`/`DeleteObject` —
-load-bearing for the eviction/rehydrate/reconcile CAS (§7/§8), not for the client write path,
+load-bearing for the eviction/rehydrate CAS (§8), not for the client write path,
 which linearizes on the §4 lock. SeaweedFS has them as of **4.07**, broken only under
 versioning/object-lock, which the cache bucket enables neither of — pin ≥ 4.07; the §11 suite
 re-verifies. It must also honor **`encoding-type=url`** on `ListObjectsV2` (universal S3) — hypha
@@ -1960,7 +1977,9 @@ multipart including **`ListParts` on an in-progress upload** — core S3 multipa
 (SeaweedFS, B2 included), used at complete to resolve the winning part set and its sizes (§6/§7) —
 and **`ListMultipartUploads`**, which the client-facing op of that name proxies outright (§7):
 in-progress uploads are remote state, and the remote's own key-position pagination is what makes
-`key-marker`/`upload-id-marker` correct. Same core-multipart family, equally universal.
+`key-marker`/`upload-id-marker` correct. Same core-multipart family, equally universal. It must also
+honor `If-Match` on `DeleteObject`: cached DELETE binds removal to the ciphertext generation
+observed by its preceding HEAD (§7).
 This is strictly weaker than the *completed-object* part index the trailer's embedded offset table
 (§6) let us drop (`GetObjectAttributes`/`HEAD partNumber=n`, which not every remote implements);
 the earlier object-tagging requirement is gone too, so tagging- and part-index-less remotes (e.g.
@@ -2032,9 +2051,10 @@ passive that failed its probe could not be promoted into.
   not destroy the first. R1's additivity from both sides: a delete taken during the window is not
   resurrected, and an entry the pass *finds* keeps the client pass-through its tombstone is the only
   copy of. R2's confinement: `<data>` byte-identical across the pass, exactly the owed keys gaining
-  markers. Each invariant fired directly against the backends (I1 planted as a cached body in an
+  markers, including a markerless committed delete recovered from a remote-only sighting. Each
+  invariant fired directly against the backends (I1 planted as a cached body in an
   untrusted namespace — which also pins "both markers absent ⇒ restore", since a rebuild would have
-  quietly raised a marker instead; I2 as a remote-only key; I3 as an eviction tombstone whose remote
+  quietly raised a marker instead; I2 as an eviction tombstone whose remote
   object was deleted), asserting the exit code, that the halt marker reached the **remote before the
   process exited**, and that the *next* run exits on that record alone without re-deriving anything —
   the crashloop is the contract, not a side effect. Plus: a reserved remote key never reaches a
@@ -2042,11 +2062,11 @@ passive that failed its probe could not be promoted into.
   that the window is still open when the write lands — startup resolves and owes the restore, so it
   is no longer the first request that opens one — and each asserts something only a write *inside*
   the window produces, so a window that closed early fails loudly instead of passing vacuously.
-- **Marker/reconcile**: (a) marker + absent remote ⇒ upload + CAS marker delete; (b) overwrite
-  mid-upload ⇒ marker CAS 412s, next pass uploads the newer body; (c) dangling marker with the
-  remote already current ⇒ marker deleted, nothing uploaded twice. Kill the active mid-sweep ⇒ the
-  new active resumes from the marker LIST, no drops, no double-handling, no eviction before
-  resolution. Cache-volume wipe ⇒ loss bounded by the pending set.
+- **Marker/reconcile**: (a) PUT marker + absent remote ⇒ upload + CAS marker delete; (b) overwrite
+  mid-upload ⇒ marker CAS 412s, next pass uploads the newer body; (c) DELETE marker ⇒ remote HEAD +
+  conditional delete + marker CAS; (d) a remote generation change between HEAD and delete ⇒ 412 and
+  retry. Kill the active mid-sweep ⇒ the new active resumes from the marker LIST, no drops, no
+  eviction before resolution. Cache-volume wipe ⇒ loss bounded by the pending set.
 - **Eviction vs. writers**: sustained PUTs against a key under eviction; assert the §8 layering
   (marker skip, remote-generation confirm, `If-Match` abort) never tombstones an
   acked-but-unuploaded body, including the prior-generation-marker case and a remote holding an
@@ -2060,7 +2080,7 @@ passive that failed its probe could not be promoted into.
   would withhold every *other* bucket's clean marker for the rest of the run; assert that deleting a
   bucket with a marker in flight still leaves the surviving buckets clean at drain. The drop is
   gated on the state map agreeing the bucket is gone, so assert the other side too: a `<meta>`
-  projection removed underneath a *live* bucket raises **I7** rather than quietly shortening a
+  projection removed underneath a *live* bucket raises **I6** rather than quietly shortening a
   pending set the run still vouches for. The quiescence ordering is the part
   worth asserting directly: a write committed but not yet marked must never coexist with a clean
   marker, so drive a body write concurrent with SIGTERM and assert the marker set and the clean
@@ -2182,7 +2202,7 @@ Each phase's mechanism is specified in §§1–10 above; this section tracks sco
 | 3 | Multipart (native-remote proxy, trailer + parts table, `ListParts` retag-match) and the rest of the client surface (CopyObject, DeleteObjects, ListObjects v1, ListMultipartUploads, ListParts, UploadPartCopy, GetObjectAttributes, GetBucketVersioning stub, storage-class passthrough) | Done vs. MinIO |
 | 3a | The `<data>`/`<meta>` keyspace split (§6) — prerequisite for v1 LIST's `NextMarker` and the twin-suffix headroom | Done vs. MinIO |
 | 4 | Cached mode, single replica: marker queue, clean marker, reconcile sweep (`replication.rs`), cached DELETE propagation, rehydrate | Done vs. MinIO |
-| 4a | The two recoveries split apart (§7): additive R1 (remote walk) + marker-only R2 (two-cursor join), the per-bucket write-mode gate (durable semantics for a restore window), full startup resolution of bucket state + the volume watchdog, invariants I1–I7 and the halt marker (§6) | Done vs. MinIO |
+| 4a | The two recoveries split apart (§7): additive R1 (remote walk) + marker-only R2 (two-cursor join), the per-bucket write-mode gate (durable semantics for a restore window), full startup resolution of bucket state + the volume watchdog, invariants I1–I6 and the halt marker (§6) | Done vs. MinIO |
 | 5 | GC: the actor and its passes, Bloom ring + touch feeders + slice persistence, usage source + vacuum and the water marks, probabilistic scan (random-position probes over bodies *and* shadows, yield-weighted bucket choice), the pressure ladder (interval → concurrency → age threshold), threshold eviction — bodies through the three gates, shadows through one conditional delete — the shadow-orphan queue/marker/backstop, mpu-range debris sweep | Done vs. MinIO |
 | 5a | The rest of phase 5: the remaining debris classes (orphan twins, leftover transition marks) riding the pass's own probes, which therefore run in both modes and unpressured; the in-memory prefix distribution shaping probe positions, §10's metrics + `/healthz`/`/readyz` on their own listener | Done vs. MinIO |
 | 6 | `hypha-fence` + active-passive: two-pod StatefulSet, leader-elected controller, lease, fence→confirm→drain→promote | Not started |

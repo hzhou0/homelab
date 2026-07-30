@@ -198,11 +198,9 @@ impl Backend {
         Ok(())
     }
 
-    /// Conditional DELETE — remove `key` only if its current ETag matches `if_match` (quoted, §8).
-    /// The CAS the reconcile sweep clears its marker and delete-tombstone through: a concurrent
-    /// overwrite moved the ETag, so the delete 412s and the racing writer's state stands (§7). The
-    /// cache must implement conditional DELETE for this (§9, SeaweedFS ≥ 4.07); a backend that
-    /// ignores the condition degrades the same-key reconcile-vs-write race, never a non-racy path.
+    /// Conditional DELETE — remove `key` only if its current ETag matches `if_match` (quoted,
+    /// §7/§8). Both backends must honor this: reconcile uses it on the remote, while GC and
+    /// transitions use it on the cache.
     pub async fn delete_if_match(&self, bucket: &str, key: &str, if_match: String) -> Result<()> {
         self.client
             .delete_object()

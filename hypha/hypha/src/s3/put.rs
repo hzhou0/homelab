@@ -195,7 +195,6 @@ impl Hypha {
                         self.tier.repair_locked(bucket, key).await?.map(|f| f.cetag)
                     }
                     Some(meta::TombKind::Evict) => md.get(meta::CETAG).cloned(),
-                    Some(meta::TombKind::Delete) => None,
                     None => head
                         .e_tag
                         .as_deref()

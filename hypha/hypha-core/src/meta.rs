@@ -1,7 +1,7 @@
-//! The cache-side structures plaintext facts travel through (§6): tombstones in the `<data>`
-//! bucket, and — in the `<meta>` bucket, keyed apart by the two control bytes client keys may not
-//! use — facts twins, pending markers, and mpu records. Plus the composite-ETag arithmetic and key
-//! admission.
+//! The cache-side structures plaintext facts travel through (§6): eviction/transition tombstones in
+//! the `<data>` bucket, and — in the `<meta>` bucket, keyed apart by the two control bytes client keys
+//! may not use — facts twins, pending markers, and mpu records. Plus the composite-ETag arithmetic
+//! and key admission.
 //!
 //! The *remote* carrier of an object's facts is the authenticated trailer behind its age
 //! ciphertext (`hypha_format::trailer`), landed atomically with every commit; nothing here is
@@ -24,18 +24,16 @@ pub const STANDARD: &str = "STANDARD";
 
 /// Tombstone kinds (value of the [`TOMB`] metadata key).
 pub const TOMB_EVICT: &str = "evict";
-pub const TOMB_DELETE: &str = "delete";
 pub const TOMB_TRANSIT: &str = "transit";
 
-/// Fixed 16-byte sentinel bodies, compiled in, one per tombstone kind, so a LIST classifies every
-/// key from its (size, ETag) pair without a metadata read (§6). Random 16-byte values so no client
-/// body collides with the classification token by accident; stable by contract (they are the
-/// on-disk classification).
+/// Fixed 16-byte tombstone bodies, compiled in, so a LIST classifies every internal data entry from
+/// its (size, ETag) pair without a metadata read (§6).
 pub const EVICT_SENTINEL: [u8; 16] = [
     0xe4, 0x80, 0xae, 0x85, 0xd6, 0xe7, 0x58, 0x9c, 0x7e, 0x07, 0xb5, 0xa5, 0xac, 0x39, 0x37, 0xaa,
 ];
-/// Client-visibly absent (§6).
-pub const DELETE_SENTINEL: [u8; 16] = [
+/// Reserved generation token carried by cached DELETE markers. A client body with this ETag would
+/// make its PUT marker indistinguishable from DELETE, so the exact body remains reserved.
+pub const DELETE_MARKER_SENTINEL: [u8; 16] = [
     0x64, 0x58, 0x6a, 0xf5, 0x7f, 0xc3, 0xf6, 0x22, 0xf3, 0x00, 0xd3, 0xbb, 0x42, 0xb8, 0x72, 0x6d,
 ];
 /// K is mid-bracket (§7): cache facts are distrusted and readers resolve K from the remote.
@@ -46,7 +44,6 @@ pub const TRANSIT_SENTINEL: [u8; 16] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TombKind {
     Evict,
-    Delete,
     Transit,
 }
 
@@ -54,7 +51,6 @@ impl TombKind {
     pub fn as_str(self) -> &'static str {
         match self {
             TombKind::Evict => TOMB_EVICT,
-            TombKind::Delete => TOMB_DELETE,
             TombKind::Transit => TOMB_TRANSIT,
         }
     }
@@ -62,7 +58,6 @@ impl TombKind {
     pub fn sentinel(self) -> &'static [u8; 16] {
         match self {
             TombKind::Evict => &EVICT_SENTINEL,
-            TombKind::Delete => &DELETE_SENTINEL,
             TombKind::Transit => &TRANSIT_SENTINEL,
         }
     }
@@ -75,13 +70,11 @@ impl TombKind {
     }
 }
 
-/// Whether `body` equals one of the reserved 16-byte tombstone sentinels (§6). A client body that
-/// did would be classified as a tombstone by every (size, ETag) scan — LIST would hide it, reconcile
-/// would reap or skip it — so cached-mode writes reject such a body at the write path
-/// ([`classify_entry`] can only fire for a 16-byte object, so this is the exact set to exclude).
+/// Whether `body` equals a reserved internal sentinel (§6). Evict/transition values would spoof the
+/// data classifier; the DELETE value would spoof the marker operation discriminator.
 pub fn is_reserved_sentinel(body: &[u8]) -> bool {
     body.len() == 16
-        && [EVICT_SENTINEL, DELETE_SENTINEL, TRANSIT_SENTINEL]
+        && [EVICT_SENTINEL, DELETE_MARKER_SENTINEL, TRANSIT_SENTINEL]
             .iter()
             .any(|s| s.as_slice() == body)
 }
@@ -91,7 +84,7 @@ pub fn classify_entry(size: i64, etag: &str) -> Option<TombKind> {
     if size != 16 {
         return None;
     }
-    [TombKind::Evict, TombKind::Delete, TombKind::Transit]
+    [TombKind::Evict, TombKind::Transit]
         .into_iter()
         .find(|k| k.sentinel_etag() == etag)
 }
@@ -100,7 +93,6 @@ pub fn classify_entry(size: i64, etag: &str) -> Option<TombKind> {
 pub fn tomb_kind(metadata: &std::collections::HashMap<String, String>) -> Option<TombKind> {
     match metadata.get(TOMB).map(String::as_str) {
         Some(TOMB_EVICT) => Some(TombKind::Evict),
-        Some(TOMB_DELETE) => Some(TombKind::Delete),
         Some(TOMB_TRANSIT) => Some(TombKind::Transit),
         _ => None,
     }
@@ -114,8 +106,15 @@ pub fn evict_sentinel_etag() -> String {
     TombKind::Evict.sentinel_etag()
 }
 
-pub fn delete_sentinel_etag() -> String {
-    TombKind::Delete.sentinel_etag()
+pub fn delete_marker_body() -> String {
+    use md5::{Digest, Md5};
+    hex::encode(Md5::digest(DELETE_MARKER_SENTINEL))
+}
+
+/// The marker object's own ETag identifies DELETE while remaining the CAS token returned by LIST.
+pub fn delete_marker_etag() -> String {
+    use md5::{Digest, Md5};
+    hex::encode(Md5::digest(delete_marker_body().as_bytes()))
 }
 
 pub fn transit_sentinel_etag() -> String {
@@ -485,12 +484,10 @@ pub fn shadow_clean_marker_key() -> String {
     format!("{c}{c}{TAG_SHADOW_CLEAN}", c = CTRL as char)
 }
 
-/// Cache (`<meta><b>`): the pending marker for `key` — **bare K**, range C (§6). Its body is the
-/// body ETag of the most recently acked cache PUT, its own S3 ETag the reconciler's CAS handle;
-/// concurrent PUTs overwrite it last-writer-wins (the write-coalescing point). Bare because a marker
-/// is a durability signal, not an optimization — every admissible key has one, no threshold. Returned
-/// borrowed since it *is* the client key; a named helper so the "marker lives at bare K" fact has one
-/// home.
+/// Cache (`<meta><b>`): the pending marker for `key` — **bare K**, range C (§6). Its body is the PUT
+/// body's ETag or [`delete_marker_body`]; its own S3 ETag identifies the operation and is the
+/// reconciler's CAS handle. Bare because a marker is a durability signal, not an optimization —
+/// every admissible key has one, no threshold. Returned borrowed since it *is* the client key.
 pub fn pending_marker_key(key: &str) -> &str {
     key
 }
@@ -803,14 +800,14 @@ mod tests {
 
     #[test]
     fn reserved_sentinel_detection() {
-        for s in [EVICT_SENTINEL, DELETE_SENTINEL, TRANSIT_SENTINEL] {
+        for s in [EVICT_SENTINEL, DELETE_MARKER_SENTINEL, TRANSIT_SENTINEL] {
             assert!(is_reserved_sentinel(&s));
         }
         assert!(
             !is_reserved_sentinel(&[0u8; 16]),
             "an ordinary 16-byte body is not a sentinel"
         );
-        // Length gate: only 16-byte bodies can collide (classify_entry requires size == 16).
+        // Length gate: only these exact 16-byte bodies carry an internal classification token.
         let mut longer = EVICT_SENTINEL.to_vec();
         longer.push(0);
         assert!(!is_reserved_sentinel(&longer));
@@ -896,10 +893,12 @@ mod tests {
 
     #[test]
     fn sentinels_are_distinct_and_classify() {
-        for kind in [TombKind::Evict, TombKind::Delete, TombKind::Transit] {
+        for kind in [TombKind::Evict, TombKind::Transit] {
             assert_eq!(kind.sentinel().len(), 16);
             assert_eq!(classify_entry(16, &kind.sentinel_etag()), Some(kind));
         }
+        assert_eq!(classify_entry(16, &delete_marker_body()), None);
+        assert_ne!(delete_marker_body(), delete_marker_etag());
         assert_eq!(classify_entry(16, &"0".repeat(32)), None);
         assert_eq!(classify_entry(17, &TombKind::Evict.sentinel_etag()), None);
     }

@@ -6,12 +6,15 @@
 //! one would resurrect a deleted object) and never settles a cache entry from a listing (which is
 //! what would roll an acked write back).
 //!
-//! **No key locks.** Raising a marker is last-writer-wins and the sweep clears one by CAS-ing on the
-//! marker's own ETag, so a marker raised beside a concurrent upload costs at most one redundant
-//! upload and never a lost write. The only lock this pass takes is on the two paths about to declare
-//! an invariant violation, where a stale snapshot must not be allowed to halt a healthy deployment.
+//! **Every marker this pass raises is raised under K's lock, off a re-read.** The bucket keeps
+//! serving throughout, so a cursor page is a snapshot of a keyspace that is still moving, and a
+//! marker records an *operation* — inferring one from a stale sighting can retype the operation a
+//! client just acked. The lock plus the re-read make the inference current at the moment it is
+//! written; the sweep's CAS on the marker's own ETag then keeps a redundant one harmless. The two
+//! paths about to declare an invariant violation lock for the same reason: a stale snapshot must not
+//! be allowed to halt a healthy deployment.
 //!
-//! Cached mode only: durable writes commit on the remote, so there is no pending set (invariant I4).
+//! Cached mode only: durable writes commit on the remote, so there is no pending set (invariant I3).
 //!
 //! §6 is what licenses re-deriving the set at all — *"what makes a cached write pending is a state
 //! of the world, not a record hypha keeps"* — and the marker's only job is to make that set
@@ -82,13 +85,11 @@ pub(super) async fn pending_set(tier: &Tiering, bucket: &str) -> Result<usize> {
     }
 }
 
-/// The tombstone kind decides this on its own except in the two cases that turn on what the remote
-/// holds: a live body (is it *this* generation?) and an eviction (is it still backed?).
+/// Rebuild the operation marker implied by the cache/remote comparison.
 async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result<bool> {
     let (key, size, etag, remote_framed) = match sighting {
         Sighting::RemoteOnly { key } => {
-            confirm_remote_only(tier, bucket, &key).await?;
-            return Ok(false);
+            return recover_remote_only(tier, bucket, &key).await;
         }
         Sighting::Cached {
             key,
@@ -99,14 +100,7 @@ async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result
     };
 
     match meta::classify_entry(size as i64, &etag) {
-        // An acked delete the remote has not honoured, or one it has — with the crash landing
-        // between the remote delete and clearing the tombstone and marker together. Both want the
-        // marker back, and the sweep clears the pair.
-        Some(meta::TombKind::Delete) => {
-            tier.raise_marker(bucket, &key, &etag).await?;
-            Ok(true)
-        }
-        // Settled, so nothing is owed — unless the remote no longer backs it, which is I3.
+        // Settled, so nothing is owed — unless the remote no longer backs it, which is I2.
         Some(meta::TombKind::Evict) => {
             if remote_framed.is_none() {
                 confirm_remote_lost_object(tier, bucket, &key).await?;
@@ -120,10 +114,7 @@ async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result
             Some(framed) if same_generation(tier, bucket, &key, size, &etag, framed).await? => {
                 Ok(false)
             }
-            _ => {
-                tier.raise_marker(bucket, &key, &etag).await?;
-                Ok(true)
-            }
+            _ => raise_upload_marker(tier, bucket, &key, &etag).await,
         },
     }
 }
@@ -144,34 +135,38 @@ async fn same_generation(
     }
 }
 
-/// Invariant **I2**, confirmed against fresh reads under K's lock.
-///
-/// The two cursors are snapshots taken at different moments, and the benign interleaving is
-/// ordinary: the cache listing runs, a client writes K, the reconcile sweep uploads it, and the
-/// remote listing then sees a key the cache listing could not. Halting on that would take a healthy
-/// deployment down. Under the lock no write can move K, so a fresh pair of HEADs settles it — and
-/// **both** sides must be re-read, since the delete that removes the cache entry removes the remote
-/// object first.
-async fn confirm_remote_only(tier: &Tiering, bucket: &str, key: &str) -> Result<()> {
+/// Re-read K under its lock before inferring an upload from it. The cursor page is a snapshot, and a
+/// marker now records an *operation*: a PUT marker raised over the DELETE marker of a delete that
+/// committed since would retype it, and the sweep — finding K absent — would then decline, leaving
+/// the remote object standing and the marker unclearable. A generation that moved since the sighting
+/// owes its own marker, so there is nothing left here to infer.
+async fn raise_upload_marker(tier: &Tiering, bucket: &str, key: &str, etag: &str) -> Result<bool> {
     let _guard = tier.locks.lock(key).await;
-    if cache_has_entry(tier, bucket, key).await? || !remote_has_object(tier, bucket, key).await? {
-        return Ok(());
+    let head = match tier.data.head(bucket, key).await {
+        Ok(h) => h,
+        Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if head.e_tag().unwrap_or_default().trim_matches('"') != etag {
+        return Ok(false);
     }
-    tier.halt
-        .raise(Violation {
-            invariant: Invariant::RemoteOnlyKey,
-            bucket: bucket.to_string(),
-            key: Some(key.to_string()),
-            detail: "the remote holds an object this ready bucket's cache has no entry for; \
-                     cache-absent is the authoritative 404, so the two disagree about whether \
-                     the object exists"
-                .to_string(),
-        })
-        .await
+    tier.raise_marker_if_absent(bucket, key, etag).await
 }
 
-/// Invariant **I3**, confirmed under K's lock — same snapshot skew as [`confirm_remote_only`], in
-/// the other direction: the remote listing can predate the upload that settled this tombstone.
+/// A remote-only cursor sighting is either snapshot skew or an interrupted cached delete. R2 may
+/// trust cache absence because total volume loss is dispatched to R1 by the missing sync marker.
+async fn recover_remote_only(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
+    let _guard = tier.locks.lock(key).await;
+    if cache_has_entry(tier, bucket, key).await? || !remote_has_object(tier, bucket, key).await? {
+        return Ok(false);
+    }
+    let delete = meta::delete_marker_body();
+    tier.raise_marker(bucket, key, &delete).await?;
+    Ok(true)
+}
+
+/// Invariant **I2**, confirmed under K's lock: the remote listing can predate the upload that
+/// settled this tombstone, so the violation needs a fresh read.
 async fn confirm_remote_lost_object(tier: &Tiering, bucket: &str, key: &str) -> Result<()> {
     let _guard = tier.locks.lock(key).await;
     if remote_has_object(tier, bucket, key).await? {
@@ -226,8 +221,7 @@ enum Sighting {
         etag: String,
         remote_framed: Option<u64>,
     },
-    /// Invariant I2 says this cannot arise: nothing removes a `<data>` entry until the remote
-    /// object is already gone.
+    /// A committed cached delete whose marker had not landed before a crash.
     RemoteOnly { key: String },
 }
 

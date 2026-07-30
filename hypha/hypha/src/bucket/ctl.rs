@@ -692,7 +692,7 @@ impl BucketTask {
     async fn create(&self, bucket: &str) -> Result<()> {
         match self.tier.remote.head_bucket(bucket).await {
             Ok(()) if self.state(bucket).readiness == Readiness::Absent => {
-                // Invariant I6: hypha is the only writer of either backend, and the startup
+                // Invariant I5: hypha is the only writer of either backend, and the startup
                 // resolution accounted for every bucket the remote held, so a remote bucket the map
                 // has no phase for was created by something that is not this deployment.
                 self.tier

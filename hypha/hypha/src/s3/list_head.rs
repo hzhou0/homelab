@@ -125,7 +125,7 @@ impl Hypha {
             .await?;
 
         // KeyCount counts keys and common prefixes alike (S3). It is ≤ MaxKeys but may be strictly
-        // less: dropped delete-tombstones leave a short — but honestly truncated — page.
+        // less when an internal transition entry is omitted.
         let key_count = (entries.len() + common_prefixes.len()) as i32;
         let resp = ListObjectsV2Output {
             name: Some(bucket),
@@ -284,7 +284,6 @@ impl Hypha {
                 .map(ts_ms);
             let kind = match meta::classify_entry(size, &etag) {
                 None => Kind::Live,
-                Some(meta::TombKind::Delete) => continue, // client-visibly absent
                 Some(meta::TombKind::Evict) => Kind::Evict,
                 Some(meta::TombKind::Transit) => Kind::Transit,
             };

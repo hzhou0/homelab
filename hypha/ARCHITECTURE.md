@@ -258,9 +258,10 @@ completion-time re-encryption pass.
   this is also how a completed multipart composite first enters the cache. A durable deployment never
   rehydrates: the body would immediately be tombstoned again.
 - **HEAD / LIST** → served from the cache while its **sync marker** is present — a reserved cache
-  object recording that reconciliation has made the namespace complete (every remote key has a
-  local body or tombstone, so an absent key is authoritatively a 404). While the marker is absent,
-  reads use the remote as the source of truth until reconciliation finishes and rewrites it.
+  object recording that reconciliation has made the cache namespace authoritative. A remote-only
+  key is then a cached DELETE awaiting propagation, so an absent key is authoritatively a 404.
+  While the marker is absent, reads use the remote as the source of truth until reconciliation
+  finishes and rewrites it.
   LIST entries always report plaintext sizes and client ETags: for tombstoned keys and cached
   multipart composites these ride **facts twins** — zero-byte cache objects whose key is the
   object's key plus a low-sorting suffix encoding the facts, so they arrive adjacent to their key
@@ -270,14 +271,14 @@ completion-time re-encryption pass.
   source of truth** and they are **always durable**: create/delete are synchronous to both sides
   (acked only once both confirm) regardless of mode, and `HeadBucket`/`ListBuckets` are answered
   from the remote, not the cache.
-- **DELETE** → in a cached deployment, overwrite the local body at K with a delete-tombstone (so
-  GET answers 404 and LIST omits K) and ack; the tombstone is the commit and a marker follows it as
-  for a PUT. The background reconcile propagates
-  `DeleteObject` to the remote, then clears marker and tombstone — the mask keeps the local
-  namespace authoritative and a crash mid-delete cannot resurrect the object. In a durable
-  deployment the remote delete is the commit: K is marked in-transition (readers keep seeing the
-  object from the remote until the delete lands, so an unacked delete stays invisible), then the
-  cache entry is cleared before the ack.
+- **DELETE** → in a cached deployment, remove the local body at K and ack, then queue a DELETE
+  marker. The background reconcile HEADs the remote object and conditionally deletes that exact
+  generation before clearing the marker. If the marker is lost to a crash, the intact sync marker
+  distinguishes the authoritative namespace from total volume loss and the pending-set rebuild
+  recovers the remote-only key as an interrupted delete. In a durable deployment the remote delete
+  is the commit: K is marked in-transition (readers keep seeing the object from the remote until the
+  delete lands, so an unacked delete stays invisible), then the cache entry is cleared before the
+  ack.
 
 ## Write-through durability
 
@@ -383,4 +384,4 @@ These grants are scoped by source **namespace** — the cluster's identity bound
 are single-tenant and pod labels are self-applied (see the design doc, §11.4). So "hypha may read the
 cache" means "workloads in hypha's namespace may."
 
-Hypha will reach seaweedFs by its cluster ip. 
+Hypha will reach seaweedFs by its cluster ip.

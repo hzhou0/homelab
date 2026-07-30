@@ -343,7 +343,7 @@ async fn foreign_remote_object_terminates_hypha() {
         .expect("put foreign object");
 
     // Drop the cache (marker included) so B's namespace is untrusted again. Stopped first, or the
-    // volume watchdog would halt on the live loss instead (§7, I7). Startup resolves every bucket's
+    // volume watchdog would halt on the live loss instead (§7, I6). Startup resolves every bucket's
     // state, so the restarted process owes B a restore before it serves anything — no client request
     // is needed to reach `foreign`, and none can be made, since the process is expected to exit
     // rather than become ready.
@@ -1495,7 +1495,7 @@ async fn get_bucket_versioning_stub() {
 /// Simulate cache-volume loss and bring hypha back onto the empty volume.
 ///
 /// Stopped before the wipe, deliberately: taking the volume out from under a *live* ready bucket is
-/// a different failure — the one the volume watchdog halts on (§7, I7) — and not what these tests
+/// a different failure — the one the volume watchdog halts on (§7, I6) — and not what these tests
 /// are about. `drop_buckets` removes the projections themselves too, modelling a volume that came
 /// back bare rather than one that came back empty.
 async fn lose_cache_volume(h: &mut Harness, drop_buckets: bool) {
@@ -1589,7 +1589,7 @@ async fn durable_put_rejects_reserved_sentinel_body() {
     put(&c, B, "s", &good).await;
 
     for sentinel in [
-        meta::DELETE_SENTINEL,
+        meta::DELETE_MARKER_SENTINEL,
         meta::EVICT_SENTINEL,
         meta::TRANSIT_SENTINEL,
     ] {

@@ -357,7 +357,7 @@ async fn still_reachable(tier: &Tiering, bucket: &str, key: &str, cetag: &str) -
     Ok(match meta::tomb_kind(&md) {
         Some(meta::TombKind::Evict) => md.get(meta::CETAG).map(String::as_str) == Some(cetag),
         Some(meta::TombKind::Transit) => true,
-        Some(meta::TombKind::Delete) | None => false,
+        None => false,
     })
 }
 

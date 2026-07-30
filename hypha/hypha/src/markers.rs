@@ -49,9 +49,9 @@ enum MarkerMsg {
 struct OwedMarker {
     bucket: String,
     key: String,
-    /// Diagnostic only: the sweep classifies K from the *data* body and CASes on the marker's own
-    /// ETag, so any payload is as good as the last (§7).
-    body_etag: String,
+    /// PUT body ETag or the reserved DELETE token; the resulting marker ETag identifies the branch
+    /// and is also its CAS handle.
+    marker_body: String,
 }
 
 impl OwedMarker {
@@ -140,7 +140,7 @@ impl Markers {
     /// it must not block or fail: the body is already committed and the ack cannot wait on — or be
     /// turned into an error by — anything that happens to the marker. That is what the queue being
     /// unbounded buys, and the only reason it is.
-    pub(crate) fn owe(&self, bucket: &str, key: &str, body_etag: String) {
+    pub(crate) fn owe(&self, bucket: &str, key: &str, marker_body: String) {
         let Some(tx) = self.queue.tx.upgrade() else {
             // The channel closes only after every handler has returned (§7), so a live write cannot
             // reach this — but "cannot" is exactly what a clean marker must not assume. Withdrawing
@@ -152,7 +152,7 @@ impl Markers {
         let _ = tx.send(MarkerMsg::Owed(OwedMarker {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            body_etag,
+            marker_body,
         }));
     }
 }
@@ -244,7 +244,7 @@ impl MarkerActor {
     /// against what this process believes. `DeleteBucket` retires the bucket from the state map
     /// *before* draining its projections (§7), so in a real delete the map has already caught up by
     /// the time a marker write can see the 404. A map that still calls the bucket live means the
-    /// `<meta>` projection vanished underneath it — the cache volume loss of invariant **I7** — and
+    /// `<meta>` projection vanished underneath it — the cache volume loss of invariant **I6** — and
     /// dropping the marker there would silently shorten a pending set the run still vouches for.
     async fn write_all(&self, owed: &mut HashMap<(String, String), OwedMarker>) {
         let failed: Vec<OwedMarker> = futures::stream::iter(owed.drain().map(|(_, r)| r))
@@ -252,7 +252,7 @@ impl MarkerActor {
                 match self
                     .queue
                     .tier
-                    .raise_marker(&r.bucket, &r.key, &r.body_etag)
+                    .raise_marker(&r.bucket, &r.key, &r.marker_body)
                     .await
                 {
                     Ok(()) => None,

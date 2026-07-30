@@ -1,7 +1,7 @@
 //! The two recoveries (§7) and the invariants they enforce.
 //!
 //! hypha recovers from exactly two failures, one per marker: a lost cache volume (**sync** marker
-//! absent ⇒ namespace restore) and writes acked without their marker landing (**clean** marker
+//! absent ⇒ namespace restore) and writes/deletes committed without their marker landing (**clean** marker
 //! absent ⇒ pending-set rebuild). Their premises are opposites — one may assume nothing about the
 //! cache namespace, the other that it is authoritative — so these tests are mostly about keeping
 //! each pass inside its own premise, and about what happens when the world contradicts one.
@@ -167,7 +167,7 @@ async fn open_restore_window(h: &mut Harness) {
     .await;
 
     // Stopped first: taking the volume from a *live* ready bucket is the one thing the watchdog
-    // halts on (I7), and it is not what these tests are about.
+    // halts on (I6), and it is not what these tests are about.
     h.stop_hypha().await;
     destroy_cache(h).await;
     h.start_hypha().await;
@@ -430,36 +430,51 @@ async fn assert_halted(h: &mut Harness) {
     );
 }
 
-/// **I2** — the remote holds an object a ready bucket's cache has no entry for.
-///
-/// Cache-absent is the authoritative 404 on a ready bucket, and no code path can produce this: every
-/// site that removes a `<data>` entry does so only once the remote object is already gone. So the
-/// two backends disagree about whether an object exists, and continuing would mean answering 404 for
-/// something that is there.
+/// A crash can lose the asynchronous marker after a cached delete has committed locally. With the
+/// sync marker intact, R2 trusts that absence and re-indexes the remote-only key as a pending delete.
 #[tokio::test]
-async fn remote_only_key_on_a_ready_bucket_halts() {
-    let mut h = Harness::cached_subprocess().await;
+async fn remote_only_key_on_a_ready_bucket_rebuilds_the_delete() {
+    let mut h = Harness::cached().await;
     h.create_bucket(B).await;
-    put(&h.client(), B, "real", &pattern(64)).await;
+    let key = "markerless-delete";
+    put(&h.client(), B, key, &pattern(64)).await;
+    wait_until(
+        15_000,
+        "the original generation reaches the remote",
+        || async { remote_present(&h, key).await && !marker_present(&h, key).await },
+    )
+    .await;
 
-    // Straight into the remote, behind hypha's back: an object the cache never knew about.
+    // The delete commit landed but its marker did not: the exact state left by a crash between the
+    // local DELETE and the queue handoff.
     h.raw()
-        .put_object()
-        .bucket(h.remote_bucket(B))
-        .key("ghost")
-        .body(bytes_body(b"not in the cache"))
+        .delete_object()
+        .bucket(h.cache_bucket(B))
+        .key(key)
         .send()
         .await
-        .expect("plant a remote-only key");
+        .expect("commit markerless cache delete");
 
-    // Ungraceful stop ⇒ no clean marker ⇒ the next run owes a pending rebuild, which walks both
-    // namespaces and meets the ghost.
     h.kill_hypha().await;
-    h.start_hypha_expecting_exit();
-    assert_halted(&mut h).await;
+    h.start_hypha().await;
+    wait_until(
+        15_000,
+        "R2 re-indexes and propagates the delete",
+        || async { !remote_present(&h, key).await && !marker_present(&h, key).await },
+    )
+    .await;
+    let err = h
+        .client()
+        .get_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect_err("the recovered delete remains authoritative");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("NoSuchKey"));
 }
 
-/// **I3** — an eviction tombstone whose remote object is gone.
+/// **I2** — an eviction tombstone whose remote object is gone.
 ///
 /// The remote lost bytes hypha reported as committed, and the tombstone is the only surviving record
 /// that they existed. The tombstone here is minted the ordinary way: by a durable-semantics write
@@ -527,7 +542,7 @@ async fn a_cached_body_in_an_untrusted_namespace_halts() {
     assert_halted(&mut h).await;
 }
 
-/// **I7** — the cache volume disappears under a *running* process.
+/// **I6** — the cache volume disappears under a *running* process.
 ///
 /// Startup resolves a bucket's readiness once and holds it for the run, which is sound only while
 /// the volume stays. A `Ready` bucket whose cache is gone answers 404 for objects that exist, and

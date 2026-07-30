@@ -1,6 +1,6 @@
 //! Phase-4 exit: cached mode over real MinIO (§7/§8). Writes ack after the cache write plus a
 //! bare-`K` pending marker; the reconcile sweep trails them onto the remote. Covers the marker +
-//! reconcile upload, cached delete propagation (mask-then-propagate), conditional-write
+//! reconcile upload, cached delete propagation (remove-then-propagate), conditional-write
 //! linearization on the cache, `Content-MD5` validation, the marker scan staying `O(pending)`
 //! (evicted keys untouched), and rehydrate on a tombstoned read — single-part back into K and a
 //! composite into the shadow body.
@@ -113,45 +113,65 @@ async fn cached_put_serves_from_cache_and_reconciles() {
     );
 }
 
-/// A cached delete masks K immediately (404 to clients) and the reconcile sweep propagates it to the
-/// remote, clearing both the tombstone and the marker.
+/// A cached delete removes K immediately, including from delimiter grouping, and the reconcile
+/// sweep propagates that authoritative absence to the remote.
 #[tokio::test]
-async fn cached_delete_masks_then_propagates() {
+async fn cached_delete_removes_then_propagates() {
     let h = Harness::cached().await;
     h.create_bucket(B).await;
     let c = h.client();
     let body = pattern(20_000);
+    let key = "gone/d";
 
-    put(&c, B, "d", &body).await;
+    put(&c, B, key, &body).await;
     wait_until(6000, "initial upload to remote", || async {
-        remote_present(&h, B, "d").await && !marker_present(&h, B, "d").await
+        remote_present(&h, B, key).await && !marker_present(&h, B, key).await
     })
     .await;
 
     c.delete_object()
         .bucket(B)
-        .key("d")
+        .key(key)
         .send()
         .await
         .expect("delete");
-    let got = c.get_object().bucket(B).key("d").send().await;
+    let got = c.get_object().bucket(B).key(key).send().await;
     assert_eq!(
         sdk_err_code(&got.unwrap_err()).as_deref(),
         Some("NoSuchKey")
     );
-    assert_eq!(data_class(&h, B, "d").await, Some(meta::TombKind::Delete));
     assert!(
-        marker_present(&h, B, "d").await,
-        "delete leaves a pending marker"
+        !raw_exists(&h, &h.cache_bucket(B), key).await,
+        "the committed cache state is absence, not a tombstone"
+    );
+    let listed = c
+        .list_objects_v2()
+        .bucket(B)
+        .delimiter("/")
+        .send()
+        .await
+        .expect("delimited list after delete");
+    assert!(
+        listed.common_prefixes().is_empty(),
+        "an absent subtree must not survive as a common prefix"
+    );
+    let listed_v1 = c
+        .list_objects()
+        .bucket(B)
+        .delimiter("/")
+        .send()
+        .await
+        .expect("delimited v1 list after delete");
+    assert!(
+        listed_v1.common_prefixes().is_empty(),
+        "v1 must project the same absent subtree"
     );
 
     wait_until(6000, "delete propagates to the remote", || async {
-        !remote_present(&h, B, "d").await
-            && !raw_exists(&h, &h.cache_bucket(B), "d").await
-            && !marker_present(&h, B, "d").await
+        !remote_present(&h, B, key).await && !marker_present(&h, B, key).await
     })
     .await;
-    let got = c.get_object().bucket(B).key("d").send().await;
+    let got = c.get_object().bucket(B).key(key).send().await;
     assert_eq!(
         sdk_err_code(&got.unwrap_err()).as_deref(),
         Some("NoSuchKey")
@@ -421,8 +441,8 @@ async fn cached_conditional_creates_linearize_under_contention() {
     assert_eq!(head.content_length(), Some(2048));
 }
 
-/// A client body colliding with a reserved 16-byte tombstone sentinel is rejected at the write path,
-/// and any prior version at K survives — nothing lands (review finding 1).
+/// A client body colliding with a reserved internal sentinel is rejected at the write path, and any
+/// prior version at K survives — nothing lands (review finding 1).
 #[tokio::test]
 async fn cached_put_rejects_reserved_sentinel_body() {
     let h = Harness::cached().await;
@@ -433,7 +453,7 @@ async fn cached_put_rejects_reserved_sentinel_body() {
     put(&c, B, "s", &good).await;
 
     for sentinel in [
-        meta::DELETE_SENTINEL,
+        meta::DELETE_MARKER_SENTINEL,
         meta::EVICT_SENTINEL,
         meta::TRANSIT_SENTINEL,
     ] {

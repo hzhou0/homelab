@@ -52,10 +52,6 @@ pub(crate) enum Invariant {
     /// durable for the whole of a restore precisely so this cannot happen, so one means the mode
     /// gate leaked and an acked write may exist that the restore is about to walk past.
     PlaintextDuringRestore,
-    /// A `Ready` bucket where the remote holds an object the cache has no entry for. No path can
-    /// produce this: every site that removes a `<data>` entry does so only once the remote object
-    /// is already gone.
-    RemoteOnlyKey,
     /// An eviction tombstone whose remote object is missing — the remote lost bytes hypha reported
     /// as committed, and the tombstone is the only remaining record that they existed.
     RemoteLostObject,
@@ -80,7 +76,6 @@ impl Invariant {
         match self {
             Invariant::ForeignObject => "foreign-object",
             Invariant::PlaintextDuringRestore => "plaintext-during-restore",
-            Invariant::RemoteOnlyKey => "remote-only-key",
             Invariant::RemoteLostObject => "remote-lost-object",
             Invariant::CacheVolumeLost => "cache-volume-lost",
             Invariant::ForeignBucket => "foreign-bucket",
@@ -236,7 +231,7 @@ mod tests {
     fn rendered_marker_names_the_invariant_and_the_key() {
         let body = String::from_utf8(
             Violation {
-                invariant: Invariant::RemoteOnlyKey,
+                invariant: Invariant::RemoteLostObject,
                 bucket: "b".into(),
                 key: Some("k".into()),
                 detail: "d".into(),
@@ -244,7 +239,7 @@ mod tests {
             .render(),
         )
         .unwrap();
-        assert!(body.contains("invariant: remote-only-key"));
+        assert!(body.contains("invariant: remote-lost-object"));
         assert!(body.contains("bucket: b"));
         assert!(body.contains("key: k"));
     }

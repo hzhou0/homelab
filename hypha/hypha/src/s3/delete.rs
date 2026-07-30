@@ -1,8 +1,8 @@
 //! DELETE, single and batch. Durable mode runs the §7 bracket under K's write lock: mark → remote
 //! delete (the commit; NotFound ⇒ already absent, still committed) → settle by removing K's cache
 //! entry and twins — absent is the authoritative 404. While marked, readers keep serving the object
-//! from the remote, so an unacked delete stays invisible. The delete-tombstone + marker machinery
-//! that propagates deletes asynchronously is a cached-path concern (Phase 4).
+//! from the remote, so an unacked delete stays invisible. Cached mode commits by removing K locally
+//! and queues a DELETE marker for asynchronous remote propagation.
 //!
 //! `DeleteObjects` is that same bracket widened from one key to the batch: the invariant is
 //! per-key, so batching is a transport question, not a correctness one — only the *remote* leg
@@ -152,9 +152,9 @@ impl Hypha {
     }
 
     /// Cached-mode DeleteObjects (§7): the remote isn't touched here, so there is nothing to batch —
-    /// it is a per-key fan-out of the cached single delete (its own write lock, tombstone + marker),
-    /// with reconcile propagating the remote deletes (and where the remote-batching opportunity
-    /// lives). Same S3 contract as durable: deleting an absent key succeeds, `VersionId` is ignored.
+    /// it is a per-key fan-out of the cached single delete (its own write lock, removal + marker),
+    /// with reconcile propagating the remote deletes. Same S3 contract as durable: deleting an
+    /// absent key succeeds, `VersionId` is ignored.
     async fn op_delete_objects_cached(
         &self,
         bucket: String,
@@ -190,29 +190,15 @@ impl Hypha {
         Ok(delete_objects_reply(quiet, requested, &failed))
     }
 
-    /// Cached-mode delete of one key (§7), under its write lock: overwrite K with the delete-tombstone
-    /// — the commit, which the caller acks on (GET/HEAD 404 and LIST omits K immediately, and the mask
-    /// keeps a crash from resurrecting K from the remote before the delete propagates) — and hand the
-    /// pending-delete marker to the marker queue, same ack rule as the cached PUT. The reconcile sweep's
-    /// delete branch does the remote `DeleteObject` and clears both.
+    /// Cached-mode delete of one key (§7), under its write lock: remove K — the commit, which makes
+    /// GET/HEAD/LIST agree immediately — then hand the DELETE marker to the same queue as PUT. A
+    /// crash before the marker lands leaves the clean marker absent; R2 recovers the remote-only key
+    /// as an interrupted delete.
     async fn commit_cached_delete(&self, bucket: &str, key: &str) -> Result<(), Error> {
         let _guard = self.write_lock(bucket, key).await;
 
-        let mut tomb_md = HashMap::new();
-        tomb_md.insert(meta::TOMB.to_string(), meta::TOMB_DELETE.to_string());
-        self.data()
-            .put_small(
-                bucket,
-                key,
-                meta::DELETE_SENTINEL.to_vec(),
-                tomb_md,
-                None,
-                None,
-            )
-            .await?;
-        // Marker body = the intended cache ETag (the delete sentinel's), mirroring the PUT marker; the
-        // reconcile classifies K from the *data* body, so only the marker's own ETag (M_etag) matters.
-        self.markers.owe(bucket, key, meta::delete_sentinel_etag());
+        self.data().delete(bucket, key).await?;
+        self.markers.owe(bucket, key, meta::delete_marker_body());
         // A deleted K can never name a shadow's generation again, so any shadow it had is orphaned (§8).
         self.orphans.owe(bucket, key);
         Ok(())

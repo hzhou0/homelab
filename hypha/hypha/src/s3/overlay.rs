@@ -104,7 +104,6 @@ impl Hypha {
         };
         let md = head.metadata.clone().unwrap_or_default();
         match meta::tomb_kind(&md) {
-            Some(meta::TombKind::Delete) => Ok(KeyState::Absent),
             Some(meta::TombKind::Evict) => Ok(KeyState::Remote {
                 facts: facts_from_tombstone(key, &md)?,
                 md,

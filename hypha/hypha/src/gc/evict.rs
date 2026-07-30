@@ -40,24 +40,37 @@ async fn evict_body(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<
         Err(e) => return Err(e),
     }
 
+    // Gates 2 and 3 run under K's lock, because gate 2 now *writes*: a marker records an operation,
+    // so raising one off a stale listing entry could retype a client's acked DELETE into a PUT. The
+    // lock plus this re-read pin the generation both gates are judging — the candidate came from a
+    // listing that may predate a write, a delete, or another pass's tombstone.
+    let _guard = tier.locks.lock(key).await;
+    if !cache_still_holds_generation(tier, bucket, key, etag).await? {
+        return Ok(0);
+    }
+
     // Gate 2 — durability. A skip here **raises the key's pending marker**: this check has just
     // established the one thing a marker records, gate 1 established there is none, and no other path
     // can see a body that is cache-only because a write forgot to owe one. It costs no extra round
     // trip and it lands on cold keys — precisely the ones no future write would have re-owed (§8).
+    //
+    // Create-only even so, because the lock cannot order this against a marker: markers are written
+    // asynchronously (§7), so a delete that committed before the lock may still owe its marker to the
+    // queue. That interleaving is safe — the queue's write lands *after* this one and wins — but the
+    // reverse is not, and `if_absent` is what forbids it.
     if !remote_holds_generation(tier, candidate, key).await? {
-        tier.raise_marker(bucket, key, etag).await?;
+        let raised = tier.raise_marker_if_absent(bucket, key, etag).await?;
         tracing::debug!(
             bucket = %bucket,
             key,
-            "eviction candidate is not durable; marker raised"
+            raised,
+            "eviction candidate is not durable; marker owed"
         );
         return Ok(0);
     }
 
-    // Gate 3 — the CAS, under K's lock. Twin before tombstone, so a sentinel always has its twin; a
-    // crash between leaves a twin next to a live body, which classification ignores (§6) and a later
-    // sweep reclaims.
-    let _guard = tier.locks.lock(key).await;
+    // Gate 3 — the CAS. Twin before tombstone, so a sentinel always has its twin; a crash between
+    // leaves a twin next to a live body, which classification ignores (§6) and a later sweep reclaims.
     match tier.tombstone_locked(bucket, key, etag).await {
         Ok(()) => Ok(candidate.bytes),
         // A client wrote, deleted, or completed K while we were judging it. Its eviction was the one
@@ -90,6 +103,23 @@ async fn drop_shadow(tier: &Tiering, candidate: &Candidate, shadow: &str) -> Res
         Err(Error::PreconditionFailed) | Err(Error::NotFound) => Ok(0),
         Err(e) => Err(e),
     }
+}
+
+/// Whether K is still the live body the candidate was scanned from. Gate 3's CAS would catch a
+/// generation that moved, but only after gate 2 has already written a marker for the generation that
+/// left.
+async fn cache_still_holds_generation(
+    tier: &Tiering,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) -> Result<bool> {
+    let head = match tier.data.head(bucket, key).await {
+        Ok(h) => h,
+        Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    Ok(head.e_tag().unwrap_or_default().trim_matches('"') == etag)
 }
 
 /// Whether the remote holds *this* candidate's generation.

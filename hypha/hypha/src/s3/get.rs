@@ -1,6 +1,6 @@
 //! GET, cache-first, dispatched on K's classification (§7): live body served straight from the
 //! cache; eviction tombstone decrypted from the remote (durable mode never repopulates — the body
-//! would immediately be tombstoned again); delete tombstone → 404; transition mark → remote-as-truth
+//! would immediately be tombstoned again); absent → 404; transition mark → remote-as-truth
 //! (repaired opportunistically if the lock is free, else read through to the writer's in-flight
 //! commit — no hybrid reads either way).
 //!
