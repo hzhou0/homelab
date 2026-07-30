@@ -11,9 +11,10 @@
 //! **The position is biased, and the bias is corrected downstream.** `start-after` takes a key, so a
 //! random position is a random key-shaped string and the probe lands on the first key at or after it
 //! — uniform over the *keyspace*, not over keys, which favours regions sitting behind large gaps.
-//! [`Yields`] is one correction; §6's prefix-distribution hint, once it exists, is the other.
+//! [`Yields`] corrects it across buckets and [`Prefixes`] within one.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rand::Rng as _;
 
@@ -35,7 +36,9 @@ const UNPROBED_YIELD: f64 = 1.0;
 /// Something a probe found that holds reclaimable plaintext, with everything eviction needs to judge
 /// it and to CAS it.
 pub(super) struct Candidate {
-    pub(super) bucket: String,
+    /// Shared with the probe that found it rather than copied per candidate: one probe can return
+    /// thousands, and they all came from the same bucket.
+    pub(super) bucket: Arc<str>,
     pub(super) artifact: Artifact,
     /// The version token the eviction conditions on (§8): a writer — or a fresher rehydrate — landing
     /// anywhere between the gates and the reclaim moves it, and the conditional write fails instead of
@@ -74,51 +77,117 @@ impl Candidate {
     }
 }
 
-pub(super) struct Probed {
-    pub(super) candidates: Vec<Candidate>,
+struct Probed {
+    candidates: Vec<Candidate>,
     /// What the yield is per — a probe that ran out of keyspace read fewer pages than its budget.
-    pub(super) pages: usize,
+    pages: usize,
+    /// Leading prefixes of the *keys* the probe walked past, candidates or not: this is a statement
+    /// about where keys are, which is a different question from where evictable ones are.
+    prefixes: HashMap<String, usize>,
 }
 
-/// What one probe taught [`Yields`], carried back to the actor that owns them once the pass — which
-/// runs off the actor's task — has taken the candidates for itself.
+/// What one probe taught the actor's learned state, carried back once the pass — which runs off the
+/// actor's task — has taken the candidates for itself.
 pub(super) struct ProbeYield {
     pub(super) bucket: String,
     pub(super) candidates: usize,
     pub(super) pages: usize,
+    /// Empty for a shadow probe, whose positions are drawn over digests and need no shaping.
+    pub(super) prefixes: HashMap<String, usize>,
 }
 
 impl Probed {
-    pub(super) fn yielded(&self, bucket: &str) -> ProbeYield {
-        ProbeYield {
-            bucket: bucket.to_string(),
-            candidates: self.candidates.len(),
-            pages: self.pages,
-        }
+    fn split(self, bucket: &str) -> (ProbeYield, Vec<Candidate>) {
+        (
+            ProbeYield {
+                bucket: bucket.to_string(),
+                candidates: self.candidates.len(),
+                pages: self.pages,
+                prefixes: self.prefixes,
+            },
+            self.candidates,
+        )
+    }
+
+    /// A shadow probe teaches the yields and nothing else: its positions are drawn over digests,
+    /// which are uniform over the range by construction, so there is no bias for a distribution to
+    /// correct.
+    fn split_yield_only(mut self, bucket: &str) -> (ProbeYield, Vec<Candidate>) {
+        self.prefixes = HashMap::new();
+        self.split(bucket)
     }
 }
 
-/// Sample `bucket`'s live client bodies: list `<data>` from a random position and keep what is not a
-/// tombstone.
-pub(super) async fn probe_bodies(tier: &Tiering, bucket: &str, pages: usize) -> Result<Probed> {
-    let sampled = sample(&tier.data, bucket, None, random_key_position(), pages).await?;
-    Ok(sampled.map(|entry| {
-        // A tombstone holds no bytes worth reclaiming and has already been evicted or deleted.
-        meta::classify_entry(entry.bytes as i64, &entry.etag)
-            .is_none()
-            .then(|| entry.into_candidate(bucket, Artifact::Body))
-    }))
+/// Sample `bucket`'s live client bodies from `position` (drawn by [`Prefixes`]) and keep what is not
+/// a tombstone — plus, free of charge, the transition marks passed on the way.
+///
+/// The marks cost nothing because every entry is classified here anyway to find the candidates, and
+/// this is the only listing that ever sees them: [`super::debris`] gives them no walk of their own,
+/// since a mark is repaired by any read of its key (§7/§8).
+pub(super) async fn probe_bodies(
+    tier: &Tiering,
+    bucket: &Arc<str>,
+    position: String,
+    pages: usize,
+) -> Result<(ProbeYield, Vec<Candidate>, Vec<String>)> {
+    let sampled = sample(&tier.data, bucket, None, position, pages).await?;
+    let mut marked = Vec::new();
+    let probed = sampled.map(
+        |entry| match meta::classify_entry(entry.bytes as i64, &entry.etag) {
+            None => Some(entry.into_candidate(bucket, Artifact::Body)),
+            // Evict/Delete hold no bytes worth reclaiming and have already been settled.
+            Some(meta::TombKind::Transit) => {
+                marked.push(entry.key);
+                None
+            }
+            Some(_) => None,
+        },
+    );
+    let (yielded, candidates) = probed.split(bucket);
+    Ok((yielded, candidates, marked))
 }
 
-/// Sample `bucket`'s shadow bodies (§6). A prefix scan, because a shadow key is a digest and there is
-/// no client key to derive one from — which is also why this is the only way GC ever sees a shadow.
+/// Sample the two things `<meta>` holds that GC acts on: shadow bodies to evict (§6), and twins that
+/// may no longer project any key. One walk, because they are one listing apart — the ranges are
+/// adjacent under the `0x01` lead — and neither earns a walk of its own.
 ///
-/// Every entry under the prefix is a candidate: unlike `<data>`, this range holds nothing else.
-pub(super) async fn probe_shadows(tier: &Tiering, bucket: &str, pages: usize) -> Result<Probed> {
-    let prefix = meta::shadow_scan_prefix();
-    let position = format!("{prefix}{}", random_digest_position());
-    let sampled = sample(&tier.meta, bucket, Some(prefix), position, pages).await?;
-    Ok(sampled.map(|entry| Some(entry.into_candidate(bucket, Artifact::Shadow))))
+/// **Aimed at one range or the other, at random.** The ranges are disjoint and not contiguous (range
+/// A's markers and mpu records sit between them), so a single position drawn over the whole prefix
+/// would land wherever that space happens to be widest rather than where the entries are. Aiming
+/// explicitly makes the split a property of the code instead of of the keyspace's shape. A
+/// shadow-aimed probe usually reads on into the twins anyway — shadows exist only for composites
+/// something read back after eviction, so for most buckets that range is nearly empty — which is why
+/// the aim matters mainly for the bucket where it does not spill.
+pub(super) async fn probe_meta(
+    tier: &Tiering,
+    bucket: &Arc<str>,
+    pages: usize,
+) -> Result<(ProbeYield, Vec<Candidate>, Vec<String>)> {
+    let lead = (meta::CTRL as char).to_string();
+    let sampled = sample(
+        &tier.meta,
+        bucket,
+        Some(lead),
+        random_meta_position(),
+        pages,
+    )
+    .await?;
+
+    let mut twins = Vec::new();
+    let probed = sampled.map(|entry| {
+        // The base key is a slice of the twin's own, so it is re-derived where the twin is judged
+        // rather than carried alongside it.
+        if meta::parse_twin(&entry.key).is_some() {
+            twins.push(entry.key);
+            return None;
+        }
+        entry
+            .key
+            .starts_with(&meta::shadow_scan_prefix())
+            .then(|| entry.into_candidate(bucket, Artifact::Shadow))
+    });
+    let (yielded, candidates) = probed.split_yield_only(bucket);
+    Ok((yielded, candidates, twins))
 }
 
 /// One listing entry, before anything has decided what kind of artifact it is.
@@ -130,9 +199,13 @@ struct Entry {
 }
 
 impl Entry {
-    fn into_candidate(self, bucket: &str, artifact: impl FnOnce(String) -> Artifact) -> Candidate {
+    fn into_candidate(
+        self,
+        bucket: &Arc<str>,
+        artifact: impl FnOnce(String) -> Artifact,
+    ) -> Candidate {
         Candidate {
-            bucket: bucket.to_string(),
+            bucket: Arc::clone(bucket),
             artifact: artifact(self.key),
             etag: self.etag,
             bytes: self.bytes,
@@ -148,9 +221,14 @@ struct Sampled {
 
 impl Sampled {
     fn map(self, classify: impl FnMut(Entry) -> Option<Candidate>) -> Probed {
+        let mut prefixes: HashMap<String, usize> = HashMap::new();
+        for entry in &self.entries {
+            *prefixes.entry(leading(&entry.key)).or_default() += 1;
+        }
         Probed {
             candidates: self.entries.into_iter().filter_map(classify).collect(),
             pages: self.pages,
+            prefixes,
         }
     }
 }
@@ -226,6 +304,12 @@ async fn read_pages(
 /// that each one still lands well inside it rather than past the end.
 const POSITION_LEN: usize = 3;
 
+/// How much of a position [`Prefixes`] shapes. The leading characters are where a keyspace's
+/// structure lives — a bucket's keys sit under a handful of `logs/`, `2026/`-style leads — so
+/// shaping them is what turns a draw over the string space into a draw over the populated part of
+/// it. The rest stays random, which is what still spreads probes *within* a busy prefix.
+const SHAPED_LEN: usize = 2;
+
 /// Printable ASCII, which is where real client-key distributions live. Positions outside it are
 /// unnecessary rather than limiting — every key is reachable from *some* position, because a probe
 /// lands on the first key at or after it.
@@ -234,6 +318,120 @@ fn random_key_position() -> String {
     (0..POSITION_LEN)
         .map(|_| rng.gen_range(b'!'..=b'~') as char)
         .collect()
+}
+
+/// The shaped head of a key, as [`Prefixes`] counts and draws it. Whole **characters**, not bytes: a
+/// window cut mid-sequence would have to be repaired into a replacement character, which sorts above
+/// nearly every real key and would turn every probe of a non-ASCII prefix into an overshoot. A key
+/// shorter than the window contributes its whole self, so single-character keys stay learnable.
+fn leading(key: &str) -> String {
+    key.chars().take(SHAPED_LEN).collect()
+}
+
+/// Where in a bucket to probe, learned — the within-bucket half of the correction [`Yields`] makes
+/// across buckets.
+///
+/// The bias it exists for is coarse and it dominates: a random key-shaped position is uniform over
+/// the *string space*, and almost all of that space holds no keys at all — a bucket whose keys all
+/// begin `logs/` or `2026-` takes nearly every probe from somewhere before its first key or after
+/// its last, so the probes pile onto the head of the one populated run and the tail is examined
+/// only by the wrap. Drawing the leading characters from prefixes that were *observed to contain
+/// keys* removes that by construction, and it needs nothing persisted: the counts are a sketch of
+/// the live keyspace, so a cold start is one pass of unshaped probes, not a wrong answer.
+///
+/// **Kept honest by an exploration share**, for the same reason [`Yields`] keeps a floor: a
+/// distribution that only ever draws where it has already looked cannot discover a prefix that
+/// appeared after it started, and a scan that learns once and stops learning is the failure both
+/// halves of this file are shaped to avoid.
+pub(super) struct Prefixes {
+    /// Per bucket, a distribution over observed leading windows. Weights sum to ~1 rather than
+    /// counting keys: what matters is a prefix's *share* of the keyspace, and totals that grow with
+    /// how long the process has been running would make an old observation outweigh a fresh one.
+    per_bucket: HashMap<String, HashMap<String, f64>>,
+}
+
+/// Share of positions drawn unshaped. Not configurable, unlike [`Yields`]'s floor: that one trades
+/// probes between buckets an operator can see and name, whereas this is an internal property of a
+/// sketch — there is no deployment fact that would tell anyone to move it.
+const EXPLORE_SHARE: f64 = 0.2;
+
+/// How fast the distribution forgets, matched to [`YIELD_SMOOTHING`] because it is fed by the same
+/// probes at the same cadence — one probe's view of a bucket is a few pages, so no single one should
+/// be able to reshape where the next round looks.
+const PREFIX_SMOOTHING: f64 = YIELD_SMOOTHING;
+
+/// Below this a prefix has been absent from the observations long enough to be noise, and dropping it
+/// keeps the map bounded by the keyspace's live shape rather than by everything it has ever had.
+const PREFIX_FLOOR: f64 = 0.001;
+
+impl Prefixes {
+    pub(super) fn new() -> Self {
+        Prefixes {
+            per_bucket: HashMap::new(),
+        }
+    }
+
+    pub(super) fn observe(&mut self, bucket: &str, observed: &HashMap<String, usize>) {
+        let total: usize = observed.values().sum();
+        if total == 0 {
+            return;
+        }
+        let distribution = self.per_bucket.entry(bucket.to_string()).or_default();
+        for weight in distribution.values_mut() {
+            *weight *= 1.0 - PREFIX_SMOOTHING;
+        }
+        for (prefix, count) in observed {
+            let share = *count as f64 / total as f64;
+            *distribution.entry(prefix.clone()).or_default() += share * PREFIX_SMOOTHING;
+        }
+        distribution.retain(|_, weight| *weight >= PREFIX_FLOOR);
+    }
+
+    pub(super) fn retain(&mut self, live: &[String]) {
+        self.per_bucket.retain(|bucket, _| live.contains(bucket));
+    }
+
+    /// A `start-after` for `bucket`: a known-populated head, then random characters that place the
+    /// probe somewhere inside that head's run rather than always at the front of it.
+    pub(super) fn position(&self, bucket: &str) -> String {
+        let mut rng = rand::thread_rng();
+        if rng.gen::<f64>() < EXPLORE_SHARE {
+            return random_key_position();
+        }
+        let Some(distribution) = self.per_bucket.get(bucket).filter(|d| !d.is_empty()) else {
+            return random_key_position();
+        };
+
+        let total: f64 = distribution.values().sum();
+        let mut draw = rng.gen::<f64>() * total;
+        let head = distribution
+            .iter()
+            .find(|(_, weight)| {
+                draw -= **weight;
+                draw <= 0.0
+            })
+            .map(|(prefix, _)| prefix.clone())
+            // Floating-point slack at the very top of the range.
+            .unwrap_or_else(|| distribution.keys().next().cloned().unwrap_or_default());
+
+        let mut position = head;
+        position.extend(
+            (position.chars().count()..POSITION_LEN).map(|_| rng.gen_range(b'!'..=b'~') as char),
+        );
+        position
+    }
+}
+
+/// A position in `<meta>`, aimed at the shadow range or the twin range with even odds.
+fn random_meta_position() -> String {
+    let c = meta::CTRL as char;
+    if rand::thread_rng().gen::<bool>() {
+        format!("{}{}", meta::shadow_scan_prefix(), random_digest_position())
+    } else {
+        // Range B is `0x01 ‖ key ‖ …`, and a client key's first byte is >= 0x02 by admission, so a
+        // printable-ASCII tail lands inside the twins rather than back in range A.
+        format!("{c}{}", random_key_position())
+    }
 }
 
 /// A position *within* the shadow range, so it must be drawn from base64url's alphabet — a printable
@@ -330,6 +528,7 @@ mod tests {
             bucket: bucket.to_string(),
             candidates,
             pages,
+            prefixes: HashMap::new(),
         }
     }
 
@@ -443,6 +642,98 @@ mod tests {
             !body.qualified().contains(char::from(meta::CTRL)),
             "a client key cannot contain the control byte, which is what keeps the two apart"
         );
+    }
+
+    fn observed(keys: &[&str]) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        for key in keys {
+            *counts.entry(leading(key)).or_default() += 1;
+        }
+        counts
+    }
+
+    fn shaped_share(prefixes: &Prefixes, bucket: &str, head: &str) -> f64 {
+        let drawn = (0..2000).map(|_| prefixes.position(bucket));
+        drawn.filter(|p| p.starts_with(head)).count() as f64 / 2000.0
+    }
+
+    /// The bias this exists for: a keyspace that lives under one prefix would otherwise take almost
+    /// every probe from somewhere it holds no keys at all.
+    #[test]
+    fn probes_land_where_the_keys_actually_are() {
+        let mut prefixes = Prefixes::new();
+        prefixes.observe("b", &observed(&["logs/a", "logs/b", "logs/c", "logs/d"]));
+        let share = shaped_share(&prefixes, "b", "lo");
+        assert!(share > 0.7, "shaped share was {share}");
+    }
+
+    /// The mirror of [`Yields`]'s floor: a distribution that only draws where it has already looked
+    /// can never find a prefix that appeared afterwards.
+    #[test]
+    fn some_positions_stay_unshaped_so_new_prefixes_are_reachable() {
+        let mut prefixes = Prefixes::new();
+        prefixes.observe("b", &observed(&["logs/a", "logs/b"]));
+        let unshaped = 1.0 - shaped_share(&prefixes, "b", "lo");
+        assert!(unshaped > 0.05, "exploration share was {unshaped}");
+    }
+
+    /// A cold start is one round of unshaped probes, not a wrong answer — which is what lets the
+    /// distribution live in memory alone.
+    #[test]
+    fn an_unlearned_bucket_draws_a_plain_random_position() {
+        let prefixes = Prefixes::new();
+        for _ in 0..200 {
+            let position = prefixes.position("never-probed");
+            assert_eq!(position.len(), POSITION_LEN);
+            assert!(meta::validate_client_key(&position).is_ok());
+        }
+    }
+
+    /// Positions are `start-after` values, so a shaped one has to be as usable as a random one —
+    /// including for a keyspace whose keys begin with multi-byte characters, where a byte-sliced
+    /// window would produce a replacement character that sorts past every real key.
+    #[test]
+    fn every_shaped_position_is_a_usable_start_after() {
+        let mut prefixes = Prefixes::new();
+        prefixes.observe(
+            "b",
+            &observed(&[
+                "a",
+                "zz/x",
+                "0-1/y",
+                "\u{e9}t\u{e9}/x",
+                "\u{4e2d}\u{6587}/y",
+            ]),
+        );
+        for _ in 0..200 {
+            let position = prefixes.position("b");
+            assert_eq!(position.chars().count(), POSITION_LEN);
+            assert!(meta::validate_client_key(&position).is_ok());
+        }
+    }
+
+    /// The keyspace moves — a prefix nothing has held keys under for a while must stop taking probes,
+    /// or the distribution is a record of what the bucket used to be.
+    #[test]
+    fn a_prefix_that_stops_appearing_is_forgotten() {
+        let mut prefixes = Prefixes::new();
+        prefixes.observe("b", &observed(&["old/a", "old/b"]));
+        for _ in 0..50 {
+            prefixes.observe("b", &observed(&["new/a", "new/b"]));
+        }
+        let stale = shaped_share(&prefixes, "b", "ol");
+        assert!(
+            stale < 0.02,
+            "a retired prefix still took {stale} of probes"
+        );
+    }
+
+    #[test]
+    fn a_retired_bucket_stops_shaping_positions() {
+        let mut prefixes = Prefixes::new();
+        prefixes.observe("deleted", &observed(&["logs/a"]));
+        prefixes.retain(&["live".to_string()]);
+        assert!(shaped_share(&prefixes, "deleted", "lo") < 0.05);
     }
 
     #[test]

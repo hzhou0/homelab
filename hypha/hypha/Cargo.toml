@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 hyper = { workspace = true }
+http-body-util = { workspace = true }
 hyper-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -37,6 +38,8 @@ dashmap = { workspace = true }
 fastbloom = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

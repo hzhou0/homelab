@@ -53,6 +53,19 @@ pub(super) enum Rung {
     Threshold,
 }
 
+impl Rung {
+    /// §8's own numbering, which is what the metric is named for and what an alert on "GC is at the
+    /// top" compares against.
+    pub(super) fn number(self) -> usize {
+        match self {
+            Rung::Unpressured => 0,
+            Rung::Interval => 1,
+            Rung::Concurrency => 2,
+            Rung::Threshold => 3,
+        }
+    }
+}
+
 pub(super) struct Ladder {
     /// Index 0 is the unpressured base; the interval steps come first, then concurrency, then the
     /// threshold moving one bucket younger at a time.

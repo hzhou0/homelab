@@ -167,6 +167,7 @@ impl Hypha {
             )
             .await?;
 
+        super::record_bytes(plen);
         // The write half of §8's recency feed. A write is the strongest statement of interest a key
         // gets, and a read-only ring would have write-hot/read-cold keys evict first — reclaiming
         // bytes the next PUT immediately takes back. Always `AtKey`: a PUT is single-part, so its
@@ -260,6 +261,7 @@ impl Hypha {
                 .await?
         };
 
+        super::record_bytes(plen);
         self.gc.touch(&bucket, &key, Plaintext::AtKey);
         // This write replaced whatever K held; if that was a rehydrated composite, its shadow is now
         // unreachable (§8). Unconditional here because the unconditional branch above never read K and

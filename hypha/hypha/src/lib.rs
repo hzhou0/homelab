@@ -23,6 +23,7 @@
 //! A phase that overruns its budget logs and aborts what is left, since the alternative is
 //! overrunning the pod's `terminationGracePeriod` and being killed mid-call anyway (§9).
 
+mod admin;
 mod auth;
 mod background;
 mod bucket;
@@ -31,6 +32,7 @@ mod gc;
 mod halt;
 mod keylocks;
 mod markers;
+pub mod metrics;
 mod replication;
 mod s3;
 mod tier;
@@ -50,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 use hypha_core::config::{Mode, DATA_ROLE, META_ROLE, REMOTE_ROLE};
 use hypha_core::{Backend, Config};
 
+pub use admin::{serve as serve_admin, Health};
 pub use halt::EXIT_INVARIANT_VIOLATION;
 pub use s3::Hypha;
 
@@ -186,6 +189,7 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     actors.extend(replication.map(|task| ("reconcile", task)));
 
     let lifecycle = Lifecycle {
+        health: admin::Health::new(startup_tier.remote.clone()),
         tier: startup_tier,
         buckets: startup_buckets,
         halt: serve_halt,
@@ -204,6 +208,9 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
 /// every bucket dirty on disk before a write can land, and the drain that proves quiescence before
 /// writing any clean marker back.
 pub struct Lifecycle {
+    /// Handed to the admin listener before this is moved into [`serve`] — the probes have to be
+    /// answering *before* startup finishes, since "not ready yet" is precisely what they report.
+    health: admin::Health,
     tier: tier::Tiering,
     buckets: bucket::BucketCtl,
     halt: halt::Halt,
@@ -226,9 +233,14 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
+    pub fn health(&self) -> admin::Health {
+        self.health.clone()
+    }
+
     pub async fn startup(&mut self) -> Result<(), BoxError> {
         halt::exit_if_marked(&self.tier.remote).await?;
         self.sweeps = bucket::resolve_all(&self.tier, &self.buckets).await?;
+        self.health.started();
         Ok(())
     }
 
@@ -341,7 +353,11 @@ where
                 Ok(c) => c,
                 Err(e) => { tracing::error!(error = %e, "accept failed"); continue; }
             },
-            () = shutdown.as_mut() => { tracing::info!("shutdown signalled: draining"); break; }
+            () = shutdown.as_mut() => {
+                tracing::info!("shutdown signalled: draining");
+                lifecycle.health.stopping();
+                break;
+            }
             () = halt.shutdown_signalled() => { halted = true; break; }
         };
 

@@ -113,6 +113,7 @@ impl Hypha {
         if !shadow_is_generation(out.metadata(), &facts.cetag) {
             return Ok(None);
         }
+        resolved(true, facts.plen);
 
         let ranged = input.range.is_some();
         let resp = GetObjectOutput {
@@ -165,6 +166,7 @@ impl Hypha {
             .data()
             .get(bucket, key, input.range.as_ref().map(range_header))
             .await?;
+        resolved(true, out.content_length.unwrap_or_default().max(0) as u64);
         let status = if input.range.is_some() {
             Some(hyper::StatusCode::PARTIAL_CONTENT)
         } else {
@@ -204,6 +206,9 @@ impl Hypha {
         facts: &RemoteFacts,
         md: &std::collections::HashMap<String, String>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        // The miss is counted here rather than at the classification above, because this is where a
+        // read *becomes* one: a tombstoned key whose shadow answered never reaches this path.
+        resolved(false, facts.plen);
         let plen = facts.plen;
         let etag = Some(ETag::Strong(facts.cetag.clone()));
         let last_modified = Some(ts_ms(facts.mtime_ms));
@@ -339,6 +344,14 @@ fn build_object_parts(
             .flatten(),
         parts: Some(parts),
     }
+}
+
+/// Where a read resolved, and how much it will return — reported to both §10 surfaces at once,
+/// because the two are the same statement and a call site that made only one of them would drift.
+fn resolved(cache_hit: bool, bytes: u64) {
+    crate::metrics::cache_read(cache_hit);
+    super::record_cache_hit(cache_hit);
+    super::record_bytes(bytes);
 }
 
 /// Plaintext facts off an eviction tombstone's own metadata (§6) — the authoritative copy.

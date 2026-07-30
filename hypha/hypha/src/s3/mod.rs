@@ -185,159 +185,79 @@ pub(crate) fn copied_part_retag(
         .to_string())
 }
 
-#[async_trait::async_trait]
-impl s3s::S3 for Hypha {
-    async fn abort_multipart_upload(
-        &self,
-        req: S3Request<AbortMultipartUploadInput>,
-    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        self.op_abort_multipart_upload(req).await
-    }
+/// The trait surface, as one table: every method is the same shape — open the request's span,
+/// delegate to the op module, report the call (§10) — so writing them out longhand would put
+/// twenty-two copies of that shape between a reader and the one line that differs.
+///
+/// The trailing bracket names which of the span's request-side fields this op *has*, which is why
+/// they are declared here rather than recorded by each handler: a new op cannot be added without an
+/// entry, and an entry cannot be written without answering the question. `bytes` and `cache_hit`
+/// are not knowable from the request, so they are left empty for the handler to fill in
+/// ([`record_bytes`], [`record_cache_hit`]).
+///
+/// The latency recorded for `GetObject` — and the moment its span closes — is the *response*, not
+/// the last byte: the body is a stream the handler returns before it is read. That is the number
+/// worth alerting on anyway; everything hypha decides has happened by then, and what follows is the
+/// client's bandwidth.
+macro_rules! client_ops {
+    ($($op:literal $method:ident($input:ident) -> $output:ident => $handler:ident [$($field:ident)*];)*) => {
+        #[async_trait::async_trait]
+        impl s3s::S3 for Hypha {
+            $(
+                async fn $method(&self, req: S3Request<$input>) -> S3Result<S3Response<$output>> {
+                    let span = tracing::info_span!(
+                        "s3",
+                        op = $op,
+                        bucket = tracing::field::Empty,
+                        key = tracing::field::Empty,
+                        bytes = tracing::field::Empty,
+                        cache_hit = tracing::field::Empty,
+                    );
+                    $( span.record(stringify!($field), req.input.$field.as_str()); )*
+                    let started = std::time::Instant::now();
+                    let out = tracing::Instrument::instrument(self.$handler(req), span).await;
+                    crate::metrics::s3_request($op, out.is_err(), started.elapsed());
+                    out
+                }
+            )*
+        }
+    };
+}
 
-    async fn complete_multipart_upload(
-        &self,
-        req: S3Request<CompleteMultipartUploadInput>,
-    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        self.op_complete_multipart_upload(req).await
-    }
+/// The payload this request moved, once the handler knows it (§10). For a read that is what the
+/// response declares rather than what the client eventually pulls, since the span closes on the
+/// response.
+pub(crate) fn record_bytes(bytes: u64) {
+    tracing::Span::current().record("bytes", bytes);
+}
 
-    async fn copy_object(
-        &self,
-        req: S3Request<CopyObjectInput>,
-    ) -> S3Result<S3Response<CopyObjectOutput>> {
-        self.op_copy_object(req).await
-    }
+/// Whether the cache held the plaintext this read resolved to. Recorded where the read *becomes* a
+/// hit or a miss, which is deeper than any single branch of the dispatch.
+pub(crate) fn record_cache_hit(hit: bool) {
+    tracing::Span::current().record("cache_hit", hit);
+}
 
-    async fn create_bucket(
-        &self,
-        req: S3Request<CreateBucketInput>,
-    ) -> S3Result<S3Response<CreateBucketOutput>> {
-        self.op_create_bucket(req).await
-    }
-
-    async fn create_multipart_upload(
-        &self,
-        req: S3Request<CreateMultipartUploadInput>,
-    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        self.op_create_multipart_upload(req).await
-    }
-
-    async fn delete_bucket(
-        &self,
-        req: S3Request<DeleteBucketInput>,
-    ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        self.op_delete_bucket(req).await
-    }
-
-    async fn delete_object(
-        &self,
-        req: S3Request<DeleteObjectInput>,
-    ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        self.op_delete_object(req).await
-    }
-
-    async fn delete_objects(
-        &self,
-        req: S3Request<DeleteObjectsInput>,
-    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        self.op_delete_objects(req).await
-    }
-
-    async fn get_bucket_location(
-        &self,
-        req: S3Request<GetBucketLocationInput>,
-    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        self.op_get_bucket_location(req).await
-    }
-
-    async fn get_bucket_versioning(
-        &self,
-        req: S3Request<GetBucketVersioningInput>,
-    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        self.op_get_bucket_versioning(req).await
-    }
-
-    async fn get_object(
-        &self,
-        req: S3Request<GetObjectInput>,
-    ) -> S3Result<S3Response<GetObjectOutput>> {
-        self.op_get_object(req).await
-    }
-
-    async fn get_object_attributes(
-        &self,
-        req: S3Request<GetObjectAttributesInput>,
-    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        self.op_get_object_attributes(req).await
-    }
-
-    async fn head_bucket(
-        &self,
-        req: S3Request<HeadBucketInput>,
-    ) -> S3Result<S3Response<HeadBucketOutput>> {
-        self.op_head_bucket(req).await
-    }
-
-    async fn head_object(
-        &self,
-        req: S3Request<HeadObjectInput>,
-    ) -> S3Result<S3Response<HeadObjectOutput>> {
-        self.op_head_object(req).await
-    }
-
-    async fn list_buckets(
-        &self,
-        req: S3Request<ListBucketsInput>,
-    ) -> S3Result<S3Response<ListBucketsOutput>> {
-        self.op_list_buckets(req).await
-    }
-
-    async fn list_multipart_uploads(
-        &self,
-        req: S3Request<ListMultipartUploadsInput>,
-    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        self.op_list_multipart_uploads(req).await
-    }
-
-    async fn list_objects(
-        &self,
-        req: S3Request<ListObjectsInput>,
-    ) -> S3Result<S3Response<ListObjectsOutput>> {
-        self.op_list_objects(req).await
-    }
-
-    async fn list_objects_v2(
-        &self,
-        req: S3Request<ListObjectsV2Input>,
-    ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        self.op_list_objects_v2(req).await
-    }
-
-    async fn list_parts(
-        &self,
-        req: S3Request<ListPartsInput>,
-    ) -> S3Result<S3Response<ListPartsOutput>> {
-        self.op_list_parts(req).await
-    }
-
-    async fn put_object(
-        &self,
-        req: S3Request<PutObjectInput>,
-    ) -> S3Result<S3Response<PutObjectOutput>> {
-        self.op_put_object(req).await
-    }
-
-    async fn upload_part(
-        &self,
-        req: S3Request<UploadPartInput>,
-    ) -> S3Result<S3Response<UploadPartOutput>> {
-        self.op_upload_part(req).await
-    }
-
-    async fn upload_part_copy(
-        &self,
-        req: S3Request<UploadPartCopyInput>,
-    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        self.op_upload_part_copy(req).await
-    }
+client_ops! {
+    "AbortMultipartUpload" abort_multipart_upload(AbortMultipartUploadInput) -> AbortMultipartUploadOutput => op_abort_multipart_upload [bucket key];
+    "CompleteMultipartUpload" complete_multipart_upload(CompleteMultipartUploadInput) -> CompleteMultipartUploadOutput => op_complete_multipart_upload [bucket key];
+    "CopyObject" copy_object(CopyObjectInput) -> CopyObjectOutput => op_copy_object [bucket key];
+    "CreateBucket" create_bucket(CreateBucketInput) -> CreateBucketOutput => op_create_bucket [bucket];
+    "CreateMultipartUpload" create_multipart_upload(CreateMultipartUploadInput) -> CreateMultipartUploadOutput => op_create_multipart_upload [bucket key];
+    "DeleteBucket" delete_bucket(DeleteBucketInput) -> DeleteBucketOutput => op_delete_bucket [bucket];
+    "DeleteObject" delete_object(DeleteObjectInput) -> DeleteObjectOutput => op_delete_object [bucket key];
+    "DeleteObjects" delete_objects(DeleteObjectsInput) -> DeleteObjectsOutput => op_delete_objects [bucket];
+    "GetBucketLocation" get_bucket_location(GetBucketLocationInput) -> GetBucketLocationOutput => op_get_bucket_location [bucket];
+    "GetBucketVersioning" get_bucket_versioning(GetBucketVersioningInput) -> GetBucketVersioningOutput => op_get_bucket_versioning [bucket];
+    "GetObject" get_object(GetObjectInput) -> GetObjectOutput => op_get_object [bucket key];
+    "GetObjectAttributes" get_object_attributes(GetObjectAttributesInput) -> GetObjectAttributesOutput => op_get_object_attributes [bucket key];
+    "HeadBucket" head_bucket(HeadBucketInput) -> HeadBucketOutput => op_head_bucket [bucket];
+    "HeadObject" head_object(HeadObjectInput) -> HeadObjectOutput => op_head_object [bucket key];
+    "ListBuckets" list_buckets(ListBucketsInput) -> ListBucketsOutput => op_list_buckets [];
+    "ListMultipartUploads" list_multipart_uploads(ListMultipartUploadsInput) -> ListMultipartUploadsOutput => op_list_multipart_uploads [bucket];
+    "ListObjects" list_objects(ListObjectsInput) -> ListObjectsOutput => op_list_objects [bucket];
+    "ListObjectsV2" list_objects_v2(ListObjectsV2Input) -> ListObjectsV2Output => op_list_objects_v2 [bucket];
+    "ListParts" list_parts(ListPartsInput) -> ListPartsOutput => op_list_parts [bucket key];
+    "PutObject" put_object(PutObjectInput) -> PutObjectOutput => op_put_object [bucket key];
+    "UploadPart" upload_part(UploadPartInput) -> UploadPartOutput => op_upload_part [bucket key];
+    "UploadPartCopy" upload_part_copy(UploadPartCopyInput) -> UploadPartCopyOutput => op_upload_part_copy [bucket key];
 }

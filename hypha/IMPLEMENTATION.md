@@ -61,7 +61,7 @@ sync; hypha drives it over adapters bridged via `spawn_blocking` (§5).
 | S3 server / clients  | `s3s`, `s3s-aws`, `aws-sdk-s3`, `aws-config`                        |
 | Encryption / hashing | `age`, `hmac`+`sha2` (trailer MAC, §6), `md-5`, `hex`                 |
 | Config / errors      | `serde`, `figment`; `thiserror`, `anyhow` (bootstrap)               |
-| Observability        | `tracing`(+`subscriber`); `metrics` + Prometheus exporter (planned) |
+| Observability        | `tracing`(+`subscriber`); `metrics` + `metrics-exporter-prometheus` (rendered on hypha's own admin listener, so none of the exporter's listener/push features are on), `hyper`+`http-body-util` for it |
 | Concurrency          | `dashmap` (the §4 key-lock table), `arc-swap` (the §7 bucket state) |
 | GC                   | `fastbloom` (the §8 recency ring; `rand` off, seed pinned so slices survive a restart) |
 | Testing              | `proptest`, `criterion`, `cargo fuzz`, `testcontainers`             |
@@ -97,11 +97,14 @@ hypha/src/
     overlay.rs           restore overlay: readiness gate + cache-vs-remote source for reads/writes (§7)
   markers.rs             pending-marker obligations and the clean marker (§6/§7)
   volume_watch.rs        the one failure a running process polls for: cache volume loss (§7)
+  metrics.rs             §10's exports, one named function per thing that happened
+  admin.rs               §10's listener: /metrics, /healthz, /readyz
   replication.rs         (phase 4) the cached-mode reconcile sweep (§7)
   gc/                    (phase 5) the GC actor, active-only (§8): mod.rs (the actor — cadence,
                          the state it owns, and each pass), ring.rs (the Bloom-ring sketch),
                          ladder.rs (the pressure ladder as one ordered position),
-                         scan.rs (probes + the learned per-bucket cold yields),
+                         scan.rs (probes + the learned per-bucket cold yields and
+                         key-prefix distributions),
                          evict.rs (the three eviction gates), orphans.rs (superseded shadow
                          bodies: the queue, the marker, the backstop),
                          usage.rs (cache usage +
@@ -542,7 +545,11 @@ the remote's retag *is* the version. Survives process restarts across a multi-ho
 > range (its prefix is self-describing) rather than paying it on the client's critical path. On the
 > **local** cache the request-count saving a batch delete would buy is small anyway (sub-ms RTT), so
 > deferral — not batching, and not a third bucket to make the keys XML-safe — is the right lever.
-> Until phase 5 lands the sweep, complete/abort still drop the range inline as a fallback.
+> The sweep is the *only* path: an inline drop beside it would be a second mechanism for a reclaim
+> the first already finds for free, and could not replace it anyway, since a process that dies
+> between the commit and the delete leaves the range regardless. Abort is the case that most looks
+> like it wants one and least deserves it — a maxed upload is 10 000 deletes on the client's call to
+> say "throw this away".
 
 **The sync marker**: an object at `0x01 0x01 s`, present iff a namespace
 reconciliation has completed — namespace trust recorded in the cache itself, dying with the
@@ -630,10 +637,6 @@ per-part age files plus the terminating `table ‖ facts ‖ tag ‖ version` tr
 part boundaries come from the trailer's own offset table, and per-part plaintext lengths fall
 out of the closed form against the constant `HLEN` — hypha never reads the remote's native part
 index, so a part-index-less remote is unrestricted (§9).
-
-**Prefix-distribution hint**: approximate per-prefix key counts at a reserved key, refreshed for
-free by the §8 scan — advisory sharding input for the namespace restore (§7), and what corrects the
-scan's own sampling bias toward regions behind large key gaps.
 
 ## 7. Operations
 
@@ -1436,9 +1439,14 @@ The pass, over the one bucket's keyspace:
    pending set is empty and complete when the marker lands.
 
 Facts come from the object's authenticated tail trailer — one bounded suffix GET per key, single-part
-and composite alike (§6). Throughput comes from sharding the keyspace, with shard boundaries from the
-prefix-distribution hint (§6); a stale or missing hint degrades to `delimiter=/` discovery with
-`start-after` splits, and the marker is written only after every shard drains.
+and composite alike (§6). Throughput is **fan-out over one cursor**, not a sharded keyspace. The
+per-key work is a trailer read plus two small writes, so a page of a thousand keys is three thousand
+round trips behind one listing call: a single cursor feeds any concurrency worth running, and
+splitting the keyspace to parallelize the *listing* would be optimizing the one part that is already
+free. Shard boundaries would also have to come from somewhere, and every source of them —
+`delimiter=/` discovery, a persisted key-count sketch — is approximate, so the shards arrive
+unbalanced and the pass ends when its unluckiest one does. Fanning out from one cursor is balanced by
+construction, and it removes the join a sharded pass would have to make before writing the marker.
 
 **R2 — the pending-set rebuild.** The namespace is authoritative here, which is the whole difference,
 so the pass re-derives the *index* and nothing else: walk `<data>`, classify each entry against the
@@ -1543,8 +1551,29 @@ there are no bodies to evict — the task only sweeps debris: orphan twins, left
 marks (repaired per §7), and **all mpu record ranges** — both those of uploads abandoned without
 complete/abort *and* the leftovers of completed/aborted uploads, whose inline drop is deferred here
 (§6, *Multipart upload state*) so complete/abort never pays a large single-object delete on the
-client path. Each range is self-describing by its `0x01 0x01 m ‖ <upload-id> ‖ 0x01` prefix, so the
-sweep finds and reclaims it without a side index. In cached mode it additionally evicts under
+client path — the sweep is the only path that reclaims one. Each range is self-describing by its
+`0x01 0x01 m ‖ <upload-id> ‖ 0x01` prefix, so it is found and reclaimed without a side index.
+
+Only the upload range gets a listing of its own, because only it *names* itself. The other two —
+a twin left beside the wrong K, a transition mark nobody came back for — are single objects
+interleaved with the live keyspace, so instead of a walk each they **ride the pass's probes**, which
+already read both namespaces and already classify every entry to find eviction candidates: a mark
+falls out of the `<data>` walk, a twin out of the `<meta>` one. Nothing extra is listed for either.
+
+Which is why **the probes run in both modes and under no pressure**. Read as the eviction scan alone
+they would be pointless in a durable deployment, which holds no bodies to evict — but a durable
+deployment accrues twins on every write and a mark on every crashed bracket, and those are found
+nowhere else. The pass therefore always walks; what pressure and mode decide is only whether a body
+it found may be *taken*. The cost is the two probes, which is what the separate debris sweeps they
+replaced cost anyway, and the same pages become eviction's the moment there is a byte target.
+
+Both are judged **under K's write lock**, taken with `try_lock` and yielded to whoever holds it —
+the only window in which K and the thing beside it are consistent. A twin is written before the
+tombstone it projects, so an unlocked test would see that gap and delete the twin of a tombstone
+about to exist; a mark under a free lock is exactly the crash-leftover inference the read path
+already makes. A twin is judged by re-deriving it: K's own tombstone metadata is the authoritative
+copy of the facts (§6), so the twin it *would* be given now either is this key or this key is
+debris — which covers the stale-generation and several-twins cases without either being a case. In cached mode it additionally evicts under
 pressure:
 
 **Write-awareness is a property of the remote, not of process memory.** The hazard is one step:
@@ -1596,7 +1625,10 @@ starts at *miss* — the keys the ring affirmatively vouches nothing has touched
 tie-break within a bucket (rehydration lands a fresh mtime, so a just-restored body sorts young).
 
 **Sampling, not a walk.** A *probe* lists from a random position in a bucket and reads at most five
-pages. Nothing tracks a cursor, and the position is fresh every probe: a rotating cursor makes
+pages. There are two per bucket, one per namespace, and each returns everything its pages held rather
+than only what eviction asked for: `<data>` gives live bodies and transition marks, `<meta>` gives
+shadow bodies and twins (the two `<meta>` ranges are disjoint and not contiguous, so its position is
+aimed at one or the other with even odds rather than drawn over the space between them). Nothing tracks a cursor, and the position is fresh every probe: a rotating cursor makes
 eviction pressure correlate with key name — keys early in the keyspace examined on every boot, keys
 late in it only under sustained pressure — and has both replicas sweep in lockstep after a failover.
 Sampling also stops the scan cost from scaling with the keyspace rather than with the pressure, which
@@ -1604,9 +1636,24 @@ is what a full loop over a cold, mostly-untouched bucket spends its round trips 
 
 `start-after` takes a key, so a random position is a random *key-shaped string*, which lands the
 probe at the first key at or after it. That is uniform over the keyspace, not over keys, so it
-favours regions behind large gaps — corrected two ways: the yield feedback below, and (once §6's
-prefix-distribution hint exists) sampling prefixes in proportion to their key counts. The hint is
-refreshed by these probes, the same way it was going to be refreshed by the walk.
+favours regions behind large gaps — and the dominant term is coarse: almost all of the string space
+holds no keys at all, so a bucket whose keys all begin `logs/` takes nearly every probe from before
+its first key or after its last, piling them onto the head of the one populated run.
+
+Both corrections are **learned from the probes themselves and held in memory**. Across buckets, the
+yield feedback below. Within one, a small **prefix distribution** — a decaying sketch of how the
+bucket's keys are spread over their leading characters, counted from every page a probe already
+reads, and used to draw those leading characters so a position lands where keys are known to be. A
+share of positions stays unshaped, for the same reason the yield weighting keeps a floor: a
+distribution that only draws where it has already looked cannot find a prefix that appeared
+afterwards.
+
+Deliberately **not persisted**, and not a shared object. A cold start costs one round of unshaped
+probes — the behaviour that was correct on its own before any of this — so nothing here can be
+wrong, only absent, which is what makes an in-memory sketch the whole of the mechanism rather than a
+cache in front of one. The alternative considered and rejected was a reserved key holding
+approximate per-prefix counts, refreshed by these same probes: a persisted structure, a refresh
+cadence, a staleness rule and a fallback path, all to save a first pass from being uninformed.
 
 **Where to probe is learned.** Each bucket carries a running **cold yield** — evictable candidates
 per page — and buckets are sampled in proportion to it, so a bucket that is mostly working set stops
@@ -1868,7 +1915,8 @@ role fixed per §6, so deployments share an account in disjoint namespaces by di
 prefix alone, and no two roles can be configured into overlapping namespaces at all,
 `mode` (`durable` | `cached`), `auth` (hypha's own
 client credentials for `S3Auth`), `master_passphrase` (the 256-bit random age passphrase, from a Secret; supersedes phase 1's
-`master_identity`), `serving.listen` + `serving.offload_threshold` (§5), `reconcile.interval_ms` +
+`master_identity`), `serving.listen` + `serving.admin_listen` (§10's metrics and probes, on a
+listener of their own) + `serving.offload_threshold` (§5), `reconcile.interval_ms` +
 `reconcile.concurrency` (the §7 sweep's cadence and per-pass fan-out, and the marker queue's write
 fan-out; that queue and §8's shadow-orphan queue are both deliberately unbounded and so have no depth
 knob, and `interval_ms` paces the retry of each),
@@ -1886,9 +1934,8 @@ count is *derived* from those two rather than configured, so the pair cannot dri
 deep but saturated filter), and `gc.usage`, the tagged usage-source block (today
 `kind = "seaweedfs"` with the master URL and a vacuum `garbage_threshold`). Omitting `gc.usage`
 leaves GC unable to measure pressure, so it sweeps debris and never evicts — a warning at boot in
-cached mode, and the correct configuration for durable mode, which has no bodies to evict. Later
-phases add restore fan-out + hint interval, and the §4 fencing block (identity selectors, lease
-timings, fence-confirm timeout, settle delay).
+cached mode, and the correct configuration for durable mode, which has no bodies to evict. Phase 6 adds
+the §4 fencing block (identity selectors, lease timings, fence-confirm timeout, settle delay).
 
 The **drain budgets are deliberately not configurable**: they are one number per shutdown phase (§9),
 meaningful only against the pod's `terminationGracePeriod`, which has to cover their sum plus `preStop`
@@ -1922,18 +1969,37 @@ itself stays owned by the `seaweedfs`/`cilium` charts per repo convention.
 
 ## 10. Observability
 
-`tracing` spans per request (op, key, bytes, cache-hit); JSON in-cluster. `metrics` → Prometheus:
+`tracing` spans per request (op, bucket, key, bytes, cache-hit); JSON in-cluster, emitted on the
+span's **close**, so one line per request carries both the fields and the latency. The span is opened
+by the same op table that reports the metric, and the request-side fields are **declared there** —
+which of `bucket`/`key` an op has is part of its entry, so a new op cannot be added without
+answering that, and a bucket op logs no empty `key` pretending to be one. `bytes` and `cache_hit`
+are not knowable from the request, so the handler fills them in where it learns them: the same call
+that decides a read resolved against the cache or the remote reports it to both surfaces at once. `metrics` → Prometheus:
 rate/latency by op, cache hit ratio, **pending-marker set size + reconcile pass duration**,
 **`markers_owed` and buckets left dirty at drain** (both should be flat zero — markers owed means the
 cache is refusing small writes, and it is also the queue's only bound, §7),
-remote-upload latency/retries, role + failover count + fence-confirm latency, scavenge throughput,
+remote-upload latency, scavenge throughput split by whether the bytes cost a client anything (debris
+is free; an eviction is paid back later as rehydration latency), debris reclaimed by class,
 usage vs. water marks, and the **rung of §8's escalation ladder currently engaged** — which is what
 tells an operator whether GC is coping, and whose top with the target still unmet is the
-cache-undersized signal, the one GC condition that warns. An invariant violation needs no metric of its own — the process shuts
+cache-undersized signal, the one GC condition that warns. Phase 6 adds role + failover count +
+fence-confirm latency. An invariant violation needs no metric of its own — the process shuts
 down and exits, so it shows up as a crashloop and as the halt marker on the remote
-(§6) — but the exit code (`86`) is distinct from any other so a supervisor can tell it apart. `/healthz` + `/readyz` (remote reachable, and in cached mode every
-bucket's clean marker cleared — §7 *Startup*); active/passive is a reported
-condition, not a readiness gate.
+(§6) — but the exit code (`86`) is distinct from any other so a supervisor can tell it apart.
+
+The exports are a **vocabulary, not a facade**: one named function per thing that happened, taking
+the numbers its caller already holds, so a metric's name, unit and labels have exactly one home and
+a call site reads as the event rather than as instrumentation. The recorder is installed by the
+**binary**, and with none installed every export is a no-op — which is what lets the integration
+harness run many hyphas in one process.
+
+`/metrics`, `/healthz` and `/readyz` are served on **`serving.admin_listen`**, separate from the S3
+port: they are unauthenticated and in-cluster, the S3 port is neither, and they must keep answering
+while it is refusing. Readiness reports what makes an answer *wrong* rather than slow — startup not
+finished (in cached mode, a clean marker perhaps not yet cleared — §7 *Startup*), a drain begun, or
+a remote hypha cannot reach; active/passive is a reported condition, not a readiness gate, since a
+passive that failed its probe could not be promoted into.
 
 ## 11. Testing strategy
 
@@ -2015,7 +2081,8 @@ condition, not a readiness gate.
   its `pmd5` record; orphan ignored and swept), including two concurrent same-part uploads;
   process restart mid-upload (`pmd5` recovered from mpu state); composite ETag correctness;
   single-stream composite GET + ranged GET across part boundaries (uniform and ragged part sizes)
-  driven off the trailer's offset table; abort cleanup (batched delete); crash at complete *plus*
+  driven off the trailer's offset table; abort cleanup — asserted against the §8 sweep, which is the
+  only path that reclaims a record range (§6); crash at complete *plus*
   cache wipe ⇒ restore decrypts the facts + table off the terminating trailer part.
 - **Failover/fencing**: two replicas, partition the active, assert fence→confirm→drain→promote —
   old active's writes refused at the backend before the new active writes; graceful path too.
@@ -2030,6 +2097,21 @@ condition, not a readiness gate.
   and an `#[ignore]`d **load/concurrency** suite — throughput, no-double-create-under-contention,
   parallel multipart (`load.rs`). Still to add: SeaweedFS as the cache backend, and a real zero-loss
   client (ZeroFS) against the durable endpoint.
+- **GC's quiet paths** (`gc.rs`, built): the ones whose failure is *silent*, which is why they are
+  tested ahead of the deferred §8 pass — a recency slice that never reaches GC's bucket, an mpu range
+  never reclaimed, an orphan twin diluting every LIST that covers it, a transition mark costing a
+  remote HEAD forever. The twin sweep asserts both directions from one population: the
+  superseded-generation twin and the one whose key never existed both go, and the twin actually
+  projecting a settled key stays — a sweep that took *that* would push its key onto the HEAD
+  fallback. The mark is asserted without reading the key through hypha, since a read would repair it
+  and prove nothing. All of it runs **durable**, which is the second assertion: the probes these ride
+  are taken for the debris alone, in the mode where eviction would never call for them.
+- **The operational surface** (`admin.rs`, built): probes and exposition against the real **binary**,
+  which is the only place the recorder is installed and the admin port bound at all (§10) — a
+  deployment that scrapes nothing while serving perfectly is invisible to every other test. Metric
+  names are strings, so the round trip from a call site to the exposition is what pins them; the
+  ladder gauge is asserted separately because it is written by a background actor rather than a
+  request.
 - **External conformance** — third-party suites run against a booted hypha, complementing the
   hand-written cases above (which assert hypha-specific internals the black-box suites can't see):
   - **`s3s-e2e`** (`s3s-project/s3s`, version-matched to our `s3s`): the S3 test suite from the
@@ -2095,15 +2177,29 @@ Each phase's mechanism is specified in §§1–10 above; this section tracks sco
 | 4 | Cached mode, single replica: marker queue, clean marker, reconcile sweep (`replication.rs`), cached DELETE propagation, rehydrate | Done vs. MinIO |
 | 4a | The two recoveries split apart (§7): additive R1 (remote walk) + marker-only R2 (two-cursor join), the per-bucket write-mode gate (durable semantics for a restore window), full startup resolution of bucket state + the volume watchdog, invariants I1–I7 and the halt marker (§6) | Done vs. MinIO |
 | 5 | GC: the actor and its passes, Bloom ring + touch feeders + slice persistence, usage source + vacuum and the water marks, probabilistic scan (random-position probes over bodies *and* shadows, yield-weighted bucket choice), the pressure ladder (interval → concurrency → age threshold), threshold eviction — bodies through the three gates, shadows through one conditional delete — the shadow-orphan queue/marker/backstop, mpu-range debris sweep | Done vs. MinIO |
-| 5a | The rest of phase 5: the remaining debris classes (orphan twins, leftover transition marks), §6's prefix-distribution hint writer, restore sharding, §10's metrics | Not started |
+| 5a | The rest of phase 5: the remaining debris classes (orphan twins, leftover transition marks) riding the pass's own probes, which therefore run in both modes and unpressured; the in-memory prefix distribution shaping probe positions, §10's metrics + `/healthz`/`/readyz` on their own listener | Done vs. MinIO |
 | 6 | `hypha-fence` + active-passive: two-pod StatefulSet, leader-elected controller, lease, fence→confirm→drain→promote | Not started |
 | 7 | `hypha/` chart, dashboards, the two production installs (cached + durable) | Not started |
 
 Per-phase exit criteria live with their test suites (§11) rather than restated here; phases 1–4's
 suites are `hypha-format`'s round-trip/bench tests and `hypha/tests/{conformance,fuzz,multipart,
 copy,cached,recovery}.rs` plus the s3s-e2e pass (§11). Phase 5's exit is the scavenge/rehydrate and
-cache-wipe → restore → rehydrate scenarios; phase 6's is the §11 partition harness; phase 7's
+cache-wipe → restore → rehydrate scenarios — still outstanding, with `gc.rs`/`admin.rs` covering only
+the paths that would fail silently; phase 6's is the §11 partition harness; phase 7's
 is both endpoints live behind the shared Gateway.
+
+**Phase 5a's correction generalizes past its own two features.** Both dropped items — a persisted
+prefix-distribution hint, and sharding the namespace restore — existed to make a *listing* faster,
+and in both places listing was never the cost: the restore pays three round trips per key behind one
+page of a thousand, and the scan's bias is a property of where it aims rather than of how fast it
+reads. The hint would have paid for that with a stored object, a refresh cadence, a staleness rule
+and a fallback path; the sharding with approximate boundaries and a join. What replaced them is
+smaller in both cases and strictly better on the axis that mattered — an in-memory sketch that
+cannot be stale because nothing depends on it being right, and fan-out over one cursor, which is
+balanced by construction where hint-derived shards are balanced only to the accuracy of the hint.
+The rule is that **a structure invented to speed something up owes an account of which round trips
+it removes**, and derived state that must be persisted, refreshed and fallen back from is the most
+expensive way to buy an optimization that a cold start would have covered anyway.
 
 **Phase 4a's correction is the one most worth keeping**, because the mistake generalizes. Phases 3a/4
 implemented both recoveries as *one* traversal on the grounds that they walk the same two namespaces

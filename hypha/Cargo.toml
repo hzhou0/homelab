@@ -33,11 +33,17 @@ s3s = "0.14"
 s3s-aws = "0.14"
 aws-sdk-s3 = "1"
 hyper = "1"
+http-body-util = "0.1"   # the admin listener's fixed-body responses; already in-tree via s3s
 hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio"] }
 # The §8 usage source, which is HTTP+JSON rather than S3. No TLS feature: the endpoints it reads are
 # the cache backend's own admin surface, in-cluster and plain HTTP, so pulling a second TLS stack in
 # beside the SDK's would buy nothing.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
+
+# Observability (§10). The exporter renders a text body on demand; hypha serves it from its own
+# admin listener beside the health probes, so none of the crate's own listener/push features are on.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 serde_json = "1"
 
 # Config / errors / observability

@@ -82,8 +82,16 @@ impl Minio {
             .env("MINIO_ROOT_USER", MINIO_USER)
             .env("MINIO_ROOT_PASSWORD", MINIO_PASS)
             .env("MINIO_UPDATE", "off")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(if std::env::var("TEST_HYPHA_LOGS").is_ok() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if std::env::var("TEST_HYPHA_LOGS").is_ok() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .unwrap_or_else(|e| panic!("spawning `{bin} server` (set HYPHA_TEST_MINIO_BIN?): {e}"));
 
@@ -204,8 +212,16 @@ impl ChildHypha {
             .envs(config_env(config))
             // A stray `hypha.toml` in the crate dir would otherwise layer under the env config.
             .current_dir(std::env::temp_dir())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(if std::env::var("TEST_HYPHA_LOGS").is_ok() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if std::env::var("TEST_HYPHA_LOGS").is_ok() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .expect("spawning the hypha binary");
 
@@ -289,6 +305,10 @@ fn config_env(config: &Config) -> HashMap<String, String> {
         config.serving.listen.clone(),
     );
     env.insert(
+        "HYPHA_SERVING__ADMIN_LISTEN".into(),
+        config.serving.admin_listen.clone(),
+    );
+    env.insert(
         "HYPHA_SERVING__OFFLOAD_THRESHOLD".into(),
         config.serving.offload_threshold.to_string(),
     );
@@ -299,6 +319,33 @@ fn config_env(config: &Config) -> HashMap<String, String> {
     env.insert(
         "HYPHA_RECONCILE__CONCURRENCY".into(),
         config.reconcile.concurrency.to_string(),
+    );
+    // Without these the child would run GC's *production* cadence — a five-minute interval and a
+    // hundred-thousand-key ring — while every in-process test runs the harness's, so a subprocess
+    // test that touched GC at all would silently be testing nothing.
+    env.insert(
+        "HYPHA_GC__INTERVAL_MS".into(),
+        config.gc.interval_ms.to_string(),
+    );
+    env.insert(
+        "HYPHA_GC__MIN_INTERVAL_MS".into(),
+        config.gc.min_interval_ms.to_string(),
+    );
+    env.insert(
+        "HYPHA_GC__CONCURRENCY".into(),
+        config.gc.concurrency.to_string(),
+    );
+    env.insert(
+        "HYPHA_GC__MAX_CONCURRENCY".into(),
+        config.gc.max_concurrency.to_string(),
+    );
+    env.insert(
+        "HYPHA_GC__RECENCY__FILL_TARGET".into(),
+        config.gc.recency.fill_target.to_string(),
+    );
+    env.insert(
+        "HYPHA_GC__RECENCY__DEPTH".into(),
+        config.gc.recency.depth.to_string(),
     );
     env
 }
@@ -353,6 +400,10 @@ impl Harness {
         let minio = Minio::start().await;
         let mut config = base_config(&minio, mode);
         config.serving.listen = format!("127.0.0.1:{}", free_port());
+        // Its own port per subprocess, since several of these run concurrently and the production
+        // default is a fixed one (§10). Nothing here scrapes it — binding it is what is under test,
+        // because a bind failure would take the whole process down.
+        config.serving.admin_listen = format!("127.0.0.1:{}", free_port());
         let hypha = Server::Child(ChildHypha::start(&config).await);
         Self {
             minio,
@@ -468,7 +519,10 @@ fn base_config(minio: &Minio, mode: Mode) -> Config {
             secret_key: HYPHA_SECRET.to_string(),
         },
         master_passphrase: MASTER_PASSPHRASE.to_string(),
-        serving: Serving::default(),
+        serving: Serving {
+            admin_listen: format!("127.0.0.1:{}", free_port()),
+            ..Serving::default()
+        },
         // A tight reconcile cadence so cached-mode tests observe uploads/propagation promptly rather
         // than waiting out the production interval.
         reconcile: Reconcile {

@@ -62,29 +62,40 @@ impl ReplicationTask {
                 () = shutdown.cancelled() => break,
                 () = tokio::time::sleep(self.interval) => {}
             }
-            if let Err(e) = self.pass().await {
-                tracing::warn!(error = %e, "reconcile pass could not enumerate buckets; retrying");
+            let started = std::time::Instant::now();
+            match self.pass().await {
+                // The pending count is the pass's own census — the markers it enumerated — so it is
+                // the size of the set *before* this pass drained it (§10).
+                Ok(pending) => crate::metrics::reconcile_pass(pending, started.elapsed()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "reconcile pass could not enumerate buckets; retrying")
+                }
             }
         }
     }
 
     /// One sweep across every cache-backed bucket. The `<meta>` bucket exists if hypha provisioned
     /// the bucket, so listing those names is the bucket set to reconcile.
-    async fn pass(&self) -> Result<()> {
+    async fn pass(&self) -> Result<usize> {
+        let mut pending = 0;
         for (bucket, _) in self.tier.meta.list_buckets().await? {
-            if let Err(e) = self.reconcile_bucket(&bucket).await {
-                tracing::warn!(bucket, error = %e, "reconcile pass for bucket failed; retrying next pass");
+            match self.reconcile_bucket(&bucket).await {
+                Ok(seen) => pending += seen,
+                Err(e) => {
+                    tracing::warn!(bucket, error = %e, "reconcile pass for bucket failed; retrying next pass")
+                }
             }
         }
-        Ok(())
+        Ok(pending)
     }
 
     /// Drain one bucket's pending markers. The flat LIST past the `0x01` block yields only range-C
     /// bare markers; a residual `0x01`-lead key (a boundary miscompare) is filtered defensively so a
     /// twin can never be mistaken for a marker.
-    async fn reconcile_bucket(&self, bucket: &str) -> Result<()> {
+    async fn reconcile_bucket(&self, bucket: &str) -> Result<usize> {
         let mut token: Option<String> = None;
         let mut first = true;
+        let mut seen = 0;
         loop {
             let page = self
                 .tier
@@ -113,6 +124,7 @@ impl ReplicationTask {
                 })
                 .collect();
 
+            seen += markers.len();
             futures::stream::iter(markers)
                 .for_each_concurrent(self.concurrency, |(key, m_etag)| async move {
                     if let Err(e) = self.reconcile_key(bucket, &key, &m_etag).await {
@@ -126,7 +138,7 @@ impl ReplicationTask {
                 None => break,
             }
         }
-        Ok(())
+        Ok(seen)
     }
 
     /// Reconcile one pending key, under its upload lock (§7). Classify K's cache body once to pick
@@ -144,7 +156,15 @@ impl ReplicationTask {
         let Some(_up) = self.tier.upload_locks.try_lock(key) else {
             return Ok(());
         };
+        let started = std::time::Instant::now();
+        let outcome = self.transition_key(bucket, key, m_etag).await;
+        crate::metrics::remote_upload(outcome.is_err(), started.elapsed());
+        outcome
+    }
 
+    /// The branch itself, split out so the timing above brackets the whole transition — including the
+    /// classify HEAD, which is part of what one pending key costs.
+    async fn transition_key(&self, bucket: &str, key: &str, m_etag: &str) -> Result<()> {
         let head = match self.tier.data.head(bucket, key).await {
             Ok(h) => h,
             // The body is gone (a delete already cleared it, or the volume was reset): the marker is

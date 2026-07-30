@@ -62,6 +62,10 @@ pub struct ClientAuth {
 pub struct Serving {
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Where §10's metrics and health probes are served. A second listener rather than paths on the
+    /// S3 port: those are unauthenticated and in-cluster, and the S3 port is neither.
+    #[serde(default = "default_admin_listen")]
+    pub admin_listen: String,
     /// A contiguous encrypt/decrypt larger than this offloads to `spawn_blocking` to keep any
     /// single async poll bounded (§5). Bytes of pending plaintext.
     #[serde(default = "default_offload")]
@@ -70,6 +74,9 @@ pub struct Serving {
 
 fn default_listen() -> String {
     "0.0.0.0:8014".to_string()
+}
+fn default_admin_listen() -> String {
+    "0.0.0.0:9014".to_string()
 }
 fn default_offload() -> usize {
     1024 * 1024
@@ -348,6 +355,7 @@ impl Default for Serving {
     fn default() -> Self {
         Serving {
             listen: default_listen(),
+            admin_listen: default_admin_listen(),
             offload_threshold: default_offload(),
         }
     }

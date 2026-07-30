@@ -47,7 +47,7 @@ async fn evict_body(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<
     if !remote_holds_generation(tier, candidate, key).await? {
         tier.raise_marker(bucket, key, etag).await?;
         tracing::debug!(
-            bucket,
+            bucket = %bucket,
             key,
             "eviction candidate is not durable; marker raised"
         );

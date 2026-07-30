@@ -605,7 +605,6 @@ impl Hypha {
         self.tier
             .settle_evict_locked(&bucket, &key, total_plen, &cetag, mtime_ms, carrier)
             .await?;
-        self.drop_mpu_state(&bucket, &upload_id).await?;
 
         // A completed composite is remote-resident with only a tombstone at K, so what a future
         // eviction could take — and therefore what this write is a statement of interest in — is the
@@ -634,11 +633,11 @@ impl Hypha {
             .abort_multipart(&input.bucket, &input.key, &input.upload_id)
             .await
         {
-            // Already gone remotely: still drop our records — abort is idempotent.
+            // Already gone remotely: abort is idempotent, and the records go the same way either
+            // way — the remote no longer running this upload is the whole of what the sweep needs.
             Ok(()) | Err(Error::NotFound) => {}
             Err(e) => return Err(e.into()),
         }
-        self.drop_mpu_state(&input.bucket, &input.upload_id).await?;
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
@@ -812,32 +811,6 @@ impl Hypha {
             token = page.next_continuation_token;
             if token.is_none() {
                 return Ok(out);
-            }
-        }
-    }
-
-    /// Drop everything recorded for one upload (the `mpu/<id>/` range); complete/abort both end
-    /// here. The §8 sweep reclaims records of uploads abandoned without either.
-    async fn drop_mpu_state(&self, bucket: &str, upload_id: &str) -> Result<(), Error> {
-        let prefix = meta::mpu_prefix(upload_id);
-        loop {
-            let page = self
-                .meta()
-                .list(bucket, Some(prefix.clone()), None, None, None, None)
-                .await?;
-            let objs = page.contents.unwrap_or_default();
-            if objs.is_empty() {
-                return Ok(());
-            }
-            // mpu record keys carry the 0x01 control byte (range A, §6), which XML 1.0 can't
-            // represent — so, like twins (§11 carve-out), they go through single-object
-            // `DeleteObject` (key in the percent-encoded URL path), never the batch `DeleteObjects`
-            // whose XML body would be rejected. One LIST page (≤1000 keys) deleted concurrently.
-            let keys: Vec<String> = objs.into_iter().filter_map(|o| o.key).collect();
-            let deletes = keys.iter().map(|k| self.meta().delete(bucket, k));
-            futures::future::try_join_all(deletes).await?;
-            if page.is_truncated != Some(true) {
-                return Ok(());
             }
         }
     }

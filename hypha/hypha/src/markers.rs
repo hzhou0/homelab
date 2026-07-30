@@ -207,6 +207,9 @@ impl MarkerActor {
             }
         }
         self.write_all(&mut owed).await;
+        // Both are flat zero in health (§10): an owed marker at drain is the cache refusing small
+        // writes, and every bucket left dirty is a rebuild the next run pays for before it serves.
+        crate::metrics::buckets_dirty_at_drain(self.dirty_at_drain(sealed && owed.is_empty()));
         match (sealed, owed.is_empty()) {
             (true, true) => self.mark_clean().await,
             (true, false) => tracing::warn!(
@@ -214,6 +217,16 @@ impl MarkerActor {
                 "markers still owed at drain; no clean markers written"
             ),
             (false, _) => tracing::warn!("marker queue closed without a drain; no clean markers"),
+        }
+    }
+
+    /// Buckets this run will not vouch for: all of them unless the drain earned the right to write
+    /// clean markers, and in that case the ones it never accounted for.
+    fn dirty_at_drain(&self, clean: bool) -> usize {
+        let live = self.queue.buckets.ready().len();
+        match clean {
+            true => live.saturating_sub(self.queue.buckets.accounted().len()),
+            false => live,
         }
     }
 
@@ -281,6 +294,7 @@ impl MarkerActor {
         for r in failed {
             owed.insert(r.dedup_key(), r);
         }
+        crate::metrics::markers_owed(owed.len());
     }
 
     /// Write the clean marker for each bucket this run accounted for, and for no other. Reached only

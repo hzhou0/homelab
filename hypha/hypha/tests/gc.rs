@@ -1,9 +1,16 @@
-//! Phase-5 GC (§8). The §11 pass proper is still deferred; what lives here now are the two paths
-//! that fail **silently** if they are wrong — a recency slice that never reaches `<meta>` and an
-//! mpu range that is never reclaimed both degrade quietly rather than failing a request.
+//! Phase-5 GC (§8). The §11 pass proper is still deferred; what lives here now are the paths that
+//! fail **silently** if they are wrong — a recency slice that never reaches `<meta>`, an mpu range
+//! that is never reclaimed, an orphan twin that dilutes every LIST page covering it, and a
+//! transition mark that quietly costs a remote round trip forever. None of them fails a request,
+//! which is exactly why none of them would be noticed.
+//!
+//! All of it runs against a **durable** harness on purpose: the sampled classes ride the pass's
+//! probes, and a durable deployment evicts nothing — so this is also the assertion that those probes
+//! are taken for the debris alone, in a mode where eviction would never call for them (§8).
 
 mod common;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
@@ -208,6 +215,93 @@ async fn completed_upload_records_are_reclaimed() {
         "the upload's record range to be reclaimed",
         || async { meta_keys(&h, &meta::mpu_scan_prefix()).await.is_empty() },
     )
+    .await;
+}
+
+/// Plant a twin for `key` carrying facts nothing at `key` projects — the shape every crash between a
+/// twin write and the K write meant to accompany it leaves behind (§6).
+async fn plant_twin(h: &Harness, key: &str, mtime_ms: i64) -> String {
+    let twin = meta::Facts {
+        client_etag: md5_hex(b"whatever this twin claims"),
+        plen: 7,
+        mtime_ms,
+    }
+    .twin_key(key)
+    .expect("twin key");
+    h.raw()
+        .put_object()
+        .bucket(h.meta_bucket(B))
+        .key(&twin)
+        .body(ByteStream::from(Vec::new()))
+        .send()
+        .await
+        .expect("plant twin");
+    twin
+}
+
+async fn twins_of(h: &Harness, key: &str) -> Vec<String> {
+    let c = meta::CTRL as char;
+    meta_keys(h, &format!("{c}{key}{c}")).await
+}
+
+/// Both orphan shapes, and the one twin that must survive them: a twin whose K holds a *different*
+/// generation, a twin whose K never existed, and the live projection of a real eviction tombstone.
+/// The last is the assertion that matters — a sweep that reclaimed it would push every LIST of that
+/// key onto the per-key HEAD fallback.
+#[tokio::test]
+async fn orphan_twins_are_reclaimed_and_the_live_one_is_not() {
+    let h = Harness::durable().await;
+    let c = h.client();
+    h.create_bucket(B).await;
+
+    // A durable PUT settles K to an eviction tombstone and writes its twin: the live one.
+    put(&c, B, "settled", b"hello").await;
+    let live = twins_of(&h, "settled").await;
+    assert_eq!(live.len(), 1, "a settled key has exactly one twin");
+
+    let superseded = plant_twin(&h, "settled", 424_242).await;
+    let keyless = plant_twin(&h, "never-existed", 424_242).await;
+
+    wait_until(5_000, "both orphan twins to be reclaimed", || async {
+        let remaining = meta_keys(&h, &(meta::CTRL as char).to_string()).await;
+        !remaining.contains(&superseded) && !remaining.contains(&keyless)
+    })
+    .await;
+
+    assert_eq!(
+        twins_of(&h, "settled").await,
+        live,
+        "the sweep took the twin that was actually projecting a key"
+    );
+}
+
+/// A transition mark whose bracket died is resolved by any read (§7), so the sweep's job is the keys
+/// nothing reads — which would otherwise hold one indefinitely and pay a remote HEAD on every LIST
+/// page that covers them. Asserted without touching the key through hypha, since a read would repair
+/// it and prove nothing.
+#[tokio::test]
+async fn a_leftover_transition_mark_is_repaired() {
+    let h = Harness::durable().await;
+    let c = h.client();
+    h.create_bucket(B).await;
+
+    put(&c, B, "stranded", b"hello").await;
+    let mut md = HashMap::new();
+    md.insert(meta::TOMB.to_string(), meta::TOMB_TRANSIT.to_string());
+    raw_cache_put(&h, B, "stranded", meta::TRANSIT_SENTINEL.to_vec(), md).await;
+
+    wait_until(5_000, "the mark to be repaired from the remote", || async {
+        let head = h
+            .raw()
+            .head_object()
+            .bucket(h.cache_bucket(B))
+            .key("stranded")
+            .send()
+            .await
+            .expect("head");
+        meta::tomb_kind(&head.metadata().cloned().unwrap_or_default())
+            == Some(meta::TombKind::Evict)
+    })
     .await;
 }
 

@@ -9,6 +9,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use common::*;
 use hypha_core::meta;
@@ -203,7 +204,10 @@ async fn multipart_concurrent_small_final_part() {
     );
 }
 
-/// Abort drops the upload: its records vanish and it can no longer be completed.
+/// Abort drops the upload: the remote stops running it, it can no longer be completed, and its
+/// records are reclaimed — by the §8 sweep, not on the abort itself. A maxed upload's range is 10 000
+/// single-object deletes (its keys carry `0x01`, so no batch delete can represent them), and paying
+/// that on the client's call to say "throw this away" is the cost the deferral exists to remove.
 #[tokio::test]
 async fn multipart_abort_cleanup() {
     let h = Harness::durable().await;
@@ -225,11 +229,18 @@ async fn multipart_abort_cleanup() {
         .expect("abort");
 
     // mpu records live in the <meta> bucket's range A (0x01 0x01 m …, §6).
-    let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
-    assert!(
-        residue.is_empty(),
-        "abort must sweep mpu records, found {residue:?}"
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
+        if residue.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sweep did not reclaim an aborted upload's records, found {residue:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Completing an aborted upload fails, and the object was never created.
     let done = complete_mpu_res(

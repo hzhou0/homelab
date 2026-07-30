@@ -60,6 +60,7 @@ impl Hypha {
                     md,
                 ),
             };
+        super::record_bytes(content_length.unwrap_or_default().max(0) as u64);
 
         let resp = HeadObjectOutput {
             content_length,

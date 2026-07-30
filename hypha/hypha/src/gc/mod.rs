@@ -43,6 +43,7 @@ mod scan;
 mod store;
 mod usage;
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,9 +55,10 @@ use hypha_core::{meta, Backend};
 
 use crate::bucket::BucketCtl;
 use crate::tier::Tiering;
+pub(crate) use debris::Swept;
 use ladder::{Ladder, Setting};
 use ring::{Age, RecencyRing};
-use scan::{Candidate, ProbeYield, Yields};
+use scan::{Candidate, Prefixes, ProbeYield, Yields};
 use store::GcStore;
 use usage::{Usage, UsageSource};
 
@@ -103,6 +105,7 @@ pub(crate) fn spawn(
         GcActor {
             ladder: Ladder::new(cfg, depth),
             yields: Yields::new(cfg.yield_floor),
+            prefixes: Prefixes::new(),
             store: GcStore::new(backend, bucket),
             depth,
             probe_pages: cfg.probe_pages.max(1),
@@ -183,6 +186,8 @@ struct GcActor {
     /// slices to keep.
     depth: usize,
     yields: Yields,
+    /// Where within a bucket its probes land — learned from the same probes that teach the yields.
+    prefixes: Prefixes,
     ladder: Ladder,
     probe_pages: usize,
     opportunistic_evictions: usize,
@@ -307,25 +312,38 @@ impl GcActor {
     fn dispatch(&mut self) -> JoinHandle<PassReport> {
         let swept = self.buckets.ready();
         self.yields.retain(&swept);
-        // Durable mode holds no bodies to evict, so it never probes. Cached mode narrows to the
-        // buckets whose pending set this run accounts for.
-        let evictable: Vec<String> = if self.tier.cached {
+        self.prefixes.retain(&swept);
+        // Every `Ready` bucket is probed, in both modes: the walk is what finds this pass's debris,
+        // and debris accrues wherever the client path acked before its cleanup was done. What mode
+        // and accounting decide is only whether a *body* found there may be taken — durable mode
+        // holds none, and a bucket whose pending set this run has not rebuilt is one whose cache
+        // cannot yet be read as exhaustive (§8).
+        let evictable: HashSet<Arc<str>> = if self.tier.cached {
             let accounted = self.buckets.accounted();
             swept
                 .iter()
                 .filter(|b| accounted.contains(b))
-                .cloned()
+                .map(|b| Arc::from(b.as_str()))
                 .collect()
         } else {
-            Vec::new()
+            HashSet::new()
         };
 
-        // One probe per evictable bucket is the pass's round: enough to keep the yields learning, and
-        // it is the *interval* the ladder shortens when this proves too slow, not the round.
-        let probes = self.yields.sample(&evictable, evictable.len());
+        // One probe per bucket is the pass's round: enough to keep the yields learning, and it is the
+        // *interval* the ladder shortens when this proves too slow, not the round.
+        let probes: Vec<Probe> = self
+            .yields
+            .sample(&swept, swept.len())
+            .into_iter()
+            .map(|bucket| Probe {
+                position: self.prefixes.position(&bucket),
+                bucket: Arc::from(bucket),
+            })
+            .collect();
         let plan = Plan {
             setting: self.ladder.current(),
             swept,
+            evictable,
             probes,
             probe_pages: self.probe_pages,
             opportunistic_evictions: self.opportunistic_evictions,
@@ -344,8 +362,26 @@ impl GcActor {
     /// Fold a finished pass back into the state it was judged against — the yields it taught, and the
     /// one rung the ladder may move on the evidence of exactly one pass (§8).
     fn settle(&mut self, report: PassReport) {
+        let elapsed = report.elapsed;
+        self.fold(report);
+        // After the fold, so the gauge names the rung now engaged rather than the one that has just
+        // been judged — a pass can be minutes long, and the whole point of the metric is what GC is
+        // about to do next.
+        crate::metrics::gc_pass(self.ladder.rung().number(), elapsed);
+    }
+
+    fn fold(&mut self, report: PassReport) {
         for observed in &report.yields {
             self.yields.observe(observed);
+            self.prefixes.observe(&observed.bucket, &observed.prefixes);
+        }
+        if let Some(usage) = &report.usage {
+            crate::metrics::cache_usage(
+                usage.after.used,
+                usage.after.capacity,
+                self.low_water,
+                self.high_water,
+            );
         }
         let Some(usage) = report.usage else {
             // No usage source, or the sample failed: the ladder has no evidence either way, and
@@ -424,12 +460,25 @@ struct Plan {
     setting: Setting,
     /// `Ready` buckets — where debris is swept.
     swept: Vec<String>,
-    /// One bucket per probe, already drawn against the cold yields. Empty in durable mode.
-    probes: Vec<String>,
+    /// Buckets an eviction may take a body from. Empty in durable mode; a subset of `swept` in
+    /// cached, since eviction waits for a bucket's pending-set rebuild (§8).
+    evictable: HashSet<Arc<str>>,
+    /// One entry per probe, already drawn against the cold yields and the learned prefixes.
+    probes: Vec<Probe>,
     probe_pages: usize,
     opportunistic_evictions: usize,
     low_water: f64,
     high_water: f64,
+}
+
+/// One bucket to probe and where in it to start. Drawn on the actor, which owns both learners, so the
+/// pass carries the decision rather than the state behind it.
+struct Probe {
+    /// Shared with every candidate the probe returns, so a bucket name is allocated once per probe
+    /// rather than once per key found — the same reason [`crate::keylocks`] shares its keys.
+    bucket: Arc<str>,
+    /// The `<data>` position only: a shadow probe draws its own, over digests.
+    position: String,
 }
 
 struct Pass {
@@ -445,9 +494,33 @@ struct Pass {
 struct PassReport {
     reclaimed: u64,
     target: u64,
+    elapsed: Duration,
     yields: Vec<ProbeYield>,
     /// `None` when there is no usage source or its sample failed — the ladder then stays put.
     usage: Option<UsageBracket>,
+}
+
+/// What one round of probes found: eviction candidates in the order they should be considered, what
+/// the probes taught the actor's learned state, and the transition marks they passed on the way.
+struct Probed {
+    /// Evictable-bucket candidates only, coldest first. A probe of a bucket eviction may not touch
+    /// still teaches the yields and still reclaims debris — it just has nothing to offer here.
+    candidates: Vec<(Candidate, Age)>,
+    yields: Vec<ProbeYield>,
+    /// Debris the probes reclaimed on their way past, as counts: it is dealt with in the future that
+    /// found it, so nothing about it travels.
+    marks: usize,
+    twins: usize,
+}
+
+/// One bucket's two walks. The debris is already reclaimed by the time this is returned — the probe
+/// holds the bucket and the tier, and nothing above needs to see a key it will never act on.
+#[derive(Default)]
+struct BucketProbe {
+    yields: Vec<ProbeYield>,
+    candidates: Vec<Candidate>,
+    marks: usize,
+    twins: usize,
 }
 
 /// Usage either side of the pass. The *after* sample is what the water marks are read against, and
@@ -459,6 +532,7 @@ struct UsageBracket {
 
 impl Pass {
     async fn execute(self) -> PassReport {
+        let started = std::time::Instant::now();
         let before = self.sample().await;
         let target = before
             .filter(|u| u.ratio() >= self.plan.high_water)
@@ -468,23 +542,41 @@ impl Pass {
         // Rung 0, always first: debris and dead bytes are reclaim at zero rehydration risk — nobody
         // was ever going to read an abandoned upload's parts — so a target met from them alone evicts
         // nothing at all.
-        let mut reclaimed = self.sweep_debris().await;
-        let mut yields = Vec::new();
+        let mut swept = self.sweep_mpu_ranges().await;
         if target > 0 {
             self.compact().await;
-            // Probing is itself listing-heavy, so an unpressured pass doesn't do it: with no target
-            // there is nothing a candidate could be selected *for*.
-            if reclaimed < target {
-                let (candidates, observed) = self.probe().await;
-                yields = observed;
-                reclaimed += self.evict(candidates, target - reclaimed).await;
-            }
         }
+
+        // The probes run in **both modes and under no pressure**, because the walk is not only the
+        // eviction scan: two of the three debris classes are found by classifying entries it reads
+        // regardless (§8), and a durable deployment — which never evicts and so would never probe on
+        // eviction's account alone — accrues both of them. It costs what the separate debris sweeps
+        // it replaced cost, and the same pages serve eviction the moment there is pressure.
+        let probed = self.probe().await;
+        swept.marks += probed.marks;
+        swept.twins += probed.twins;
+
+        let mut reclaimed = swept.bytes;
+        if reclaimed < target {
+            reclaimed += self.evict(probed.candidates, target - reclaimed).await;
+        }
+        let yields = probed.yields;
+        if swept.any() {
+            tracing::info!(
+                uploads = swept.uploads,
+                twins = swept.twins,
+                marks = swept.marks,
+                bytes = swept.bytes,
+                "swept debris"
+            );
+        }
+        crate::metrics::gc_debris_swept(&swept);
 
         let after = self.sample().await;
         PassReport {
             reclaimed,
             target,
+            elapsed: started.elapsed(),
             yields,
             usage: before
                 .zip(after)
@@ -511,8 +603,10 @@ impl Pass {
         }
     }
 
-    async fn sweep_debris(&self) -> u64 {
-        let mut reclaimed = debris::Reclaimed::default();
+    /// The one debris class with a listing of its own: an upload's record range is named by a single
+    /// prefix, so it is swept exhaustively rather than sampled.
+    async fn sweep_mpu_ranges(&self) -> debris::Swept {
+        let mut reclaimed = debris::Swept::default();
         for chunk in self.plan.swept.chunks(self.plan.setting.concurrency.max(1)) {
             let sweeps = chunk
                 .iter()
@@ -527,59 +621,39 @@ impl Pass {
                 }
             }
         }
-        if reclaimed.uploads > 0 {
-            tracing::info!(
-                uploads = reclaimed.uploads,
-                bytes = reclaimed.bytes,
-                "reclaimed mpu record ranges"
-            );
-        }
-        reclaimed.bytes
+        reclaimed
     }
 
     /// Run the pass's probes and return the candidates in the order eviction should consider them:
     /// coldest age first, LastModified ascending within an age (§8).
     ///
-    /// Each probe covers **both** places a bucket keeps plaintext — `<data>`'s client bodies and
-    /// `<meta>`'s shadow bodies — rather than making shadows a separately weighted namespace. One
-    /// bucket's shadows are only the composites something has read back, so the range is usually small
-    /// or empty and the extra listing is close to free; giving it its own yield would mean two
-    /// feedback loops to reason about for a range that mostly does not exist.
-    async fn probe(&self) -> (Vec<(Candidate, Age)>, Vec<ProbeYield>) {
-        let mut candidates = Vec::new();
-        let mut yields = Vec::new();
+    /// Two walks per bucket, one per namespace, and each returns everything its pages contained:
+    /// `<data>` gives client bodies and transition marks, `<meta>` gives shadow bodies and twins.
+    /// Shadows are not a separately weighted namespace — one bucket's shadows are only the composites
+    /// something read back, so that range is usually near-empty and a yield of its own would mean two
+    /// feedback loops to reason about for something that mostly does not exist.
+    async fn probe(&self) -> Probed {
+        let mut found = BucketProbe::default();
         for chunk in self
             .plan
             .probes
             .chunks(self.plan.setting.concurrency.max(1))
         {
-            let probes = chunk.iter().map(|bucket| async move {
-                let pages = self.plan.probe_pages;
-                (
-                    scan::probe_bodies(&self.tier, bucket, pages).await,
-                    scan::probe_shadows(&self.tier, bucket, pages).await,
-                )
-            });
-            // One bucket's listing failing says nothing about the others', so the round continues on
-            // whatever it did find rather than abandoning the pass.
-            for (bucket, found) in chunk.iter().zip(futures::future::join_all(probes).await) {
-                let (bodies, shadows) = found;
-                for found in [bodies, shadows] {
-                    match found {
-                        Ok(found) => {
-                            yields.push(found.yielded(bucket));
-                            candidates.extend(found.candidates);
-                        }
-                        Err(e) => tracing::debug!(bucket, error = %e, "probe failed"),
-                    }
-                }
+            let probes = chunk.iter().map(|probe| self.probe_bucket(probe));
+            for one in futures::future::join_all(probes).await {
+                found.yields.extend(one.yields);
+                found.candidates.extend(one.candidates);
+                found.marks += one.marks;
+                found.twins += one.twins;
             }
         }
 
         let mut aged: Vec<(Candidate, Age)> = {
             let ring = self.ring.lock().expect("recency ring lock poisoned");
-            candidates
+            found
+                .candidates
                 .into_iter()
+                .filter(|candidate| self.plan.evictable.contains(&candidate.bucket))
                 .map(|candidate| {
                     let age = ring.probe(&candidate.qualified());
                     (candidate, age)
@@ -591,7 +665,39 @@ impl Pass {
                 .cmp(left_age)
                 .then(left.mtime_ms.cmp(&right.mtime_ms))
         });
-        (aged, yields)
+        Probed {
+            candidates: aged,
+            yields: found.yields,
+            marks: found.marks,
+            twins: found.twins,
+        }
+    }
+
+    /// Walk one bucket's two namespaces and reclaim what the walks turn up that eviction will not.
+    ///
+    /// One walk's failure says nothing about the other's, or about any other bucket's, so each is
+    /// logged and the round continues on whatever it did find.
+    async fn probe_bucket(&self, probe: &Probe) -> BucketProbe {
+        let (pages, bucket) = (self.plan.probe_pages, &probe.bucket);
+        let mut found = BucketProbe::default();
+
+        match scan::probe_bodies(&self.tier, bucket, probe.position.clone(), pages).await {
+            Ok((yielded, candidates, marked)) => {
+                found.yields.push(yielded);
+                found.candidates = candidates;
+                found.marks = debris::repair_marks(&self.tier, bucket, marked).await;
+            }
+            Err(e) => tracing::debug!(bucket = %bucket, error = %e, "body probe failed"),
+        }
+        match scan::probe_meta(&self.tier, bucket, pages).await {
+            Ok((yielded, candidates, twins)) => {
+                found.yields.push(yielded);
+                found.candidates.extend(candidates);
+                found.twins = debris::reclaim_twins(&self.tier, bucket, twins).await;
+            }
+            Err(e) => tracing::debug!(bucket = %bucket, error = %e, "meta probe failed"),
+        }
+        found
     }
 
     /// Evict coldest-first until `target` bytes are reclaimed, then keep taking **misses** up to the
@@ -640,6 +746,7 @@ impl Pass {
         if reclaimed > 0 {
             tracing::info!(bytes = reclaimed, threshold = ?threshold, "evicted cold bodies");
         }
+        crate::metrics::gc_evicted(reclaimed);
         reclaimed
     }
 }
