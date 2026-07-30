@@ -120,15 +120,17 @@ impl Hypha {
     }
 
     /// The read source of truth while the cache restores. Facts come off the object's tail trailer;
-    /// user metadata is empty (the trailer carries none).
+    /// user metadata is empty (the trailer carries none) except for the content type, which the
+    /// remote object carries natively and so survives the cache loss this pass is recovering from.
     async fn resolve_key_remote(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
         match self.remote().head(bucket, key).await {
             Ok(h) => {
+                let mut md = HashMap::new();
+                if let Some(ct) = h.content_type() {
+                    md.insert(meta::CTYPE.to_string(), meta::encode_content_type(ct));
+                }
                 let facts = self.tier.remote_facts(bucket, key, &h).await?;
-                Ok(KeyState::Remote {
-                    facts,
-                    md: HashMap::new(),
-                })
+                Ok(KeyState::Remote { facts, md })
             }
             Err(Error::NotFound) => Ok(KeyState::Absent),
             Err(e) => Err(e.into()),

@@ -19,6 +19,9 @@ pub const MTIME: &str = "mtime";
 /// Echoed storage class (§7). hypha has one physical tier, so the class is a label the write path
 /// records and the read path replays; absent ⇒ [`STANDARD`].
 pub const SCLASS: &str = "sc";
+/// Client `Content-Type`. Unlike the rest of the pass-through it is *also* written to the remote
+/// object natively (§6, *Remote objects*), so it is the one client value a restore recovers.
+pub const CTYPE: &str = "ct";
 
 pub const STANDARD: &str = "STANDARD";
 
@@ -135,6 +138,8 @@ pub fn is_composite_etag(cetag: &str) -> bool {
 // prefix of any hypha key. Only the cache holds them: the remote's sole facts carrier is the
 // trailer (§6), so a repair or restore that rebuilds K from the remote drops the user metadata and
 // the storage class back to their defaults — the accepted durability limit of this carrier.
+// [`CTYPE`] is the exception, and rides the remote object's native `Content-Type` because a wrong
+// media type is a wrong answer rather than a lost label.
 
 /// Namespace for pass-through client metadata on a cache object.
 pub const USER_PREFIX: &str = "u-";
@@ -183,6 +188,22 @@ pub fn decode_user_metadata(
         .collect()
 }
 
+/// Client `Content-Type`, escaped like a user metadata value because a media type carries spaces
+/// (`text/html; charset=utf-8`) and SigV4 canonicalization rewrites runs of whitespace.
+pub fn encode_content_type(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, META_ESCAPE).to_string()
+}
+
+pub fn content_type(stored: &std::collections::HashMap<String, String>) -> Option<String> {
+    let raw = stored.get(CTYPE)?;
+    Some(
+        percent_encoding::percent_decode_str(raw)
+            .decode_utf8()
+            .ok()?
+            .into_owned(),
+    )
+}
+
 /// The client-visible pass-through carried on a tombstone: its `x-amz-meta-*` (under [`USER_PREFIX`])
 /// and echoed storage class ([`SCLASS`]), dropping hypha's own facts (`tomb`/`plen`/`cetag`/`mtime`).
 /// Used when rehydrate promotes an eviction tombstone back to a live cache body (§8): the facts
@@ -193,7 +214,7 @@ pub fn passthrough_metadata(
 ) -> std::collections::HashMap<String, String> {
     metadata
         .iter()
-        .filter(|(k, _)| k.starts_with(USER_PREFIX) || k.as_str() == SCLASS)
+        .filter(|(k, _)| k.starts_with(USER_PREFIX) || k.as_str() == SCLASS || k.as_str() == CTYPE)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }

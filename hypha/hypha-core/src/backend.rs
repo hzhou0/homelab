@@ -134,6 +134,7 @@ impl Backend {
         content_md5: Option<String>,
         if_match: Option<String>,
         if_none_match: Option<String>,
+        content_type: Option<String>,
     ) -> Result<PutObjectOutput> {
         self.client
             .put_object()
@@ -142,6 +143,7 @@ impl Backend {
             .body(body)
             .set_content_length(content_length)
             .set_metadata(Some(metadata))
+            .set_content_type(content_type)
             // Client `Content-MD5` forwarded to the cache (cached-mode PUT, §7) so the backend
             // validates the plaintext and returns `BadDigest` atomically — nothing lands on a bad
             // digest, and any prior body stays intact. `None` for hypha's own writes (ciphertext,
@@ -411,12 +413,14 @@ impl Backend {
         bucket: &str,
         key: &str,
         metadata: HashMap<String, String>,
+        content_type: Option<String>,
     ) -> Result<CreateMultipartUploadOutput> {
         self.client
             .create_multipart_upload()
             .bucket(self.backend_bucket(bucket))
             .key(key)
             .set_metadata(Some(metadata))
+            .set_content_type(content_type)
             .send()
             .await
             .map_err(Error::from_sdk)

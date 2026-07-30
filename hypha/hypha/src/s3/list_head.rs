@@ -70,6 +70,7 @@ impl Hypha {
             // or mid-restore) carries neither, so both fall back to their defaults.
             metadata: Some(meta::decode_user_metadata(&md)),
             storage_class: Some(StorageClass::from(meta::storage_class(&md))),
+            content_type: meta::content_type(&md),
             accept_ranges: Some("bytes".to_string()),
             ..Default::default()
         };

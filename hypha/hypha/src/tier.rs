@@ -179,6 +179,12 @@ impl Tiering {
             }
             Err(e) => return Err(e),
         };
+        // The client pass-through is cache-resident and this settle is rebuilding the cache, so it
+        // comes back empty — except the content type, which rides the remote object natively.
+        let mut passthrough = HashMap::new();
+        if let Some(ct) = head.content_type() {
+            passthrough.insert(meta::CTYPE.to_string(), meta::encode_content_type(ct));
+        }
         let facts = self.remote_facts(bucket, key, &head).await?;
         self.settle_evict_locked(
             bucket,
@@ -186,7 +192,7 @@ impl Tiering {
             facts.plen,
             &facts.cetag,
             facts.mtime_ms,
-            HashMap::new(),
+            passthrough,
         )
         .await?;
         Ok(Some(facts))
@@ -372,6 +378,7 @@ impl Tiering {
             Err(e) => return Err(e),
         };
         let plen = out.content_length().unwrap_or(0).max(0) as u64;
+        let content_type = meta::content_type(&out.metadata.clone().unwrap_or_default());
         let cetag = out
             .e_tag()
             .unwrap_or_default()
@@ -413,6 +420,7 @@ impl Tiering {
                 None,
                 None,
                 None,
+                content_type,
             )
             .await?;
         Ok(UploadOutcome::Uploaded)
@@ -508,6 +516,7 @@ impl Tiering {
                 md,
                 None,
                 Some(quote(&meta::evict_sentinel_etag())),
+                None,
                 None,
             )
             .await?;
@@ -626,6 +635,7 @@ impl Tiering {
                 body,
                 Some(plen as i64),
                 md,
+                None,
                 None,
                 None,
                 None,

@@ -92,9 +92,17 @@ impl Hypha {
             .as_ref()
             .is_some_and(|d| d.as_str() == MetadataDirective::REPLACE);
         let dst_passthrough = if replace {
-            write_metadata(input.metadata.as_ref(), &storage_class)
+            write_metadata(
+                input.metadata.as_ref(),
+                &storage_class,
+                input.content_type.as_deref(),
+            )
         } else {
-            write_metadata(Some(&meta::decode_user_metadata(&src_md)), &storage_class)
+            write_metadata(
+                Some(&meta::decode_user_metadata(&src_md)),
+                &storage_class,
+                meta::content_type(&src_md).as_deref(),
+            )
         };
 
         // One bounded tail GET of the source's remote trailer (MAC-verified at K_src) fixes the
@@ -122,12 +130,29 @@ impl Hypha {
         let trailer = encode_trailer(&self.tier.trailer_key, &key, body_ct_len, &footer, &table);
 
         self.tier.mark_transit_locked(&bucket, &key).await?;
+        let dst_ct = meta::content_type(&dst_passthrough);
         let commit = if body_ct_len >= MIN_REMOTE_PART {
-            self.commit_copy_multipart(&bucket, &key, &src_bucket, &src_key, body_ct_len, &trailer)
-                .await
+            self.commit_copy_multipart(
+                &bucket,
+                &key,
+                &src_bucket,
+                &src_key,
+                body_ct_len,
+                &trailer,
+                dst_ct,
+            )
+            .await
         } else {
-            self.commit_copy_reencrypt(&bucket, &key, &src_bucket, &src_key, &facts, trailer)
-                .await
+            self.commit_copy_reencrypt(
+                &bucket,
+                &key,
+                &src_bucket,
+                &src_key,
+                &facts,
+                trailer,
+                dst_ct,
+            )
+            .await
         };
         if let Err(e) = commit {
             // Settle K_dst to whatever the remote actually holds — the same repair as a crashed PUT.
@@ -165,6 +190,7 @@ impl Hypha {
 
     /// Large-body commit (§7). Owns the native upload, so a failure aborts it best-effort — a
     /// leftover is a sweepable orphan regardless.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_copy_multipart(
         &self,
         bucket: &str,
@@ -173,10 +199,11 @@ impl Hypha {
         src_key: &str,
         body_ct_len: u64,
         trailer: &[u8],
+        content_type: Option<String>,
     ) -> Result<(), Error> {
         let created = self
             .remote()
-            .create_multipart(bucket, key, HashMap::new())
+            .create_multipart(bucket, key, HashMap::new(), content_type)
             .await?;
         let upload_id = created
             .upload_id()
@@ -274,6 +301,7 @@ impl Hypha {
     /// Small-body commit (§7): the source is one age file, so decrypt it whole and re-encrypt as one
     /// age file (age's framed length is fixed by the plaintext length, so body_ct_len — and thus the
     /// prebuilt trailer's table — is unchanged), with the fresh trailer appended inline in one PUT.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_copy_reencrypt(
         &self,
         bucket: &str,
@@ -282,6 +310,7 @@ impl Hypha {
         src_key: &str,
         facts: &RemoteFacts,
         trailer: Vec<u8>,
+        content_type: Option<String>,
     ) -> Result<(), Error> {
         let plaintext = self
             .tier
@@ -303,6 +332,7 @@ impl Hypha {
                 None,
                 None,
                 None,
+                content_type,
             )
             .await?;
         Ok(())

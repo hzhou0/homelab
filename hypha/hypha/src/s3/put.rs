@@ -126,6 +126,7 @@ impl Hypha {
                 None,
                 None,
                 None,
+                input.content_type.clone(),
             )
             .await
         {
@@ -163,7 +164,11 @@ impl Hypha {
                 plen,
                 &etag,
                 mtime_ms,
-                write_metadata(input.metadata.as_ref(), &storage_class),
+                write_metadata(
+                    input.metadata.as_ref(),
+                    &storage_class,
+                    input.content_type.as_deref(),
+                ),
             )
             .await?;
 
@@ -241,7 +246,11 @@ impl Hypha {
         let body = input
             .body
             .ok_or_else(|| Error::Invalid("PutObject requires a body".into()))?;
-        let md = write_metadata(input.metadata.as_ref(), &storage_class);
+        let md = write_metadata(
+            input.metadata.as_ref(),
+            &storage_class,
+            input.content_type.as_deref(),
+        );
 
         let conditional = input.if_match.is_some() || input.if_none_match.is_some();
         let etag = if conditional {
@@ -297,6 +306,7 @@ impl Hypha {
                 Some(plen as i64),
                 md,
                 content_md5,
+                None,
                 None,
                 None,
             )

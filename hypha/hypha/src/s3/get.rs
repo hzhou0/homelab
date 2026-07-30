@@ -133,6 +133,7 @@ impl Hypha {
             body: Some(codec::bytestream_to_blob(out.body)),
             metadata: Some(meta::decode_user_metadata(md)),
             storage_class: Some(StorageClass::from(meta::storage_class(md))),
+            content_type: meta::content_type(md),
             accept_ranges: Some("bytes".to_string()),
             ..Default::default()
         };
@@ -194,6 +195,7 @@ impl Hypha {
             body: Some(codec::bytestream_to_blob(out.body)),
             metadata: Some(meta::decode_user_metadata(md)),
             storage_class: Some(StorageClass::from(meta::storage_class(md))),
+            content_type: meta::content_type(md),
             accept_ranges: Some("bytes".to_string()),
             ..Default::default()
         };
@@ -223,6 +225,7 @@ impl Hypha {
         let last_modified = Some(ts_ms(facts.mtime_ms));
         let metadata = Some(meta::decode_user_metadata(md));
         let storage_class = Some(StorageClass::from(meta::storage_class(md)));
+        let content_type = meta::content_type(md);
         let pt = match &input.range {
             None => None,
             Some(range) => Some(plaintext_range(range, plen)?),
@@ -241,6 +244,7 @@ impl Hypha {
                 last_modified,
                 metadata,
                 storage_class,
+                content_type: content_type.clone(),
                 accept_ranges: Some("bytes".to_string()),
                 ..Default::default()
             },
@@ -252,6 +256,7 @@ impl Hypha {
                 last_modified,
                 metadata,
                 storage_class,
+                content_type,
                 accept_ranges: Some("bytes".to_string()),
                 ..Default::default()
             },

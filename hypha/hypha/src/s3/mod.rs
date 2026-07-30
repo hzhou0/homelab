@@ -151,15 +151,19 @@ pub(crate) fn resolve_storage_class(requested: Option<&StorageClass>) -> S3Resul
 }
 
 /// The cache-side user-metadata a write carries alongside its facts (§7): the client's
-/// `x-amz-meta-*` under hypha's namespace, plus the echoed storage class.
+/// `x-amz-meta-*` under hypha's namespace, the echoed storage class, and the content type.
 pub(crate) fn write_metadata(
     client: Option<&Metadata>,
     storage_class: &str,
+    content_type: Option<&str>,
 ) -> HashMap<String, String> {
     let mut md: HashMap<String, String> = client
         .map(|m| meta::encode_user_metadata(m).collect())
         .unwrap_or_default();
     md.insert(meta::SCLASS.to_string(), storage_class.to_string());
+    if let Some(ct) = content_type {
+        md.insert(meta::CTYPE.to_string(), meta::encode_content_type(ct));
+    }
     md
 }
 

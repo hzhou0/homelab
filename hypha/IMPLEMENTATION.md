@@ -632,8 +632,12 @@ zero-padded so the listing's order is rotation order.
 ### Remote objects
 
 Every remote object is age ciphertext ending in its authenticated facts+table trailer (§6 above);
-key names and the trailer are plaintext, the body is not. The trailer is the sole facts carrier —
-no user-metadata, no tags.
+key names and the trailer are plaintext, the body is not. The trailer is the sole *facts* carrier —
+no user-metadata, no tags. The one exception is the client **`Content-Type`**, set natively on the
+remote object: it is known at request start, so it has none of the atomicity problem that put the
+facts behind the body, and it is the one client value whose default is *wrong* rather than merely
+lost, so it must survive a restore. It is deliberately outside the MAC — an actor with remote write
+access cannot alter an object's bytes without failing verification, but can retype it.
 
 **Single-part object**: one age file at `K` with `facts ‖ tag ‖ version` appended in the same
 `PutObject`.
@@ -1234,7 +1238,8 @@ a third of S3's: an invisible conformance shortfall of exactly the kind the key-
 
 The remote's sole facts carrier is the trailer (§6), which holds facts and nothing else, so a
 repair or restore that rebuilds K from the remote settles user metadata and storage class back to
-their defaults — the accepted durability limit of this carrier.
+their defaults — the accepted durability limit of this carrier. `Content-Type` is the exception
+(below): it rides the remote object natively, so a restore recovers it.
 
 ### Storage class (passthrough, both modes)
 
@@ -1246,6 +1251,23 @@ carrier** as `x-amz-meta-*` and echo on HEAD / GET / GetObjectAttributes. Two ac
 corners: **LIST reports `STANDARD`** for every key (the twin's packed facts carry only
 `{cetag, plen, mtime, count}`; per-object class would mean a twin-format change), and a cache-loss restore falls the class back to
 `STANDARD` (the user-metadata carrier's durability limit).
+
+### Content type (passthrough, both modes)
+
+`Content-Type` rides the same cache-side carrier as `x-amz-meta-*` under its own bare key (`ct`),
+escaped like a user metadata value because a media type carries spaces (`text/html; charset=utf-8`)
+and SigV4 canonicalization rewrites runs of whitespace. It is read on PUT / CopyObject /
+CreateMultipartUpload and echoed on HEAD / GET; LIST has no field for it. Under `COPY` the source's
+type carries forward, under `REPLACE` the request's.
+
+**Unlike the rest of the pass-through it is also written to the remote object natively**, and read
+back from there by the repair rule and the restore overlay. Storage class can default to `STANDARD`
+when a restore rebuilds K, because one physical tier makes the label cosmetic; a media type has no
+correct default, and guessing `binary/octet-stream` changes how every client renders the object. The
+native slot works precisely because the type is known at request start, so none of the atomicity
+argument that put the facts behind the body applies to it. What it gives up is MAC coverage: an
+actor with remote write access cannot alter an object's bytes without failing trailer verification,
+but can retype it — for a browser-served bucket, that is the stored-XSS shape.
 
 ### Background: the reconcile sweep (cached mode)
 

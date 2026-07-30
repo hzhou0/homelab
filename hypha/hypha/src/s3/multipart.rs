@@ -62,7 +62,7 @@ impl Hypha {
 
         let created = self
             .remote()
-            .create_multipart(&bucket, &key, HashMap::new())
+            .create_multipart(&bucket, &key, HashMap::new(), input.content_type.clone())
             .await?;
         let upload_id = created
             .upload_id()
@@ -77,7 +77,11 @@ impl Hypha {
                 &bucket,
                 &meta::mpu_upload_key(&upload_id),
                 key.clone().into_bytes(),
-                write_metadata(input.metadata.as_ref(), &storage_class),
+                write_metadata(
+                    input.metadata.as_ref(),
+                    &storage_class,
+                    input.content_type.as_deref(),
+                ),
                 None,
                 None,
             )
@@ -209,6 +213,7 @@ impl Hypha {
                     to_cache,
                     Some(ct_len as i64),
                     HashMap::new(),
+                    None,
                     None,
                     None,
                     None,
