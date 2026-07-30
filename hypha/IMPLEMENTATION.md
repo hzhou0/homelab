@@ -1498,15 +1498,34 @@ state into the cache, then runs the normal §4 path.
   needs. A bucket whose clean marker cannot be deleted is not served — startup fails rather than
   serving a bucket that will skip next run's scan. Sub-second at homelab bucket counts (two HEADs and
   at most one DELETE each); the passes themselves run in the background behind it.
-- **Graceful drain.** On SIGTERM: stop accepting → await hyper's connection drain → close the repair
-  queue and let its worker run to `None` → if nothing is left owed, a clean marker (§6) for each
-  bucket this run accounted for and for no other → **release the active claim** (passive promotes sub-second,
-  no fence). The ordering is the
-  quiescence proof of §7, and the release is last for the reason given there. A best-effort final
+- **Graceful drain.** On SIGTERM, in three phases, each with its own budget:
+
+  1. **The API closes** — stop accepting, await hyper's connection drain.
+  2. **Obligations settle** — join the startup shadow sweeps (a sweep only earns its bucket's
+     accounting by finishing), then close the repair queue and let its worker run to `None` → if
+     nothing is left owed, a clean marker (§6) for each bucket this run accounted for and for no
+     other. This precedes phase 3 deliberately: the clean markers are the run's durability-relevant
+     output and must not queue behind a bucket recovery that can run for minutes.
+  3. **The remaining actors quiesce** — the shutdown signal goes out, the last handles drop so each
+     queue closes, and every actor is *joined*: it finishes the messages it already holds and returns
+     on its own. Nothing is aborted while it still has work. The GC pass in flight is awaited (its
+     evictions hold a key's write lock across a twin write and a CAS, and a cut between the two leaves
+     a twin beside a live body); rotated recency slices finish their PUTs; the bucket actor completes
+     pending Create/Delete and any recovery under way. The one exception is a *queued* background
+     rehydrate, which is shed rather than started — its whole value is saving a future read a remote
+     fetch, and after phase 1 there are no future reads.
+
+  Then **release the active claim** (passive promotes sub-second, no fence). The phase-1→2 ordering is
+  the quiescence proof of §7, and the release is last for the reason given there. A best-effort final
   reconcile pass can shrink the pending set anywhere in here — it is an optimization, since a clean
-  marker claims the pending set is *complete*, not that it is empty. Sized into
-  `terminationGracePeriod` + `preStop`; running out of grace period simply leaves the clean markers
-  unwritten and the promoted replica scans.
+  marker claims the pending set is *complete*, not that it is empty.
+
+  The budgets are fixed, not configurable: they are a property of the pod's `terminationGracePeriod`,
+  which must be at least their sum plus the `preStop` delay, so the numbers only mean anything
+  together. A phase that overruns aborts what is left and logs it — the alternative is being SIGKILLed
+  with the same work outstanding and nothing in the log to say so. Overrunning phase 1 or 2 leaves the
+  clean markers unwritten and the promoted replica scans; overrunning phase 3 leaves only debris that
+  the next run's sweeps already look for.
 - **Remote unavailable** → hot reads fine; tombstoned reads fail cleanly; cached-mode writes
   still ack and markers accumulate; durable-mode writes fail (correctly — they can't be made
   durable).
@@ -1852,8 +1871,7 @@ client credentials for `S3Auth`), `master_passphrase` (the 256-bit random age pa
 `master_identity`), `serving.listen` + `serving.offload_threshold` (§5), `reconcile.interval_ms` +
 `reconcile.concurrency` (the §7 sweep's cadence and per-pass fan-out, and the marker queue's write
 fan-out; that queue and §8's shadow-orphan queue are both deliberately unbounded and so have no depth
-knob, and `interval_ms` paces the retry of each) + the drain budget, which must fit inside the pod's
-`terminationGracePeriod`: overrunning it is safe but withholds every clean marker,
+knob, and `interval_ms` paces the retry of each),
 `background.concurrency` + `background.queue_depth` (the §8 transition actor: whole-object transfers
 in flight, and how many wait before submissions are shed — so `concurrency` sits far below
 `reconcile.concurrency`, since it bounds remote bandwidth rather than request count),
@@ -1871,6 +1889,10 @@ leaves GC unable to measure pressure, so it sweeps debris and never evicts — a
 cached mode, and the correct configuration for durable mode, which has no bodies to evict. Later
 phases add restore fan-out + hint interval, and the §4 fencing block (identity selectors, lease
 timings, fence-confirm timeout, settle delay).
+
+The **drain budgets are deliberately not configurable**: they are one number per shutdown phase (§9),
+meaningful only against the pod's `terminationGracePeriod`, which has to cover their sum plus `preStop`
+— two knobs that must move together are better as one constant and a deployment note.
 
 **Backend requirements.** The **cache** must implement conditional `PutObject`/`DeleteObject` —
 load-bearing for the eviction/rehydrate/reconcile CAS (§7/§8), not for the client write path,

@@ -1,8 +1,8 @@
 //! The recency sketch (§8) — the only thing GC knows about what clients want.
 //!
-//! Plain state, owned by [`super::GcActor`] and reached only from its task: no lock, no interior
-//! mutability, and nothing here is `Send`-shared. What keeps it off the request path is the actor
-//! boundary in [`super`], not anything in this file.
+//! Plain state with no interior mutability: [`super::GcActor`] writes it and a running pass probes it,
+//! both under the one lock [`super`] holds it behind. What keeps it off the *request* path is the
+//! touch queue in [`super`], not anything in this file.
 //!
 //! Recency is a **Bloom-ring sketch**: one filter per *fill window*, retained `depth` deep behind
 //! the current one. A probe answers with the newest slice holding the key, which is a quantized

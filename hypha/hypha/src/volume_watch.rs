@@ -23,6 +23,8 @@
 
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
@@ -45,13 +47,14 @@ impl VolumeWatch {
         }
     }
 
-    /// Polls until `liveness` drops, i.e. until the service does — the same weak-handle shutdown
-    /// the reconcile sweep uses, so there is nothing to wire.
-    pub(crate) async fn run(self, liveness: std::sync::Weak<()>) {
+    /// Polls until the drain signals. Interruptible mid-wait, since a watchdog asleep between polls is
+    /// pure delay to a drain that is trying to bound itself — and the round it is *in* is a handful of
+    /// HEADs, so finishing it costs nothing.
+    pub(crate) async fn run(self, shutdown: CancellationToken) {
         loop {
-            tokio::time::sleep(self.interval).await;
-            if liveness.upgrade().is_none() {
-                return;
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(self.interval) => {}
             }
             for bucket in self.buckets.ready() {
                 if let Err(e) = self.check(&bucket).await {

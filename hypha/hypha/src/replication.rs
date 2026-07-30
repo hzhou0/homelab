@@ -15,16 +15,17 @@
 //! returned, so a PUT that landed a newer body mid-pass simply defers that key to the next pass
 //! rather than being lost.
 //!
-//! Lifecycle is implicit: the task holds a `Weak` to the service's liveness sentinel (§3, `Hypha`)
-//! and exits once the service drops, so no explicit shutdown channel is needed. A process crash
+//! The drain's shutdown token ends the loop between passes and lets the pass in flight finish (§9). A
+//! process crash
 //! loses nothing — acked bodies are on the cache, a marker that had not yet landed is rebuilt by the
 //! recovery scan ([`crate::markers`]), and the next active resumes from the same LIST. Only losing
 //! the cache *volume* with markers outstanding loses data (the bounded window, §7).
 
-use std::sync::Weak;
 use std::time::Duration;
 
 use futures::StreamExt as _;
+
+use tokio_util::sync::CancellationToken;
 
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
@@ -48,14 +49,18 @@ impl ReplicationTask {
         }
     }
 
-    /// Run passes on `interval` until the service drops (`liveness` no longer upgrades). Each pass is
-    /// best-effort: a bucket or key that errors is logged and the sweep moves on, since every
-    /// transition is idempotent and re-attempted next pass.
-    pub async fn run(self, liveness: Weak<()>) {
+    /// Run passes on `interval` until the drain signals. The wait is interruptible so the drain does
+    /// not spend its budget on a sleeping task, while a pass already under way is left to finish: it
+    /// writes bodies to the remote and clears their markers, and stopping between the two would leave
+    /// the marker for the next run to redo.
+    ///
+    /// Each pass is best-effort: a bucket or key that errors is logged and the sweep moves on, since
+    /// every transition is idempotent and re-attempted next pass.
+    pub async fn run(self, shutdown: CancellationToken) {
         loop {
-            tokio::time::sleep(self.interval).await;
-            if liveness.upgrade().is_none() {
-                break;
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(self.interval) => {}
             }
             if let Err(e) = self.pass().await {
                 tracing::warn!(error = %e, "reconcile pass could not enumerate buckets; retrying");

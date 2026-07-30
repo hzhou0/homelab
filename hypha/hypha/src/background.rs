@@ -23,9 +23,9 @@
 //!   blocks nobody — the lock handoff is the rendezvous, so `cancel` is a fire-and-forget map
 //!   lookup on the write path.
 //!
-//! Lifecycle mirrors [`crate::bucket`]: the task holds a [`Tiering`], never a `Hypha`, so it
-//! neither keeps the service's liveness sentinel alive nor needs shutdown plumbing — it drains and
-//! exits once the last handle drops.
+//! Lifecycle mirrors [`crate::bucket`]: the task holds a [`Tiering`], never a `Hypha`, so the queue
+//! closes when the service drops. At the drain it sheds what is still queued and waits out what is
+//! running — see [`TransitionActor::run`] for why those two get opposite treatment.
 //!
 //! **Eviction is deliberately not here**, though it is equally discardable. §8's rung 2 makes GC's
 //! own concurrency the bound on per-key eviction work, so that work has to belong to a GC pass or
@@ -40,6 +40,7 @@ use std::sync::Arc;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use hypha_core::config;
@@ -123,7 +124,11 @@ impl Background {
     }
 }
 
-pub(crate) fn spawn(tier: Tiering, cfg: config::Background) -> Background {
+pub(crate) fn spawn(
+    tier: Tiering,
+    cfg: config::Background,
+    shutdown: CancellationToken,
+) -> (Background, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(cfg.queue_depth.max(1));
     let live: LiveTransitions = Arc::new(DashMap::new());
     let actor = TransitionActor {
@@ -131,9 +136,11 @@ pub(crate) fn spawn(tier: Tiering, cfg: config::Background) -> Background {
         tier,
         live: live.clone(),
         sem: Arc::new(Semaphore::new(cfg.concurrency.max(1))),
+        running: JoinSet::new(),
+        shutdown,
     };
-    tokio::spawn(actor.run());
-    Background { tx, live }
+    let task = tokio::spawn(actor.run());
+    (Background { tx, live }, task)
 }
 
 struct TransitionActor {
@@ -141,26 +148,59 @@ struct TransitionActor {
     tier: Tiering,
     live: LiveTransitions,
     sem: Arc<Semaphore>,
+    /// The transitions running now. Tracked rather than detached so the drain can wait on them: a
+    /// rehydrate killed between landing a body and deleting its twin leaves the one hybrid state §8
+    /// orders every path to avoid, and it is the *last* step of the transition that does that.
+    running: JoinSet<()>,
+    shutdown: CancellationToken,
 }
 
 impl TransitionActor {
-    /// Drain the queue until every handle drops. Awaiting a permit here rather than inside the
-    /// spawned transition is deliberate: it is what makes the mpsc back up and `submit` shed,
-    /// instead of accumulating parked tasks that each hold a transition's worth of state.
+    /// Run queued transitions until the service drops or the drain signals. Awaiting a permit here
+    /// rather than inside the spawned transition is deliberate: it is what makes the mpsc back up and
+    /// `submit` shed, instead of accumulating parked tasks that each hold a transition's worth of
+    /// state.
+    ///
+    /// **At shutdown the queue is shed, not worked through.** A queued transition's whole value is
+    /// saving a *future* read a remote fetch, and once the API is closed there are no future reads —
+    /// so starting a whole-object download here would spend the drain's budget on nothing. Cancelling
+    /// their tokens is how a queued transition is abandoned everywhere else in this module. What is
+    /// already *running* is awaited, since that work is mid-transition rather than merely queued.
     async fn run(mut self) {
-        while let Some((transition, token)) = self.rx.recv().await {
+        loop {
+            let received = tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => break,
+                received = self.rx.recv() => received,
+                Some(_) = self.running.join_next(), if !self.running.is_empty() => continue,
+            };
+            let Some((transition, token)) = received else {
+                break; // every handle dropped
+            };
             let registered = transition.registry_key();
             // Cancelled while queued: the client that cancelled is already past us.
             if token.is_cancelled() {
                 self.live.remove(&registered);
                 continue;
             }
-            let Ok(permit) = self.sem.clone().acquire_owned().await else {
-                break; // semaphore closed — shutting down
+            // Cancellation has to reach here too, not just the receive: the permit this waits on frees
+            // only when a running transition finishes, which is long enough for the shutdown to have
+            // been signalled and this one to no longer be worth starting.
+            let permit = tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => {
+                    token.cancel();
+                    self.live.remove(&registered);
+                    break;
+                }
+                permit = self.sem.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break, // semaphore closed — shutting down
+                },
             };
             let tier = self.tier.clone();
             let live = self.live.clone();
-            tokio::spawn(async move {
+            self.running.spawn(async move {
                 if let Err(e) = run_transition(&tier, &transition, &token).await {
                     tracing::debug!(transition = %registered, error = %e,
                         "background transition failed; the key's tombstone stands");
@@ -171,6 +211,22 @@ impl TransitionActor {
                 live.remove(&registered);
                 drop(permit);
             });
+        }
+        self.abandon_queued();
+        while let Some(finished) = self.running.join_next().await {
+            if let Err(e) = finished {
+                tracing::warn!(error = %e, "background transition did not finish");
+            }
+        }
+    }
+
+    /// Tell every transition still queued to stop, so the one that is mid-`select!` on its token
+    /// returns instead of starting a fetch nothing will read.
+    fn abandon_queued(&mut self) {
+        self.rx.close();
+        while let Ok((transition, token)) = self.rx.try_recv() {
+            token.cancel();
+            self.live.remove(&transition.registry_key());
         }
     }
 }

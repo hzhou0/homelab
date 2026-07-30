@@ -631,6 +631,31 @@ async fn clean_marker_is_written_on_drain_and_cleared_on_startup() {
     .await;
 }
 
+/// The drain joins every actor rather than leaving the runtime to drop them mid-call, so it has to
+/// *end* — an actor that cannot observe shutdown would sit out its whole budget instead. Traffic first,
+/// so the ring has slices to persist, GC has a bucket to sweep and the reconcile sweep has markers to
+/// clear: the paths whose in-flight work the drain waits on.
+#[tokio::test]
+async fn a_graceful_drain_joins_every_actor_well_inside_its_budget() {
+    let mut h = Harness::cached().await;
+    h.create_bucket(B).await;
+    for i in 0..8 {
+        put(&h.client(), B, &format!("k{i}"), b"body").await;
+    }
+
+    let started = std::time::Instant::now();
+    h.stop_hypha().await;
+    let drain = started.elapsed();
+
+    // Sub-second in practice; the bound is loose because the assertion is about an actor that never
+    // returns, not about latency. Reaching even half of one phase budget means something was waited
+    // out rather than joined.
+    assert!(
+        drain < std::time::Duration::from_secs(5),
+        "drain took {drain:?}; an actor is not observing shutdown"
+    );
+}
+
 /// A kill leaves no clean marker, so the next run rebuilds the pending set from cache-vs-remote
 /// state (§7). The orphan here is a live cache body with no marker whose generation the remote does
 /// not hold — exactly what a crash between an acked write and its marker leaves behind, and what

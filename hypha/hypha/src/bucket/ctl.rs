@@ -13,13 +13,15 @@
 //! deduped: the op that triggered one already resolves from the remote meanwhile, so there is no
 //! waiter, and a storm of triggers for one bucket collapses to a single pass.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
 use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
@@ -319,7 +321,11 @@ impl BucketCtl {
 /// A cache bucket with no remote bucket is not resolved and never served: it is debris from a crash
 /// between `delete`'s remote commit and its cache drain, and a later create of the same name resets
 /// it.
-pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<()> {
+///
+/// The shadow sweeps it dispatches are returned rather than detached: each one only earns its bucket's
+/// accounting by finishing, so the drain joins them before it reads that accounting back (§8).
+pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<JoinSet<()>> {
+    let mut sweeps = JoinSet::new();
     for (bucket, _) in tier.remote.list_buckets().await? {
         let synced = marker_present(tier, &bucket, &meta::sync_marker_key()).await?;
         // Durable mode has neither a pending set nor shadow bodies: it writes no clean markers of
@@ -346,10 +352,10 @@ pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<(
         if shadows_accounted {
             buckets.account_shadows_for(&bucket);
         } else if tier.cached {
-            orphans::dispatch_sweep(tier.clone(), buckets.clone(), bucket);
+            orphans::dispatch_sweep(&mut sweeps, tier.clone(), buckets.clone(), bucket);
         }
     }
-    Ok(())
+    Ok(sweeps)
 }
 
 async fn marker_present(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
@@ -373,29 +379,30 @@ async fn take_marker(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Spawn the actor and return its handle. The task runs until every handle is dropped, then drains
-/// whatever is still queued before exiting.
-pub fn spawn(tier: Tiering) -> BucketCtl {
+/// Spawn the actor and return its handle beside the task, which drains whatever is still queued —
+/// pending Create/Delete complete, an in-flight recovery finishes — before exiting.
+///
+/// Shutdown arrives as `shutdown`, not as the queue closing: the actor keeps a sender of its own so a
+/// recovery can re-queue itself, so its receiver never runs out of senders and closure is not a signal
+/// it can observe.
+pub fn spawn(tier: Tiering, shutdown: CancellationToken) -> (BucketCtl, JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let (done_tx, done_rx) = mpsc::unbounded_channel();
-    let (prov_tx, prov_rx) = mpsc::unbounded_channel();
     let states: BucketStates = Arc::new(ArcSwap::from_pointee(HashMap::new()));
     let actor = BucketActor {
         rx,
         tx: tx.clone(),
-        done_tx,
-        done_rx,
-        prov_tx,
-        prov_rx,
+        shutdown,
         tier,
         states: states.clone(),
         sem: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         queued: HashMap::new(),
-        running: HashSet::new(),
+        batches: JoinSet::new(),
+        running: HashMap::new(),
+        provisions: JoinSet::new(),
         provisioning: HashMap::new(),
     };
-    tokio::spawn(actor.run());
-    BucketCtl { tx, states }
+    let task = tokio::spawn(actor.run());
+    (BucketCtl { tx, states }, task)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -431,34 +438,49 @@ enum LifecycleRequest {
     Delete(oneshot::Sender<Result<()>>),
 }
 
+/// Stringified because it crosses a task boundary and is fanned out to every waiter, so it has to be
+/// `Clone` — [`Error`] is not.
+type ProvisionResult = std::result::Result<(), String>;
+
+/// Everyone waiting on one bucket's in-flight provisioning. The entry *is* the coalescing: only the
+/// caller that creates it spawns the backend work.
+struct Provisioning {
+    task: Id,
+    waiters: Vec<oneshot::Sender<Result<()>>>,
+}
+
 struct BucketActor {
     rx: mpsc::UnboundedReceiver<BucketMsg>,
     /// Handed to each task so a recovery that could not run can re-queue itself.
     tx: mpsc::UnboundedSender<BucketMsg>,
-    /// Tasks signal here when they finish a bucket's batch, so any work that arrived mid-drain
-    /// gets re-dispatched. Held here too, so it never closes on its own.
-    done_tx: mpsc::UnboundedSender<String>,
-    done_rx: mpsc::UnboundedReceiver<String>,
-    /// Provisioning tasks report here. Separate from `done_tx` because provisioning deliberately
-    /// runs *outside* the per-bucket task: the task for a lost-volume bucket is busy with the
-    /// restore sweep, and a write must not queue behind it (§7 — serving is never gated).
-    prov_tx: mpsc::UnboundedSender<(String, std::result::Result<(), String>)>,
-    prov_rx: mpsc::UnboundedReceiver<(String, std::result::Result<(), String>)>,
+    shutdown: CancellationToken,
     tier: Tiering,
     states: BucketStates,
     sem: Arc<Semaphore>,
     queued: HashMap<String, QueuedWork>,
-    running: HashSet<String>,
-    /// Buckets with provisioning in flight → everyone waiting on it. The entry *is* the coalescing:
-    /// only the caller that creates it spawns the backend work.
-    provisioning: HashMap<String, Vec<oneshot::Sender<Result<()>>>>,
+    /// The bucket batches in flight. Joined rather than signalled over a channel because a *panicking*
+    /// task sends nothing, and a completion the actor never observes would leave its bucket marked as
+    /// draining for the rest of the run — every later request for it queued behind a task that is
+    /// already gone. A join reports the panic instead.
+    batches: JoinSet<()>,
+    /// Which bucket each in-flight batch belongs to. Bucket-keyed because "is this bucket already
+    /// draining?" is the question [`Self::dispatch`] asks; the reverse lookup is a scan over at most
+    /// [`MAX_CONCURRENT`] entries and only a panic needs it.
+    running: HashMap<String, Id>,
+    /// Provisioning runs *outside* the per-bucket task — the task for a lost-volume bucket is busy with
+    /// the restore sweep, and a write must not queue behind it (§7 — serving is never gated) — so it is
+    /// its own set of tasks with its own waiters.
+    provisions: JoinSet<ProvisionResult>,
+    provisioning: HashMap<String, Provisioning>,
 }
 
 impl BucketActor {
     async fn run(mut self) {
         let mut ext_open = true;
         loop {
-            // Shutdown completes only once the queue is fully drained and nothing is in flight.
+            // Shutdown completes only once the queue is fully drained and nothing is in flight: the
+            // join sets abort whatever they still hold when they drop, so returning earlier would cut
+            // a batch off mid-backend-call.
             if !ext_open
                 && self.queued.is_empty()
                 && self.running.is_empty()
@@ -466,15 +488,27 @@ impl BucketActor {
             {
                 break;
             }
+            // The join arms are guarded because an empty `JoinSet` yields `None` at once, which would
+            // disable the branch — and with the external queue closed there would be nothing left for
+            // `select!` to wait on.
             tokio::select! {
                 msg = self.rx.recv(), if ext_open => match msg {
                     Some(msg) => self.enqueue(msg),
                     None => ext_open = false,
                 },
-                Some(bucket) = self.done_rx.recv() => {
-                    self.running.remove(&bucket);
+                // Everything already queued still runs — this only stops new work being taken. A
+                // recovery retry that fires after this lands in a queue nobody reads again, which is
+                // the same outcome as the process ending before its 5 s backoff elapsed.
+                () = self.shutdown.cancelled(), if ext_open => {
+                    tracing::debug!("shutdown signalled; draining the bucket queue");
+                    ext_open = false;
                 }
-                Some((bucket, result)) = self.prov_rx.recv() => self.finish_provision(bucket, result),
+                Some(done) = self.batches.join_next_with_id(), if !self.batches.is_empty() => {
+                    self.finish_batch(done);
+                }
+                Some(done) = self.provisions.join_next_with_id(), if !self.provisions.is_empty() => {
+                    self.finish_provision(done);
+                }
             }
             self.dispatch();
         }
@@ -516,42 +550,92 @@ impl BucketActor {
             let _ = reply.send(Ok(()));
             return;
         }
-        let waiters = self.provisioning.entry(bucket.clone()).or_default();
-        waiters.push(reply);
-        if waiters.len() > 1 {
+        if let Some(inflight) = self.provisioning.get_mut(&bucket) {
+            inflight.waiters.push(reply);
             return;
         }
         let tier = self.tier.clone();
-        let done = self.prov_tx.clone();
-        tokio::spawn(async move {
-            let result = async {
-                ensure_cache_bucket(&tier.data, &bucket).await?;
-                ensure_cache_bucket(&tier.meta, &bucket).await
-            }
-            .await;
-            let _ = done.send((bucket, result.map_err(|e| e.to_string())));
-        });
+        let provisioned = bucket.clone();
+        let task = self
+            .provisions
+            .spawn(async move {
+                async {
+                    ensure_cache_bucket(&tier.data, &provisioned).await?;
+                    ensure_cache_bucket(&tier.meta, &provisioned).await
+                }
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .id();
+        self.provisioning.insert(
+            bucket,
+            Provisioning {
+                task,
+                waiters: vec![reply],
+            },
+        );
     }
 
-    fn finish_provision(&mut self, bucket: String, result: std::result::Result<(), String>) {
+    /// Answer the waiters and publish the bucket as provisioned if it landed. A task that panicked
+    /// answers them with an error rather than leaving them to time out on a dropped `oneshot`, and —
+    /// the part that matters — clears the entry, which otherwise coalesces every later caller onto a
+    /// provisioning that will never report.
+    fn finish_provision(&mut self, done: std::result::Result<(Id, ProvisionResult), JoinError>) {
+        let (task, result) = match done {
+            Ok((task, result)) => (task, result),
+            Err(e) => (e.id(), Err(format!("provisioning task failed: {e}"))),
+        };
+        let Some(bucket) = self.provisioned_by(task) else {
+            return;
+        };
         if result.is_ok() {
             update(&self.states, &bucket, set_provisioned);
         }
-        for reply in self.provisioning.remove(&bucket).unwrap_or_default() {
+        for reply in self
+            .provisioning
+            .remove(&bucket)
+            .map(|p| p.waiters)
+            .unwrap_or_default()
+        {
             let _ = reply.send(result.clone().map_err(Error::Backend));
         }
     }
 
-    /// Hand each bucket with pending work — and no task already draining it — to a fresh task,
-    /// taking the whole batch with it. Work that arrives during the drain accumulates in a fresh
-    /// entry
-    /// and is dispatched when the task signals done, so a bucket is never drained by two tasks
-    /// at once (per-bucket serialization) and its batches run in arrival order.
+    fn provisioned_by(&self, task: Id) -> Option<String> {
+        self.provisioning
+            .iter()
+            .find(|(_, p)| p.task == task)
+            .map(|(bucket, _)| bucket.clone())
+    }
+
+    /// Release the bucket for its next batch. A panicking task leaves its batch's replies dropped —
+    /// those callers see the actor as gone, which is the honest answer — but the bucket itself has to
+    /// be released, or nothing would ever be dispatched for it again.
+    fn finish_batch(&mut self, done: std::result::Result<(Id, ()), JoinError>) {
+        let task = match done {
+            Ok((task, ())) => task,
+            Err(e) => {
+                let bucket = self
+                    .running
+                    .iter()
+                    .find(|(_, task)| **task == e.id())
+                    .map(|(bucket, _)| bucket.as_str());
+                tracing::error!(?bucket, error = %e, "bucket task did not finish; its batch is lost");
+                e.id()
+            }
+        };
+        self.running.retain(|_, running| *running != task);
+    }
+
+    /// Hand each bucket with pending work — and no task already draining it — to a fresh task, taking
+    /// the whole batch with it. Work that arrives during the drain accumulates in a fresh entry and is
+    /// dispatched once the batch is joined, so a bucket is never drained by two tasks at once
+    /// (per-bucket serialization) and its batches run in arrival order.
     fn dispatch(&mut self) {
         let ready: Vec<String> = self
             .queued
             .iter()
-            .filter(|(bucket, work)| !work.is_empty() && !self.running.contains(*bucket))
+            .filter(|(bucket, work)| !work.is_empty() && !self.running.contains_key(*bucket))
             .map(|(bucket, _)| bucket.clone())
             .collect();
         for bucket in ready {
@@ -559,15 +643,14 @@ impl BucketActor {
                 .queued
                 .remove(&bucket)
                 .expect("dispatchable bucket has queued work");
-            self.running.insert(bucket.clone());
             let task = BucketTask {
                 tier: self.tier.clone(),
                 states: self.states.clone(),
                 sem: self.sem.clone(),
-                done: self.done_tx.clone(),
                 requeue: self.tx.clone(),
             };
-            tokio::spawn(task.run(bucket, work));
+            let spawned = self.batches.spawn(task.run(bucket.clone(), work)).id();
+            self.running.insert(bucket, spawned);
         }
     }
 }
@@ -576,7 +659,6 @@ struct BucketTask {
     tier: Tiering,
     states: BucketStates,
     sem: Arc<Semaphore>,
-    done: mpsc::UnboundedSender<String>,
     requeue: mpsc::UnboundedSender<BucketMsg>,
 }
 
@@ -597,7 +679,6 @@ impl BucketTask {
         if let Some(pass) = work.recovery {
             self.recover(&bucket, pass).await;
         }
-        let _ = self.done.send(bucket);
     }
 
     /// The remote create is the sole commit, and the cache work all precedes it: an empty namespace

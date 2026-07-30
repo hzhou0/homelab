@@ -24,7 +24,7 @@ use hypha_core::config::Mode;
 use hypha_core::meta;
 use hypha_core::Backend;
 
-use crate::background::{self, Background};
+use crate::background::Background;
 use crate::bucket::BucketCtl;
 use crate::gc::orphans::Orphans;
 use crate::gc::Gc;
@@ -62,10 +62,6 @@ pub struct Hypha {
     /// an inline (non-offloaded) codec path exists — today every codec bridge offloads.
     #[allow(dead_code)]
     pub offload_threshold: usize,
-    /// Liveness sentinel shared by every `Hypha` clone: the reconcile sweep (Phase 4) holds only a
-    /// `Weak` to it and exits once the last clone drops, so the background task stops with the
-    /// service without any explicit shutdown plumbing.
-    liveness: Arc<()>,
 }
 
 impl Hypha {
@@ -76,12 +72,11 @@ impl Hypha {
         markers: Markers,
         gc: Gc,
         orphans: Orphans,
+        background: Background,
         mode: Mode,
         offload_threshold: usize,
         max_bucket_prefix_len: usize,
-        background_cfg: hypha_core::config::Background,
     ) -> Self {
-        let background = background::spawn(tier.clone(), background_cfg);
         Self {
             tier,
             buckets,
@@ -92,14 +87,7 @@ impl Hypha {
             mode,
             max_bucket_prefix_len,
             offload_threshold,
-            liveness: Arc::new(()),
         }
-    }
-
-    /// A `Weak` to the liveness sentinel — the background reconcile sweep polls it and exits once the
-    /// service (and all its `Hypha` clones) drop.
-    pub(crate) fn liveness(&self) -> std::sync::Weak<()> {
-        Arc::downgrade(&self.liveness)
     }
 
     /// Take K's **write** lock for a client write (§4), first telling any background transition on K

@@ -10,17 +10,18 @@
 //! Eviction is the other half, and the opposite: it takes bodies a client can still ask for, so it
 //! answers to a byte target and to the gates in [`evict`].
 //!
-//! **One actor, one owner.** GC's state — the recency ring, the per-bucket cold yields, the pressure
-//! rung — is read and written from this task and nowhere else. The rest of the crate holds a [`Gc`],
-//! whose whole API is [`Gc::touch`]: a request states interest in a key and returns, with no lock to
-//! contend on and no I/O to wait for. The filter bits, the rotation and the encode of the retired
-//! slice all happen here, so a request never carries the rotation its own touch happened to trigger —
-//! which, at the design fill target, means copying out a megabyte-scale filter.
+//! **The queue is for outside callers only.** The rest of the crate holds a [`Gc`], whose whole API is
+//! [`Gc::touch`]: a request states interest in a key and returns, with no lock to contend on and no
+//! I/O to wait for. The filter bits, the rotation and the encode of the retired slice all happen on
+//! this task, so a request never carries the rotation its own touch happened to trigger — which, at
+//! the design fill target, means copying out a megabyte-scale filter. A pass is not an outside caller:
+//! it is GC's own work, so it reads the ring directly under its lock instead of round-tripping through
+//! the queue it would otherwise be competing with.
 //!
-//! **The loop itself never awaits I/O.** Every pass is dispatched as its own task, and the actor only
-//! picks the moment, refuses to start a second one, and answers the questions a running pass asks of
-//! the state it owns. Doing the pass inline would stall the touch queue for the length of a
-//! listing-heavy round of probes and shed exactly the traffic GC most wants to remember.
+//! **The loop itself never awaits I/O.** Every pass is dispatched as its own task; the actor picks the
+//! moment, refuses to start a second one, and folds the finished pass's report back into the ladder and
+//! the yields. Doing the pass inline would stall the touch queue for the length of a listing-heavy
+//! round of probes and shed exactly the traffic GC most wants to remember.
 //!
 //! Both modes sweep debris. Durable mode evicts nothing — it holds no bodies to evict — so it never
 //! probes, and its passes are rung 0 alone.
@@ -42,11 +43,11 @@ mod scan;
 mod store;
 mod usage;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 
 use hypha_core::config;
 use hypha_core::{meta, Backend};
@@ -68,36 +69,29 @@ const TOUCH_QUEUE_DEPTH: usize = 1024;
 /// path, so one wake-up should take whatever a burst deposited.
 const TOUCH_BATCH: usize = 256;
 
-enum GcMsg {
-    Touch(String),
-    /// A running pass asking for its candidates' ages. The ring is the actor's alone, so a pass asks
-    /// rather than holding a reference to it — a round trip through this queue, which the actor
-    /// answers from memory without awaiting anything.
-    Ages {
-        qualified: Vec<String>,
-        reply: oneshot::Sender<Vec<Age>>,
-    },
-    Finished(PassReport),
-}
-
 /// The rest of the crate's view of GC. Cheap to clone, holds no GC state, and offers nothing but a
 /// touch — every decision GC makes is its own.
 #[derive(Clone)]
 pub(crate) struct Gc {
-    tx: mpsc::Sender<GcMsg>,
+    /// Fully qualified keys to record. One message shape, because a touch is the only thing anyone
+    /// outside GC ever asks of it.
+    tx: mpsc::Sender<String>,
 }
 
-/// The actor runs until the last [`Gc`] drops, i.e. with the service — the same handle-drop
-/// shutdown [`crate::bucket`] and [`crate::markers`] use, with no separate liveness plumbing.
+/// The actor runs until the last [`Gc`] drops, i.e. with the service: every sender is a handle held
+/// outside GC, so closure is a signal the actor can observe and it needs no shutdown token of its own.
+/// The returned task is what the drain joins — see [`GcActor::run`] for what it finishes on the way
+/// out.
 pub(crate) fn spawn(
     tier: Tiering,
     buckets: BucketCtl,
     backend: Backend,
     bucket: String,
     cfg: &config::Gc,
-) -> Gc {
+) -> (Gc, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(TOUCH_QUEUE_DEPTH);
     let ring = RecencyRing::new(&cfg.recency);
+    let depth = ring.depth();
     let source = cfg.usage.as_ref().map(usage::connect);
     if source.is_none() && tier.cached {
         tracing::warn!(
@@ -105,11 +99,12 @@ pub(crate) fn spawn(
              will never evict"
         );
     }
-    tokio::spawn(
+    let task = tokio::spawn(
         GcActor {
-            ladder: Ladder::new(cfg, ring.depth()),
+            ladder: Ladder::new(cfg, depth),
             yields: Yields::new(cfg.yield_floor),
             store: GcStore::new(backend, bucket),
+            depth,
             probe_pages: cfg.probe_pages.max(1),
             opportunistic_evictions: cfg.opportunistic_evictions,
             low_water: cfg.low_water,
@@ -117,14 +112,13 @@ pub(crate) fn spawn(
             source,
             tier,
             buckets,
-            ring,
+            ring: Arc::new(Mutex::new(ring)),
             rx,
-            replies: tx.clone(),
-            pass: None,
+            persists: JoinSet::new(),
         }
         .run(),
     );
-    Gc { tx }
+    (Gc { tx }, task)
 }
 
 /// Where a key's plaintext lives, and therefore what a touch is *about* — the one thing a caller has
@@ -171,7 +165,7 @@ impl Gc {
             Plaintext::AtKey => ring::qualified(bucket, key),
             Plaintext::InShadow => ring::qualified(bucket, &meta::shadow_key(key)),
         };
-        if self.tx.try_send(GcMsg::Touch(artifact)).is_err() {
+        if self.tx.try_send(artifact).is_err() {
             tracing::debug!("recency touch dropped; GC is behind");
         }
     }
@@ -181,7 +175,13 @@ struct GcActor {
     tier: Tiering,
     buckets: BucketCtl,
     store: GcStore,
-    ring: RecencyRing,
+    /// Shared with the running pass, which probes it directly. The critical sections are a handful of
+    /// filter lookups with no I/O and no await inside them, so contention with the touch loop is
+    /// bounded by the ring's own arithmetic.
+    ring: Arc<Mutex<RecencyRing>>,
+    /// Fixed at construction, so the persist path doesn't take the ring's lock to learn how many
+    /// slices to keep.
+    depth: usize,
     yields: Yields,
     ladder: Ladder,
     probe_pages: usize,
@@ -189,47 +189,54 @@ struct GcActor {
     low_water: f64,
     high_water: f64,
     source: Option<Arc<dyn UsageSource>>,
-    rx: mpsc::Receiver<GcMsg>,
-    /// Handed to each pass so it can ask the actor for ages and report its own completion. Held as a
-    /// sender rather than reconstructed per pass because it must *not* keep the actor alive: it is a
-    /// clone of the same handle the rest of the crate holds, so the queue closes when the service
-    /// drops regardless of how many passes have run.
-    replies: mpsc::Sender<GcMsg>,
-    /// At most one pass in flight: passes are idempotent, but overlapping them buys nothing and
-    /// doubles the listing load exactly when the cache is already struggling.
-    pass: Option<JoinHandle<()>>,
+    rx: mpsc::Receiver<String>,
+    /// Rotated slices on their way to GC's bucket. Tracked rather than detached so the drain can wait
+    /// for them: a slice is only worth writing if the *next* process gets to read it.
+    persists: JoinSet<()>,
 }
 
 impl GcActor {
+    /// The loop, and what it owes on the way out. Both are exits worth being precise about:
+    ///
+    /// A touch queue with no senders left means the service is gone, so the pass in flight is *awaited*
+    /// rather than abandoned — its evictions each hold a key's write lock across a twin write and a CAS,
+    /// and one cut between the two leaves a twin beside a live body for a later sweep to find. The
+    /// retired slices still being persisted are joined for the same reason, less severely: a slice lost
+    /// mid-PUT costs the next process a colder ring.
     async fn run(mut self) {
         self.restore().await;
 
         let mut cadence = self.ladder.current().interval;
         let mut ticks = interval(cadence);
         let mut batch = Vec::with_capacity(TOUCH_BATCH);
+        // At most one pass in flight: passes are idempotent, but overlapping them buys nothing and
+        // doubles the listing load exactly when the cache is already struggling.
+        let mut pass: Option<JoinHandle<PassReport>> = None;
         loop {
             tokio::select! {
                 n = self.rx.recv_many(&mut batch, TOUCH_BATCH) => {
                     if n == 0 {
-                        // Every reclaim a pass makes is idempotent and will be re-found by the next
-                        // process, so there is nothing to finish on the way out.
-                        if let Some(pass) = self.pass.take() {
-                            pass.abort();
-                        }
+                        self.finish(pass).await;
                         return;
                     }
-                    for msg in batch.drain(..) {
-                        match msg {
-                            GcMsg::Touch(qualified) => self.record(qualified),
-                            GcMsg::Ages { qualified, reply } => {
-                                let ages = qualified.iter().map(|q| self.ring.probe(q)).collect();
-                                let _ = reply.send(ages);
-                            }
-                            GcMsg::Finished(report) => self.settle(report),
-                        }
+                    for qualified in batch.drain(..) {
+                        self.record(qualified);
                     }
                 }
-                _ = ticks.tick() => self.dispatch(),
+                report = finished(&mut pass) => {
+                    if let Some(report) = report {
+                        self.settle(report);
+                    }
+                }
+                // Reaped as they land so the set does not grow across a long run; the persist itself
+                // logs its own failure.
+                Some(_) = self.persists.join_next(), if !self.persists.is_empty() => {}
+                _ = ticks.tick() => match pass {
+                    // A handle still here is a pass whose report has not been folded in yet;
+                    // replacing it would discard that report.
+                    Some(_) => tracing::debug!("scavenger pass still running; skipping this tick"),
+                    None => pass = Some(self.dispatch()),
+                },
             }
             // The ladder moves the cadence, so the timer is rebuilt whenever a rung changed it —
             // never on the same tick that fired, so a shortened interval takes effect from now.
@@ -249,36 +256,55 @@ impl GcActor {
             tracing::warn!(error = %e, "GC bucket unavailable; recency will not survive this run");
             return;
         }
-        match self.store.load(self.ring.depth()).await {
+        match self.store.load(self.depth).await {
             Ok(slices) if slices.is_empty() => {}
             Ok(slices) => {
                 tracing::info!(slices = slices.len(), "recency ring restored");
-                self.ring.install(slices);
+                self.ring().install(slices);
             }
             Err(e) => tracing::warn!(error = %e, "recency ring not restored; starting cold"),
         }
     }
 
+    /// Panic-free by construction: nothing under this lock can panic, so a poisoned lock is
+    /// unreachable and treating it as fatal is honest about that.
+    fn ring(&self) -> std::sync::MutexGuard<'_, RecencyRing> {
+        self.ring.lock().expect("recency ring lock poisoned")
+    }
+
     fn record(&mut self, qualified: String) {
-        let Some(retired) = self.ring.record(qualified) else {
+        let Some(retired) = self.ring().record(qualified) else {
             return;
         };
         // Off the loop, for the same reason a pass is: the actor must stay ready to record the
         // touches arriving behind this one. The slice is already in the ring, so a persist that
         // fails costs only the *next* process one colder cycle.
-        let (store, depth) = (self.store.clone(), self.ring.depth());
-        tokio::spawn(async move {
+        let (store, depth) = (self.store.clone(), self.depth);
+        self.persists.spawn(async move {
             if let Err(e) = store.persist(&retired, depth).await {
                 tracing::warn!(seq = retired.seq, error = %e, "recency slice not persisted");
             }
         });
     }
 
-    fn dispatch(&mut self) {
-        if self.pass.as_ref().is_some_and(|p| !p.is_finished()) {
-            tracing::debug!("scavenger pass still running; skipping this tick");
-            return;
+    /// Let the work already in hand land. The report is still settled even though nothing outlives the
+    /// process to read the ladder or the yields: settling is what logs the bytes the pass reclaimed,
+    /// and a pass that did its work unrecorded is indistinguishable from one that was cut off.
+    async fn finish(&mut self, pass: Option<JoinHandle<PassReport>>) {
+        if let Some(pass) = pass {
+            match pass.await {
+                Ok(report) => self.settle(report),
+                Err(e) => tracing::warn!(error = %e, "scavenger pass did not finish"),
+            }
         }
+        while let Some(persisted) = self.persists.join_next().await {
+            if let Err(e) = persisted {
+                tracing::warn!(error = %e, "recency slice persist did not finish");
+            }
+        }
+    }
+
+    fn dispatch(&mut self) -> JoinHandle<PassReport> {
         let swept = self.buckets.ready();
         self.yields.retain(&swept);
         // Durable mode holds no bodies to evict, so it never probes. Cached mode narrows to the
@@ -309,10 +335,10 @@ impl GcActor {
         let pass = Pass {
             tier: self.tier.clone(),
             source: self.source.clone(),
-            actor: self.replies.clone(),
+            ring: self.ring.clone(),
             plan,
         };
-        self.pass = Some(tokio::spawn(pass.run()));
+        tokio::spawn(pass.execute())
     }
 
     /// Fold a finished pass back into the state it was judged against — the yields it taught, and the
@@ -365,6 +391,25 @@ impl GcActor {
     }
 }
 
+/// The running pass's report, clearing the handle as it takes it. Pends forever when no pass is
+/// running, so it can sit in the loop's `select!` unconditionally. A pass that panicked or was
+/// aborted leaves nothing to settle: the ladder and the yields simply keep the state they were
+/// judged against, and the next tick starts a pass that re-derives its plan from scratch.
+async fn finished(pass: &mut Option<JoinHandle<PassReport>>) -> Option<PassReport> {
+    let Some(handle) = pass.as_mut() else {
+        return std::future::pending().await;
+    };
+    let outcome = handle.await;
+    *pass = None;
+    match outcome {
+        Ok(report) => Some(report),
+        Err(e) => {
+            tracing::warn!(error = %e, "scavenger pass did not finish");
+            None
+        }
+    }
+}
+
 /// Missed ticks are *delayed*, not caught up on: a pass that overran its interval has already done
 /// the work the skipped ticks would have asked for, and firing them back to back would only stack
 /// listings on a backend that is evidently already slow.
@@ -390,7 +435,9 @@ struct Plan {
 struct Pass {
     tier: Tiering,
     source: Option<Arc<dyn UsageSource>>,
-    actor: mpsc::Sender<GcMsg>,
+    /// Read directly, not asked for: a pass is GC's own work, and a probe is a filter lookup that
+    /// would cost more to queue than to take the lock for.
+    ring: Arc<Mutex<RecencyRing>>,
     plan: Plan,
 }
 
@@ -411,13 +458,7 @@ struct UsageBracket {
 }
 
 impl Pass {
-    async fn run(self) {
-        let report = self.execute().await;
-        // A closed queue is shutdown; the next process re-derives everything this pass learned.
-        let _ = self.actor.send(GcMsg::Finished(report)).await;
-    }
-
-    async fn execute(&self) -> PassReport {
+    async fn execute(self) -> PassReport {
         let before = self.sample().await;
         let target = before
             .filter(|u| u.ratio() >= self.plan.high_water)
@@ -535,31 +576,22 @@ impl Pass {
             }
         }
 
-        let Some(ages) = self.ages(&candidates).await else {
-            return (Vec::new(), yields);
+        let mut aged: Vec<(Candidate, Age)> = {
+            let ring = self.ring.lock().expect("recency ring lock poisoned");
+            candidates
+                .into_iter()
+                .map(|candidate| {
+                    let age = ring.probe(&candidate.qualified());
+                    (candidate, age)
+                })
+                .collect()
         };
-        let mut aged: Vec<(Candidate, Age)> = candidates.into_iter().zip(ages).collect();
         aged.sort_by(|(left, left_age), (right, right_age)| {
             right_age
                 .cmp(left_age)
                 .then(left.mtime_ms.cmp(&right.mtime_ms))
         });
         (aged, yields)
-    }
-
-    async fn ages(&self, candidates: &[Candidate]) -> Option<Vec<Age>> {
-        if candidates.is_empty() {
-            return Some(Vec::new());
-        }
-        let qualified = candidates.iter().map(Candidate::qualified).collect();
-        let (reply, answer) = oneshot::channel();
-        self.actor
-            .send(GcMsg::Ages { qualified, reply })
-            .await
-            .ok()?;
-        // No answer means the actor is gone. Declining to evict is the only safe reading: without
-        // ages every candidate would look like a miss, which is *evict everything*.
-        answer.await.ok()
     }
 
     /// Evict coldest-first until `target` bytes are reclaimed, then keep taking **misses** up to the

@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
@@ -407,11 +408,19 @@ async fn list_shadows(tier: &Tiering, bucket: &str, pages: usize) -> Result<Hash
 }
 
 /// Run [`sweep`] for a bucket whose shadow-clean marker was absent, and account for it if the sweep
-/// succeeds. Fire-and-forget: nothing waits on it, since an orphan is invisible to clients — and a
-/// sweep that fails simply leaves the bucket unaccounted, so the drain withholds its marker and the
-/// next run tries again. Positive evidence only, as everywhere else in this pair (§7).
-pub(crate) fn dispatch_sweep(tier: Tiering, buckets: BucketCtl, bucket: String) {
-    tokio::spawn(async move {
+/// succeeds. Nothing on the serving path waits on it — an orphan is invisible to clients, and a sweep
+/// that fails simply leaves the bucket unaccounted, so the drain withholds its marker and the next run
+/// tries again. Positive evidence only, as everywhere else in this pair (§7).
+///
+/// It joins `sweeps` rather than running detached so the drain can wait for it: a sweep killed a moment
+/// before it would have accounted for its bucket costs the next run a listing for nothing.
+pub(crate) fn dispatch_sweep(
+    sweeps: &mut JoinSet<()>,
+    tier: Tiering,
+    buckets: BucketCtl,
+    bucket: String,
+) {
+    sweeps.spawn(async move {
         match sweep(&tier, &bucket).await {
             Ok(reclaimed) => {
                 if reclaimed > 0 {
