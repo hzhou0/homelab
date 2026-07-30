@@ -74,8 +74,9 @@ impl Hypha {
     /// enabled" passes.
     pub(super) async fn op_get_bucket_versioning(
         &self,
-        _req: S3Request<GetBucketVersioningInput>,
+        req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        self.remote().head_bucket(&req.input.bucket).await?;
         let resp = GetBucketVersioningOutput {
             status: None,
             mfa_delete: Some(MFADeleteStatus::from_static(MFADeleteStatus::DISABLED)),

@@ -61,14 +61,16 @@ pub type BoxError = Box<dyn Error + Send + Sync>;
 /// Build the s3s `S3Service` — hypha's client auth over the `Hypha` app — from a validated config,
 /// alongside the [`Lifecycle`] [`serve`] needs to bracket it: the startup marker clear and the
 /// drain-time quiescence proof (§7). The age envelope and trailer key both derive from
-/// `master_passphrase` (§6).
-pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError> {
+/// `master_passphrase` (§6). The persistent halt check precedes every actor spawn, so a halted
+/// deployment does no background work on its way back out.
+pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError> {
     let env = hypha_format::Envelope::new(&config.master_passphrase)
         .map_err(|e| format!("parsing master passphrase: {e}"))?;
     // Trailer authentication key: same master passphrase, distinct KDF domain (§6).
     let trailer_key = hypha_format::TrailerKey::derive(&config.master_passphrase);
 
     let remote = Backend::connect(&config.remote, config.role_prefix(REMOTE_ROLE));
+    halt::exit_if_marked(&remote).await?;
     // The cache carries three roles on one endpoint (§6, §8): <data> holds client bodies +
     // tombstones, <meta> hypha's twins/markers/mpu records, and GC's own bucket the recency ring.
     let data = Backend::connect(&config.cache, config.role_prefix(DATA_ROLE));
@@ -189,7 +191,7 @@ pub fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError
     actors.extend(replication.map(|task| ("reconcile", task)));
 
     let lifecycle = Lifecycle {
-        health: admin::Health::new(startup_tier.remote.clone()),
+        health: Health::new(startup_tier.remote.clone()),
         tier: startup_tier,
         buckets: startup_buckets,
         halt: serve_halt,
@@ -238,7 +240,6 @@ impl Lifecycle {
     }
 
     pub async fn startup(&mut self) -> Result<(), BoxError> {
-        halt::exit_if_marked(&self.tier.remote).await?;
         self.sweeps = bucket::resolve_all(&self.tier, &self.buckets).await?;
         self.health.started();
         Ok(())
@@ -251,10 +252,18 @@ impl Lifecycle {
     /// Called only when the connection drain completed. A drain that timed out cannot bound the work
     /// a clean marker would be vouching for, so the run ends with none.
     async fn seal(&mut self) {
-        if tokio::time::timeout(OBLIGATION_DRAIN, self.settle())
-            .await
-            .is_err()
-        {
+        let settled = {
+            let halt = self.halt.clone();
+            let halt_signal = halt.shutdown_signalled();
+            let settle = tokio::time::timeout(OBLIGATION_DRAIN, self.settle());
+            tokio::pin!(halt_signal, settle);
+            tokio::select! {
+                biased;
+                () = halt_signal.as_mut() => halt_until_exit().await,
+                settled = settle.as_mut() => settled,
+            }
+        };
+        if settled.is_err() {
             tracing::warn!("obligation drain overran its budget; clean markers withheld");
             self.sweeps.abort_all();
             self.marker_actor.abort();
@@ -296,14 +305,23 @@ impl Lifecycle {
         drop(self.buckets);
         drop(self.tier);
 
-        let joined = tokio::time::timeout(ACTOR_QUIESCE, async {
-            for (name, actor) in &mut self.actors {
-                if let Err(e) = actor.await {
-                    tracing::warn!(actor = name, error = %e, "actor did not finish");
+        let joined = {
+            let halt = self.halt.clone();
+            let halt_signal = halt.shutdown_signalled();
+            let actors = tokio::time::timeout(ACTOR_QUIESCE, async {
+                for (name, actor) in &mut self.actors {
+                    if let Err(e) = actor.await {
+                        tracing::warn!(actor = name, error = %e, "actor did not finish");
+                    }
                 }
+            });
+            tokio::pin!(halt_signal, actors);
+            tokio::select! {
+                biased;
+                () = halt_signal.as_mut() => halt_until_exit().await,
+                joined = actors.as_mut() => joined,
             }
-        })
-        .await;
+        };
 
         // Reached only when an actor still had work in hand, where the choice is no longer between
         // finishing and not — it is between this and being SIGKILLed with the same work outstanding
@@ -326,6 +344,11 @@ impl Lifecycle {
     }
 }
 
+async fn halt_until_exit() -> ! {
+    tracing::error!("halted on an invariant violation; recording the halt");
+    std::future::pending().await
+}
+
 /// Serve `service` on `listener`, accepting connections until `shutdown` resolves, then drain
 /// in-flight connections (bounded to 15 s). TLS is terminated at the cluster gateway, so this is
 /// plain HTTP.
@@ -345,59 +368,117 @@ where
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
     let halt = lifecycle.halt.clone();
-    let mut halted = false;
+    let mut connections = JoinSet::new();
+    let mut accept_backoff = ACCEPT_RETRY_MIN;
 
-    loop {
-        let (stream, _peer) = tokio::select! {
-            res = listener.accept() => match res {
-                Ok(c) => c,
-                Err(e) => { tracing::error!(error = %e, "accept failed"); continue; }
-            },
+    let halted = 'accept: loop {
+        tokio::select! {
+            biased;
+            () = halt.shutdown_signalled() => {
+                lifecycle.health.stopping();
+                break true;
+            }
             () = shutdown.as_mut() => {
                 tracing::info!("shutdown signalled: draining");
                 lifecycle.health.stopping();
-                break;
+                break false;
             }
-            () = halt.shutdown_signalled() => { halted = true; break; }
-        };
-
-        // Disable Nagle: streamed-body responses (GET) write headers then body chunks, and with
-        // Nagle on the second small segment waits for the client's delayed ACK — a ~40 ms stall on
-        // every read (writes/HEAD have single-segment responses and don't hit it). Latency over
-        // throughput is the right trade for a request/response S3 surface.
-        stream.set_nodelay(true)?;
-        let conn = http.serve_connection(TokioIo::new(stream), service.clone());
-        let conn = graceful.watch(conn.into_owned());
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::debug!(error = %e, "connection ended");
+            Some(finished) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(e) = finished {
+                    tracing::warn!(error = %e, "connection task did not finish");
+                }
             }
-        });
-    }
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(connection) => {
+                        accept_backoff = ACCEPT_RETRY_MIN;
+                        connection
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            retry_ms = accept_backoff.as_millis(),
+                            "accept failed; retrying"
+                        );
+                        tokio::select! {
+                            biased;
+                            () = halt.shutdown_signalled() => {
+                                lifecycle.health.stopping();
+                                break 'accept true;
+                            }
+                            () = shutdown.as_mut() => {
+                                tracing::info!("shutdown signalled: draining");
+                                lifecycle.health.stopping();
+                                break 'accept false;
+                            }
+                            () = tokio::time::sleep(accept_backoff) => {}
+                        }
+                        accept_backoff = (accept_backoff * 2).min(ACCEPT_RETRY_MAX);
+                        continue;
+                    }
+                };
 
-    // Signal the live connections, but neither await the drain nor return: the handler that raised
-    // the violation is itself in flight and parked on the record write, so the drain could only time
+                // Disable Nagle: streamed-body responses (GET) write headers then body chunks, and
+                // with Nagle on the second small segment waits for the client's delayed ACK — a
+                // ~40 ms stall on every read (writes/HEAD have single-segment responses and don't
+                // hit it). Latency over throughput is the right trade for a request/response S3
+                // surface, but failing to set the optimization is not a reason to reject a client.
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!(%peer, error = %e, "TCP_NODELAY could not be enabled");
+                }
+                let conn = http.serve_connection(TokioIo::new(stream), service.clone());
+                let conn = graceful.watch(conn.into_owned());
+                connections.spawn(async move {
+                    if let Err(e) = conn.await {
+                        tracing::debug!(%peer, error = %e, "connection ended");
+                    }
+                });
+            }
+        }
+    };
+    drop(listener);
+
+    // Signal the live connections, but neither await the drain nor return: a handler that raised the
+    // violation remains in flight until the recorder exits the process, so the drain could only time
     // out — and returning would end the process *successfully*, losing the record (`crate::halt`).
     if halted {
-        tracing::error!(
-            "halted on an invariant violation: closing connections, recording the halt"
-        );
         tokio::spawn(graceful.shutdown());
-        std::future::pending::<()>().await;
-        unreachable!("`pending` never resolves; the process ends from the halt's record loop")
+        halt_until_exit().await
     }
 
     // Step 1 of the quiescence proof (§7): when this resolves, every handler has returned and no new
     // one can start, so every marker obligation that will ever exist has been raised. On timeout the
     // seal is skipped entirely — a connection may still commit a write, and the claim a clean marker
     // makes is about work we can no longer bound.
+    let mut connection_drain = tokio::spawn(graceful.shutdown());
     let drained = tokio::select! {
-        () = graceful.shutdown() => { tracing::info!("connections drained"); true }
+        biased;
+        () = halt.shutdown_signalled() => halt_until_exit().await,
+        result = &mut connection_drain => match result {
+            Ok(()) => {
+                tracing::info!("connections drained");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "connection drain task did not finish");
+                false
+            }
+        },
         () = tokio::time::sleep(CONNECTION_DRAIN) => {
             tracing::warn!("drain timeout; clean markers withheld and the next run scans");
             false
         }
     };
+    if drained {
+        while let Some(finished) = connections.join_next().await {
+            if let Err(e) = finished {
+                tracing::warn!(error = %e, "connection task did not finish");
+            }
+        }
+    } else {
+        connections.shutdown().await;
+        let _ = connection_drain.await;
+    }
 
     // The API's own copy of every actor handle. Dropped before the actors are joined, or each of them
     // would still be holding a queue that the service could in principle write to again.
@@ -417,3 +498,5 @@ where
 const CONNECTION_DRAIN: Duration = Duration::from_secs(15);
 const OBLIGATION_DRAIN: Duration = Duration::from_secs(10);
 const ACTOR_QUIESCE: Duration = Duration::from_secs(10);
+const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);

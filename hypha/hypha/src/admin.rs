@@ -20,6 +20,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -30,6 +31,9 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 
 use hypha_core::Backend;
+
+const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
 
 /// What the probes read. Cloned freely; the flag is the only state, since everything else worth
 /// asking about is a live call to the thing being asked about.
@@ -73,13 +77,30 @@ where
 {
     let http = std::sync::Arc::new(ConnBuilder::new(TokioExecutor::new()));
     let mut shutdown = std::pin::pin!(shutdown);
+    let mut accept_backoff = ACCEPT_RETRY_MIN;
     loop {
-        let stream = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _peer)) => stream,
-                Err(e) => { tracing::warn!(error = %e, "admin accept failed"); continue; }
-            },
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
             () = shutdown.as_mut() => return,
+        };
+        let stream = match accepted {
+            Ok((stream, _peer)) => {
+                accept_backoff = ACCEPT_RETRY_MIN;
+                stream
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    retry_ms = accept_backoff.as_millis(),
+                    "admin accept failed; retrying"
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(accept_backoff) => {}
+                    () = shutdown.as_mut() => return,
+                }
+                accept_backoff = (accept_backoff * 2).min(ACCEPT_RETRY_MAX);
+                continue;
+            }
         };
 
         let (health, metrics, http) = (health.clone(), metrics.clone(), http.clone());

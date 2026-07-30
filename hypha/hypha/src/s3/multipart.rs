@@ -21,9 +21,12 @@ use hypha_core::meta;
 use hypha_format::offset::{ciphertext_len, plaintext_len_from, HLEN};
 use hypha_format::{encode_trailer, Footer, FooterKind};
 
+use super::copy::evaluate_copy_source_time;
 use super::overlay::KeyState;
+use super::put::evaluate_precondition;
 use super::{
-    copied_part_retag, resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
+    copied_part_retag, parse_content_md5, resolve_storage_class, ts_ms, write_metadata, Hypha,
+    MAX_INLINE_PLAINTEXT,
 };
 use crate::codec;
 use crate::gc::Plaintext;
@@ -116,6 +119,11 @@ impl Hypha {
                 "parts are capped at {MAX_INLINE_PLAINTEXT} bytes"
             ));
         }
+        let expect_md5 = input
+            .content_md5
+            .as_deref()
+            .map(parse_content_md5)
+            .transpose()?;
         let body = input
             .body
             .ok_or_else(|| Error::Invalid("UploadPart requires a body".into()))?;
@@ -125,7 +133,15 @@ impl Hypha {
         // Past the byte source, a part is a part: encrypt as a pure age file, stream to the remote,
         // record its facts. The copy path (`op_upload_part_copy`) shares this tail (§7).
         let pmd5 = self
-            .stream_part(&bucket, &key, &input.upload_id, part_number, plen, body)
+            .stream_part(
+                &bucket,
+                &key,
+                &input.upload_id,
+                part_number,
+                plen,
+                body,
+                expect_md5,
+            )
             .await?;
 
         let resp = UploadPartOutput {
@@ -138,6 +154,7 @@ impl Hypha {
     /// The shared tail of `UploadPart` and the re-encrypt leg of `UploadPartCopy` (§7): one plaintext
     /// part body becomes its own pure age file on the remote's native upload. Returns the part's
     /// plaintext MD5, computed inline as the body streams.
+    #[allow(clippy::too_many_arguments)]
     async fn stream_part(
         &self,
         bucket: &str,
@@ -146,9 +163,10 @@ impl Hypha {
         part_number: i32,
         plen: u64,
         body: StreamingBlob,
+        expect_md5: Option<[u8; 16]>,
     ) -> S3Result<String> {
-        let (ct_len, enc, etag_rx) =
-            codec::encrypt_blob_with_etag(self.env(), body, plen, None, None)
+        let (ct_len, enc, mut etag_rx) =
+            codec::encrypt_blob_with_etag(self.env(), body, plen, None, expect_md5)
                 .await
                 .map_err(Error::Io)?;
 
@@ -162,7 +180,7 @@ impl Hypha {
             .then(mint_nonce)
             .unwrap_or_default();
 
-        let out = if stash_nonce.is_empty() {
+        let uploaded = if stash_nonce.is_empty() {
             self.remote()
                 .upload_part(
                     bucket,
@@ -172,11 +190,11 @@ impl Hypha {
                     enc,
                     Some(ct_len as i64),
                 )
-                .await?
+                .await
         } else {
             let stash_key = meta::mpu_stash_key(upload_id, part_number, &stash_nonce);
             let (to_remote, to_cache) = codec::tee(enc);
-            let (out, _) = tokio::try_join!(
+            tokio::try_join!(
                 self.remote().upload_part(
                     bucket,
                     key,
@@ -195,8 +213,19 @@ impl Hypha {
                     None,
                     None,
                 ),
-            )?;
-            out
+            )
+            .map(|(out, _)| out)
+        };
+        let out = match uploaded {
+            Ok(out) => out,
+            Err(e) => {
+                return Err(match etag_rx.try_recv() {
+                    Ok(Err(_)) => {
+                        s3_error!(BadDigest, "Content-MD5 does not match the request body")
+                    }
+                    _ => e.into(),
+                });
+            }
         };
         // The remote accepted the part, so it must echo the ETag that identifies it — an empty
         // `retag` would silently fail to match this part at complete (§6).
@@ -205,13 +234,10 @@ impl Hypha {
             .ok_or_else(|| Error::Backend("part upload returned no ETag".into()))?
             .trim_matches('"')
             .to_string();
-        // No expected digest passes through this path, so the mismatch arm is unreachable here.
         let pmd5 = etag_rx
             .await
             .map_err(|_| Error::Backend("MD5 task dropped before completing".into()))?
-            .map_err(|_| {
-                Error::Backend("unexpected digest mismatch on an unchecked part".into())
-            })?;
+            .map_err(|_| s3_error!(BadDigest, "Content-MD5 does not match the request body"))?;
 
         self.record_part(bucket, upload_id, part_number, &retag, &pmd5, &stash_nonce)
             .await?;
@@ -304,6 +330,16 @@ impl Hypha {
             KeyState::Remote { facts, .. } => (facts, false),
             KeyState::CacheBody { head, .. } => (RemoteFacts::from_cache_head(&head), true),
         };
+        evaluate_precondition(
+            input.copy_source_if_match.as_ref(),
+            input.copy_source_if_none_match.as_ref(),
+            Some(&facts.cetag),
+        )?;
+        evaluate_copy_source_time(
+            input.copy_source_if_modified_since.as_ref(),
+            input.copy_source_if_unmodified_since.as_ref(),
+            facts.mtime_ms,
+        )?;
 
         // The copy range over the source's PLAINTEXT: the whole object, or `copy-source-range`.
         let pt = match input.copy_source_range.as_deref() {
@@ -368,6 +404,7 @@ impl Hypha {
                 part_number,
                 part_plen,
                 plaintext,
+                None,
             )
             .await?
         };
@@ -465,10 +502,12 @@ impl Hypha {
                 .ok_or_else(|| Error::Backend(format!("no local pmd5 for winning part {n}")))?;
             // S3 verifies the caller's part ETags against what the uploads returned — for hypha
             // those are the plaintext part MD5s.
-            if let Some(e) = &cp.e_tag {
-                if e.value().trim_matches('"') != pmd5 {
-                    return Err(s3_error!(InvalidPart, "part etag mismatch"));
-                }
+            let e = cp
+                .e_tag
+                .as_ref()
+                .ok_or_else(|| s3_error!(InvalidPart, "part entry missing etag"))?;
+            if e.value().trim_matches('"') != pmd5 {
+                return Err(s3_error!(InvalidPart, "part etag mismatch"));
             }
             let plen = plaintext_len_from(*size, HLEN).ok_or_else(|| {
                 Error::Backend(format!("part {n} size {size} inconsistent with HLEN"))

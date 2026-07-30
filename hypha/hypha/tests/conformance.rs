@@ -520,6 +520,23 @@ async fn ranged_reads() {
         .send()
         .await;
     assert!(err.is_err(), "range past EOF must error");
+
+    put(&client, B, "empty-range", &[]).await;
+    for (key, range) in [(key, "bytes=-0"), ("empty-range", "bytes=-1")] {
+        let err = client
+            .get_object()
+            .bucket(B)
+            .key(key)
+            .range(range)
+            .send()
+            .await
+            .expect_err("an empty byte range must be rejected");
+        assert_eq!(
+            sdk_err_code(&err).as_deref(),
+            Some("InvalidRange"),
+            "{range} against {key}"
+        );
+    }
 }
 
 /// `If-None-Match: *` (no double-create) and `If-Match` (no lost update) preconditions.
@@ -1464,6 +1481,15 @@ async fn get_bucket_versioning_stub() {
         .await
         .expect("get bucket versioning");
     assert!(out.status().is_none(), "versioning is never enabled");
+
+    let err = h
+        .client()
+        .get_bucket_versioning()
+        .bucket("not-created")
+        .send()
+        .await
+        .expect_err("the stub must still validate bucket existence");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("NoSuchBucket"));
 }
 
 /// Simulate cache-volume loss and bring hypha back onto the empty volume.

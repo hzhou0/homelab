@@ -12,10 +12,10 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
-criterion = "0.8.2"
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
 
 [[bench]]
 name = "throughput"

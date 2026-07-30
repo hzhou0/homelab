@@ -38,11 +38,7 @@ pub struct SingleTrailer {
     pub mtime_ms: i64,
 }
 
-/// The client's `Content-MD5` did not match the body that arrived. The digest is computed inline
-/// as the plaintext streams, so it does not exist until the last byte has passed — by which point
-/// the backend op is already in flight. The encrypt task answers by stopping there: the body ends
-/// short of its declared length, so the op fails and the commit never lands, leaving the caller to
-/// report `BadDigest` over an untouched key (§7).
+/// The client's `Content-MD5` did not match the body that arrived.
 #[derive(Debug)]
 pub struct DigestMismatch;
 
@@ -240,7 +236,7 @@ pub async fn encrypt_blob_with_etag(
 
     tokio::task::spawn_blocking(move || {
         let out = SyncIoBridge::new_with_handle(pipe_w, h.clone());
-        let w = match env.encrypt(out) {
+        let w = match env.encrypt(CommitGate::new(out)) {
             Ok(w) => w,
             Err(e) => {
                 tracing::error!(error = %e, "encrypt: wrap_output failed");
@@ -252,9 +248,7 @@ pub async fn encrypt_blob_with_etag(
         let src = SyncIoBridge::new_with_handle(bs.into_async_read(), h);
         let mut md5_src = Md5Reader::new(src);
 
-        // finish() returns the inner pipe writer, so the trailer (whose digest only exists now)
-        // appends to the very same stream, then we shut it down to signal body EOF.
-        let mut sink = match pump_encrypt(w, &mut md5_src) {
+        let sink = match pump_encrypt(w, &mut md5_src) {
             Ok(sink) => sink,
             Err(e) => {
                 tracing::error!(error = %e, "encrypt: streaming payload failed");
@@ -263,13 +257,20 @@ pub async fn encrypt_blob_with_etag(
         };
         let md5 = md5_src.finish();
 
-        // The only point the client's declared digest can be checked at all — and still before the
-        // commit, since the trailer is what makes a single-part upload well-formed. Leaving the
-        // pipe short-and-closed is the signal to the caller (§7).
+        // The digest is unknowable until EOF. Holding one ciphertext byte until this check keeps
+        // even a trailerless multipart part short of its declared length on mismatch.
         if expect_md5.is_some_and(|want| want != md5) {
             let _ = etag_tx.send(Err(DigestMismatch));
             return;
         }
+
+        let mut sink = match sink.commit() {
+            Ok(sink) => sink,
+            Err(e) => {
+                tracing::error!(error = %e, "encrypt: committing ciphertext failed");
+                return;
+            }
+        };
 
         if let Some(t) = trailer {
             let footer = Footer {
@@ -291,6 +292,46 @@ pub async fn encrypt_blob_with_etag(
 
     let body = blob_to_bytestream(StreamingBlob::wrap(ReaderStream::new(pipe_r)));
     Ok((body_len, body, etag_rx))
+}
+
+struct CommitGate<W> {
+    inner: W,
+    held: Option<u8>,
+}
+
+impl<W> CommitGate<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, held: None }
+    }
+}
+
+impl<W: Write> CommitGate<W> {
+    fn commit(mut self) -> io::Result<W> {
+        if let Some(byte) = self.held.take() {
+            self.inner.write_all(&[byte])?;
+        }
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for CommitGate<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if let Some(byte) = self.held.take() {
+            self.inner.write_all(&[byte])?;
+        }
+        if buf.len() > 1 {
+            self.inner.write_all(&buf[..buf.len() - 1])?;
+        }
+        self.held = buf.last().copied();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Header+nonce were emitted by `wrap_output`; stream the payload, then write the age finalizer

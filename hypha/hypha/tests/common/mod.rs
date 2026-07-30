@@ -27,12 +27,8 @@ use hypha_core::config::{
     META_ROLE, REMOTE_ROLE,
 };
 
-/// Fixed root credentials for the throwaway MinIO (password must be ≥ 8 chars).
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASS: &str = "minioadmin";
-
 /// The client-facing credentials hypha authenticates its own S3 clients with (§2) — distinct from
-/// the MinIO backend creds above.
+/// each MinIO's backend credentials.
 const HYPHA_ACCESS: &str = "hyphatestaccess";
 const HYPHA_SECRET: &str = "hyphatestsecretkey";
 
@@ -57,6 +53,8 @@ pub struct Minio {
     child: Child,
     _data_dir: tempfile::TempDir,
     pub endpoint: String,
+    access_key: String,
+    secret_key: String,
 }
 
 impl Minio {
@@ -65,60 +63,93 @@ impl Minio {
             .acquire()
             .await
             .expect("boot gate is never closed");
-        let data_dir = tempfile::tempdir().expect("minio data dir");
-        let api_port = free_port();
-        let console_port = free_port();
-        let endpoint = format!("http://127.0.0.1:{api_port}");
-
         let bin = std::env::var("HYPHA_TEST_MINIO_BIN").unwrap_or_else(|_| "minio".to_string());
-        // Console must not share the API port; both are pinned to free ephemeral ports.
-        let child = Command::new(&bin)
-            .arg("server")
-            .arg(data_dir.path())
-            .arg("--address")
-            .arg(format!("127.0.0.1:{api_port}"))
-            .arg("--console-address")
-            .arg(format!("127.0.0.1:{console_port}"))
-            .env("MINIO_ROOT_USER", MINIO_USER)
-            .env("MINIO_ROOT_PASSWORD", MINIO_PASS)
-            .env("MINIO_UPDATE", "off")
-            .stdout(if std::env::var("TEST_HYPHA_LOGS").is_ok() {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .stderr(if std::env::var("TEST_HYPHA_LOGS").is_ok() {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawning `{bin} server` (set HYPHA_TEST_MINIO_BIN?): {e}"));
+        let mut last_error = String::new();
+        for _ in 0..8 {
+            let data_dir = tempfile::tempdir().expect("minio data dir");
+            let api_port = free_port();
+            let mut console_port = free_port();
+            while console_port == api_port {
+                console_port = free_port();
+            }
+            let endpoint = format!("http://127.0.0.1:{api_port}");
+            let access_key = format!("h{:016x}", rand::random::<u64>());
+            let secret_key = format!("s{:016x}", rand::random::<u64>());
 
-        let minio = Self {
-            child,
-            _data_dir: data_dir,
-            endpoint,
-        };
-        minio.await_ready().await;
-        minio
+            let child = Command::new(&bin)
+                .arg("server")
+                .arg(data_dir.path())
+                .arg("--address")
+                .arg(format!("127.0.0.1:{api_port}"))
+                .arg("--console-address")
+                .arg(format!("127.0.0.1:{console_port}"))
+                .env("MINIO_ROOT_USER", &access_key)
+                .env("MINIO_ROOT_PASSWORD", &secret_key)
+                .env("MINIO_UPDATE", "off")
+                .stdout(if std::env::var("TEST_HYPHA_LOGS").is_ok() {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .stderr(if std::env::var("TEST_HYPHA_LOGS").is_ok() {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .spawn()
+                .unwrap_or_else(|e| {
+                    panic!("spawning `{bin} server` (set HYPHA_TEST_MINIO_BIN?): {e}")
+                });
+
+            let mut minio = Self {
+                child,
+                _data_dir: data_dir,
+                endpoint,
+                access_key,
+                secret_key,
+            };
+            match minio.await_ready().await {
+                Ok(()) => return minio,
+                Err(e) => last_error = e,
+            }
+        }
+        panic!("MinIO could not claim a test port after 8 attempts: {last_error}");
     }
 
     /// An S3 client bound straight to this MinIO with its root credentials — used to inspect the
     /// backend directly (ciphertext-at-rest checks, cache-state assertions).
     pub fn raw_client(&self) -> Client {
-        s3_client(&self.endpoint, MINIO_USER, MINIO_PASS)
+        s3_client(&self.endpoint, &self.access_key, &self.secret_key)
     }
 
-    async fn await_ready(&self) {
+    async fn await_ready(&mut self) -> Result<(), String> {
         let client = self.raw_client();
         for _ in 0..240 {
-            if client.list_buckets().send().await.is_ok() {
-                return;
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|e| format!("checking MinIO process: {e}"))?
+            {
+                return Err(format!(
+                    "MinIO at {} exited during startup: {status}",
+                    self.endpoint
+                ));
+            }
+            if client.list_buckets().send().await.is_ok()
+                && self
+                    .child
+                    .try_wait()
+                    .map_err(|e| format!("checking MinIO process: {e}"))?
+                    .is_none()
+            {
+                return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        panic!("MinIO at {} did not become ready within 60s", self.endpoint);
+        Err(format!(
+            "MinIO at {} did not become ready within 60s",
+            self.endpoint
+        ))
     }
 }
 
@@ -140,7 +171,9 @@ pub struct Hypha {
 
 impl Hypha {
     async fn start(config: &Config) -> Self {
-        let (service, lifecycle) = hypha::build_service(config).expect("build hypha service");
+        let (service, lifecycle) = hypha::build_service(config)
+            .await
+            .expect("build hypha service");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind hypha");
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel::<()>();
@@ -510,8 +543,8 @@ impl Harness {
 
 fn base_config(minio: &Minio, mode: Mode) -> Config {
     Config {
-        remote: endpoint_cfg(&minio.endpoint),
-        cache: endpoint_cfg(&minio.endpoint),
+        remote: endpoint_cfg(minio),
+        cache: endpoint_cfg(minio),
         bucket_prefix: BUCKET_PREFIX.to_string(),
         mode,
         auth: ClientAuth {
@@ -574,17 +607,17 @@ pub fn s3_client(endpoint: &str, access: &str, secret: &str) -> Client {
     Client::from_conf(conf)
 }
 
-fn endpoint_cfg(endpoint: &str) -> S3Endpoint {
+fn endpoint_cfg(minio: &Minio) -> S3Endpoint {
     S3Endpoint {
-        endpoint: endpoint.to_string(),
+        endpoint: minio.endpoint.clone(),
         region: "us-east-1".to_string(),
-        access_key: MINIO_USER.to_string(),
-        secret_key: MINIO_PASS.to_string(),
+        access_key: minio.access_key.clone(),
+        secret_key: minio.secret_key.clone(),
     }
 }
 
-/// Grab a currently-free localhost port by binding to :0 and immediately releasing it. A small
-/// window exists before the port is re-claimed; acceptable for a test harness.
+/// Grab a currently-free localhost port by binding to :0 and immediately releasing it. MinIO startup
+/// retries if another test claims it before the child binds.
 fn free_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
@@ -661,8 +694,8 @@ pub async fn upload_part(
         .to_string()
 }
 
-/// Complete a multipart upload from `(part_number, etag)` pairs (`etag` empty ⇒ omitted, letting
-/// hypha resolve the winner itself). Returns the composite ETag hypha reports.
+/// Complete a multipart upload from `(part_number, etag)` pairs. Returns the composite ETag hypha
+/// reports.
 pub async fn complete_mpu(
     client: &Client,
     bucket: &str,

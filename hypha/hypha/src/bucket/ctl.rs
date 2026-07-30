@@ -762,11 +762,18 @@ impl BucketTask {
     }
 
     async fn run_recovery(&self, bucket: &str, pass: Recovery) -> Outcome {
-        if self.tier.remote.head_bucket(bucket).await.is_err() {
-            // Deleted since startup resolved it. Retiring is what makes the map agree with the remote
-            // again, and turns later requests into `NoSuchBucket` instead of remote reads.
-            retire(&self.states, bucket);
-            return Outcome::Done;
+        match self.tier.remote.head_bucket(bucket).await {
+            Ok(()) => {}
+            Err(Error::NoSuchBucket) => {
+                // Deleted since startup resolved it. Retiring is what makes the map agree with the
+                // remote again, and turns later requests into `NoSuchBucket` instead of remote reads.
+                retire(&self.states, bucket);
+                return Outcome::Done;
+            }
+            Err(e) => {
+                tracing::warn!(bucket, error = %e, "recovery could not check remote bucket; retrying");
+                return Outcome::Retry;
+            }
         }
         if let Err(e) = self.provision(bucket).await {
             tracing::warn!(bucket, error = %e, "recovery could not provision cache; retrying");

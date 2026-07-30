@@ -337,7 +337,7 @@ fn copy_part_ranges(total: u64) -> Vec<Range<u64>> {
 /// The two time-based copy-source conditions (§7), compared at the second granularity a client sees
 /// `LastModified` at. `if_modified_since` fails when the source has *not* changed since; `if_unmodified_since`
 /// fails when it *has* — both surface as `412 PreconditionFailed`.
-fn evaluate_copy_source_time(
+pub(super) fn evaluate_copy_source_time(
     if_modified_since: Option<&Timestamp>,
     if_unmodified_since: Option<&Timestamp>,
     src_mtime_ms: i64,

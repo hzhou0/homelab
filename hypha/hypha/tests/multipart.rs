@@ -82,6 +82,63 @@ async fn multipart_roundtrip_ranges_and_etag() {
     );
 }
 
+#[tokio::test]
+async fn upload_part_validates_content_md5() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "part-md5";
+    let good = pattern_seeded(4096, 8);
+    let rejected = pattern_seeded(4096, 9);
+    let up = create_mpu(&client, B, key).await;
+    let good_etag = upload_part(&client, B, key, &up, 1, &good).await;
+
+    let err = client
+        .upload_part()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .part_number(1)
+        .body(bytes_body(&rejected))
+        .content_length(rejected.len() as i64)
+        .content_md5(base64_md5(b"different bytes"))
+        .send()
+        .await
+        .expect_err("a mismatched Content-MD5 must reject the part");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("BadDigest"));
+
+    let listed = client
+        .list_parts()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .send()
+        .await
+        .expect("list after rejected part");
+    let parts = listed.parts();
+    assert_eq!(parts.len(), 1, "the rejected part must not land");
+    assert_eq!(
+        parts[0].e_tag().map(|etag| etag.trim_matches('"')),
+        Some(good_etag.as_str()),
+        "a rejected re-upload must leave the previous generation intact"
+    );
+}
+
+#[tokio::test]
+async fn complete_requires_every_part_etag() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "missing-complete-etag";
+    let up = create_mpu(&client, B, key).await;
+    upload_part(&client, B, key, &up, 1, &pattern_seeded(4096, 10)).await;
+
+    let err = complete_mpu_res(&client, B, key, &up, &[(1, String::new())])
+        .await
+        .expect_err("a completed part without its ETag must be rejected");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("InvalidPart"));
+}
+
 /// A re-uploaded part's stale record is resolved away at complete by the remote's `ListParts`; the
 /// surviving object reflects the *last* upload, and no mpu records linger.
 #[tokio::test]
@@ -147,8 +204,8 @@ async fn multipart_concurrent_same_part() {
         "the two candidate parts have distinct plaintext MD5s"
     );
 
-    // Let hypha resolve the winner via the remote's ListParts (omit the part-2 ETag).
-    let etag = complete_mpu(&client, B, key, &up, &[(1, e1), (2, String::new())]).await;
+    let e2 = listed_part_etag(&client, B, key, &up, 2).await;
+    let etag = complete_mpu(&client, B, key, &up, &[(1, e1), (2, e2)]).await;
 
     let whole = get_all(&client, B, key).await;
     let part2 = &whole[MIN_PART..];
@@ -186,7 +243,8 @@ async fn multipart_concurrent_small_final_part() {
         upload_part(&client, B, key, &up, 2, &b),
     );
 
-    let etag = complete_mpu(&client, B, key, &up, &[(1, e1), (2, String::new())]).await;
+    let e2 = listed_part_etag(&client, B, key, &up, 2).await;
+    let etag = complete_mpu(&client, B, key, &up, &[(1, e1), (2, e2)]).await;
     let whole = get_all(&client, B, key).await;
     let tail = &whole[MIN_PART..];
     assert!(
@@ -834,7 +892,80 @@ async fn upload_part_copy_missing_source() {
     );
 }
 
+#[tokio::test]
+async fn upload_part_copy_source_preconditions() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let src = pattern_seeded(4096, 97);
+    let etag = put(&client, B, "copy-part/source-cond", &src).await;
+    let key = "copy-part/dest-cond";
+    let up = create_mpu(&client, B, key).await;
+
+    let err = client
+        .upload_part_copy()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .part_number(1)
+        .copy_source(format!("{B}/copy-part/source-cond"))
+        .copy_source_if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await
+        .expect_err("a stale copy-source If-Match must fail");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("PreconditionFailed"));
+
+    let err = client
+        .upload_part_copy()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .part_number(1)
+        .copy_source(format!("{B}/copy-part/source-cond"))
+        .copy_source_if_none_match(format!("\"{etag}\""))
+        .send()
+        .await
+        .expect_err("a matching copy-source If-None-Match must fail");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("PreconditionFailed"));
+
+    client
+        .upload_part_copy()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .part_number(1)
+        .copy_source(format!("{B}/copy-part/source-cond"))
+        .copy_source_if_match(format!("\"{etag}\""))
+        .send()
+        .await
+        .expect("a matching copy-source If-Match must pass");
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────────────────────
+
+async fn listed_part_etag(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+) -> String {
+    client
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .expect("list winning parts")
+        .parts()
+        .iter()
+        .find(|part| part.part_number() == Some(part_number))
+        .and_then(|part| part.e_tag())
+        .expect("winning part etag")
+        .trim_matches('"')
+        .to_string()
+}
 
 /// Copy (a range of) a source object into part `part_number` of `upload_id`; returns the part ETag.
 #[allow(clippy::too_many_arguments)]

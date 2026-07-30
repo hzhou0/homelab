@@ -12,7 +12,7 @@
 use std::ops::Range as ByteRange;
 
 use s3s::dto::*;
-use s3s::{S3Request, S3Response, S3Result};
+use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use hypha_core::config::Mode;
 use hypha_core::error::Error;
@@ -50,8 +50,10 @@ impl Hypha {
                     self.serve_remote(&bucket, &key, &input, &facts, &md).await
                 }
             }
-            KeyState::CacheBody { md, .. } => {
-                self.serve_cache_body(&bucket, &key, &input, &md).await
+            KeyState::CacheBody { head, md } => {
+                let plen = head.content_length.unwrap_or_default().max(0) as u64;
+                self.serve_cache_body(&bucket, &key, &input, plen, &md)
+                    .await
             }
         }
     }
@@ -96,6 +98,9 @@ impl Hypha {
         facts: &RemoteFacts,
         md: &std::collections::HashMap<String, String>,
     ) -> S3Result<Option<S3Response<GetObjectOutput>>> {
+        if let Some(range) = &input.range {
+            plaintext_range(range, facts.plen)?;
+        }
         let shadow = meta::shadow_key(key);
         let out = match self
             .meta()
@@ -160,8 +165,12 @@ impl Hypha {
         bucket: &str,
         key: &str,
         input: &GetObjectInput,
+        plen: u64,
         md: &std::collections::HashMap<String, String>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        if let Some(range) = &input.range {
+            plaintext_range(range, plen)?;
+        }
         let out = self
             .data()
             .get(bucket, key, input.range.as_ref().map(range_header))
@@ -391,15 +400,14 @@ fn range_header(range: &Range) -> String {
     }
 }
 
-fn plaintext_range(range: &Range, plen: u64) -> Result<ByteRange<u64>, Error> {
-    match *range {
-        Range::Int { first, last } => {
-            if first >= plen {
-                return Err(Error::Invalid("range start beyond object length".into()));
-            }
-            let end = last.map(|l| l.saturating_add(1).min(plen)).unwrap_or(plen);
-            Ok(first..end)
-        }
-        Range::Suffix { length } => Ok(plen.saturating_sub(length)..plen),
+fn plaintext_range(range: &Range, plen: u64) -> S3Result<ByteRange<u64>> {
+    if plen == 0 {
+        return Err(s3_error!(
+            InvalidRange,
+            "range cannot select an empty object"
+        ));
     }
+    range
+        .check(plen)
+        .map_err(|_| s3_error!(InvalidRange, "requested range is not satisfiable"))
 }

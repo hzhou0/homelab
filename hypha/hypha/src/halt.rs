@@ -145,9 +145,6 @@ impl Halt {
              Shutting the server down and recording the halt marker; every restart will exit \
              until an operator resolves the violation and deletes the marker object."
         );
-        // `notify_one`, not `notify_waiters`: the latter drops the signal if `serve` happens to be
-        // between registrations, and this signal has no second chance.
-        self.stop.notify_one();
 
         // First violation wins: it describes the actual divergence, and one observed during the
         // wind-down is most likely its consequence.
@@ -155,32 +152,13 @@ impl Halt {
             std::future::pending().await
         }
 
-        let mut attempt: u64 = 0;
-        while let Err(e) = self
-            .remote
-            .put_small(
-                &violation.bucket,
-                &meta::halt_marker_key(),
-                violation.render(),
-                Default::default(),
-                None,
-                None,
-            )
-            .await
-        {
-            attempt += 1;
-            tracing::error!(
-                bucket = violation.bucket, attempt, error = %e,
-                "halt marker not recorded; the server is down and the write is still owed, retrying"
-            );
-            tokio::time::sleep(RECORD_RETRY).await;
-        }
-        tracing::error!(
-            bucket = violation.bucket,
-            invariant = violation.invariant.as_str(),
-            "halt marker recorded; exiting"
-        );
-        std::process::exit(EXIT_INVARIANT_VIOLATION)
+        // Recording belongs to the process, not the task that happened to detect the violation:
+        // connection and actor drains are allowed to abort that task after their budgets expire.
+        tokio::spawn(record(self.remote.clone(), violation));
+        // `notify_one`, not `notify_waiters`: the latter drops the signal if `serve` happens to be
+        // between registrations, and this signal has no second chance.
+        self.stop.notify_one();
+        std::future::pending().await
     }
 
     /// One helper is what keeps every trailer-reading site (§6) on the same footing — none may
@@ -194,6 +172,34 @@ impl Halt {
         })
         .await
     }
+}
+
+async fn record(remote: Backend, violation: Violation) -> ! {
+    let mut attempt: u64 = 0;
+    while let Err(e) = remote
+        .put_small(
+            &violation.bucket,
+            &meta::halt_marker_key(),
+            violation.render(),
+            Default::default(),
+            None,
+            None,
+        )
+        .await
+    {
+        attempt += 1;
+        tracing::error!(
+            bucket = violation.bucket, attempt, error = %e,
+            "halt marker not recorded; the server is down and the write is still owed, retrying"
+        );
+        tokio::time::sleep(RECORD_RETRY).await;
+    }
+    tracing::error!(
+        bucket = violation.bucket,
+        invariant = violation.invariant.as_str(),
+        "halt marker recorded; exiting"
+    );
+    std::process::exit(EXIT_INVARIANT_VIOLATION)
 }
 
 /// The other half of the crashloop: the run that *recorded* a violation exits from [`Halt::raise`],

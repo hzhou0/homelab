@@ -1043,6 +1043,13 @@ twin cursor's shape tracks the client cursor's, and no scan runs past a rolled-u
    Dilution is gone with the twins: pages are short only where keys were *deleted*, not for every
    evicted key, so the effect is now the exception rather than the norm.
 
+> **Follow-up — delimiter prefixes over cached deletes.** The backend applies `delimiter` before
+> hypha sees the page, so a subtree containing only delete tombstones arrives as a `CommonPrefix`
+> with no content entries left to classify. Hypha currently forwards that prefix until reconcile
+> removes the tombstones. Filtering it soundly requires either an undelimited probe through the
+> subtree or moving delete masks out of the client-key namespace; keep the transient artifact until
+> one of those costs is justified.
+
 **ListObjects (v1)** reuses the classifier and the two-cursor merge verbatim (s3s does not translate
 v1→v2, so it is its own method); only the pagination shell differs — request `marker`, response
 `NextMarker` = **the last raw key of the client-cursor page**. Cache-served, both modes identical.

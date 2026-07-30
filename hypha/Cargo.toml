@@ -55,7 +55,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Testing
 proptest = "1"
-criterion = "0.5"
+criterion = "0.8.2"
 tempfile = "3"
 futures = "0.3"
 arc-swap = "1.9"
