@@ -58,10 +58,6 @@ pub struct Serving {
     /// S3 port: those are unauthenticated and in-cluster, and the S3 port is neither.
     #[serde(default = "default_admin_listen")]
     pub admin_listen: String,
-    /// A contiguous encrypt/decrypt larger than this offloads to `spawn_blocking` to keep any
-    /// single async poll bounded (§5). Bytes of pending plaintext.
-    #[serde(default = "default_offload")]
-    pub offload_threshold: usize,
 }
 
 fn default_listen() -> String {
@@ -69,9 +65,6 @@ fn default_listen() -> String {
 }
 fn default_admin_listen() -> String {
     "0.0.0.0:9014".to_string()
-}
-fn default_offload() -> usize {
-    1024 * 1024
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -324,7 +317,6 @@ impl Default for Serving {
         Serving {
             listen: default_listen(),
             admin_listen: default_admin_listen(),
-            offload_threshold: default_offload(),
         }
     }
 }

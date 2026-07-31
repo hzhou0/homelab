@@ -1,10 +1,11 @@
-//! Bounded async bridges around the synchronous encryption codec.
+//! Async streaming codecs, with a synchronous bridge only where age's seekable reader is required.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
 use aws_sdk_s3::primitives::ByteStream;
+use futures::io::AsyncWriteExt as _;
 use hypha_format::offset::{ciphertext_len, HLEN};
 use hypha_format::{
     encode_trailer, Envelope, Footer, FooterKind, RangeReader, RangeSource, TrailerKey,
@@ -16,12 +17,14 @@ use s3s_aws::conv::{try_from_aws, try_into_aws};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
+use tokio_util::compat::{
+    FuturesAsyncReadCompatExt as _, TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _,
+};
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 
 use hypha_core::Backend;
 
-/// Pipe capacity: a handful of age chunks, enough to keep the blocking encrypter/decrypter and
-/// the async socket both busy without buffering the object.
+/// A handful of age chunks keeps adjacent streaming stages busy without buffering the object.
 const PIPE_CAP: usize = 256 * 1024;
 
 /// The facts a single-part commit stamps into its tail trailer, alongside the body. The MD5 isn't
@@ -94,34 +97,28 @@ pub fn append_bytes(body: ByteStream, tail: Vec<u8>) -> ByteStream {
 }
 
 /// Decrypt a whole remote object body to a plaintext `StreamingBlob`. One remote GET (the caller
-/// already opened `body`); the sync `StreamReader` reads header-then-chunks straight through.
+/// already opened `body`); age reads header-then-chunks straight through.
 /// `ct_len` is the age-envelope length — the object's Content-Length minus the tail trailer — so
 /// the trailer never reaches the decryptor (it would read as a truncated chunk).
 pub fn decrypt_full(env: Arc<Envelope>, body: ByteStream, ct_len: u64) -> StreamingBlob {
-    let handle = Handle::current();
-    let (writer, reader) = tokio::io::duplex(PIPE_CAP);
-    let h = handle.clone();
-    tokio::task::spawn_blocking(move || {
-        let src = SyncIoBridge::new_with_handle(body.into_async_read(), h.clone());
-        let mut dst = SyncIoBridge::new_with_handle(writer, h);
+    let (mut writer, reader) = tokio::io::duplex(PIPE_CAP);
+    tokio::spawn(async move {
+        let src = body.into_async_read().take(ct_len).compat();
+        let result = async {
+            let dec = env.decrypt_async(src).await?;
+            let mut dec = dec.compat();
+            tokio::io::copy(&mut dec, &mut writer).await?;
+            Ok::<_, hypha_core::error::Error>(())
+        }
+        .await;
         // Truncation/auth failures surface as a short read on the client — the encrypted stream
         // simply ends; a mid-stream error can't be turned into an HTTP status once headers are sent.
-        if let Err(e) = pump_decrypt_full(&env, src.take(ct_len), &mut dst) {
+        if let Err(e) = result {
             tracing::error!(error = %e, "decrypt (full) failed mid-stream");
         }
-        let _ = dst.shutdown();
+        let _ = writer.shutdown().await;
     });
     StreamingBlob::wrap(ReaderStream::new(reader))
-}
-
-fn pump_decrypt_full<R: Read>(
-    env: &Envelope,
-    src: R,
-    dst: &mut impl Write,
-) -> hypha_core::error::Result<()> {
-    let mut dec = env.decrypt(src)?;
-    io::copy(&mut dec, dst)?;
-    Ok(())
 }
 
 /// Decrypt plaintext byte range `pt` of a remote object, re-opening ranged ciphertext GETs
@@ -213,10 +210,8 @@ pub async fn encrypt_blob_with_etag(
     trailer: Option<SingleTrailer>,
     expect_md5: Option<[u8; 16]>,
 ) -> io::Result<(u64, ByteStream, EtagReceiver)> {
-    let handle = Handle::current();
     let (pipe_w, pipe_r) = tokio::io::duplex(PIPE_CAP);
     let (etag_tx, etag_rx) = oneshot::channel::<Result<String, DigestMismatch>>();
-    let h = handle.clone();
 
     let body_ct_len = ciphertext_len(plen, HLEN);
     let body_len = body_ct_len
@@ -226,44 +221,91 @@ pub async fn encrypt_blob_with_etag(
             0
         };
 
-    tokio::task::spawn_blocking(move || {
-        let out = SyncIoBridge::new_with_handle(pipe_w, h.clone());
-        let w = match env.encrypt(CommitGate::new(out)) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!(error = %e, "encrypt: wrap_output failed");
-                return;
+    tokio::spawn(async move {
+        if let Err(e) = pump_encrypt_async(
+            env,
+            plaintext,
+            pipe_w,
+            etag_tx,
+            plen,
+            body_ct_len,
+            trailer,
+            expect_md5,
+        )
+        .await
+        {
+            tracing::error!(error = %e, "encrypt: streaming payload failed");
+        }
+    });
+
+    let body = blob_to_bytestream(StreamingBlob::wrap(ReaderStream::new(pipe_r)));
+    Ok((body_len, body, etag_rx))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_encrypt_async(
+    env: Arc<Envelope>,
+    plaintext: StreamingBlob,
+    mut output: tokio::io::DuplexStream,
+    etag_tx: oneshot::Sender<Result<String, DigestMismatch>>,
+    plen: u64,
+    body_ct_len: u64,
+    trailer: Option<SingleTrailer>,
+    expect_md5: Option<[u8; 16]>,
+) -> io::Result<()> {
+    let (age_w, mut age_r) = tokio::io::duplex(PIPE_CAP);
+    let (digest_tx, digest_rx) = oneshot::channel::<[u8; 16]>();
+
+    let produce = async move {
+        let mut src = blob_to_bytestream(plaintext).into_async_read();
+        let mut encrypted = env
+            .encrypt_async(age_w.compat_write())
+            .await
+            .map_err(io::Error::other)?;
+        let mut hasher = md5::Md5::new();
+        let mut buf = vec![0; 64 * 1024];
+        loop {
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
             }
-        };
+            hasher.update(&buf[..n]);
+            encrypted.write_all(&buf[..n]).await?;
+        }
+        encrypted.close().await?;
+        let _ = digest_tx.send(hasher.finalize().into());
+        Ok::<_, io::Error>(())
+    };
 
-        let bs = blob_to_bytestream(plaintext);
-        let src = SyncIoBridge::new_with_handle(bs.into_async_read(), h);
-        let mut md5_src = Md5Reader::new(src);
-
-        let sink = match pump_encrypt(w, &mut md5_src) {
-            Ok(sink) => sink,
-            Err(e) => {
-                tracing::error!(error = %e, "encrypt: streaming payload failed");
-                return;
+    let consume = async move {
+        let mut held = None;
+        let mut buf = vec![0; 64 * 1024];
+        loop {
+            let n = age_r.read(&mut buf).await?;
+            if n == 0 {
+                break;
             }
-        };
-        let md5 = md5_src.finish();
+            if let Some(byte) = held.take() {
+                output.write_all(&[byte]).await?;
+            }
+            if n > 1 {
+                output.write_all(&buf[..n - 1]).await?;
+            }
+            held = buf[..n].last().copied();
+        }
 
+        let md5 = digest_rx
+            .await
+            .map_err(|_| io::Error::other("encrypt task ended before producing a digest"))?;
         // The digest is unknowable until EOF. Holding one ciphertext byte until this check keeps
         // even a trailerless multipart part short of its declared length on mismatch.
         if expect_md5.is_some_and(|want| want != md5) {
             let _ = etag_tx.send(Err(DigestMismatch));
-            return;
+            return Ok(());
         }
 
-        let mut sink = match sink.commit() {
-            Ok(sink) => sink,
-            Err(e) => {
-                tracing::error!(error = %e, "encrypt: committing ciphertext failed");
-                return;
-            }
-        };
-
+        let final_byte = held.ok_or_else(|| io::Error::other("age emitted no ciphertext"))?;
+        output.write_all(&[final_byte]).await?;
         if let Some(t) = trailer {
             let footer = Footer {
                 kind: FooterKind::Single,
@@ -273,95 +315,15 @@ pub async fn encrypt_blob_with_etag(
                 md5,
             };
             let blob = encode_trailer(&t.trailer_key, &t.object_key, body_ct_len, &footer, &[]);
-            if let Err(e) = sink.write_all(&blob) {
-                tracing::error!(error = %e, "encrypt: writing trailer failed");
-                return;
-            }
+            output.write_all(&blob).await?;
         }
         let _ = etag_tx.send(Ok(hex::encode(md5)));
-        let _ = sink.shutdown();
-    });
+        output.shutdown().await
+    };
 
-    let body = blob_to_bytestream(StreamingBlob::wrap(ReaderStream::new(pipe_r)));
-    Ok((body_len, body, etag_rx))
-}
-
-struct CommitGate<W> {
-    inner: W,
-    held: Option<u8>,
-}
-
-impl<W> CommitGate<W> {
-    fn new(inner: W) -> Self {
-        Self { inner, held: None }
-    }
-}
-
-impl<W: Write> CommitGate<W> {
-    fn commit(mut self) -> io::Result<W> {
-        if let Some(byte) = self.held.take() {
-            self.inner.write_all(&[byte])?;
-        }
-        Ok(self.inner)
-    }
-}
-
-impl<W: Write> Write for CommitGate<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if let Some(byte) = self.held.take() {
-            self.inner.write_all(&[byte])?;
-        }
-        if buf.len() > 1 {
-            self.inner.write_all(&buf[..buf.len() - 1])?;
-        }
-        self.held = buf.last().copied();
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// Header+nonce were emitted by `wrap_output`; stream the payload, then write the age finalizer
-/// chunk. Returns the reclaimed inner writer so the caller can append the trailer.
-fn pump_encrypt<W: Write>(
-    mut w: age::stream::StreamWriter<W>,
-    mut src: impl Read,
-) -> io::Result<W> {
-    io::copy(&mut src, &mut w)?;
-    w.finish()
-}
-
-/// Derives the client ETag alongside encryption, so durable-mode PUTs never need a second pass or a
-/// cache round-trip.
-struct Md5Reader<R> {
-    inner: R,
-    hasher: md5::Md5,
-}
-
-impl<R> Md5Reader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hasher: md5::Md5::new(),
-        }
-    }
-
-    fn finish(self) -> [u8; 16] {
-        self.hasher.finalize().into()
-    }
-}
-
-impl<R: Read> Read for Md5Reader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
-    }
+    let (produce_result, consume_result) = tokio::join!(produce, consume);
+    produce_result?;
+    consume_result
 }
 
 /// A [`RangeSource`] over a byte window `[base, base+len)` of a remote object, re-opened by
@@ -421,32 +383,25 @@ pub fn decrypt_composite_full(
     body: ByteStream,
     part_ct_lens: Vec<u64>,
 ) -> StreamingBlob {
-    let handle = Handle::current();
-    let (writer, reader) = tokio::io::duplex(PIPE_CAP);
-    let h = handle.clone();
-    tokio::task::spawn_blocking(move || {
-        let src = SyncIoBridge::new_with_handle(body.into_async_read(), h.clone());
-        let mut dst = SyncIoBridge::new_with_handle(writer, h);
-        if let Err(e) = pump_decrypt_composite_full(&env, src, &part_ct_lens, &mut dst) {
+    let (mut writer, reader) = tokio::io::duplex(PIPE_CAP);
+    tokio::spawn(async move {
+        let mut src = body.into_async_read();
+        let result = async {
+            for len in part_ct_lens {
+                let part = (&mut src).take(len).compat();
+                let dec = env.decrypt_async(part).await?;
+                let mut dec = dec.compat();
+                tokio::io::copy(&mut dec, &mut writer).await?;
+            }
+            Ok::<_, hypha_core::error::Error>(())
+        }
+        .await;
+        if let Err(e) = result {
             tracing::error!(error = %e, "decrypt (composite full) failed mid-stream");
         }
-        let _ = dst.shutdown();
+        let _ = writer.shutdown().await;
     });
     StreamingBlob::wrap(ReaderStream::new(reader))
-}
-
-fn pump_decrypt_composite_full<R: Read>(
-    env: &Envelope,
-    mut src: R,
-    part_ct_lens: &[u64],
-    dst: &mut impl Write,
-) -> hypha_core::error::Result<()> {
-    for &len in part_ct_lens {
-        // by_ref so the shared stream survives the Take; age reads exactly `len` (its EOF).
-        let mut dec = env.decrypt(src.by_ref().take(len))?;
-        io::copy(&mut dec, dst)?;
-    }
-    Ok(())
 }
 
 /// One part's contribution to a **ranged** composite read: the part's absolute ciphertext window

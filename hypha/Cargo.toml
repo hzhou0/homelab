@@ -12,7 +12,7 @@ hypha-format = { path = "hypha-format" }
 hypha-core = { path = "hypha-core" }
 
 # Encryption
-age = "0.11"
+age = { version = "0.11", features = ["async"] }
 hmac = "0.12"          # trailer MAC (also an age dep — its own header MAC)
 sha2 = "0.10"
 subtle = "2"           # constant-time tag compare
@@ -20,7 +20,7 @@ bytemuck = { version = "1", features = ["derive"] }  # zero-copy facts struct
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
-tokio-util = { version = "0.7", features = ["io", "io-util", "codec"] }
+tokio-util = { version = "0.7", features = ["io", "io-util", "codec", "compat"] }
 
 # S3 server surface + client
 async-trait = "0.1"

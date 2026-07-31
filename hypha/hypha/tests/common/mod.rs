@@ -1066,10 +1066,6 @@ fn config_env(config: &Config) -> HashMap<String, String> {
         config.serving.admin_listen.clone(),
     );
     env.insert(
-        "HYPHA_SERVING__OFFLOAD_THRESHOLD".into(),
-        config.serving.offload_threshold.to_string(),
-    );
-    env.insert(
         "HYPHA_RECONCILE__INTERVAL_MS".into(),
         config.reconcile.interval_ms.to_string(),
     );

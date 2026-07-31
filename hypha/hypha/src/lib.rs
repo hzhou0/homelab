@@ -123,7 +123,6 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), Bo
         orphans,
         background,
         config.mode,
-        config.serving.offload_threshold,
         config.max_bucket_prefix_len(),
     );
 

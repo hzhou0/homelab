@@ -44,10 +44,6 @@ pub struct Hypha {
     /// Longest configured bucket prefix, charged against S3's 63-byte cap so the client-visible
     /// bucket-name limit is `63 − this` (§7 *Buckets*). Checked at CreateBucket.
     pub max_bucket_prefix_len: usize,
-    /// Contiguous encrypt/decrypt above this offloads to `spawn_blocking` (§5). Unwired until
-    /// an inline (non-offloaded) codec path exists — today every codec bridge offloads.
-    #[allow(dead_code)]
-    pub offload_threshold: usize,
 }
 
 impl Hypha {
@@ -60,7 +56,6 @@ impl Hypha {
         orphans: Orphans,
         background: Background,
         mode: Mode,
-        offload_threshold: usize,
         max_bucket_prefix_len: usize,
     ) -> Self {
         Self {
@@ -72,7 +67,6 @@ impl Hypha {
             orphans,
             mode,
             max_bucket_prefix_len,
-            offload_threshold,
         }
     }
 

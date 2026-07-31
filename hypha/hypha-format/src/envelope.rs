@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 
 use age::secrecy::SecretString;
 use age::stream::{StreamReader, StreamWriter};
+use futures::io::{AsyncRead, AsyncWrite};
 
 use crate::Error;
 
@@ -41,11 +42,32 @@ impl Envelope {
         Ok(encryptor.wrap_output(writer)?)
     }
 
+    pub async fn encrypt_async<W: AsyncWrite + Unpin>(
+        &self,
+        writer: W,
+    ) -> Result<StreamWriter<W>, Error> {
+        let mut recipient = age::scrypt::Recipient::new(self.passphrase.clone());
+        recipient.set_work_factor(PINNED_WORK_FACTOR);
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))?;
+        Ok(encryptor.wrap_async_output(writer).await?)
+    }
+
     pub fn decrypt<R: Read>(&self, reader: R) -> Result<StreamReader<R>, Error> {
         let mut identity = age::scrypt::Identity::new(self.passphrase.clone());
         identity.set_max_work_factor(self.max_work_factor);
         let decryptor = age::Decryptor::new(reader)?;
         Ok(decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity))?)
+    }
+
+    pub async fn decrypt_async<R: AsyncRead + Unpin>(
+        &self,
+        reader: R,
+    ) -> Result<StreamReader<R>, Error> {
+        let mut identity = age::scrypt::Identity::new(self.passphrase.clone());
+        identity.set_max_work_factor(self.max_work_factor);
+        let decryptor = age::Decryptor::new_async(reader).await?;
+        Ok(decryptor.decrypt_async(std::iter::once(&identity as &dyn age::Identity))?)
     }
 }
 
@@ -62,6 +84,28 @@ mod tests {
         w.finish().unwrap();
         ct.truncate(ct.len() - (PAYLOAD_NONCE + TAG) as usize);
         ct
+    }
+
+    #[test]
+    fn async_round_trip() {
+        futures::executor::block_on(async {
+            let env = Envelope::new("async round-trip passphrase").unwrap();
+            let mut ciphertext = Vec::new();
+            let mut writer = env.encrypt_async(&mut ciphertext).await.unwrap();
+            futures::io::AsyncWriteExt::write_all(&mut writer, b"streamed through age async")
+                .await
+                .unwrap();
+            futures::io::AsyncWriteExt::close(&mut writer)
+                .await
+                .unwrap();
+
+            let mut reader = env.decrypt_async(&ciphertext[..]).await.unwrap();
+            let mut plaintext = Vec::new();
+            futures::io::AsyncReadExt::read_to_end(&mut reader, &mut plaintext)
+                .await
+                .unwrap();
+            assert_eq!(plaintext, b"streamed through age async");
+        });
     }
 
     /// Pins `HLEN`. age can't grease a scrypt sole-stanza header and the stanza is fixed-shape, so

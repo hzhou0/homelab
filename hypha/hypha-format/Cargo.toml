@@ -12,6 +12,7 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

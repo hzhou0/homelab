@@ -327,7 +327,6 @@ Optional settings and defaults:
 |---|---:|
 | `serving.listen` | `0.0.0.0:8014` |
 | `serving.admin_listen` | `0.0.0.0:9014` |
-| `serving.offload_threshold` | 1 MiB; currently all codec bridges offload |
 | `reconcile.interval_ms` | 5,000 |
 | `reconcile.concurrency` | 16 |
 | `background.concurrency` | 4 |
@@ -437,8 +436,6 @@ is therefore unsupported.
   carries the remote's opaque continuation token; after the bucket becomes `Ready`, the next page
   may send it to the cache. Target backends encode key positions compatibly, and a failure is
   retryable. Hypha-owned continuation tokens would remove that assumption.
-- **Make `serving.offload_threshold` effective or remove it.** The setting is accepted today, but all
-  codec bridges use `spawn_blocking`.
 
 ### Additional verification
 
