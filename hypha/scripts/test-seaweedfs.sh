@@ -2,8 +2,8 @@
 # Run the integration suite with **SeaweedFS as the cache** and a per-test MinIO remote.
 #
 # MinIO ignores `If-Match` on `DeleteObject`, so cache-side marker and shadow CAS need the backend the
-# cluster actually uses. A final focused probe also assigns SeaweedFS to the remote role to assert the
-# same contract there; the general suite keeps a replacement-style, globally ordered multipart remote.
+# cluster actually uses. The remote stays on MinIO: its deletes are serialized inside Hypha and need
+# no conditional-delete extension.
 #
 # One server for the whole run rather than one per test: the fixture costs ~10 s to become ready, and
 # tests are isolated by their per-harness `bucket_prefix` anyway (`list_buckets` filters by it, §9).
@@ -79,10 +79,4 @@ if [ "$#" -eq 0 ]; then
     cargo test --manifest-path "$REPO/Cargo.toml" --test cached \
     bursty_same_key_overwrites_converge_on_the_last_acked_generation \
     -- --exact --ignored
-
-  echo "→ remote conditional-delete contract"
-  TEST_S3_ENDPOINT="$SEAWEED_ENDPOINT" \
-    cargo test --manifest-path "$REPO/Cargo.toml" --test backend \
-    a_conditional_delete_is_enforced_by_the_deployed_backend \
-    -- --exact
 fi

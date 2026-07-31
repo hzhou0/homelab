@@ -430,15 +430,19 @@ impl Tiering {
     }
 
     /// **DELETE branch** of the reconcile sweep (§7). Confirm the listed marker is still current and
-    /// that K is still absent, then bind the delete to the remote generation returned by HEAD. Any of
-    /// those CASes moving leaves the marker for the operation that superseded this one.
+    /// that K is still absent, then delete the remote object. A newer marker survives the completion
+    /// CAS for the operation that superseded this one.
     ///
     /// **This branch takes K's write lock**, unlike the upload branch beside it. The reason the
     /// upload branch does not is a transfer it must not queue conditional writes behind (§4); a
-    /// delete is two small round trips, so it pays nothing for the lock — and it needs it, because it
+    /// delete is a small round trip, so it pays nothing for the lock — and it needs it, because it
     /// is the only reconcile action that *destroys* a generation. The upload branch racing a newer
     /// write is self-correcting (the newer write's own marker is still standing, so it is uploaded
     /// next pass); a delete racing one is not.
+    ///
+    /// The caller already holds K's upload lock. Taking both lock domains excludes every remote
+    /// writer: reconcile uploads take the upload lock, while durable writes and multipart completion
+    /// take the write lock. Hypha exclusively owns the remote, so no backend CAS is needed here.
     ///
     /// And racing one is possible without any of the usual interleaving: **multipart is always
     /// durable** (§7), so a `CompleteMultipartUpload` commits to the remote and settles K *without
@@ -486,22 +490,8 @@ impl Tiering {
             return Ok(());
         }
 
-        let remote_etag = match self.remote.head(bucket, key).await {
-            Ok(head) => head
-                .e_tag()
-                .ok_or_else(|| Error::Backend(format!("remote HEAD for {key:?} had no ETag")))?
-                .trim_matches('"')
-                .to_string(),
-            Err(Error::NotFound) => return self.clear_marker_cas(bucket, key, m_etag).await,
-            Err(e) => return Err(e),
-        };
-        match self
-            .remote
-            .delete_if_match(bucket, key, quote(&remote_etag))
-            .await
-        {
+        match self.remote.delete(bucket, key).await {
             Ok(()) | Err(Error::NotFound) => {}
-            Err(Error::PreconditionFailed) => return Ok(()),
             Err(e) => return Err(e),
         }
         self.clear_marker_cas(bucket, key, m_etag).await

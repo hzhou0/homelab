@@ -98,24 +98,19 @@ async fn conditional_writes_are_enforced() {
     );
 }
 
-/// The requirement itself: a delete bound to a generation must be **refused** once that generation
-/// is superseded. Runs only against an external backend (`scripts/test-seaweedfs.sh`), because it is
-/// the one assertion in the suite that the default one cannot satisfy — see below.
+/// Marker completion and shadow reclamation delete cache metadata from stale listings, so their
+/// `If-Match` must protect a replacement written after the listing.
 #[tokio::test]
-async fn a_conditional_delete_is_enforced_by_the_deployed_backend() {
-    let Some(_) = external_remote_backend() else {
-        // Deliberately a skip rather than a failure: the default backend's behaviour is asserted by
-        // the test below, and the two together are the whole statement.
+async fn conditional_deletes_are_enforced_by_the_cache_backend() {
+    let Some(_) = external_cache_backend() else {
         return;
     };
     let h = Harness::durable().await;
-    let raw = h.raw_remote();
+    let raw = h.raw();
     let bucket = probe_bucket(&h, &raw, "ce").await;
 
     let superseded = put_raw(&raw, &bucket, "k", b"one").await;
     let current = put_raw(&raw, &bucket, "k", b"two").await;
-    assert_ne!(superseded, current);
-
     let refused = raw
         .delete_object()
         .bucket(&bucket)
@@ -124,85 +119,47 @@ async fn a_conditional_delete_is_enforced_by_the_deployed_backend() {
         .send()
         .await;
     assert_eq!(
-        sdk_err_code(&refused.expect_err("a delete of a superseded generation must be refused"))
-            .as_deref(),
-        Some("PreconditionFailed"),
-        "without this the reconcile sweep can clear a marker a newer write raised"
+        sdk_err_code(&refused.expect_err("a stale cache CAS must be refused")).as_deref(),
+        Some("PreconditionFailed")
     );
-    assert!(
-        raw.head_object()
-            .bucket(&bucket)
-            .key("k")
-            .send()
-            .await
-            .is_ok(),
-        "and the current generation must survive the refusal"
-    );
-    assert!(
-        raw.delete_object()
-            .bucket(&bucket)
-            .key("k")
-            .if_match(&current)
-            .send()
-            .await
-            .is_ok(),
-        "while the generation the caller observed is still deletable"
-    );
+    assert!(raw
+        .delete_object()
+        .bucket(&bucket)
+        .key("k")
+        .if_match(&current)
+        .send()
+        .await
+        .is_ok());
 }
 
-/// **The conditional delete is not enforced by MinIO**, and this records that as the fact it is.
-///
-/// It matters because three paths condition a *delete* on a generation they observed: the reconcile
-/// sweep clearing a pending marker (§7), the cached DELETE branch removing a remote object bound to
-/// the ETag its HEAD returned (§7), and the two shadow reclaims (§8). On a backend that ignores the
-/// precondition, each becomes an unconditional delete of whatever is there **now**:
-///
-/// - the sweep can clear a marker raised by a write that landed after its listing, leaving the remote
-///   holding an older generation with an empty pending set — stale for good, since nothing revisits a
-///   key no marker names (`bursty_same_key_overwrites_converge_on_the_last_acked_generation`, which is
-///   `#[ignore]`d for exactly this);
-/// - the delete branch can remove a *newer* remote object that landed between its HEAD and its delete.
-///
-/// **SeaweedFS 4.37 — the deployed cache and the focused remote-contract fixture — does enforce
-/// it**: a stale-ETag delete is refused 412 and the object survives. The mixed suite therefore
-/// exercises cache-side CAS against SeaweedFS, while the focused probe above covers the same
-/// required contract on the remote role.
-///
-/// **If this test fails, MinIO has gained the semantics**: re-enable the ignored test above and turn
-/// this one into the positive assertion it wants to be.
+/// Keep the default fixture's limitation explicit: it is suitable for the remote role, but not the
+/// cache role whose marker and shadow cleanup require conditional deletion.
 #[tokio::test]
-async fn the_default_test_backend_does_not_enforce_a_conditional_delete() {
-    if external_remote_backend().is_some() {
-        return; // this one is about MinIO; the requirement is asserted above
+async fn the_default_minio_cache_does_not_enforce_a_conditional_delete() {
+    if external_cache_backend().is_some() {
+        return;
     }
     let h = Harness::durable().await;
-    let raw = h.raw_remote();
+    let raw = h.raw();
     let bucket = probe_bucket(&h, &raw, "cd").await;
 
     let superseded = put_raw(&raw, &bucket, "k", b"one").await;
     let current = put_raw(&raw, &bucket, "k", b"two").await;
     assert_ne!(superseded, current);
-
-    let deleted = raw
-        .delete_object()
+    raw.delete_object()
         .bucket(&bucket)
         .key("k")
         .if_match(&superseded)
         .send()
-        .await;
-    assert!(
-        deleted.is_ok(),
-        "MinIO is expected to accept the stale precondition; a refusal means it now enforces it"
-    );
-    assert!(
-        raw.head_object()
-            .bucket(&bucket)
-            .key("k")
-            .send()
-            .await
-            .is_err(),
-        "and to have deleted the current generation regardless of the condition"
-    );
+        .await
+        .expect("MinIO ignores the stale precondition");
+    assert!(raw
+        .head_object()
+        .bucket(&bucket)
+        .key("k")
+        .send()
+        .await
+        .is_err());
 }
 
 /// **`DeleteBucket` on a non-empty bucket is not portable.** S3 and MinIO answer `BucketNotEmpty`;

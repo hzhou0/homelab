@@ -217,9 +217,8 @@ impl Backend {
         Ok(())
     }
 
-    /// Conditional DELETE — remove `key` only if its current ETag matches `if_match` (quoted,
-    /// §7/§8). Both backends must honor this: reconcile uses it on the remote, while GC and
-    /// transitions use it on the cache.
+    /// Cache-side conditional DELETE — remove `key` only if its current ETag matches `if_match`
+    /// (quoted, §7/§8). Marker completion and shadow reclamation depend on this CAS.
     pub async fn delete_if_match(&self, bucket: &str, key: &str, if_match: String) -> Result<()> {
         self.client
             .delete_object()

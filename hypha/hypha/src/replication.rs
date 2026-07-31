@@ -4,7 +4,7 @@
 //! encoded by each marker:
 //!
 //! - **PUT** → encrypt the current cache body and PUT it to the remote;
-//! - **DELETE** → HEAD the remote generation and delete it with `If-Match`.
+//! - **DELETE** → delete the remote object while holding both lock domains.
 //!
 //! The markers are the range-C tail of `<meta><b>` (bare `K`, above the `0x01` block), so **one flat
 //! LIST** past [`meta::marker_scan_start_after`] enumerates the pending set — `O(pending)`, never

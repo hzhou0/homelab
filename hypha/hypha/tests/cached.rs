@@ -4,7 +4,7 @@
 //! linearization on the cache, `Content-MD5` validation, the marker scan staying `O(pending)`
 //! (evicted keys untouched), and rehydrate on a tombstoned read — single-part back into K and a
 //! composite into the shadow body. Faulted paths cover failed marker writes, reconcile generation
-//! races, conditional remote deletes, and the marker/clean-seal ordering during shutdown.
+//! races, remote-delete serialization, and the marker/clean-seal ordering during shutdown.
 
 mod common;
 
@@ -386,38 +386,28 @@ async fn cached_delete_removes_then_propagates() {
     );
 }
 
-/// The remote generation can change after DELETE's HEAD. `DeleteObject If-Match` must reject that
-/// first attempt, leave the marker standing, then retry against the replacement generation.
+/// A cached delete cannot pass an older reconcile upload: both use K's upload lock, so the upload
+/// finishes first and the following delete removes it. This is what makes an unconditional remote
+/// delete safe against the one remote writer that deliberately does not take K's write lock.
 #[tokio::test]
-async fn cached_delete_retries_when_the_remote_generation_moves() {
+async fn cached_delete_waits_for_an_in_flight_reconcile_upload() {
     let h = Harness::cached_with_faults().await;
     h.create_bucket(B).await;
-    let key = "delete-cas";
-    put(&h.client(), B, key, b"old").await;
-    wait_until(6_000, "initial generation to settle remotely", || async {
-        remote_present(&h, B, key).await && !marker_present(&h, B, key).await
-    })
-    .await;
-    let old_etag = h
-        .raw_remote()
-        .head_object()
-        .bucket(h.remote_bucket(B))
-        .key(key)
-        .send()
-        .await
-        .expect("head old remote generation")
-        .e_tag()
-        .expect("old remote ETag")
-        .trim_matches('"')
-        .to_string();
-
+    let key = "delete-behind-upload";
     let faults = h.remote_faults();
     let path = format!("/{}/{key}", h.remote_bucket(B));
-    let mut first_delete = faults.pause_next_then_fail(
-        hyper::Method::DELETE,
-        &path,
-        hyper::StatusCode::PRECONDITION_FAILED,
-    );
+    let mut upload = faults.pause_next(hyper::Method::PUT, &path);
+    put(&h.client(), B, key, &pattern(20_000)).await;
+    tokio::time::timeout(Duration::from_secs(5), upload.reached())
+        .await
+        .expect("reconcile upload was never attempted");
+
+    let delete = faults.pause_next(hyper::Method::DELETE, &path);
+    let mut delete_reached = tokio::spawn(async move {
+        let mut delete = delete;
+        let request = delete.reached().await;
+        (delete, request)
+    });
     h.client()
         .delete_object()
         .bucket(B)
@@ -425,57 +415,102 @@ async fn cached_delete_retries_when_the_remote_generation_moves() {
         .send()
         .await
         .expect("cached delete");
-    let first = tokio::time::timeout(Duration::from_secs(5), first_delete.reached())
-        .await
-        .expect("conditional delete was never attempted");
-    assert_eq!(
-        first
-            .headers
-            .get(hyper::header::IF_MATCH)
-            .and_then(|v| v.to_str().ok()),
-        Some(format!("\"{old_etag}\"").as_str()),
-        "the delete must be bound to the generation returned by HEAD"
+    wait_until(
+        5_000,
+        "the delete marker to replace the upload marker",
+        || async { marker_present(&h, B, key).await },
+    )
+    .await;
+    // The default fixture's MinIO cache ignores this CAS. Refuse the stale clear explicitly so this
+    // test isolates the remote lock ordering; backend.rs tests the deployed cache's real refusal.
+    let stale_clear = h.cache_faults().fail_next(
+        hyper::Method::DELETE,
+        format!("/{}/{key}", h.meta_bucket(B)),
+        hyper::StatusCode::PRECONDITION_FAILED,
     );
 
-    let replacement = h
-        .raw_remote()
-        .put_object()
-        .bucket(h.remote_bucket(B))
-        .key(key)
-        .body(bytes_body(b"replacement generation"))
-        .send()
-        .await
-        .expect("race a replacement remote generation");
-    let replacement_etag = replacement
-        .e_tag()
-        .expect("replacement ETag")
-        .trim_matches('"')
-        .to_string();
-
-    let mut retry_delete = faults.pause_next(hyper::Method::DELETE, &path);
-    first_delete.release();
-    let retry = tokio::time::timeout(Duration::from_secs(5), retry_delete.reached())
-        .await
-        .expect("delete was not retried after the remote CAS failed");
     assert!(
-        marker_present(&h, B, key).await,
-        "a 412 must leave the DELETE marker standing"
+        tokio::time::timeout(Duration::from_millis(200), &mut delete_reached)
+            .await
+            .is_err(),
+        "the remote delete passed an upload still holding K's upload lock"
     );
-    assert!(remote_present(&h, B, key).await, "the replacement survived");
-    assert_eq!(
-        retry
-            .headers
-            .get(hyper::header::IF_MATCH)
-            .and_then(|v| v.to_str().ok()),
-        Some(format!("\"{replacement_etag}\"").as_str()),
-        "the retry must bind itself to the replacement generation"
-    );
-    retry_delete.release();
+    upload.release();
+    tokio::time::timeout(Duration::from_secs(5), stale_clear)
+        .await
+        .expect("the stale upload did not try to clear the replacement marker")
+        .expect("cache fault proxy stopped before the stale marker clear");
 
-    wait_until(6_000, "retried delete to settle", || async {
+    let (delete, request) = tokio::time::timeout(Duration::from_secs(5), delete_reached)
+        .await
+        .expect("remote delete was never attempted after the upload finished")
+        .expect("delete observer task panicked");
+    assert!(
+        !request.headers.contains_key(hyper::header::IF_MATCH),
+        "the serialized remote delete must not require a backend CAS"
+    );
+    delete.release();
+
+    wait_until(6_000, "serialized delete to settle", || async {
         !remote_present(&h, B, key).await && !marker_present(&h, B, key).await
     })
     .await;
+}
+
+/// Multipart completion is the remote writer that raises no pending marker. The delete branch's
+/// write lock keeps it behind the remote delete; once the lock is released, the completion becomes
+/// the newer operation and its committed composite survives.
+#[tokio::test]
+async fn multipart_completion_waits_for_an_in_flight_cached_delete() {
+    let h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+    let key = "complete-behind-delete";
+
+    put(&c, B, key, &pattern_seeded(20_000, 1)).await;
+    wait_until(6_000, "initial generation to settle remotely", || async {
+        remote_present(&h, B, key).await && !marker_present(&h, B, key).await
+    })
+    .await;
+
+    let body = pattern_seeded(30_000, 2);
+    let upload_id = create_mpu(&c, B, key).await;
+    let part = upload_part(&c, B, key, &upload_id, 1, &body).await;
+
+    let path = format!("/{}/{key}", h.remote_bucket(B));
+    let mut remote_delete = h.remote_faults().pause_next(hyper::Method::DELETE, &path);
+    c.delete_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect("cached delete");
+    let request = tokio::time::timeout(Duration::from_secs(5), remote_delete.reached())
+        .await
+        .expect("remote delete was never attempted");
+    assert!(!request.headers.contains_key(hyper::header::IF_MATCH));
+
+    let complete_client = c.clone();
+    let complete_upload_id = upload_id.clone();
+    let mut completion = tokio::spawn(async move {
+        complete_mpu(&complete_client, B, key, &complete_upload_id, &[(1, part)]).await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut completion)
+            .await
+            .is_err(),
+        "multipart completion passed a delete still holding K's write lock"
+    );
+
+    remote_delete.release();
+    let completed = tokio::time::timeout(Duration::from_secs(5), completion)
+        .await
+        .expect("multipart completion stayed blocked after the delete")
+        .expect("multipart completion task panicked");
+    assert_eq!(completed, expected_composite_etag(&[&body]));
+    assert_eq!(get_all(&c, B, key).await, body);
+    assert!(remote_present(&h, B, key).await);
+    assert!(!marker_present(&h, B, key).await);
 }
 
 /// Conditional writes linearize on the cache in cached mode (§4): `If-None-Match: *` creates only
@@ -1631,15 +1666,14 @@ async fn a_bucket_whose_rebuild_never_completed_ends_the_run_dirty() {
 /// queue landing its marker there is a moment when the key is genuinely owed and genuinely unmarked,
 /// and sampling a single instant can catch exactly that moment.
 ///
-/// **`#[ignore]`d because it does not pass against MinIO, and the reason is not the test.** The sweep's
+/// **`#[ignore]`d because the default fixture uses MinIO as the cache.** The sweep's cache-side
 /// marker clear is a conditional delete, and MinIO ignores `If-Match` on `DeleteObject`
 /// (`backend.rs`) — so a clear issued for the generation a pass listed also removes the marker a
-/// newer write raised while that pass ran. The remote is then left holding an older generation with an
-/// empty pending set, which nothing revisits: this test reproduces that in roughly one run in three
-/// under load. SeaweedFS 4.37 — the deployed backend — enforces the precondition, so this is the
-/// first test to un-ignore once the harness can be pointed at one.
+/// newer write raised while that pass ran. The remote is then left holding an older generation with
+/// an empty pending set, which nothing revisits: this test reproduces that in roughly one run in
+/// three under load. The SeaweedFS cache enforces the precondition.
 #[tokio::test]
-#[ignore = "needs a backend that enforces If-Match on DeleteObject (SeaweedFS does, MinIO does not); see tests/backend.rs"]
+#[ignore = "needs a cache that enforces If-Match on DeleteObject (SeaweedFS does, MinIO does not); see tests/backend.rs"]
 async fn bursty_same_key_overwrites_converge_on_the_last_acked_generation() {
     let h = Harness::cached().await;
     h.create_bucket(B).await;
