@@ -21,16 +21,15 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
-use hypha_core::config::Mode;
 use hypha_core::error::Error;
 use hypha_core::meta;
 use hypha_format::{encode_trailer, Footer};
 
 use super::multipart::{parse_copy_source, MIN_REMOTE_PART};
-use super::overlay::KeyState;
+use super::overlay::{KeyState, WriteMode};
 use super::put::evaluate_precondition;
 use super::{copied_part_retag, resolve_storage_class, ts_ms, write_metadata, Hypha};
-use crate::codec;
+use crate::codec::{self, SingleTrailer};
 use crate::gc::Plaintext;
 use crate::tier::{self, RemoteFacts};
 
@@ -51,11 +50,6 @@ impl Hypha {
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        if self.mode != Mode::Durable {
-            // Cached-mode copy (cache→cache server-side, reconcile mints the trailer) lands in Phase 4.
-            return Err(s3_error!(NotImplemented, "cached-mode CopyObject pending"));
-        }
-
         let (src_bucket, src_key) = parse_copy_source(&input.copy_source)?;
         meta::validate_client_key(&src_key).map_err(|e| Error::Invalid(e.to_string()))?;
 
@@ -63,14 +57,14 @@ impl Hypha {
 
         // Overlay (§7): the destination bucket must exist; a restoring one has K_dst materialized
         // from the remote first, so this copy's bracket then overwrites a correct tombstone.
-        let (_gate, _) = self.prepare_write(&bucket, &key).await?;
+        let (_gate, write_mode) = self.prepare_write(&bucket, &key).await?;
 
         // Resolve the source's facts + cache-side user metadata through the restore overlay, exactly
         // as a read would: a live cache body reports natively, anything else resolves remote-side.
-        let (facts, src_md) = match self.resolve_key(&src_bucket, &src_key).await? {
+        let (facts, src_md, source_live) = match self.resolve_key(&src_bucket, &src_key).await? {
             KeyState::Absent => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
-            KeyState::Remote { facts, md } => (facts, md),
-            KeyState::CacheBody { head, md } => (RemoteFacts::from_cache_head(&head), md),
+            KeyState::Remote { facts, md } => (facts, md, false),
+            KeyState::CacheBody { head, md } => (RemoteFacts::from_cache_head(&head), md, true),
         };
 
         // Copy-source preconditions against the source's current state (§7). ETag conditions reuse
@@ -104,6 +98,41 @@ impl Hypha {
                 meta::content_type(&src_md).as_deref(),
             )
         };
+
+        // Representation, not deployment mode, selects the transport. A live source is a
+        // single-part plaintext cache body, so a ready cached destination can use one atomic
+        // cache-side copy and owe the normal PUT marker. Tombstoned sources — composites included —
+        // are already remote-resident and take the durable ciphertext-copy path below.
+        //
+        // A restoring destination is the exception: its cache namespace is deliberately ignored,
+        // so even a live source must commit remotely. Stream that source snapshot through the
+        // single-part durable path rather than acknowledging a body no reader would see.
+        if source_live {
+            return match write_mode {
+                WriteMode::Cached => {
+                    self.commit_cached_copy(
+                        &bucket,
+                        &key,
+                        &src_bucket,
+                        &src_key,
+                        &facts,
+                        dst_passthrough,
+                    )
+                    .await
+                }
+                WriteMode::Durable => {
+                    self.commit_live_source_durable_copy(
+                        &bucket,
+                        &key,
+                        &src_bucket,
+                        &src_key,
+                        &facts,
+                        dst_passthrough,
+                    )
+                    .await
+                }
+            };
+        }
 
         // One bounded tail GET of the source's remote trailer (MAC-verified at K_src) fixes the
         // body/trailer boundary and, for a composite, the offset table — both body-relative, so they
@@ -186,6 +215,214 @@ impl Hypha {
             ..Default::default()
         };
         Ok(S3Response::new(resp))
+    }
+
+    /// A live cached source copied into a ready cached destination. The backend copy is the commit,
+    /// exactly like cached PUT's plaintext write; its native ETag names the marker obligation.
+    ///
+    /// `copy_source_if_match` is not the client's condition repeated. It binds the backend operation
+    /// to the physical generation whose facts were evaluated above, closing HEAD → copy without
+    /// making cached unconditional PUTs take the process write lock.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_cached_copy(
+        &self,
+        bucket: &str,
+        key: &str,
+        src_bucket: &str,
+        src_key: &str,
+        facts: &RemoteFacts,
+        dst_passthrough: HashMap<String, String>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let content_type = meta::content_type(&dst_passthrough);
+        let copied = match self
+            .data()
+            .copy(
+                bucket,
+                key,
+                src_bucket,
+                src_key,
+                format!("\"{}\"", facts.cetag),
+                dst_passthrough,
+                content_type,
+            )
+            .await
+        {
+            Ok(out) => out,
+            // These answers prove the destination did not commit. Everything else is indeterminate:
+            // the cache may have copied K and lost its response before Hypha could queue the marker.
+            Err(e @ (Error::PreconditionFailed | Error::NotFound | Error::NoSuchBucket)) => {
+                return Err(e.into())
+            }
+            Err(e) => {
+                self.buckets.unaccount(bucket);
+                return Err(e.into());
+            }
+        };
+
+        let result = match copied.copy_object_result() {
+            Some(result) => result,
+            None => {
+                self.buckets.unaccount(bucket);
+                return Err(Error::Backend("cache copy returned no result".into()).into());
+            }
+        };
+        let etag = match result
+            .e_tag()
+            .map(|value| value.trim_matches('"').to_string())
+        {
+            Some(etag) if !etag.is_empty() => etag,
+            _ => {
+                // The copy committed but cannot be named by a marker. R2 must derive it next run.
+                self.buckets.unaccount(bucket);
+                return Err(Error::Backend("cache copy returned no ETag".into()).into());
+            }
+        };
+        if etag != facts.cetag {
+            // A normal cache body is a single-part plaintext object, so its native ETag is stable
+            // across copy. Do not publish inconsistent facts if a backend implements otherwise.
+            self.buckets.unaccount(bucket);
+            return Err(Error::Backend(format!(
+                "cache copy changed plaintext ETag from {} to {etag}",
+                facts.cetag
+            ))
+            .into());
+        }
+        let mtime_ms = result
+            .last_modified()
+            .and_then(|value| value.to_millis().ok())
+            .unwrap_or_else(tier::now_ms);
+
+        self.markers.owe(bucket, key, etag.clone());
+        self.gc.touch(bucket, key, Plaintext::AtKey);
+        self.orphans.owe(bucket, key);
+        super::record_bytes(facts.plen);
+
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(ETag::Strong(etag)),
+                last_modified: Some(ts_ms(mtime_ms)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    /// A live source copied into a destination that is currently running durable semantics (a
+    /// restore window in a cached deployment). Open a generation-bound cache GET before marking the
+    /// destination, then use the ordinary single-part remote commit. Live cache bodies are always
+    /// single-part and capped below the remote PUT limit.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_live_source_durable_copy(
+        &self,
+        bucket: &str,
+        key: &str,
+        src_bucket: &str,
+        src_key: &str,
+        facts: &RemoteFacts,
+        dst_passthrough: HashMap<String, String>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let source = self
+            .data()
+            .get_if_match(src_bucket, src_key, format!("\"{}\"", facts.cetag))
+            .await?;
+        let source_len = source.content_length().unwrap_or(0).max(0) as u64;
+        if source_len != facts.plen {
+            return Err(Error::PreconditionFailed.into());
+        }
+
+        let raw_md5 = hex::decode(&facts.cetag)
+            .ok()
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "live cache body has non-single-part ETag {}",
+                    facts.cetag
+                ))
+            })?;
+        let body = codec::bytestream_to_blob(source.body);
+
+        let _guard = self.write_lock(bucket, key).await;
+        let mtime_ms = tier::now_ms();
+        self.tier.mark_transit_locked(bucket, key).await?;
+
+        let trailer = SingleTrailer {
+            trailer_key: self.tier.trailer_key.clone(),
+            object_key: key.to_string(),
+            mtime_ms,
+        };
+        let (framed_len, encrypted, etag_rx) = match codec::encrypt_blob_with_etag(
+            self.env(),
+            body,
+            facts.plen,
+            Some(trailer),
+            Some(raw_md5),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(e) => {
+                if let Err(repair) = self.tier.repair_locked(bucket, key).await {
+                    tracing::warn!(key, error = %repair, "repair after failed live-source copy did not settle");
+                }
+                return Err(Error::Io(e).into());
+            }
+        };
+
+        let content_type = meta::content_type(&dst_passthrough);
+        if let Err(e) = self
+            .remote()
+            .put(
+                bucket,
+                key,
+                encrypted,
+                Some(framed_len as i64),
+                HashMap::new(),
+                None,
+                None,
+                None,
+                content_type,
+            )
+            .await
+        {
+            if let Err(repair) = self.tier.repair_locked(bucket, key).await {
+                tracing::warn!(key, error = %repair, "repair after failed live-source copy commit did not settle");
+            }
+            return Err(e.into());
+        }
+
+        let etag = match etag_rx.await {
+            Ok(Ok(etag)) => etag,
+            other => {
+                if let Err(repair) = self.tier.repair_locked(bucket, key).await {
+                    tracing::warn!(key, error = %repair, "repair after indeterminate live-source copy did not settle");
+                }
+                return Err(match other {
+                    Ok(Err(_)) => {
+                        Error::Backend("cache source changed while it was copied".into()).into()
+                    }
+                    Err(_) => {
+                        Error::Backend("copy MD5 task dropped before completing".into()).into()
+                    }
+                    Ok(Ok(_)) => unreachable!("successful digest handled by the outer match"),
+                });
+            }
+        };
+
+        self.tier
+            .settle_evict_locked(bucket, key, facts.plen, &etag, mtime_ms, dst_passthrough)
+            .await?;
+        self.gc.touch(bucket, key, Plaintext::AtKey);
+        self.orphans.owe(bucket, key);
+        super::record_bytes(facts.plen);
+
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: Some(ETag::Strong(etag)),
+                last_modified: Some(ts_ms(mtime_ms)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
     }
 
     /// Large-body commit (§7). Owns the native upload, so a failure aborts it best-effort — a

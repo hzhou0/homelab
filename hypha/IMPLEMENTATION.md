@@ -251,6 +251,8 @@ Implemented behavior includes:
 - byte-range GETs;
 - PUT `If-Match` and `If-None-Match`;
 - copy-source ETag and time preconditions;
+- representation-aware copy: live sources copy atomically within the cache and raise a reconcile
+  marker, while remote-resident sources reuse the durable ciphertext-copy path;
 - client metadata, `Content-Type`, and non-archive storage-class labels;
 - up to 1,000 keys in `DeleteObjects`;
 - part numbers 1–10,000 and S3 multipart ordering/minimum-size rules;
@@ -259,7 +261,6 @@ Implemented behavior includes:
 Current surface limits:
 
 - `PutObject` and `UploadPart` require `Content-Length` and accept at most 4 GiB of plaintext;
-- `CopyObject` is implemented only in durable mode;
 - destination `CopyObject` conditions are unavailable in the `s3s` 0.14 request type;
 - flexible checksum fields are not implemented;
 - bucket versioning is always reported disabled and versioned operations are not implemented;
@@ -347,6 +348,7 @@ Cache requirements:
 
 - unversioned buckets without Object Lock;
 - conditional `PutObject` and `DeleteObject` with enforced `If-Match`;
+- `CopyObject` with an enforced source `If-Match`;
 - `ListObjectsV2` with `encoding-type=url`;
 - ordinary S3 bucket, object, range, listing, and metadata behavior.
 
@@ -421,8 +423,6 @@ is therefore unsupported.
     0.14 request type;
   - review the remaining 0.15 breaking changes and rerun the external conformance suite.
   The relevant upstream fix is [s3s#629](https://github.com/s3s-project/s3s/issues/629).
-- **Implement cached-mode `CopyObject`.** It currently returns `NotImplemented`; durable mode is the
-  only implemented copy path.
 - **Implement flexible checksums.** Validate and persist single-part plaintext checksums inline,
   then add multipart checksum-of-checksums behavior. The checksum cases in `s3s-e2e` remain
   intentionally deselected.

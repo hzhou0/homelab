@@ -1,12 +1,10 @@
-//! Phase-3 exit: CopyObject (§7). A copy reuses the source body ciphertext verbatim (key-independent
-//! per-file keys) and re-mints only the trailer, bound to the destination key. Covers the small-body
-//! re-encrypt path and the large-body server-side `UploadPartCopy` path, single-part and composite
-//! sources, `COPY`/`REPLACE` metadata directives, the copy-source preconditions, in-place metadata
-//! edit, and the missing-source 404.
+//! CopyObject (§7): durable ciphertext reuse and cached plaintext copy, including metadata,
+//! preconditions, in-place edits, generation races, and indeterminate cache responses.
 
 mod common;
 
 use common::*;
+use hypha_core::config::Mode;
 
 const B: &str = "cpy";
 
@@ -136,63 +134,67 @@ async fn copy_composite_source_preserves_geometry() {
 /// request's. Storage class is the request's either way.
 #[tokio::test]
 async fn copy_metadata_directive() {
-    let h = Harness::durable().await;
-    h.create_bucket(B).await;
-    let client = h.client();
+    for mode in [Mode::Durable, Mode::Cached] {
+        let h = Harness::with_mode(mode).await;
+        h.create_bucket(B).await;
+        let client = h.client();
 
-    client
-        .put_object()
-        .bucket(B)
-        .key("src/meta")
-        .body(bytes_body(b"body"))
-        .content_length(4)
-        .metadata("colour", "green")
-        .send()
-        .await
-        .expect("put with metadata");
+        client
+            .put_object()
+            .bucket(B)
+            .key("src/meta")
+            .body(bytes_body(b"body"))
+            .content_length(4)
+            .metadata("colour", "green")
+            .send()
+            .await
+            .expect("put with metadata");
 
-    // COPY (default): the source metadata rides along.
-    copy(&client, "dst/copied-meta", B, "src/meta").await;
-    let copied = client
-        .head_object()
-        .bucket(B)
-        .key("dst/copied-meta")
-        .send()
-        .await
-        .expect("head");
-    assert_eq!(
-        copied
-            .metadata()
-            .and_then(|m| m.get("colour"))
-            .map(String::as_str),
-        Some("green")
-    );
+        // COPY (default): the source metadata rides along.
+        copy(&client, "dst/copied-meta", B, "src/meta").await;
+        let copied = client
+            .head_object()
+            .bucket(B)
+            .key("dst/copied-meta")
+            .send()
+            .await
+            .expect("head");
+        assert_eq!(
+            copied
+                .metadata()
+                .and_then(|m| m.get("colour"))
+                .map(String::as_str),
+            Some("green"),
+            "COPY metadata in {mode:?}"
+        );
 
-    // REPLACE: the request's metadata wins, the source's is dropped.
-    client
-        .copy_object()
-        .bucket(B)
-        .key("dst/replaced-meta")
-        .copy_source(format!("{B}/src/meta"))
-        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
-        .metadata("colour", "blue")
-        .send()
-        .await
-        .expect("copy REPLACE");
-    let replaced = client
-        .head_object()
-        .bucket(B)
-        .key("dst/replaced-meta")
-        .send()
-        .await
-        .expect("head");
-    assert_eq!(
-        replaced
-            .metadata()
-            .and_then(|m| m.get("colour"))
-            .map(String::as_str),
-        Some("blue")
-    );
+        // REPLACE: the request's metadata wins, the source's is dropped.
+        client
+            .copy_object()
+            .bucket(B)
+            .key("dst/replaced-meta")
+            .copy_source(format!("{B}/src/meta"))
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .metadata("colour", "blue")
+            .send()
+            .await
+            .expect("copy REPLACE");
+        let replaced = client
+            .head_object()
+            .bucket(B)
+            .key("dst/replaced-meta")
+            .send()
+            .await
+            .expect("head");
+        assert_eq!(
+            replaced
+                .metadata()
+                .and_then(|m| m.get("colour"))
+                .map(String::as_str),
+            Some("blue"),
+            "REPLACE metadata in {mode:?}"
+        );
+    }
 }
 
 /// `x-amz-copy-source-if-match` / `if-none-match` gate on the source's current ETag.
@@ -251,49 +253,52 @@ async fn copy_source_preconditions() {
 /// A same-key `REPLACE` copy is an in-place metadata edit: the body is unchanged, the metadata swaps.
 #[tokio::test]
 async fn copy_in_place_metadata_edit() {
-    let h = Harness::durable().await;
-    h.create_bucket(B).await;
-    let client = h.client();
+    for mode in [Mode::Durable, Mode::Cached] {
+        let h = Harness::with_mode(mode).await;
+        h.create_bucket(B).await;
+        let client = h.client();
 
-    let body = pattern_seeded(1024, 4);
-    client
-        .put_object()
-        .bucket(B)
-        .key("obj")
-        .body(bytes_body(&body))
-        .content_length(body.len() as i64)
-        .metadata("v", "1")
-        .send()
-        .await
-        .expect("put");
+        let body = pattern_seeded(1024, 4);
+        client
+            .put_object()
+            .bucket(B)
+            .key("obj")
+            .body(bytes_body(&body))
+            .content_length(body.len() as i64)
+            .metadata("v", "1")
+            .send()
+            .await
+            .expect("put");
 
-    client
-        .copy_object()
-        .bucket(B)
-        .key("obj")
-        .copy_source(format!("{B}/obj"))
-        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
-        .metadata("v", "2")
-        .send()
-        .await
-        .expect("in-place copy");
+        client
+            .copy_object()
+            .bucket(B)
+            .key("obj")
+            .copy_source(format!("{B}/obj"))
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .metadata("v", "2")
+            .send()
+            .await
+            .expect("in-place copy");
 
-    let head = client
-        .head_object()
-        .bucket(B)
-        .key("obj")
-        .send()
-        .await
-        .expect("head");
-    assert_eq!(
-        head.metadata().and_then(|m| m.get("v")).map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(
-        get_all(&client, B, "obj").await,
-        body,
-        "body unchanged by the edit"
-    );
+        let head = client
+            .head_object()
+            .bucket(B)
+            .key("obj")
+            .send()
+            .await
+            .expect("head");
+        assert_eq!(
+            head.metadata().and_then(|m| m.get("v")).map(String::as_str),
+            Some("2"),
+            "metadata replaced in {mode:?}"
+        );
+        assert_eq!(
+            get_all(&client, B, "obj").await,
+            body,
+            "body unchanged by the edit in {mode:?}"
+        );
+    }
 }
 
 /// A copy from a source that does not exist is a client-visible 404.
@@ -312,4 +317,198 @@ async fn copy_missing_source() {
         .await
         .expect_err("copy from a missing source must fail");
     assert_eq!(err.into_service_error().meta().code(), Some("NoSuchKey"));
+}
+
+/// A live source in cached mode stays on the cache fast path: the cache copy is the commit, its
+/// native plaintext ETag names the pending marker, and reconcile trails the destination remotely.
+#[tokio::test]
+async fn cached_live_source_copies_in_cache_and_raises_a_marker() {
+    let h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let source = pattern_seeded(64 * 1024, 21);
+    let source_etag = put(&client, B, "src/live", &source).await;
+
+    // Hold the reconcile upload so the post-copy representation can be inspected without racing a
+    // fast local MinIO round trip.
+    let mut upload = h.remote_faults().pause_next(
+        hyper::Method::PUT,
+        format!("/{}/dst/live", h.remote_bucket(B)),
+    );
+
+    let copied_etag = copy(&client, "dst/live", B, "src/live").await;
+    assert_eq!(copied_etag, source_etag);
+    assert_eq!(get_all(&client, B, "dst/live").await, source);
+    assert_eq!(
+        data_class(&h, B, "dst/live").await,
+        None,
+        "a live-source copy commits as a live cache body"
+    );
+
+    wait_until(5_000, "the cached copy's marker to land", || async {
+        marker_present(&h, B, "dst/live").await
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), upload.reached())
+        .await
+        .expect("reconcile never attempted the copied destination");
+    upload.release();
+
+    wait_until(5_000, "the copied destination to reconcile", || async {
+        remote_present(&h, B, "dst/live").await && !marker_present(&h, B, "dst/live").await
+    })
+    .await;
+}
+
+/// A remote-resident source in a cached deployment keeps the durable ciphertext-copy path. A
+/// composite is the decisive case: its plaintext may have a warm shadow, but K remains tombstoned,
+/// so the destination preserves its composite ETag and never raises a pending marker.
+#[tokio::test]
+async fn cached_remote_source_uses_the_durable_copy_path() {
+    let h = Harness::cached().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let p1 = pattern_seeded(MIN_PART, 31);
+    let p2 = pattern_seeded(1024 * 1024, 32);
+    let whole: Vec<u8> = [p1.as_slice(), p2.as_slice()].concat();
+
+    let upload = create_mpu(&client, B, "src/composite").await;
+    let e1 = upload_part(&client, B, "src/composite", &upload, 1, &p1).await;
+    let e2 = upload_part(&client, B, "src/composite", &upload, 2, &p2).await;
+    let source_etag = complete_mpu(&client, B, "src/composite", &upload, &[(1, e1), (2, e2)]).await;
+
+    let copied_etag = copy(&client, "dst/composite", B, "src/composite").await;
+    assert_eq!(copied_etag, source_etag);
+    assert_eq!(
+        data_class(&h, B, "dst/composite").await,
+        Some(hypha_core::meta::TombKind::Evict),
+        "remote-source copy settles an eviction tombstone"
+    );
+    assert!(
+        !marker_present(&h, B, "dst/composite").await,
+        "the synchronous remote commit owes no reconcile marker"
+    );
+    assert!(remote_present(&h, B, "dst/composite").await);
+    assert_eq!(get_all(&client, B, "dst/composite").await, whole);
+}
+
+/// The source HEAD only chooses the cache-copy branch; the backend copy itself is bound to that
+/// physical ETag. A concurrent unconditional PUT may win without taking Hypha's write lock, but it
+/// must make this copy fail rather than copying new bytes under the old source facts.
+#[tokio::test]
+async fn cached_copy_is_bound_to_the_resolved_source_generation() {
+    let h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let first = pattern_seeded(32 * 1024, 41);
+    let second = pattern_seeded(32 * 1024, 42);
+    let first_etag = put(&h.client(), B, "src/race", &first).await;
+
+    let mut backend_copy = h.cache_faults().pause_next(
+        hyper::Method::PUT,
+        format!("/{}/dst/race", h.cache_bucket(B)),
+    );
+    let client = h.client();
+    let request = tokio::spawn(async move {
+        client
+            .copy_object()
+            .bucket(B)
+            .key("dst/race")
+            .copy_source(format!("{B}/src/race"))
+            .send()
+            .await
+    });
+
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(5), backend_copy.reached())
+        .await
+        .expect("cache copy was never attempted");
+    assert_eq!(
+        captured
+            .headers
+            .get("x-amz-copy-source-if-match")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("\"{first_etag}\"").as_str()),
+        "the cache operation must bind the generation selected by HEAD"
+    );
+
+    put(&h.client(), B, "src/race", &second).await;
+    backend_copy.release();
+
+    let error = request
+        .await
+        .expect("copy task panicked")
+        .expect_err("a replaced source must fail the generation-bound copy");
+    assert_eq!(
+        error.into_service_error().meta().code(),
+        Some("PreconditionFailed")
+    );
+    assert!(
+        h.raw()
+            .head_object()
+            .bucket(h.cache_bucket(B))
+            .key("dst/race")
+            .send()
+            .await
+            .is_err(),
+        "a failed source condition must leave the destination absent"
+    );
+}
+
+/// A cache copy can commit and lose every response before Hypha raises its marker. As with cached
+/// PUT/DELETE, the run must withdraw its clean accounting so R2 reconstructs the missing obligation
+/// instead of permanently leaving the destination absent from the remote.
+#[tokio::test]
+async fn cached_copy_with_a_lost_response_is_rebuilt_next_run() {
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let body = pattern_seeded(48 * 1024, 51);
+    put(&h.client(), B, "src/lost-response", &body).await;
+
+    let faults = h.cache_faults();
+    let lost = faults.fail_response_times(
+        hyper::Method::PUT,
+        format!("/{}/dst/lost-response", h.cache_bucket(B)),
+        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+        1_000,
+    );
+    let result = h
+        .client()
+        .copy_object()
+        .bucket(B)
+        .key("dst/lost-response")
+        .copy_source(format!("{B}/src/lost-response"))
+        .send()
+        .await;
+    assert!(result.is_err(), "the lost responses must reach the client");
+    tokio::time::timeout(std::time::Duration::from_secs(5), lost)
+        .await
+        .expect("the cache copy was never attempted")
+        .expect("fault proxy stopped before losing the response");
+    faults.clear();
+
+    assert_eq!(
+        get_all(&h.client(), B, "dst/lost-response").await,
+        body,
+        "the cache commit landed despite the client error"
+    );
+    assert!(
+        !marker_present(&h, B, "dst/lost-response").await,
+        "the response was lost before the marker could be queued"
+    );
+
+    h.stop_hypha().await;
+    assert!(
+        !raw_exists(&h, &h.meta_bucket(B), &hypha_core::meta::clean_marker_key()).await,
+        "an indeterminate copy must withhold the clean marker"
+    );
+
+    h.start_hypha().await;
+    wait_until(
+        10_000,
+        "R2 to rebuild and reconcile the copied body",
+        || async {
+            remote_present(&h, B, "dst/lost-response").await
+                && !marker_present(&h, B, "dst/lost-response").await
+        },
+    )
+    .await;
 }

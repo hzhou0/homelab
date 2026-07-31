@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+use aws_sdk_s3::operation::copy_object::CopyObjectOutput;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
@@ -22,7 +23,9 @@ use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, Delete, EncodingType, ObjectIdentifier};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, Delete, EncodingType, MetadataDirective, ObjectIdentifier,
+};
 use aws_sdk_s3::Client;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
@@ -128,6 +131,25 @@ impl Backend {
             .map_err(Error::from_sdk)
     }
 
+    /// Read exactly the generation identified by `if_match`. Used when a live cache body becomes
+    /// the source of a durable copy: the HEAD that selected the live branch and the GET that opens
+    /// its stream must not silently resolve to different bodies.
+    pub async fn get_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: String,
+    ) -> Result<GetObjectOutput> {
+        self.client
+            .get_object()
+            .bucket(self.backend_bucket(bucket))
+            .key(key)
+            .if_match(if_match)
+            .send()
+            .await
+            .map_err(Error::from_sdk)
+    }
+
     pub async fn head(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput> {
         self.client
             .head_object()
@@ -204,6 +226,40 @@ impl Backend {
             .unwrap_or_default()
             .trim_matches('"')
             .to_string())
+    }
+
+    /// Atomic plaintext cache copy, generation-bound to the source HEAD Hypha resolved. Metadata is
+    /// always replaced because the cache carrier contains Hypha's namespaced projection as well as
+    /// the client's values; forwarding the backend source metadata implicitly would bypass the
+    /// `COPY`/`REPLACE` decision already made by the S3 handler.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy(
+        &self,
+        dst_bucket: &str,
+        dst_key: &str,
+        src_bucket: &str,
+        src_key: &str,
+        src_if_match: String,
+        metadata: HashMap<String, String>,
+        content_type: Option<String>,
+    ) -> Result<CopyObjectOutput> {
+        let copy_source = format!(
+            "{}/{}",
+            self.backend_bucket(src_bucket),
+            encode_copy_source_key(src_key)
+        );
+        self.client
+            .copy_object()
+            .bucket(self.backend_bucket(dst_bucket))
+            .key(dst_key)
+            .copy_source(copy_source)
+            .copy_source_if_match(src_if_match)
+            .metadata_directive(MetadataDirective::Replace)
+            .set_metadata(Some(metadata))
+            .set_content_type(content_type)
+            .send()
+            .await
+            .map_err(Error::from_sdk)
     }
 
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<()> {
