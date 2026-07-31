@@ -572,8 +572,8 @@ impl Pass {
 
     /// The one debris class with a listing of its own: an upload's record range is named by a single
     /// prefix, so it is swept exhaustively rather than sampled.
-    async fn sweep_mpu_ranges(&self) -> debris::Swept {
-        let mut reclaimed = debris::Swept::default();
+    async fn sweep_mpu_ranges(&self) -> Swept {
+        let mut reclaimed = Swept::default();
         for chunk in self.plan.swept.chunks(self.plan.setting.concurrency.max(1)) {
             let sweeps = chunk
                 .iter()

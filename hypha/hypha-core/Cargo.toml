@@ -17,4 +17,3 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 percent-encoding = { workspace = true }
 base64-simd = { workspace = true }
-tracing = { workspace = true }

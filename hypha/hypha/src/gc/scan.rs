@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rand::Rng as _;
+use rand::{random, Rng as _};
 
 use hypha_core::error::Result;
 use hypha_core::{meta, Backend};
@@ -414,7 +414,7 @@ impl Prefixes {
 /// A position in `<meta>`, aimed at the shadow range or the twin range with even odds.
 fn random_meta_position() -> String {
     let c = meta::CTRL as char;
-    if rand::thread_rng().gen::<bool>() {
+    if random::<bool>() {
         format!("{}{}", meta::shadow_scan_prefix(), random_digest_position())
     } else {
         // Range B is `0x01 ‖ key ‖ …`, and a client key's first byte is >= 0x02 by admission, so a

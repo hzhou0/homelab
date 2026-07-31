@@ -258,7 +258,7 @@ async fn overwrite_during_reconcile_preserves_the_newer_marker() {
 /// of whether the backend refuses one at all.
 #[tokio::test]
 async fn a_cached_bucket_deletes_before_its_deletes_have_propagated() {
-    let mut h = Harness::builder(hypha_core::config::Mode::Cached)
+    let mut h = Harness::builder(Mode::Cached)
         // Long enough that the DELETE marker cannot propagate on its own — the remote must still
         // hold the body when the bucket delete runs, or the test proves nothing.
         .tune(|c| c.reconcile.interval_ms = 600_000)
@@ -1430,7 +1430,7 @@ async fn a_graceful_drain_joins_every_actor_well_inside_its_budget() {
     // returns, not about latency. Reaching even half of one phase budget means something was waited
     // out rather than joined.
     assert!(
-        drain < std::time::Duration::from_secs(5),
+        drain < Duration::from_secs(5),
         "drain took {drain:?}; an actor is not observing shutdown"
     );
 }

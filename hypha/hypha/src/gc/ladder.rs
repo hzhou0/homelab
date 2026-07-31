@@ -205,14 +205,10 @@ mod tests {
             ]
         );
         let settings: Vec<Setting> = seen.iter().map(|(_, s)| *s).collect();
-        assert!(
-            settings
-                .iter()
-                .take_while(|s| s.threshold == Age::Miss)
-                .count()
-                == 6,
-            "the threshold must hold at miss until both cheap bounds are reached"
-        );
+        assert_eq!(settings
+                       .iter()
+                       .take_while(|s| s.threshold == Age::Miss)
+                       .count(), 6, "the threshold must hold at miss until both cheap bounds are reached");
         assert_eq!(
             settings.last().copied(),
             Some(Setting {

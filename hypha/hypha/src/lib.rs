@@ -185,7 +185,7 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), Bo
 pub struct Lifecycle {
     /// Handed to the admin listener before this is moved into [`serve`] — the probes have to be
     /// answering *before* startup finishes, since "not ready yet" is precisely what they report.
-    health: admin::Health,
+    health: Health,
     tier: tier::Tiering,
     buckets: bucket::BucketCtl,
     halt: halt::Halt,
@@ -208,7 +208,7 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
-    pub fn health(&self) -> admin::Health {
+    pub fn health(&self) -> Health {
         self.health.clone()
     }
 

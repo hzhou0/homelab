@@ -62,7 +62,7 @@ pub async fn serve<F>(listener: TcpListener, health: Health, metrics: Prometheus
 where
     F: Future<Output = ()>,
 {
-    let http = std::sync::Arc::new(ConnBuilder::new(TokioExecutor::new()));
+    let http = Arc::new(ConnBuilder::new(TokioExecutor::new()));
     let mut shutdown = std::pin::pin!(shutdown);
     let mut accept_backoff = ACCEPT_RETRY_MIN;
     loop {

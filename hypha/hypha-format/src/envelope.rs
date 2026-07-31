@@ -131,7 +131,7 @@ mod tests {
         let env = Envelope::new(passphrase).unwrap();
         let read = env
             .decrypt(&ct[..])
-            .and_then(|mut r| r.read_to_end(&mut Vec::new()).map_err(crate::Error::Io));
+            .and_then(|mut r| r.read_to_end(&mut Vec::new()).map_err(Error::Io));
         assert!(
             read.is_err(),
             "a work factor above the bound must be refused, not honoured"
