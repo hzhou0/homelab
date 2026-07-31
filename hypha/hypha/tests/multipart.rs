@@ -170,12 +170,10 @@ async fn multipart_part_record_failure_requires_a_reupload() {
         record.path
     );
 
-    // Non-empty rather than exactly one: the SDK retries the failing UploadPart, and how many
-    // entries that leaves is the *backend's* business — S3 and MinIO replace a re-uploaded part
-    // number, SeaweedFS keeps every upload of it (tests/backend.rs). What this asserts is the thing
-    // hypha depends on: the ciphertext reached the remote before the record write failed.
+    // The ciphertext may reach the remote before the local facts record, but without both halves
+    // hypha must not acknowledge or complete it.
     let remote_parts = h
-        .raw()
+        .raw_remote()
         .list_parts()
         .bucket(h.remote_bucket(B))
         .key(key)
@@ -523,7 +521,7 @@ async fn multipart_last_part_number_folds_trailer() {
 
     // The committed object carries exactly the client's parts — no trailer part above 10000.
     let raw = h
-        .raw()
+        .raw_remote()
         .head_object()
         .bucket(h.remote_bucket(B))
         .key(key)
@@ -842,6 +840,71 @@ async fn multipart_failed_complete_restores_the_previous_generation() {
         part,
         "the uncommitted native upload must remain retryable"
     );
+}
+
+/// Folding replaces the client's final part on a compliant backend. If native completion is then
+/// refused, the persisted intent must let a retry restore the retained pure part before folding it
+/// again. Both reasons a part cannot take a trailer successor exercise the same recovery.
+#[tokio::test]
+async fn multipart_failed_folded_complete_is_retryable() {
+    let mut h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+
+    for (case, part_number) in [("small", 1), ("last-number", 10_000)] {
+        let client = h.client();
+        let key = format!("complete/folded-{case}");
+        let old = format!("old generation for {case}");
+        put(&client, B, &key, old.as_bytes()).await;
+
+        let part = pattern_seeded(256 * 1024, part_number as u8);
+        let up = create_mpu(&client, B, &key).await;
+        let etag = upload_part(&client, B, &key, &up, part_number, &part).await;
+        let faults = h.remote_faults();
+        let refused = faults.fail_times(
+            hyper::Method::POST,
+            format!("/{}/{key}", h.remote_bucket(B)),
+            hyper::StatusCode::PRECONDITION_FAILED,
+            8,
+        );
+        complete_mpu_res(&client, B, &key, &up, &[(part_number, etag.clone())])
+            .await
+            .expect_err("the injected native completion failure must reach the client");
+        tokio::time::timeout(Duration::from_secs(5), refused)
+            .await
+            .expect("complete request never reached the remote")
+            .expect("fault proxy stopped before refusing complete");
+        faults.clear();
+
+        assert_eq!(
+            get_all(&client, B, &key).await,
+            old.as_bytes(),
+            "the failed folded completion must preserve the previous object"
+        );
+        let rejected = pattern_seeded(256 * 1024, part_number as u8 ^ 0x80);
+        let err = client
+            .upload_part()
+            .bucket(B)
+            .key(&key)
+            .upload_id(&up)
+            .part_number(part_number)
+            .body(bytes_body(&rejected))
+            .content_length(rejected.len() as i64)
+            .content_md5(base64_md5(b"different bytes"))
+            .send()
+            .await
+            .expect_err("a rejected replacement must not supersede the fold intent");
+        assert_eq!(sdk_err_code(&err).as_deref(), Some("BadDigest"));
+        drop(client);
+        h.restart_hypha().await;
+
+        let client = h.client();
+        complete_mpu(&client, B, &key, &up, &[(part_number, etag)]).await;
+        assert_eq!(
+            get_all(&client, B, &key).await,
+            part,
+            "the retry must unfold and refold the retained part"
+        );
+    }
 }
 
 /// The remote may commit CompleteMultipartUpload while its response is lost. The client receives an

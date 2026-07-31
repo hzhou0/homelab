@@ -90,6 +90,7 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), Bo
         trailer_key,
         locks: keylocks::KeyLocks::default(),
         upload_locks: keylocks::KeyLocks::default(),
+        mpu_part_locks: keylocks::KeyLocks::default(),
         cached: config.mode == Mode::Cached,
         halt,
     };

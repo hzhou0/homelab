@@ -1,23 +1,17 @@
-//! Integration-test harness. Every test is fully self-contained and stateless: it starts its own
-//! MinIO server (serving as **both** the cache and the remote backend, kept in disjoint bucket
-//! namespaces by hypha's per-backend `bucket_prefix`), runs hypha in-process over an ephemeral
-//! port, and drives it with a real `aws-sdk-s3` client. All state — the MinIO data dir and the
-//! server process — is torn down on `Drop`, so a test leaves nothing behind whether it passes,
-//! fails, or panics.
+//! Integration-test harness. Every test is fully self-contained and stateless: it normally starts
+//! one MinIO server for both backend roles, runs hypha in-process over an ephemeral port, and drives
+//! it with a real `aws-sdk-s3` client. The SeaweedFS run replaces only the cache, matching the
+//! deployed topology while each test keeps its own MinIO remote.
 //!
 //! One MinIO **per test**: the cheapest thing that is unconditionally clean. Tests run in parallel
 //! (each `#[tokio::test]` on its own runtime), each on its own ports and data dir.
 //! Faulted harnesses interpose independent cache and remote proxies so a test can reject, pause, or
 //! lose the response to one backend operation without changing MinIO's behavior for other calls.
 //!
-//! **`TEST_S3_ENDPOINT` points the whole suite at a server it does not own** — the SeaweedFS
-//! compose fixture (`scripts/test-seaweedfs.sh`), which is the only way to exercise the paths whose
-//! correctness rests on a conditional *delete*: MinIO ignores `If-Match` on `DeleteObject`, so
-//! against it the marker CAS and both shadow reclaims are unconditional deletes that happen to work
-//! (`tests/backend.rs`). Isolation then comes from the per-harness `bucket_prefix` instead of from a
-//! server each: `list_buckets` filters by it (§9), so one fixture cannot see another's buckets,
-//! resolve them at startup, or halt on them as foreign. Nothing here starts or stops that server —
-//! the script owns its lifetime, which is also what lets it drop the volume when the run ends.
+//! **`TEST_CACHE_S3_ENDPOINT` replaces only the cache** with a server this process does not own.
+//! `TEST_S3_ENDPOINT` remains the focused backend-contract mode where both roles use that server.
+//! The SeaweedFS runner uses the former for the suite and the latter only for the direct
+//! conditional-delete contract MinIO cannot satisfy.
 
 #![allow(dead_code)] // each test binary uses only part of this shared module
 
@@ -61,9 +55,18 @@ fn unique_bucket_prefix() -> String {
     format!("hy{:08x}", rand::random::<u32>())
 }
 
-/// The S3 endpoint the suite is pointed at, when it is one this process does not own.
-pub fn external_backend() -> Option<String> {
-    std::env::var("TEST_S3_ENDPOINT")
+/// The cache endpoint the suite is pointed at, when it is one this process does not own.
+pub fn external_cache_backend() -> Option<String> {
+    endpoint_env("TEST_CACHE_S3_ENDPOINT").or_else(external_remote_backend)
+}
+
+/// The focused mode where the remote is also the externally supplied backend.
+pub fn external_remote_backend() -> Option<String> {
+    endpoint_env("TEST_S3_ENDPOINT")
+}
+
+fn endpoint_env(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
         .filter(|endpoint| !endpoint.is_empty())
 }
@@ -105,21 +108,25 @@ struct LocalMinio {
 
 impl TestS3 {
     pub async fn start() -> Self {
-        if let Some(endpoint) = external_backend() {
-            let (access_key, secret_key) = fixture_credentials();
-            let shared = Self {
-                endpoint,
-                access_key,
-                secret_key,
-                local: None,
-            };
-            shared
-                .await_serving()
-                .await
-                .unwrap_or_else(|e| panic!("TEST_S3_ENDPOINT is not serving: {e}"));
-            return shared;
+        if let Some(endpoint) = external_remote_backend() {
+            return Self::connect(endpoint, "TEST_S3_ENDPOINT").await;
         }
         Self::start_minio().await
+    }
+
+    async fn connect(endpoint: String, variable: &str) -> Self {
+        let (access_key, secret_key) = fixture_credentials();
+        let shared = Self {
+            endpoint,
+            access_key,
+            secret_key,
+            local: None,
+        };
+        shared
+            .await_serving()
+            .await
+            .unwrap_or_else(|e| panic!("{variable} is not serving: {e}"));
+        shared
     }
 
     async fn start_minio() -> Self {
@@ -1159,7 +1166,9 @@ impl Server {
 }
 
 pub struct Harness {
+    /// The cache backend, shared with the remote only in the default all-MinIO fixture.
     pub storage: TestS3,
+    remote_storage: Option<TestS3>,
     pub hypha: Server,
     pub config: Config,
     cache_proxy: Option<FaultProxy>,
@@ -1216,11 +1225,23 @@ impl HarnessBuilder {
     }
 
     pub async fn start(self) -> Harness {
-        let storage = TestS3::start().await;
+        if external_remote_backend().is_some() && endpoint_env("TEST_CACHE_S3_ENDPOINT").is_some() {
+            panic!("TEST_S3_ENDPOINT and TEST_CACHE_S3_ENDPOINT are mutually exclusive");
+        }
+        let (storage, remote_storage) =
+            if let Some(endpoint) = endpoint_env("TEST_CACHE_S3_ENDPOINT") {
+                (
+                    TestS3::connect(endpoint, "TEST_CACHE_S3_ENDPOINT").await,
+                    Some(TestS3::start_minio().await),
+                )
+            } else {
+                (TestS3::start().await, None)
+            };
+        let remote = remote_storage.as_ref().unwrap_or(&storage);
         let (cache_proxy, remote_proxy) = if self.faults {
             (
                 Some(FaultProxy::start(&storage.endpoint).await),
-                Some(FaultProxy::start(&storage.endpoint).await),
+                Some(FaultProxy::start(&remote.endpoint).await),
             )
         } else {
             (None, None)
@@ -1230,7 +1251,7 @@ impl HarnessBuilder {
             None => None,
         };
 
-        let mut config = base_config(&storage, self.mode);
+        let mut config = base_config(&storage, remote, self.mode);
         if let Some(proxy) = &cache_proxy {
             config.cache.endpoint = proxy.endpoint.clone();
         }
@@ -1257,6 +1278,7 @@ impl HarnessBuilder {
         };
         Harness {
             storage,
+            remote_storage,
             hypha,
             config,
             cache_proxy,
@@ -1277,7 +1299,7 @@ impl Harness {
         }
     }
 
-    /// A durable-mode deployment: one MinIO backing both roles, hypha in front of it.
+    /// A durable-mode deployment: MinIO backs both roles unless the cache fixture is overridden.
     pub async fn durable() -> Self {
         Self::with_mode(Mode::Durable).await
     }
@@ -1347,9 +1369,25 @@ impl Harness {
         s3_client(self.hypha.endpoint(), HYPHA_ACCESS, HYPHA_SECRET)
     }
 
-    /// A client pointed straight at the MinIO backend (root creds) — bypasses hypha.
+    /// A client pointed straight at the cache backend — bypasses hypha.
     pub fn raw(&self) -> Client {
         self.storage.raw_client()
+    }
+
+    /// A client pointed straight at the remote backend — bypasses hypha.
+    pub fn raw_remote(&self) -> Client {
+        self.remote_storage
+            .as_ref()
+            .unwrap_or(&self.storage)
+            .raw_client()
+    }
+
+    pub fn raw_for_bucket(&self, bucket: &str) -> Client {
+        if bucket.starts_with(&self.config.role_prefix(REMOTE_ROLE)) {
+            self.raw_remote()
+        } else {
+            self.raw()
+        }
     }
 
     pub fn remote_bucket(&self, client_bucket: &str) -> String {
@@ -1432,10 +1470,10 @@ impl Harness {
     }
 }
 
-fn base_config(storage: &TestS3, mode: Mode) -> Config {
+fn base_config(cache: &TestS3, remote: &TestS3, mode: Mode) -> Config {
     Config {
-        remote: endpoint_cfg(storage),
-        cache: endpoint_cfg(storage),
+        remote: endpoint_cfg(remote),
+        cache: endpoint_cfg(cache),
         bucket_prefix: unique_bucket_prefix(),
         mode,
         auth: ClientAuth {
@@ -1709,7 +1747,7 @@ pub async fn put(client: &Client, bucket: &str, key: &str, body: &[u8]) -> Strin
 /// The raw ciphertext hypha wrote to the remote for `key` (bypasses hypha, reads MinIO directly).
 pub async fn raw_remote_object(harness: &Harness, bucket: &str, key: &str) -> Vec<u8> {
     let out = harness
-        .raw()
+        .raw_remote()
         .get_object()
         .bucket(harness.remote_bucket(bucket))
         .key(key)
@@ -1823,7 +1861,7 @@ where
 }
 
 pub async fn raw_exists(h: &Harness, bucket: &str, key: &str) -> bool {
-    h.raw()
+    h.raw_for_bucket(bucket)
         .head_object()
         .bucket(bucket)
         .key(key)

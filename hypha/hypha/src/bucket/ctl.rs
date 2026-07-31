@@ -797,8 +797,16 @@ impl BucketTask {
         // dropping it is what a deleted bucket should leave behind.
         retire(&self.states, bucket);
         self.gates.retire(bucket);
-        drain_and_delete_if_exists(&self.tier.data, bucket).await?;
-        drain_and_delete_if_exists(&self.tier.meta, bucket).await?;
+        for (role, backend) in [("data", &self.tier.data), ("meta", &self.tier.meta)] {
+            if let Err(error) = drain_and_delete_if_exists(backend, bucket).await {
+                tracing::warn!(
+                    bucket,
+                    role,
+                    %error,
+                    "deleted bucket projection cleanup failed"
+                );
+            }
+        }
         Ok(())
     }
 

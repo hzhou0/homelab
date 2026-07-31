@@ -194,7 +194,7 @@ async fn a_body_the_remote_does_not_hold_owes_a_marker_instead_of_a_tombstone() 
     put(&c, B, "undurable", &body).await;
     until_durable(&h, "undurable").await;
 
-    h.raw()
+    h.raw_remote()
         .delete_object()
         .bucket(h.remote_bucket(B))
         .key("undurable")

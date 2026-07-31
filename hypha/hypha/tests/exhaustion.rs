@@ -532,7 +532,7 @@ async fn a_full_cache_never_acks_a_cached_write_it_could_not_commit() {
     // The remote is healthy here, so the halt marker is writable — its absence is a real assertion
     // rather than an artefact of the store being full.
     assert!(
-        !halted(&h, &h.raw()).await,
+        !halted(&h, &h.raw_remote()).await,
         "a full cache is an error the client is told about, not a violated invariant"
     );
 }

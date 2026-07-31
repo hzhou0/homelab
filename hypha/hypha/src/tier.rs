@@ -32,7 +32,7 @@ pub(crate) fn single_part_framed_len(plen: u64) -> Option<u64> {
 }
 
 /// Every backend a key can move between, plus what it takes to move it: the crypto that frames a
-/// body on its way out, and the two lock tables that decide who may. Three handles, two endpoints —
+/// body on its way out, and the lock tables that decide who may. Three handles, two endpoints —
 /// `data` and `meta` are bucket namespaces on the same cache endpoint (§6), so a write that touches
 /// both is one round trip's worth of connection reuse, not two. Cloned into every task that touches
 /// storage (the S3 ops, `BucketTask`, `TransitionActor`, `ReplicationTask`); each field is itself a
@@ -56,6 +56,9 @@ pub struct Tiering {
     /// (which takes `locks`, not this). Held via `try_lock`: a pass that finds K busy coalesces onto
     /// the in-flight upload rather than queuing, so this table never accumulates waiters.
     pub upload_locks: KeyLocks,
+    /// Same-part multipart mutations serialize without suppressing parallel uploads of distinct
+    /// parts. Completion holds the last part here while it may replace that part with a folded form.
+    pub mpu_part_locks: KeyLocks,
     /// Cached mode (§4). Decides who wins when a surviving cache entry and the remote disagree: in
     /// cached mode the cache write *is* the commit, so a generation the remote lacks is an acked
     /// write still owed to it — the pending set the clean marker accounts for (§6). Durable mode

@@ -12,18 +12,17 @@
 //! rather than folded into the tests that depend on them for exactly the reason above: a test whose
 //! subject is a race reports "the backend did not refuse" as a flake.
 //!
-//! The last four are the mirror image: S3 behaviours the two backends **disagree** on, pinned so
-//! that hypha's not depending on either is a checked claim rather than an intention.
+//! Cache-dialect probes run against the configured cache. Multipart probes run against the remote,
+//! whose replacement and ordering semantics are part of hypha's backend contract.
 
 mod common;
 
 use common::*;
 
 /// A distinct bucket per test, so the two never race each other's objects.
-async fn probe_bucket(h: &Harness, name: &str) -> String {
+async fn probe_bucket(h: &Harness, raw: &aws_sdk_s3::Client, name: &str) -> String {
     let bucket = format!("{}-{name}", h.gc_bucket());
-    h.raw()
-        .create_bucket()
+    raw.create_bucket()
         .bucket(&bucket)
         .send()
         .await
@@ -31,9 +30,8 @@ async fn probe_bucket(h: &Harness, name: &str) -> String {
     bucket
 }
 
-async fn put_raw(h: &Harness, bucket: &str, key: &str, body: &[u8]) -> String {
-    h.raw()
-        .put_object()
+async fn put_raw(raw: &aws_sdk_s3::Client, bucket: &str, key: &str, body: &[u8]) -> String {
+    raw.put_object()
         .bucket(bucket)
         .key(key)
         .body(bytes_body(body))
@@ -52,10 +50,10 @@ async fn put_raw(h: &Harness, bucket: &str, key: &str, body: &[u8]) -> String {
 #[tokio::test]
 async fn conditional_writes_are_enforced() {
     let h = Harness::durable().await;
-    let bucket = probe_bucket(&h, "cw").await;
     let raw = h.raw();
+    let bucket = probe_bucket(&h, &raw, "cw").await;
 
-    let first = put_raw(&h, &bucket, "k", b"one").await;
+    let first = put_raw(&raw, &bucket, "k", b"one").await;
     let created_twice = raw
         .put_object()
         .bucket(&bucket)
@@ -71,7 +69,7 @@ async fn conditional_writes_are_enforced() {
         "without this, two concurrent creates could both win"
     );
 
-    let second = put_raw(&h, &bucket, "k", b"three").await;
+    let second = put_raw(&raw, &bucket, "k", b"three").await;
     assert_ne!(first, second);
     let stale = raw
         .put_object()
@@ -105,17 +103,17 @@ async fn conditional_writes_are_enforced() {
 /// the one assertion in the suite that the default one cannot satisfy — see below.
 #[tokio::test]
 async fn a_conditional_delete_is_enforced_by_the_deployed_backend() {
-    let Some(_) = external_backend() else {
+    let Some(_) = external_remote_backend() else {
         // Deliberately a skip rather than a failure: the default backend's behaviour is asserted by
         // the test below, and the two together are the whole statement.
         return;
     };
     let h = Harness::durable().await;
-    let bucket = probe_bucket(&h, "ce").await;
-    let raw = h.raw();
+    let raw = h.raw_remote();
+    let bucket = probe_bucket(&h, &raw, "ce").await;
 
-    let superseded = put_raw(&h, &bucket, "k", b"one").await;
-    let current = put_raw(&h, &bucket, "k", b"two").await;
+    let superseded = put_raw(&raw, &bucket, "k", b"one").await;
+    let current = put_raw(&raw, &bucket, "k", b"two").await;
     assert_ne!(superseded, current);
 
     let refused = raw
@@ -165,25 +163,24 @@ async fn a_conditional_delete_is_enforced_by_the_deployed_backend() {
 ///   `#[ignore]`d for exactly this);
 /// - the delete branch can remove a *newer* remote object that landed between its HEAD and its delete.
 ///
-/// **SeaweedFS 4.37 — what the deployment runs on both legs (§9) — does enforce it**: a stale-ETag
-/// delete is refused 412 and the object survives. So the mechanism is sound where it ships, and what
-/// this test measures is the distance between the test backend and the deployed one: every
-/// CAS-dependent path above is exercised here only where the precondition is a no-op, so no run of
-/// this suite would catch a regression that stopped sending it.
+/// **SeaweedFS 4.37 — the deployed cache and the focused remote-contract fixture — does enforce
+/// it**: a stale-ETag delete is refused 412 and the object survives. The mixed suite therefore
+/// exercises cache-side CAS against SeaweedFS, while the focused probe above covers the same
+/// required contract on the remote role.
 ///
 /// **If this test fails, MinIO has gained the semantics**: re-enable the ignored test above and turn
 /// this one into the positive assertion it wants to be.
 #[tokio::test]
 async fn the_default_test_backend_does_not_enforce_a_conditional_delete() {
-    if external_backend().is_some() {
+    if external_remote_backend().is_some() {
         return; // this one is about MinIO; the requirement is asserted above
     }
     let h = Harness::durable().await;
-    let bucket = probe_bucket(&h, "cd").await;
-    let raw = h.raw();
+    let raw = h.raw_remote();
+    let bucket = probe_bucket(&h, &raw, "cd").await;
 
-    let superseded = put_raw(&h, &bucket, "k", b"one").await;
-    let current = put_raw(&h, &bucket, "k", b"two").await;
+    let superseded = put_raw(&raw, &bucket, "k", b"one").await;
+    let current = put_raw(&raw, &bucket, "k", b"two").await;
     assert_ne!(superseded, current);
 
     let deleted = raw
@@ -219,12 +216,12 @@ async fn the_default_test_backend_does_not_enforce_a_conditional_delete() {
 #[tokio::test]
 async fn a_non_empty_bucket_is_refused_by_only_one_of_the_two_backends() {
     let h = Harness::durable().await;
-    let bucket = probe_bucket(&h, "ne").await;
     let raw = h.raw();
-    put_raw(&h, &bucket, "k", b"one").await;
+    let bucket = probe_bucket(&h, &raw, "ne").await;
+    put_raw(&raw, &bucket, "k", b"one").await;
 
     let deleted = raw.delete_bucket().bucket(&bucket).send().await;
-    match external_backend() {
+    match external_cache_backend() {
         Some(_) => {
             deleted.expect("SeaweedFS is expected to delete a non-empty bucket");
             assert!(
@@ -255,9 +252,9 @@ async fn a_non_empty_bucket_is_refused_by_only_one_of_the_two_backends() {
 #[tokio::test]
 async fn an_emptied_prefix_survives_on_only_one_of_the_two_backends() {
     let h = Harness::durable().await;
-    let bucket = probe_bucket(&h, "ep").await;
     let raw = h.raw();
-    put_raw(&h, &bucket, "p/k", b"one").await;
+    let bucket = probe_bucket(&h, &raw, "ep").await;
+    put_raw(&raw, &bucket, "p/k", b"one").await;
     raw.delete_object()
         .bucket(&bucket)
         .key("p/k")
@@ -276,7 +273,7 @@ async fn an_emptied_prefix_survives_on_only_one_of_the_two_backends() {
         .iter()
         .filter_map(|p| p.prefix().map(str::to_string))
         .collect();
-    match external_backend() {
+    match external_cache_backend() {
         Some(_) => assert_eq!(
             prefixes,
             vec!["p/".to_string()],
@@ -289,22 +286,13 @@ async fn an_emptied_prefix_survives_on_only_one_of_the_two_backends() {
     }
 }
 
-/// **A re-uploaded part number is not replaced everywhere.** S3 and MinIO keep one entry per part
-/// number — the last upload wins and `ListParts` reports only it. SeaweedFS keeps every upload and
-/// lists them all, in an order that is not the arrival order.
-///
-/// This is the divergence that mattered most: §7's complete used to build a `part → retag` map from
-/// this listing, which on SeaweedFS silently kept whichever duplicate came last in it — so the ETag
-/// `ListParts` reported and the one complete resolved could name different generations, and complete
-/// refused the client's own part ETag. Complete now resolves the generation from the **client's**
-/// part ETag (S3's own model) and `ListParts` reports one entry per number, so neither reads a
-/// winner out of this listing. `CompleteMultipartUpload` honours whichever entry it is handed, which
-/// is what makes that sound on both backends.
+/// The remote contract: re-uploading a part number replaces it, so `ListParts` exposes only the
+/// generation a subsequent complete may select.
 #[tokio::test]
-async fn a_re_uploaded_part_replaces_the_old_one_on_only_one_of_the_two_backends() {
+async fn a_re_uploaded_remote_part_replaces_the_old_one() {
     let h = Harness::durable().await;
-    let bucket = probe_bucket(&h, "rp").await;
-    let raw = h.raw();
+    let raw = h.raw_remote();
+    let bucket = probe_bucket(&h, &raw, "rp").await;
     let created = raw
         .create_multipart_upload()
         .bucket(&bucket)
@@ -348,68 +336,19 @@ async fn a_re_uploaded_part_replaces_the_old_one_on_only_one_of_the_two_backends
         .iter()
         .filter_map(|p| p.e_tag().map(|e| e.trim_matches('"').to_string()))
         .collect();
-    match external_backend() {
-        Some(_) => {
-            assert_eq!(
-                reported.len(),
-                2,
-                "SeaweedFS is expected to keep both uploads of part 1: {reported:?}"
-            );
-            // And to honour the older of them at complete, which is what lets hypha choose.
-            raw.complete_multipart_upload()
-                .bucket(&bucket)
-                .key("k")
-                .upload_id(upload_id)
-                .multipart_upload(
-                    aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                        .parts(
-                            aws_sdk_s3::types::CompletedPart::builder()
-                                .part_number(1)
-                                .e_tag(&etags[0])
-                                .build(),
-                        )
-                        .build(),
-                )
-                .send()
-                .await
-                .expect("complete against the superseded generation");
-            let landed = raw
-                .get_object()
-                .bucket(&bucket)
-                .key("k")
-                .send()
-                .await
-                .expect("get the completed object")
-                .body
-                .collect()
-                .await
-                .expect("collect body")
-                .to_vec();
-            assert_eq!(
-                landed,
-                b"first part payload".to_vec(),
-                "the entry named by the request is the one that lands"
-            );
-        }
-        None => assert_eq!(
-            reported,
-            vec![etags[1].clone()],
-            "MinIO is expected to report only the last upload of part 1"
-        ),
-    }
+    assert_eq!(
+        reported,
+        vec![etags[1].clone()],
+        "the remote must report only the last upload of part 1"
+    );
 }
 
-/// **`ListMultipartUploads` is ordered by upload id, not by key**, on SeaweedFS — S3 and MinIO order
-/// by key then upload id, and that is also the cursor SeaweedFS paginates on (it returns a
-/// `NextUploadIdMarker` and no `NextKeyMarker`). Pagination itself is sound: the cursor advances and
-/// terminates, so a client echoing the markers back sees every upload exactly once, and §8's debris
-/// sweep — which only collects upload ids into a set — is unaffected. hypha sorts each page it
-/// returns; across pages the order stays the remote's (§12).
+/// The remote contract: multipart uploads are globally ordered by the S3 listing cursor.
 #[tokio::test]
-async fn multipart_uploads_are_listed_in_key_order_by_only_one_of_the_two_backends() {
+async fn remote_multipart_uploads_are_listed_in_key_order() {
     let h = Harness::durable().await;
-    let bucket = probe_bucket(&h, "lu").await;
-    let raw = h.raw();
+    let raw = h.raw_remote();
+    let bucket = probe_bucket(&h, &raw, "lu").await;
     // Keys chosen so key order and creation order agree; any disagreement with the reported order is
     // then the backend's own ordering showing through.
     for key in ["a", "b", "c", "d"] {
@@ -433,14 +372,5 @@ async fn multipart_uploads_are_listed_in_key_order_by_only_one_of_the_two_backen
         s.sort_unstable();
         s
     };
-    match external_backend() {
-        // Not asserting a *specific* wrong order — upload ids are random, so which permutation comes
-        // back is random too. The claim is only that key order is not what the backend guarantees.
-        Some(_) => assert_eq!(
-            keys.len(),
-            sorted.len(),
-            "the set is complete however it is ordered"
-        ),
-        None => assert_eq!(keys, sorted, "MinIO is expected to order by key"),
-    }
+    assert_eq!(keys, sorted, "the remote must order uploads by key");
 }

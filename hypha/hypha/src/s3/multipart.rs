@@ -7,8 +7,8 @@
 //! lands body and facts in one op, and clients keep S3's full 1–10000 part range.
 //!
 //! hypha's own state per upload is minimal and lives in the `<meta>` cache bucket's range A
-//! (`0x01 0x01 m …`, §6): per-part `{pmd5, retag}` facts, needed at complete because an in-progress
-//! upload's parts aren't readable. Its loss with the cache volume merely fails the eventual
+//! (`0x01 0x01 m …`, §6): per-part `{pmd5, retag}` facts, plus a fold intent while completion has
+//! temporarily replaced a client part. Its loss with the cache volume merely fails the eventual
 //! complete — never-acked, the client retries.
 
 use std::collections::HashMap;
@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
-use hypha_core::backend::RemotePart;
 use hypha_core::error::Error;
 use hypha_core::meta;
 use hypha_format::offset::{ciphertext_len, plaintext_len_from, HLEN};
@@ -43,11 +42,38 @@ fn mint_nonce() -> String {
     base64_simd::URL_SAFE_NO_PAD.encode_to_string(rand::random::<[u8; 16]>())
 }
 
+fn mpu_part_lock_key(bucket: &str, upload_id: &str, part_number: i32) -> String {
+    format!("mpu\0{bucket}\0{upload_id}\0{part_number}")
+}
+
 /// S3/MinIO reject any multipart part below 5 MiB except the upload's final part. hypha's trailer
 /// normally occupies that final-part slot, so a client's last data part this small must instead
 /// *carry* the trailer (the fold in `op_complete_multipart_upload`, §7); `op_upload_part` retains
 /// such a part's ciphertext up front so complete can re-upload it as `part ‖ trailer`.
 pub(super) const MIN_REMOTE_PART: u64 = 5 * 1024 * 1024;
+
+const FOLD_PART_NUMBER: &str = "part";
+const FOLD_RETAG: &str = "retag";
+const FOLD_PMD5: &str = "pmd5";
+const FOLD_STASH_NONCE: &str = "nonce";
+const FOLD_CIPHERTEXT_LEN: &str = "ctlen";
+
+#[derive(Clone, Debug)]
+struct FoldIntent {
+    part_number: i32,
+    retag: String,
+    pmd5: String,
+    stash_nonce: String,
+    ciphertext_len: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedPart {
+    number: i32,
+    retag: String,
+    size: u64,
+    stash_nonce: String,
+}
 
 impl Hypha {
     pub(super) async fn op_create_multipart_upload(
@@ -134,6 +160,8 @@ impl Hypha {
             .ok_or_else(|| Error::Invalid("UploadPart requires a body".into()))?;
 
         self.require_upload(&bucket, &input.upload_id).await?;
+        let lock_key = mpu_part_lock_key(&bucket, &input.upload_id, part_number);
+        let _part_guard = self.tier.mpu_part_locks.lock(&lock_key).await;
 
         // Past the byte source, a part is a part: encrypt as a pure age file, stream to the remote,
         // record its facts. The copy path (`op_upload_part_copy`) shares this tail (§7).
@@ -147,6 +175,8 @@ impl Hypha {
                 body,
                 expect_md5,
             )
+            .await?;
+        self.clear_fold_intent_for_part(&bucket, &input.upload_id, part_number)
             .await?;
 
         let resp = UploadPartOutput {
@@ -300,6 +330,102 @@ impl Hypha {
         Ok(())
     }
 
+    async fn fold_intent(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+    ) -> Result<Option<FoldIntent>, Error> {
+        let head = match self
+            .meta()
+            .head(bucket, &meta::mpu_fold_key(upload_id))
+            .await
+        {
+            Ok(head) => head,
+            Err(Error::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let md = head.metadata.unwrap_or_default();
+        let malformed = || Error::Backend("multipart fold intent is malformed".into());
+        Ok(Some(FoldIntent {
+            part_number: md
+                .get(FOLD_PART_NUMBER)
+                .ok_or_else(malformed)?
+                .parse()
+                .map_err(|_| malformed())?,
+            retag: md.get(FOLD_RETAG).ok_or_else(malformed)?.clone(),
+            pmd5: md.get(FOLD_PMD5).ok_or_else(malformed)?.clone(),
+            stash_nonce: md.get(FOLD_STASH_NONCE).ok_or_else(malformed)?.clone(),
+            ciphertext_len: md
+                .get(FOLD_CIPHERTEXT_LEN)
+                .ok_or_else(malformed)?
+                .parse()
+                .map_err(|_| malformed())?,
+        }))
+    }
+
+    async fn persist_fold_intent(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        intent: &FoldIntent,
+    ) -> Result<(), Error> {
+        let md = HashMap::from([
+            (FOLD_PART_NUMBER.to_string(), intent.part_number.to_string()),
+            (FOLD_RETAG.to_string(), intent.retag.clone()),
+            (FOLD_PMD5.to_string(), intent.pmd5.clone()),
+            (FOLD_STASH_NONCE.to_string(), intent.stash_nonce.clone()),
+            (
+                FOLD_CIPHERTEXT_LEN.to_string(),
+                intent.ciphertext_len.to_string(),
+            ),
+        ]);
+        self.meta()
+            .put_small(
+                bucket,
+                &meta::mpu_fold_key(upload_id),
+                Vec::new(),
+                md,
+                None,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_fold_intent_for_part(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: i32,
+    ) -> Result<(), Error> {
+        if self
+            .fold_intent(bucket, upload_id)
+            .await?
+            .is_some_and(|intent| intent.part_number == part_number)
+        {
+            match self
+                .meta()
+                .delete(bucket, &meta::mpu_fold_key(upload_id))
+                .await
+            {
+                Ok(()) | Err(Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_fold_intent(&self, bucket: &str, upload_id: &str) -> Result<(), Error> {
+        match self
+            .meta()
+            .delete(bucket, &meta::mpu_fold_key(upload_id))
+            .await
+        {
+            Ok(()) | Err(Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// **UploadPartCopy** (§7): the copy-source is an alternate byte source for a part. Fast path —
     /// a whole, unranged, single-part, remote-resident source is one age file, so its body copies
     /// **server-side** with `pmd5` = the source cetag and no bytes through hypha; everything else
@@ -327,6 +453,8 @@ impl Hypha {
         meta::validate_client_key(&src_key).map_err(|e| Error::Invalid(e.to_string()))?;
 
         self.require_upload(&bucket, &input.upload_id).await?;
+        let lock_key = mpu_part_lock_key(&bucket, &input.upload_id, part_number);
+        let _part_guard = self.tier.mpu_part_locks.lock(&lock_key).await;
 
         // Resolve the source's facts + residency through the restore overlay, exactly as a read
         // would (§7): a live cache body reports natively, anything else resolves remote-side —
@@ -414,6 +542,8 @@ impl Hypha {
             )
             .await?
         };
+        self.clear_fold_intent_for_part(&bucket, &input.upload_id, part_number)
+            .await?;
 
         let resp = UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
@@ -456,9 +586,17 @@ impl Hypha {
                 "parts must be listed in ascending part-number order"
             ));
         }
+        let last_requested_n = requested
+            .last()
+            .and_then(|part| part.part_number)
+            .ok_or_else(|| s3_error!(InvalidPart, "part entry missing part number"))?;
 
         // The whole bracket runs under K's write lock (§7).
         let _guard = self.write_lock(&bucket, &key).await;
+        // Only the final part can be folded. Same-part UploadPart calls share this lock, so the
+        // intent below can never be mistaken for a later client re-upload; other parts stay parallel.
+        let part_lock_key = mpu_part_lock_key(&bucket, &upload_id, last_requested_n);
+        let _part_guard = self.tier.mpu_part_locks.lock(&part_lock_key).await;
 
         // The upload record also carries the pass-through metadata + storage class recorded at
         // create (§7); settle stamps them onto the tombstone below.
@@ -477,27 +615,102 @@ impl Hypha {
         //    · one LIST of the upload's records → `(part, retag) → pmd5` (facts live in the keys);
         //    · one `ListParts` of the remote upload → each live `(part, retag)`'s ciphertext size.
         //
-        //    **The client's own part ETag selects the generation**, which is S3's model rather than
-        //    hypha's convenience: `CompleteMultipartUpload` names the parts by the ETags `UploadPart`
-        //    returned, and for hypha those are plaintext MD5s. So the requested `pmd5` resolves to
-        //    the record that issued it, that record's `retag` names the ciphertext on the remote, and
-        //    the native complete is handed that same `retag` — one generation chosen once, by the
-        //    caller, and carried through. Nothing here asks the backend which upload of a part number
-        //    won: SeaweedFS keeps them all and lists them all (§12), so a `part → retag` map built
-        //    from that listing would silently keep whichever entry came last in it. Stale records
-        //    simply resolve nothing and are swept at settle.
-        let pmd5_by_part = self.load_part_pmd5s(&bucket, &upload_id).await?;
-        let retag_by_etag: HashMap<(i32, String), String> = pmd5_by_part
-            .iter()
-            .map(|((n, retag), (pmd5, _))| ((*n, pmd5.clone()), retag.clone()))
-            .collect();
-        let live: HashMap<(i32, String), u64> = self
+        //    The client's part ETag selects its cache record; intersecting that record with the
+        //    remote's live generation rejects a superseded re-upload without trusting stale facts.
+        let mut pmd5_by_part = self.load_part_pmd5s(&bucket, &upload_id).await?;
+        let fold_intent = self.fold_intent(&bucket, &upload_id).await?;
+        let mut live: HashMap<(i32, String), u64> = self
             .remote()
             .list_parts(&bucket, &key, &upload_id)
             .await?
             .into_iter()
             .map(|p| ((p.number, p.etag), p.size))
             .collect();
+
+        // Normalize any interrupted fold before resolving this request. The retry need not repeat
+        // the same part list: once the retained pure part is live again, ordinary part selection
+        // applies and a new fold intent can safely replace the old one.
+        if let Some(intent) = fold_intent {
+            let record_matches = pmd5_by_part
+                .get(&(intent.part_number, intent.retag.clone()))
+                .is_some_and(|(pmd5, nonce)| pmd5 == &intent.pmd5 && nonce == &intent.stash_nonce);
+            if !record_matches {
+                return Err(Error::Backend(
+                    "multipart fold intent has no matching part record".into(),
+                )
+                .into());
+            }
+            let replacement_is_live = pmd5_by_part.iter().any(|((part_number, retag), _)| {
+                *part_number == intent.part_number
+                    && retag != &intent.retag
+                    && live.contains_key(&(*part_number, retag.clone()))
+            });
+            let pure_is_live = replacement_is_live
+                || pmd5_by_part
+                    .iter()
+                    .any(|((part_number, retag), (pmd5, nonce))| {
+                        *part_number == intent.part_number
+                            && pmd5 == &intent.pmd5
+                            && nonce == &intent.stash_nonce
+                            && live.contains_key(&(*part_number, retag.clone()))
+                    });
+            if !pure_is_live {
+                let stash_key =
+                    meta::mpu_stash_key(&upload_id, intent.part_number, &intent.stash_nonce);
+                let original = match self.meta().get(&bucket, &stash_key, None).await {
+                    Ok(o) => o,
+                    Err(Error::NotFound) => {
+                        return Err(Error::Backend(format!(
+                            "final part {} ciphertext not retained; cannot unfold",
+                            intent.part_number
+                        ))
+                        .into())
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let original_len = original.content_length().unwrap_or(0).max(0) as u64;
+                if original_len != intent.ciphertext_len {
+                    return Err(Error::Backend(format!(
+                        "retained final part {} has size {original_len}, expected {}",
+                        intent.part_number, intent.ciphertext_len
+                    ))
+                    .into());
+                }
+                let out = self
+                    .remote()
+                    .upload_part(
+                        &bucket,
+                        &key,
+                        &upload_id,
+                        intent.part_number,
+                        original.body,
+                        Some(original_len as i64),
+                    )
+                    .await?;
+                let retag = out
+                    .e_tag()
+                    .ok_or_else(|| {
+                        Error::Backend("unfolded final part upload returned no ETag".into())
+                    })?
+                    .trim_matches('"')
+                    .to_string();
+                self.record_part(
+                    &bucket,
+                    &upload_id,
+                    intent.part_number,
+                    &retag,
+                    &intent.pmd5,
+                    &intent.stash_nonce,
+                )
+                .await?;
+                pmd5_by_part.insert(
+                    (intent.part_number, retag.clone()),
+                    (intent.pmd5, intent.stash_nonce),
+                );
+                live.insert((intent.part_number, retag), original_len);
+            }
+            self.clear_fold_intent(&bucket, &upload_id).await?;
+        }
 
         let mut pmd5s = Vec::with_capacity(requested.len());
         let mut remote_parts = Vec::with_capacity(requested.len());
@@ -518,28 +731,39 @@ impl Hypha {
                 .value()
                 .trim_matches('"')
                 .to_string();
-            // An ETag naming no upload of this part number is the same client error as naming a part
-            // that was never uploaded — S3 answers `InvalidPart` to both.
-            let retag = retag_by_etag
-                .get(&(n, pmd5.clone()))
-                .ok_or_else(|| s3_error!(InvalidPart, "part etag mismatch"))?;
-            let size = *live
-                .get(&(n, retag.clone()))
-                .ok_or_else(|| s3_error!(InvalidPart, "no such uploaded part"))?;
-            let plen = plaintext_len_from(size, HLEN).ok_or_else(|| {
-                Error::Backend(format!("part {n} size {size} inconsistent with HLEN"))
+            let current =
+                pmd5_by_part
+                    .iter()
+                    .find_map(|((record_n, retag), (record_pmd5, stash_nonce))| {
+                        (*record_n == n && record_pmd5 == &pmd5)
+                            .then(|| {
+                                live.get(&(n, retag.clone())).map(|size| ResolvedPart {
+                                    number: n,
+                                    retag: retag.clone(),
+                                    size: *size,
+                                    stash_nonce: stash_nonce.clone(),
+                                })
+                            })
+                            .flatten()
+                    });
+            let part = current.ok_or_else(|| s3_error!(InvalidPart, "no such uploaded part"))?;
+            let plen = plaintext_len_from(part.size, HLEN).ok_or_else(|| {
+                Error::Backend(format!(
+                    "part {n} size {} inconsistent with HLEN",
+                    part.size
+                ))
             })?;
             total_plen += plen;
-            ct_acc += size;
+            ct_acc += part.size;
             table.push(ct_acc);
-            resolved.push((n, retag.clone(), size));
             pmd5s.push(pmd5);
             remote_parts.push(
                 aws_sdk_s3::types::CompletedPart::builder()
                     .part_number(n)
-                    .e_tag(retag)
+                    .e_tag(&part.retag)
                     .build(),
             );
+            resolved.push(part);
         }
         let md5 = meta::composite_md5(&pmd5s)
             .ok_or_else(|| Error::Backend("empty part md5 set".into()))?;
@@ -568,24 +792,40 @@ impl Hypha {
         // ciphertext had to be retained, which is what makes the fold possible at all: an
         // in-progress part cannot be read back. K is byte-identical either way (same
         // concatenation), so reads are unaffected (§7).
-        let (last_n, last_retag, last_size) = resolved
+        let last = resolved
             .last()
             .cloned()
             .expect("requested is non-empty, so resolved is too");
-        if meta::admits_no_successor(last_n, last_size, MIN_REMOTE_PART) {
+        if meta::admits_no_successor(last.number, last.size, MIN_REMOTE_PART) {
             // The generation the caller named, not whichever the listing offered: its record carries
             // the nonce naming the ciphertext retained for it, so the fold re-uploads exactly the
             // bytes the composite ETag was just computed over (§6).
-            let (_, nonce) = pmd5_by_part
-                .get(&(last_n, last_retag.clone()))
-                .cloned()
-                .unwrap_or_default();
-            let stash_key = meta::mpu_stash_key(&upload_id, last_n, &nonce);
+            if last.stash_nonce.is_empty() {
+                return Err(Error::Backend(format!(
+                    "final part {} ciphertext not retained; cannot fold trailer",
+                    last.number
+                ))
+                .into());
+            }
+            let desired_intent = FoldIntent {
+                part_number: last.number,
+                retag: last.retag.clone(),
+                pmd5: pmd5s
+                    .last()
+                    .cloned()
+                    .expect("requested is non-empty, so pmd5s is too"),
+                stash_nonce: last.stash_nonce.clone(),
+                ciphertext_len: last.size,
+            };
+            self.persist_fold_intent(&bucket, &upload_id, &desired_intent)
+                .await?;
+            let stash_key = meta::mpu_stash_key(&upload_id, last.number, &last.stash_nonce);
             let stashed = match self.meta().get(&bucket, &stash_key, None).await {
                 Ok(o) => o,
                 Err(Error::NotFound) => {
                     return Err(Error::Backend(format!(
-                        "final part {last_n} ciphertext not retained; cannot fold trailer"
+                        "final part {} ciphertext not retained; cannot fold trailer",
+                        last.number
                     ))
                     .into())
                 }
@@ -593,6 +833,13 @@ impl Hypha {
             };
             // Streamed, not buffered: part 10000 may be gigabytes.
             let stash_len = stashed.content_length().unwrap_or(0).max(0) as u64;
+            if stash_len != last.size {
+                return Err(Error::Backend(format!(
+                    "retained final part {} has size {stash_len}, expected {}",
+                    last.number, last.size
+                ))
+                .into());
+            }
             let folded_len = stash_len + trailer.len() as u64;
             let folded = codec::append_bytes(stashed.body, trailer.clone());
             let fout = self
@@ -601,7 +848,7 @@ impl Hypha {
                     &bucket,
                     &key,
                     &upload_id,
-                    last_n,
+                    last.number,
                     folded,
                     Some(folded_len as i64),
                 )
@@ -613,11 +860,11 @@ impl Hypha {
                 .last_mut()
                 .expect("requested is non-empty, so remote_parts is too") =
                 aws_sdk_s3::types::CompletedPart::builder()
-                    .part_number(last_n)
+                    .part_number(last.number)
                     .e_tag(fold_etag)
                     .build();
         } else {
-            let trailer_pn = last_n + 1;
+            let trailer_pn = last.number + 1;
             let fout = self
                 .remote()
                 .upload_part(
@@ -720,7 +967,7 @@ impl Hypha {
             )
             .await?;
 
-        let mut uploads: Vec<MultipartUpload> = raw
+        let uploads: Vec<MultipartUpload> = raw
             .uploads
             .unwrap_or_default()
             .into_iter()
@@ -734,14 +981,6 @@ impl Hypha {
                 ..Default::default()
             })
             .collect();
-        // S3 orders uploads by key then upload id; SeaweedFS orders them by upload id alone (§12),
-        // which is also the cursor it paginates on. Sorting the page is therefore all hypha can do
-        // without draining the whole listing into memory on a client-triggered path: within a page —
-        // 1000 uploads by default, so every bucket that has not accumulated abandoned ones — the
-        // order is S3's, while across pages it stays the remote's. Nothing inside hypha reads this
-        // op (the debris sweep collects upload ids into a set, §8), and the remote's cursor is
-        // forwarded untouched, so a paginating client still sees every upload exactly once.
-        uploads.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
 
         let resp = ListMultipartUploadsOutput {
             bucket: Some(input.bucket),
@@ -771,14 +1010,6 @@ impl Hypha {
     /// ETag the client saw at upload, and the one datum the remote cannot reproduce. Sizes convert
     /// back to plaintext through the closed form over the constant `HLEN`, and the reserved trailer
     /// part (above every client part) is filtered out.
-    ///
-    /// **One entry per part number, chosen here.** S3 replaces a re-uploaded part; SeaweedFS keeps
-    /// every upload of one and lists them all (§12), and reporting duplicates would hand a client a
-    /// part list no `CompleteMultipartUpload` request can be built from. The newest `LastModified`
-    /// wins, with the `retag` breaking a tie — second granularity cannot order two uploads racing
-    /// inside one second, and for those "which won" is the caller's own race to lose. What the tie
-    /// break buys is that hypha answers the *same* one every time, so the ETag a client reads back
-    /// here is one `op_complete` will still resolve.
     pub(super) async fn op_list_parts(
         &self,
         req: S3Request<ListPartsInput>,
@@ -790,45 +1021,24 @@ impl Hypha {
         self.require_upload(&bucket, &input.upload_id).await?;
 
         let pmd5_by_part = self.load_part_pmd5s(&bucket, &input.upload_id).await?;
-        let mut current: HashMap<i32, RemotePart> = HashMap::new();
-        for p in self
+        let mut parts: Vec<Part> = self
             .remote()
             .list_parts(&bucket, &key, &input.upload_id)
             .await?
-        {
-            // The trailer's own part, when it has one, sits above every client part.
-            if p.number > meta::MAX_CLIENT_PART {
-                continue;
-            }
-            // A part with no record lost its cache state; its plaintext ETag is gone and cannot be
-            // re-derived from ciphertext, so there is nothing truthful to report for it.
-            if !pmd5_by_part.contains_key(&(p.number, p.etag.clone())) {
-                continue;
-            }
-            match current.get(&p.number) {
-                Some(held)
-                    if (held.last_modified_ms, &held.etag) >= (p.last_modified_ms, &p.etag) => {}
-                _ => {
-                    current.insert(p.number, p);
-                }
-            }
-        }
-        let mut parts: Vec<Part> = current
-            .into_values()
-            .map(|p| {
-                let (pmd5, _) = &pmd5_by_part[&(p.number, p.etag.clone())];
-                Part {
+            .into_iter()
+            .filter(|p| p.number <= meta::MAX_CLIENT_PART)
+            .filter_map(|p| {
+                pmd5_by_part.get(&(p.number, p.etag)).map(|(pmd5, _)| Part {
                     part_number: Some(p.number),
                     e_tag: Some(ETag::Strong(pmd5.clone())),
                     size: plaintext_len_from(p.size, HLEN).map(|n| n as i64),
                     ..Default::default()
-                }
+                })
             })
             .collect();
         parts.sort_by_key(|p| p.part_number);
 
-        // Parts cap at 10000, so the winning set is already in hand and small — paginate over it
-        // here rather than threading the remote's cursor through a set hypha has to re-filter.
+        // Parts cap at 10000, so the set is already in hand and small.
         let after: i32 = input.part_number_marker.unwrap_or(0);
         let max = input.max_parts.unwrap_or(1000).max(0) as usize;
         let mut page: Vec<Part> = parts

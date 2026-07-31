@@ -1,7 +1,5 @@
-# A throwaway SeaweedFS for the test suite — the backend hypha actually deploys on (§9), and the
-# only one that enforces `If-Match` on `DeleteObject`. Everything whose correctness rests on a
-# conditional delete (the reconcile sweep's marker CAS, the cached DELETE branch, both shadow
-# reclaims) is a no-op precondition against MinIO, so those paths are only really exercised here.
+# A throwaway SeaweedFS for the test suite — the cache backend hypha actually deploys on (§9), and
+# the local fixture that enforces `If-Match` on `DeleteObject`.
 #
 # Driven by `scripts/test-seaweedfs.sh`, which owns the lifetime — including `down -v`, since the
 # named volume below is the only state a run leaves behind.
@@ -15,7 +13,7 @@ services:
     # than realism — with none configured SeaweedFS serves anonymous requests but **refuses signed
     # ones**, and the SDK always signs.
     # `volume.max` is the fixture's real capacity limit, and it is counted in *buckets*: every bucket
-    # is a SeaweedFS collection with volumes of its own, and each harness makes four. A run past the
+    # is a SeaweedFS collection with volumes of its own, and each harness makes three. A run past the
     # ceiling does not degrade — every PUT answers `500 InternalError` — so the default is sized for
     # the whole workspace at once. Volume files are allocated lazily, so a high ceiling costs nothing
     # until it is used.

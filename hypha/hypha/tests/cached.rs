@@ -40,7 +40,7 @@ where
 
 /// Does a raw object exist at `key` in `bucket` (bypassing hypha)?
 async fn raw_exists(h: &Harness, bucket: &str, key: &str) -> bool {
-    h.raw()
+    h.raw_for_bucket(bucket)
         .head_object()
         .bucket(bucket)
         .key(key)
@@ -278,7 +278,7 @@ async fn a_cached_bucket_deletes_before_its_deletes_have_propagated() {
     put(&h.client(), B, key, b"body").await;
     // Written straight to the remote by the harness's own client so the pending state under test is
     // the *delete*, not an upload the paused sweep never made.
-    h.raw()
+    h.raw_remote()
         .put_object()
         .bucket(h.remote_bucket(B))
         .key(key)
@@ -303,7 +303,12 @@ async fn a_cached_bucket_deletes_before_its_deletes_have_propagated() {
 
     for gone in [h.remote_bucket(B), h.cache_bucket(B), h.meta_bucket(B)] {
         assert!(
-            h.raw().head_bucket().bucket(&gone).send().await.is_err(),
+            h.raw_for_bucket(&gone)
+                .head_bucket()
+                .bucket(&gone)
+                .send()
+                .await
+                .is_err(),
             "{gone} outlived the delete"
         );
     }
@@ -359,7 +364,7 @@ async fn cached_delete_removes_then_propagates() {
     // Only where the backend has no directories to leave behind: SeaweedFS keeps the emptied prefix
     // and hypha forwards common prefixes verbatim. tests/backend.rs states that divergence, and why
     // nothing here works around it.
-    if external_backend().is_none() {
+    if external_cache_backend().is_none() {
         assert!(
             listed.common_prefixes().is_empty(),
             "an absent subtree must not survive as a common prefix"
@@ -394,7 +399,7 @@ async fn cached_delete_retries_when_the_remote_generation_moves() {
     })
     .await;
     let old_etag = h
-        .raw()
+        .raw_remote()
         .head_object()
         .bucket(h.remote_bucket(B))
         .key(key)
@@ -433,7 +438,7 @@ async fn cached_delete_retries_when_the_remote_generation_moves() {
     );
 
     let replacement = h
-        .raw()
+        .raw_remote()
         .put_object()
         .bucket(h.remote_bucket(B))
         .key(key)
@@ -932,6 +937,7 @@ async fn drain_orders_a_concurrent_commit_before_the_clean_marker() {
     let meta_bucket = h.meta_bucket(B);
     let remote_bucket = h.remote_bucket(B);
     let raw = h.raw();
+    let raw_remote = h.raw_remote();
     let faults = h.cache_faults();
     let mut body_write = faults.pause_next(hyper::Method::PUT, format!("/{data_bucket}/{key}"));
     let mut marker_write = faults.pause_next(hyper::Method::PUT, format!("/{meta_bucket}/{key}"));
@@ -1012,7 +1018,7 @@ async fn drain_orders_a_concurrent_commit_before_the_clean_marker() {
         .send()
         .await
         .is_ok();
-    let remote_settled = raw
+    let remote_settled = raw_remote
         .head_object()
         .bucket(&remote_bucket)
         .key(key)
@@ -1132,7 +1138,7 @@ async fn a_multipart_complete_survives_the_delete_marker_it_superseded() {
     // nothing would upload it, and what this test needs is only that the delete branch finds
     // something there to bind to.
     put(&c, B, key, &pattern_seeded(20_000, 3)).await;
-    h.raw()
+    h.raw_remote()
         .put_object()
         .bucket(h.remote_bucket(B))
         .key(key)
@@ -1149,10 +1155,10 @@ async fn a_multipart_complete_survives_the_delete_marker_it_superseded() {
         .send()
         .await
         .expect("cached delete");
-    assert!(
-        marker_present(&h, B, key).await,
-        "the delete's obligation must be standing"
-    );
+    wait_until(6_000, "the delete's obligation to stand", || async {
+        marker_present(&h, B, key).await
+    })
+    .await;
 
     // K is taken again by the one path that raises no marker of its own, so nothing supersedes the
     // marker the sweep is about to read.
@@ -1322,14 +1328,15 @@ async fn marker_for_a_deleted_bucket_does_not_withhold_surviving_clean_markers()
 
     h.stop_hypha().await;
     assert!(
-        raw.head_bucket()
+        h.raw_remote()
+            .head_bucket()
             .bucket(h.remote_bucket(DELETED))
             .send()
             .await
             .is_err(),
         "the delete must stand — the remote bucket is the client-visible one"
     );
-    if external_backend().is_none() {
+    if external_cache_backend().is_none() {
         assert!(
             raw.head_bucket()
                 .bucket(&deleted_meta)
@@ -1656,7 +1663,7 @@ async fn bursty_same_key_overwrites_converge_on_the_last_acked_generation() {
         "the remote to converge on the last acked generation",
         || async {
             let settled = h
-                .raw()
+                .raw_remote()
                 .head_object()
                 .bucket(h.remote_bucket(B))
                 .key(key)

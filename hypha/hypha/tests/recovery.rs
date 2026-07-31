@@ -41,7 +41,7 @@ where
 }
 
 async fn raw_exists(h: &Harness, bucket: &str, key: &str) -> bool {
-    h.raw()
+    h.raw_for_bucket(bucket)
         .head_object()
         .bucket(bucket)
         .key(key)
@@ -495,7 +495,7 @@ async fn eviction_tombstone_without_its_remote_object_halts() {
     .await;
 
     // The remote loses the object the tombstone stands for.
-    h.raw()
+    h.raw_remote()
         .delete_object()
         .bucket(h.remote_bucket(B))
         .key("k")
@@ -577,7 +577,7 @@ async fn a_sync_marker_vanishing_mid_run_halts() {
 /// backend-dependent is only how fast, and this is the fast path.
 #[tokio::test]
 async fn a_marker_owed_to_a_live_bucket_whose_projection_vanished_halts() {
-    if external_backend().is_some() {
+    if external_cache_backend().is_some() {
         return;
     }
     let mut h = Harness::builder(hypha_core::config::Mode::Cached)
@@ -605,7 +605,12 @@ async fn a_marker_owed_to_a_live_bucket_whose_projection_vanished_halts() {
     marker.release();
 
     assert_halted(&mut h).await;
-    let recorded = get_all(&h.raw(), &h.remote_bucket(B), &meta::halt_marker_key()).await;
+    let recorded = get_all(
+        &h.raw_remote(),
+        &h.remote_bucket(B),
+        &meta::halt_marker_key(),
+    )
+    .await;
     let recorded =
         String::from_utf8(recorded).expect("the halt marker is plain text for an operator");
     assert!(
@@ -635,7 +640,7 @@ async fn reserved_remote_keys_are_invisible_and_harmless() {
     // A reserved-prefix key that is not the halt marker: the filter must be the control byte, not a
     // name match, or the next reserved key added would slip through.
     let reserved = format!("{c}{c}z", c = meta::CTRL as char);
-    h.raw()
+    h.raw_remote()
         .put_object()
         .bucket(h.remote_bucket(B))
         .key(&reserved)

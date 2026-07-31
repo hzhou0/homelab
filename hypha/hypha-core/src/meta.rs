@@ -319,6 +319,13 @@ pub fn mpu_upload_key(upload_id: &str) -> String {
     format!("{}u", mpu_range(upload_id))
 }
 
+/// Cache (`<meta>`): fixed record proving hypha replaced one retained part with its folded form
+/// during an earlier completion attempt. Its metadata identifies the original generation; the
+/// retained ciphertext remains at [`mpu_stash_key`].
+pub fn mpu_fold_key(upload_id: &str) -> String {
+    format!("{}f", mpu_range(upload_id))
+}
+
 /// Every upload's records at once — what the §8 debris sweep scans, since no upload id is known to
 /// it in advance.
 pub fn mpu_scan_prefix() -> String {
@@ -383,9 +390,9 @@ pub fn mpu_part_key(upload_id: &str, part: MpuPart<'_>) -> String {
     )
 }
 
-/// Parse an mpu part record key; `None` for the upload's own `u` record, a retained-ciphertext
-/// `c` record, or a malformed key. Reads only the record segment after the final `0x01`, so the
-/// upload id (which never contains `0x01`) can't be mistaken for it.
+/// Parse an mpu part record key; `None` for the upload's own `u` record, fold-intent `f` record, a
+/// retained-ciphertext `c` record, or a malformed key. Reads only the record segment after the final
+/// `0x01`, so the upload id (which never contains `0x01`) can't be mistaken for it.
 pub fn parse_mpu_part(key: &str) -> Option<MpuPart<'_>> {
     let mut it = key
         .rsplit(CTRL as char)
@@ -1068,8 +1075,10 @@ mod tests {
 
         // The upload's own record and malformed keys don't parse as parts.
         assert_eq!(parse_mpu_part(&mpu_upload_key("up-1")), None);
+        assert_eq!(parse_mpu_part(&mpu_fold_key("up-1")), None);
         // Every record of one upload sorts under its prefix, ahead of the twin/marker ranges.
         assert!(mpu_upload_key("up-1").starts_with(&mpu_prefix("up-1")));
+        assert!(mpu_fold_key("up-1").starts_with(&mpu_prefix("up-1")));
         assert!(ks.starts_with(&mpu_prefix("up-1")));
         // Records sort by part number under one LIST.
         assert!(

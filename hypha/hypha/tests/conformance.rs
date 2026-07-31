@@ -11,9 +11,8 @@ use common::*;
 const B: &str = "objs";
 
 /// One client bucket maps to three prefixed backend buckets (§7), but `ListBuckets` must show only
-/// the client name — the cache `<data>`/`<meta>` prefixes never leak even though all three share
-/// one MinIO account in the harness. DeleteBucket then removes every backend projection, twins and
-/// markers included.
+/// the client name — the cache `<data>`/`<meta>` prefixes never leak. DeleteBucket then removes
+/// every backend projection, twins and markers included.
 #[tokio::test]
 async fn list_buckets_hides_backend_projections() {
     let h = Harness::durable().await;
@@ -37,8 +36,7 @@ async fn list_buckets_hides_backend_projections() {
         vec![B.to_string()],
         "only the client name is visible"
     );
-    // The raw backend really does hold the three prefixed buckets underneath.
-    let raw_buckets: Vec<String> = h
+    let cache_buckets: Vec<String> = h
         .raw()
         .list_buckets()
         .send()
@@ -48,12 +46,26 @@ async fn list_buckets_hides_backend_projections() {
         .iter()
         .filter_map(|b| b.name().map(str::to_string))
         .collect();
-    for want in [h.cache_bucket(B), h.meta_bucket(B), h.remote_bucket(B)] {
+    for want in [h.cache_bucket(B), h.meta_bucket(B)] {
         assert!(
-            raw_buckets.contains(&want),
-            "backend missing {want}: {raw_buckets:?}"
+            cache_buckets.contains(&want),
+            "cache missing {want}: {cache_buckets:?}"
         );
     }
+    let remote_buckets: Vec<String> = h
+        .raw_remote()
+        .list_buckets()
+        .send()
+        .await
+        .expect("raw remote list buckets")
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name().map(str::to_string))
+        .collect();
+    assert!(
+        remote_buckets.contains(&h.remote_bucket(B)),
+        "remote projection is missing: {remote_buckets:?}"
+    );
 
     // DeleteBucket after emptying the client bucket sweeps all three projections.
     client
@@ -69,7 +81,7 @@ async fn list_buckets_hides_backend_projections() {
         .send()
         .await
         .expect("delete bucket");
-    let after: Vec<String> = h
+    let cache_after: Vec<String> = h
         .raw()
         .list_buckets()
         .send()
@@ -79,12 +91,26 @@ async fn list_buckets_hides_backend_projections() {
         .iter()
         .filter_map(|b| b.name().map(str::to_string))
         .collect();
-    for gone in [h.cache_bucket(B), h.meta_bucket(B), h.remote_bucket(B)] {
+    for gone in [h.cache_bucket(B), h.meta_bucket(B)] {
         assert!(
-            !after.contains(&gone),
-            "bucket {gone} outlived delete: {after:?}"
+            !cache_after.contains(&gone),
+            "bucket {gone} outlived delete: {cache_after:?}"
         );
     }
+    let remote_after: Vec<String> = h
+        .raw_remote()
+        .list_buckets()
+        .send()
+        .await
+        .expect("raw remote list buckets")
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name().map(str::to_string))
+        .collect();
+    assert!(
+        !remote_after.contains(&h.remote_bucket(B)),
+        "remote bucket outlived delete: {remote_after:?}"
+    );
 }
 
 /// `DeleteBucket` refuses a bucket that still holds objects, and hypha is what refuses it: the gate
@@ -166,8 +192,62 @@ async fn a_write_cannot_slip_into_a_bucket_whose_delete_is_committing() {
         .expect("delete task")
         .expect("the paused delete still commits");
     assert!(
-        h.raw().head_bucket().bucket(&remote).send().await.is_err(),
+        h.raw_remote()
+            .head_bucket()
+            .bucket(&remote)
+            .send()
+            .await
+            .is_err(),
         "the delete must carry the remote bucket away, not the late write's re-creation of it"
+    );
+}
+
+/// Once the remote bucket is gone, cache projection cleanup cannot turn the committed delete into
+/// an error. A later create resets any projection the best-effort cleanup left behind.
+#[tokio::test]
+async fn cache_cleanup_failure_does_not_fail_a_committed_bucket_delete() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let data_bucket = h.cache_bucket(B);
+    let failed = h.cache_faults().fail_prefix_times(
+        hyper::Method::DELETE,
+        format!("/{data_bucket}"),
+        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+        8,
+    );
+
+    h.client()
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect("cache cleanup cannot reverse the committed remote delete");
+    tokio::time::timeout(std::time::Duration::from_secs(5), failed)
+        .await
+        .expect("the data projection delete was never attempted")
+        .expect("fault proxy stopped before failing projection cleanup");
+
+    assert!(
+        h.raw_remote()
+            .head_bucket()
+            .bucket(h.remote_bucket(B))
+            .send()
+            .await
+            .is_err(),
+        "the remote delete is the commit"
+    );
+    h.cache_faults().clear();
+    h.create_bucket(B).await;
+    let listed = h
+        .client()
+        .list_objects_v2()
+        .bucket(B)
+        .send()
+        .await
+        .expect("list the recreated bucket");
+    assert!(
+        listed.contents().is_empty(),
+        "a recreation must reset the projection left by failed cleanup"
     );
 }
 
@@ -591,8 +671,9 @@ async fn foreign_remote_object_terminates_hypha() {
     put(&client, B, "mine", &pattern(32)).await;
 
     // Out-of-band write straight into the remote bucket: no age envelope, no trailer.
-    let raw = h.raw();
-    raw.put_object()
+    let remote = h.raw_remote();
+    remote
+        .put_object()
         .bucket(h.remote_bucket(B))
         .key("foreign")
         .body(bytes_body(b"not written through hypha"))
@@ -606,9 +687,11 @@ async fn foreign_remote_object_terminates_hypha() {
     // is needed to reach `foreign`, and none can be made, since the process is expected to exit
     // rather than become ready.
     h.stop_hypha().await;
+    let cache_raw = h.raw();
     for cache in [h.cache_bucket(B), h.meta_bucket(B)] {
-        for key in raw_list(&raw, &cache, None).await {
-            raw.delete_object()
+        for key in raw_list(&cache_raw, &cache, None).await {
+            cache_raw
+                .delete_object()
                 .bucket(&cache)
                 .key(&key)
                 .send()
@@ -630,7 +713,8 @@ async fn foreign_remote_object_terminates_hypha() {
 
     // The exit is only half of it: the violation must be *recorded* on the remote, or the next
     // process would come up and serve the same data (`crate::halt`).
-    raw.head_object()
+    remote
+        .head_object()
         .bucket(h.remote_bucket(B))
         .key(hypha_core::meta::halt_marker_key())
         .send()

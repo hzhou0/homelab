@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# Run the integration suite against a throwaway **SeaweedFS** instead of the per-test MinIO.
+# Run the integration suite with **SeaweedFS as the cache** and a per-test MinIO remote.
 #
-# Why: MinIO ignores `If-Match` on `DeleteObject` (tests/backend.rs), so against it every path whose
-# correctness rests on a conditional delete — the reconcile sweep's marker CAS, the cached DELETE
-# branch's generation-bound remote delete, both shadow reclaims — is exercised with the precondition
-# doing nothing. SeaweedFS enforces it, and it is what the cluster runs (§9), so this is where those
-# paths are actually tested and where the `#[ignore]`d convergence test passes.
+# MinIO ignores `If-Match` on `DeleteObject`, so cache-side marker and shadow CAS need the backend the
+# cluster actually uses. A final focused probe also assigns SeaweedFS to the remote role to assert the
+# same contract there; the general suite keeps a replacement-style, globally ordered multipart remote.
 #
 # One server for the whole run rather than one per test: the fixture costs ~10 s to become ready, and
 # tests are isolated by their per-harness `bucket_prefix` anyway (`list_buckets` filters by it, §9).
 # The volume is the only state a run leaves behind, and `down -v` at exit is what drops it — on
 # success, on failure, and on Ctrl-C alike.
-#
-# The dialect differences this fixture found are recorded in tests/backend.rs and §12; hypha now
-# depends on none of them, so the whole workspace passes here as it does on MinIO. There is no
-# expected-red list — a standing red would train the eye past the ones that mean something.
 #
 # Requires docker with the compose plugin. Extra args replace the default test selection:
 #   scripts/test-seaweedfs.sh                        # the whole workspace
@@ -61,8 +55,6 @@ if ! compose up -d --wait; then
   exit 1
 fi
 
-# `--include-ignored` is what picks up the two tests that cannot pass on MinIO — the convergence test
-# and the ListMultipartUploads prefix filter — and running them is the whole point of the fixture.
 DEFAULT_ARGS=(--workspace)
 if [ "$#" -gt 0 ]; then
   CARGO_ARGS=("$@")
@@ -70,13 +62,27 @@ else
   CARGO_ARGS=("${DEFAULT_ARGS[@]}")
 fi
 
-# **Bounded, unlike the default run.** With a MinIO per test the suite's parallelism costs nothing
-# shared; here every fixture's client path, reconcile sweep and GC actor lands on one server, and the
-# tight cadences the harness runs them at multiply. Left unbounded the server saturates and tests
-# fail on backend errors that say nothing about hypha.
+# Cache traffic from every fixture shares this server; bound the suite so its deliberately tight
+# reconcile and GC cadences do not turn backend saturation into false failures.
 TEST_THREADS="${HYPHA_TEST_THREADS:-4}"
 
-echo "→ cargo test ${CARGO_ARGS[*]} -- --include-ignored --test-threads=$TEST_THREADS"
-TEST_S3_ENDPOINT="http://127.0.0.1:$SEAWEED_S3_PORT" \
+SEAWEED_ENDPOINT="http://127.0.0.1:$SEAWEED_S3_PORT"
+
+echo "→ cargo test ${CARGO_ARGS[*]} -- --test-threads=$TEST_THREADS"
+TEST_CACHE_S3_ENDPOINT="$SEAWEED_ENDPOINT" \
   cargo test --manifest-path "$REPO/Cargo.toml" "${CARGO_ARGS[@]}" \
-  -- --include-ignored --test-threads="$TEST_THREADS"
+  -- --test-threads="$TEST_THREADS"
+
+if [ "$#" -eq 0 ]; then
+  echo "→ cache conditional-delete convergence"
+  TEST_CACHE_S3_ENDPOINT="$SEAWEED_ENDPOINT" \
+    cargo test --manifest-path "$REPO/Cargo.toml" --test cached \
+    bursty_same_key_overwrites_converge_on_the_last_acked_generation \
+    -- --exact --ignored
+
+  echo "→ remote conditional-delete contract"
+  TEST_S3_ENDPOINT="$SEAWEED_ENDPOINT" \
+    cargo test --manifest-path "$REPO/Cargo.toml" --test backend \
+    a_conditional_delete_is_enforced_by_the_deployed_backend \
+    -- --exact
+fi
