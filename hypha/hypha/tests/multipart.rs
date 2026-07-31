@@ -4,7 +4,8 @@
 //! alone. Covers out-of-order/parallel parts, re-upload last-write-wins resolution, composite ETag
 //! correctness, single-stream + ranged composite GET (uniform and ragged parts), abort cleanup,
 //! process restart mid-upload, the part-number range, the two fold conditions, the in-progress
-//! listing ops, and trailer-based recovery after a mid-complete crash mark.
+//! listing ops, failed part-record persistence, pre/post-commit completion failures, and
+//! trailer-based recovery after both a mid-complete crash mark and total cache-volume loss.
 
 mod common;
 
@@ -122,6 +123,79 @@ async fn upload_part_validates_content_md5() {
         Some(good_etag.as_str()),
         "a rejected re-upload must leave the previous generation intact"
     );
+}
+
+/// The remote part can commit before its cache-resident plaintext-MD5 record fails. That upload is
+/// not falsely acknowledged or completable; a normal re-upload supplies a new winning part and
+/// record, after which completion succeeds.
+#[tokio::test]
+async fn multipart_part_record_failure_requires_a_reupload() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "part-record-fault";
+    let body = pattern_seeded(MIN_PART, 11);
+    let up = create_mpu(&client, B, key).await;
+
+    let faults = h.cache_faults();
+    let failed = faults.fail_prefix_times(
+        hyper::Method::PUT,
+        format!("/{}/%01%01m", h.meta_bucket(B)),
+        hyper::StatusCode::FORBIDDEN,
+        8,
+    );
+    let upload = client
+        .upload_part()
+        .bucket(B)
+        .key(key)
+        .upload_id(&up)
+        .part_number(1)
+        .body(bytes_body(&body))
+        .content_length(body.len() as i64)
+        .send()
+        .await;
+    let record = tokio::time::timeout(Duration::from_secs(5), failed)
+        .await
+        .expect("part record write was never attempted")
+        .expect("fault proxy stopped before failing the part record");
+    assert!(
+        upload.is_err(),
+        "the intercepted path was {}, but UploadPart succeeded",
+        record.path
+    );
+    faults.clear();
+    assert!(
+        record.path.to_ascii_lowercase().contains("%01%01m"),
+        "the injected write must be the MPU facts record: {}",
+        record.path
+    );
+
+    // Non-empty rather than exactly one: the SDK retries the failing UploadPart, and how many
+    // entries that leaves is the *backend's* business — S3 and MinIO replace a re-uploaded part
+    // number, SeaweedFS keeps every upload of it (tests/backend.rs). What this asserts is the thing
+    // hypha depends on: the ciphertext reached the remote before the record write failed.
+    let remote_parts = h
+        .raw()
+        .list_parts()
+        .bucket(h.remote_bucket(B))
+        .key(key)
+        .upload_id(&up)
+        .send()
+        .await
+        .expect("raw remote ListParts after record failure");
+    assert!(
+        !remote_parts.parts().is_empty(),
+        "the backend part committed before its local record failed"
+    );
+
+    complete_mpu_res(&client, B, key, &up, &[(1, md5_hex(&body))])
+        .await
+        .expect_err("a remote part without its pmd5 record is not completable");
+
+    let etag = upload_part(&client, B, key, &up, 1, &body).await;
+    let complete = complete_mpu(&client, B, key, &up, &[(1, etag)]).await;
+    assert_eq!(complete, expected_composite_etag(&[&body]));
+    assert_eq!(get_all(&client, B, key).await, body);
 }
 
 #[tokio::test]
@@ -648,11 +722,9 @@ async fn listed_uploads(
         .collect()
 }
 
-/// Trailer-based recovery: after a completed composite, plant the crash-window state a mid-complete
+/// Trailer-based repair: after a completed composite, plant the crash-window state a mid-complete
 /// death leaves — a lone transition mark at the key — and assert a read reconstructs the facts and
-/// the parts table from the terminating trailer part on the remote, with correct bytes and ETag,
-/// then settles the cache back to a tombstone. (Full cache-wipe restore is the phase-5 sweep; the
-/// mark-driven repair is the phase-3-testable core of it.)
+/// parts table from the terminating trailer, then settles the cache back to a tombstone.
 #[tokio::test]
 async fn multipart_restore_from_trailer() {
     let h = Harness::durable().await;
@@ -709,6 +781,195 @@ async fn multipart_restore_from_trailer() {
         tomb.map(String::as_str),
         Some(meta::TOMB_EVICT),
         "mark must settle to a tombstone"
+    );
+}
+
+/// If the remote rejects the native complete, repair must expose the prior object and leave the
+/// upload available for an explicit retry.
+#[tokio::test]
+async fn multipart_failed_complete_restores_the_previous_generation() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "complete/refused";
+    let old = b"old generation";
+    put(&client, B, key, old).await;
+
+    let part = pattern_seeded(MIN_PART, 76);
+    let up = create_mpu(&client, B, key).await;
+    let etag = upload_part(&client, B, key, &up, 1, &part).await;
+    let faults = h.remote_faults();
+    let refused = faults.fail_times(
+        hyper::Method::POST,
+        format!("/{}/{key}", h.remote_bucket(B)),
+        hyper::StatusCode::PRECONDITION_FAILED,
+        8,
+    );
+    complete_mpu_res(&client, B, key, &up, &[(1, etag.clone())])
+        .await
+        .expect_err("the injected complete failure must reach the client");
+    tokio::time::timeout(Duration::from_secs(5), refused)
+        .await
+        .expect("complete request never reached the remote")
+        .expect("fault proxy stopped before refusing complete");
+    faults.clear();
+
+    assert_eq!(
+        get_all(&client, B, key).await,
+        old,
+        "the refused complete must restore the previous object"
+    );
+    let cached = h
+        .raw()
+        .head_object()
+        .bucket(h.cache_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("cache projection after refused complete");
+    assert_eq!(
+        cached
+            .metadata()
+            .and_then(|md| md.get(meta::TOMB))
+            .map(String::as_str),
+        Some(meta::TOMB_EVICT),
+        "repair must leave no transition mark"
+    );
+
+    complete_mpu(&client, B, key, &up, &[(1, etag)]).await;
+    assert_eq!(
+        get_all(&client, B, key).await,
+        part,
+        "the uncommitted native upload must remain retryable"
+    );
+}
+
+/// The remote may commit CompleteMultipartUpload while its response is lost. The client receives an
+/// error, but the failed-commit repair must discover the committed trailer and settle a coherent
+/// cache projection before returning.
+#[tokio::test]
+async fn multipart_lost_complete_response_repairs_the_committed_object() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "complete/lost-response";
+    put(&client, B, key, b"old generation").await;
+
+    let p1 = pattern_seeded(MIN_PART, 72);
+    let p2 = pattern_seeded(512 * 1024, 73);
+    let whole: Vec<u8> = [p1.as_slice(), p2.as_slice()].concat();
+    let up = create_mpu(&client, B, key).await;
+    let e1 = upload_part(&client, B, key, &up, 1, &p1).await;
+    let e2 = upload_part(&client, B, key, &up, 2, &p2).await;
+
+    let lost = h.remote_faults().fail_next_response(
+        hyper::Method::POST,
+        format!("/{}/{key}", h.remote_bucket(B)),
+        hyper::StatusCode::FORBIDDEN,
+    );
+    complete_mpu_res(&client, B, key, &up, &[(1, e1), (2, e2)])
+        .await
+        .expect_err("the injected response loss must reach the client as an error");
+    let complete = tokio::time::timeout(Duration::from_secs(5), lost)
+        .await
+        .expect("complete request never reached the remote")
+        .expect("fault proxy stopped before complete");
+    assert!(
+        complete.path.contains("uploadId="),
+        "the intercepted POST must be CompleteMultipartUpload"
+    );
+
+    assert_eq!(
+        get_all(&client, B, key).await,
+        whole,
+        "repair must expose the fully committed generation, never the old/new hybrid"
+    );
+    let head = client
+        .head_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect("head repaired composite");
+    assert_eq!(
+        head.e_tag().map(|e| e.trim_matches('"')),
+        Some(expected_composite_etag(&[&p1, &p2]).as_str())
+    );
+    let cached = h
+        .raw()
+        .head_object()
+        .bucket(h.cache_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("cache projection after repair");
+    assert_eq!(
+        cached
+            .metadata()
+            .and_then(|md| md.get(meta::TOMB))
+            .map(String::as_str),
+        Some(meta::TOMB_EVICT),
+        "the failed-commit path must settle the transition mark"
+    );
+}
+
+/// A total cache-volume loss discards every multipart record and projection. The completed remote
+/// object remains self-describing: R1 rebuilds its tombstone from the terminating trailer alone.
+#[tokio::test]
+async fn multipart_cache_wipe_restores_facts_and_part_geometry() {
+    let mut h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "restore/cache-wipe";
+
+    let p1 = pattern_seeded(MIN_PART, 74);
+    let p2 = pattern_seeded(768 * 1024, 75);
+    let whole: Vec<u8> = [p1.as_slice(), p2.as_slice()].concat();
+    let up = create_mpu(&client, B, key).await;
+    let e1 = upload_part(&client, B, key, &up, 1, &p1).await;
+    let e2 = upload_part(&client, B, key, &up, 2, &p2).await;
+    let etag = complete_mpu(&client, B, key, &up, &[(1, e1), (2, e2)]).await;
+    drop(client);
+
+    h.stop_hypha().await;
+    drop_backend_bucket(&h, &h.cache_bucket(B)).await;
+    drop_backend_bucket(&h, &h.meta_bucket(B)).await;
+    h.start_hypha().await;
+
+    let client = h.client();
+    let head = client
+        .head_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect("head after cache-volume restore");
+    assert_eq!(head.content_length(), Some(whole.len() as i64));
+    assert_eq!(
+        head.e_tag().map(|e| e.trim_matches('"')),
+        Some(etag.as_str())
+    );
+    assert_eq!(get_all(&client, B, key).await, whole);
+    assert_eq!(
+        get_range(&client, B, key, MIN_PART as u64 - 4, MIN_PART as u64 + 4).await,
+        whole[MIN_PART - 4..=MIN_PART + 4],
+        "the restored trailer table must retain the original part boundary"
+    );
+
+    let cached = h
+        .raw()
+        .head_object()
+        .bucket(h.cache_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("restored cache projection");
+    assert_eq!(
+        cached
+            .metadata()
+            .and_then(|md| md.get(meta::TOMB))
+            .map(String::as_str),
+        Some(meta::TOMB_EVICT)
     );
 }
 

@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "hypha-test",
+      "credentials": [
+        {
+          "accessKey": "hyphatest",
+          "secretKey": "hyphatestsecret"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

@@ -561,6 +561,63 @@ async fn a_sync_marker_vanishing_mid_run_halts() {
     assert_halted(&mut h).await;
 }
 
+/// **I6 from the other side** — the marker queue, rather than the watchdog.
+///
+/// A marker whose bucket is gone is *dropped*, deliberately: it can never land, and retrying it would
+/// withhold every other bucket's clean marker for the rest of the run (§7). That drop is gated on the
+/// state map agreeing the bucket is gone, and this is the case where it does not: the `<meta>`
+/// projection vanished under a live bucket, so dropping the marker would silently shorten a pending set
+/// this run still vouches for. The watchdog would eventually see the same loss, so its interval is
+/// pinned out of reach here — the point is that the queue does not wait for it.
+///
+/// **MinIO only**, because the signal is the backend's: SeaweedFS answers a PUT into a bucket that
+/// does not exist by creating it (tests/backend.rs), so the marker simply lands and there is nothing
+/// for the queue to notice. The loss itself is still caught there — by the watchdog, on its own
+/// interval, which `a_sync_marker_vanishing_mid_run_halts` covers on both backends. What is
+/// backend-dependent is only how fast, and this is the fast path.
+#[tokio::test]
+async fn a_marker_owed_to_a_live_bucket_whose_projection_vanished_halts() {
+    if external_backend().is_some() {
+        return;
+    }
+    let mut h = Harness::builder(hypha_core::config::Mode::Cached)
+        .subprocess()
+        .with_faults()
+        // Long enough that only the marker path can raise the violation; the watchdog's own detection
+        // is `a_sync_marker_vanishing_mid_run_halts`.
+        .tune(|c| c.volume_watch_interval_ms = 600_000)
+        .start()
+        .await;
+    h.create_bucket(B).await;
+
+    // Hold the marker write at the proxy: the body is committed and acked, and the obligation is in
+    // flight, which is the only window in which the projection can vanish underneath one.
+    let mut marker = h
+        .cache_faults()
+        .pause_next(hyper::Method::PUT, format!("/{}/k", h.meta_bucket(B)));
+    put(&h.client(), B, "k", &pattern(256)).await;
+    tokio::time::timeout(Duration::from_secs(10), marker.reached())
+        .await
+        .expect("the marker write was never attempted");
+
+    // The volume goes, not the bucket: nothing has deleted it, so the state map still calls it live.
+    drop_backend_bucket(&h, &h.meta_bucket(B)).await;
+    marker.release();
+
+    assert_halted(&mut h).await;
+    let recorded = get_all(&h.raw(), &h.remote_bucket(B), &meta::halt_marker_key()).await;
+    let recorded =
+        String::from_utf8(recorded).expect("the halt marker is plain text for an operator");
+    assert!(
+        recorded.contains("invariant: cache-volume-lost"),
+        "the recorded violation must name the invariant: {recorded}"
+    );
+    assert!(
+        recorded.contains("an owed marker's <meta> projection is gone"),
+        "and it must be the marker queue's own detection, not the watchdog's: {recorded}"
+    );
+}
+
 /// hypha's own keys live in the remote bucket alongside client objects (the halt marker, §6), and
 /// every remote key a restore-time LIST emits goes to a trailer read. An unfiltered one would be
 /// reported as a foreign object — hypha halting on its own bookkeeping.

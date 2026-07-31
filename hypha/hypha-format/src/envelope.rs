@@ -62,19 +62,87 @@ mod tests {
     use super::*;
     use crate::offset::{HLEN, PAYLOAD_NONCE, TAG};
 
-    /// Pins `HLEN`. age can't grease a scrypt sole-stanza header and the stanza is fixed-shape, so
-    /// the header length is constant; if a future age changes it, this trips ⇒ bump the trailer
-    /// version. An empty plaintext encrypts to `header ‖ payload_nonce(16) ‖ one empty chunk (tag)`.
-    #[test]
-    fn hlen_is_constant() {
-        let env = Envelope::new("hlen pinning test passphrase").unwrap();
+    /// An empty plaintext encrypts to `header ‖ payload_nonce(16) ‖ one empty chunk (tag)`, so the
+    /// header is what is left when those are taken off the end.
+    fn header_of(env: &Envelope) -> Vec<u8> {
         let mut ct = Vec::new();
         let w = env.encrypt(&mut ct).unwrap();
         w.finish().unwrap();
-        let hlen = ct.len() as u64 - PAYLOAD_NONCE - TAG;
+        ct.truncate(ct.len() - (PAYLOAD_NONCE + TAG) as usize);
+        ct
+    }
+
+    /// Pins `HLEN`. age can't grease a scrypt sole-stanza header and the stanza is fixed-shape, so
+    /// the header length is constant; if a future age changes it, this trips ⇒ bump the trailer
+    /// version.
+    #[test]
+    fn hlen_is_constant() {
+        let env = Envelope::new("hlen pinning test passphrase").unwrap();
+        let hlen = header_of(&env).len() as u64;
         assert_eq!(
             hlen, HLEN,
             "age scrypt header length changed to {hlen}; bump the trailer version"
+        );
+    }
+
+    /// The work factor **as emitted**, read off the stanza rather than off the value handed to the
+    /// recipient. What this guards is a silent fallback to the crate's auto-tuned default: that costs
+    /// ~1 s and ~256 MiB *per file*, which for a small-object namespace is not a slow path but an
+    /// unusable one, and nothing else in the system would report it as anything but latency.
+    ///
+    /// `hlen_is_constant` would also trip on a two-digit exponent, but only as a side effect of the
+    /// digit count — a fallback that happened to be one digit would pass it. This reads the number.
+    #[test]
+    fn the_emitted_stanza_carries_the_pinned_work_factor() {
+        assert_eq!(
+            PINNED_WORK_FACTOR, 1,
+            "the pin is the smallest value age accepts; 0 panics"
+        );
+        let env = Envelope::new("work factor pinning test passphrase").unwrap();
+        let header = String::from_utf8(header_of(&env)).expect("an age header is ASCII text");
+        let stanza = header
+            .lines()
+            .find(|line| line.starts_with("-> scrypt "))
+            .unwrap_or_else(|| panic!("no scrypt stanza in the emitted header:\n{header}"));
+
+        // `-> scrypt <salt> <log_n>`: the sole stanza of a hypha file, hence the fixed shape HLEN
+        // rests on.
+        let fields: Vec<&str> = stanza.split(' ').collect();
+        assert_eq!(fields.len(), 4, "unexpected stanza shape: {stanza:?}");
+        assert_eq!(
+            fields[3],
+            PINNED_WORK_FACTOR.to_string(),
+            "the emitted work factor is not the pinned one: {stanza:?}"
+        );
+    }
+
+    /// The decryption bound, from the side that matters: a file demanding more work than hypha ever
+    /// emits is refused rather than honoured, so a corrupted or foreign work factor cannot stall a GET
+    /// for seconds (§6). Asserted against a file *this* crate can otherwise read — same passphrase,
+    /// same format — so the only reason it fails is the bound.
+    #[test]
+    fn a_file_over_the_work_factor_bound_is_refused() {
+        use std::io::{Read, Write};
+
+        let passphrase = "work factor bound test passphrase";
+        let mut recipient = age::scrypt::Recipient::new(SecretString::from(passphrase.to_owned()));
+        recipient.set_work_factor(PINNED_WORK_FACTOR + 1);
+        let mut ct = Vec::new();
+        let mut w =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .unwrap()
+                .wrap_output(&mut ct)
+                .unwrap();
+        w.write_all(b"costlier than we ever emit").unwrap();
+        w.finish().unwrap();
+
+        let env = Envelope::new(passphrase).unwrap();
+        let read = env
+            .decrypt(&ct[..])
+            .and_then(|mut r| r.read_to_end(&mut Vec::new()).map_err(crate::Error::Io));
+        assert!(
+            read.is_err(),
+            "a work factor above the bound must be refused, not honoured"
         );
     }
 }

@@ -1,0 +1,50 @@
+# A throwaway SeaweedFS for the test suite — the backend hypha actually deploys on (§9), and the
+# only one that enforces `If-Match` on `DeleteObject`. Everything whose correctness rests on a
+# conditional delete (the reconcile sweep's marker CAS, the cached DELETE branch, both shadow
+# reclaims) is a no-op precondition against MinIO, so those paths are only really exercised here.
+#
+# Driven by `scripts/test-seaweedfs.sh`, which owns the lifetime — including `down -v`, since the
+# named volume below is the only state a run leaves behind.
+services:
+  seaweedfs:
+    # Pinned to the same version `seaweedfs/Chart.lock` deploys, so a dialect difference found here
+    # is one the cluster would have.
+    image: chrislusf/seaweedfs:4.37
+    # `server` runs master + volume + filer + the S3 gateway in one process: this stands in for a
+    # cluster's storage semantics, not for its topology. The identity file is load-bearing rather
+    # than realism — with none configured SeaweedFS serves anonymous requests but **refuses signed
+    # ones**, and the SDK always signs.
+    # `volume.max` is the fixture's real capacity limit, and it is counted in *buckets*: every bucket
+    # is a SeaweedFS collection with volumes of its own, and each harness makes four. A run past the
+    # ceiling does not degrade — every PUT answers `500 InternalError` — so the default is sized for
+    # the whole workspace at once. Volume files are allocated lazily, so a high ceiling costs nothing
+    # until it is used.
+    #
+    # Both are overridable because that exhaustion is itself a test subject: `test-seaweedfs-tiny.sh`
+    # starts the same fixture small enough to run out under a few megabytes, which is the only way to
+    # exercise hypha against a backend that fails for a reason no proxy can fake — a real store with
+    # no room left (§11).
+    command: >
+      server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+      -master.volumeSizeLimitMB=${SEAWEED_VOLUME_SIZE_MB:-64}
+      -volume.max=${SEAWEED_VOLUME_MAX:-3000} -volume.minFreeSpacePercent=0
+    ports:
+      - "${SEAWEED_S3_PORT:-8333}:8333"
+    volumes:
+      - data:/data
+      - ./seaweedfs-test-s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      # Liveness only: the S3 gateway answering HTTP at all. A real readiness probe would have to be
+      # a signed bucket round trip, which a healthcheck has no way to sign — so the waiting that
+      # matters is the harness's own (`TestS3::await_serving`), which polls with the credentials
+      # above. curl rather than the image's busybox wget, which cannot send a method other than GET.
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:8333/"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 2s
+
+volumes:
+  # Named rather than a bind mount so `down -v` is the whole cleanup, and so a run cannot write into
+  # the repo. Anonymous would do the same but would leave nothing to name in a failure.
+  data:

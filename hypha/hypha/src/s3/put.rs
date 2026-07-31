@@ -48,7 +48,8 @@ impl Hypha {
             }
         }
 
-        if let WriteMode::Cached = self.prepare_write(&bucket, &key).await? {
+        let (_gate, mode) = self.prepare_write(&bucket, &key).await?;
+        if let WriteMode::Cached = mode {
             return self.op_put_object_cached(input, bucket, key).await;
         }
 
@@ -312,10 +313,19 @@ impl Hypha {
             )
             .await
             .map_err(|e| match e {
+                // The cache validated the digest against the body and refused it, so nothing landed
+                // — a clean client error, and the one failure here that is *not* indeterminate.
                 Error::BadDigest => {
                     s3_error!(BadDigest, "Content-MD5 does not match the request body")
                 }
-                other => other.into(),
+                other => {
+                    // Everything else may have landed and lost its response, leaving K live with no
+                    // marker queued behind it. This run can no longer claim the bucket's pending set
+                    // is a complete account of itself, so it withdraws the claim (§6) — no clean
+                    // marker, and the next run's R2 rebuilds the set from both namespaces.
+                    self.buckets.unaccount(bucket);
+                    other.into()
+                }
             })?;
         let etag = out
             .e_tag()

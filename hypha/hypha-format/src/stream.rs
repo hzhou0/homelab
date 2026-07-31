@@ -169,4 +169,62 @@ mod tests {
         assert_eq!(&buf[..], &data[250_000..250_008]);
         assert_eq!(r.source.opens, 2);
     }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+        /// Random seek/read sequences against a slice. This reader has three code paths behind one
+        /// interface — a re-open, a short-forward discard, and a read that continues an open stream —
+        /// and which one a seek takes depends on the *distance* from wherever the last read left the
+        /// position. The hand-written cases above pick those distances deliberately; this picks them
+        /// adversarially, including the seeks past the end and before byte 0 that a decryptor probing
+        /// a chunk boundary can produce.
+        #[test]
+        fn prop_seek_and_read_track_a_slice(
+            len in 1usize..80_000,
+            ops in proptest::collection::vec((0u8..=2, 0i64..100_000, 0usize..3_000), 1..24),
+        ) {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut reader = RangeReader::new(MemSource::new(data.clone()));
+            let mut pos: u64 = 0;
+
+            for (kind, magnitude, take) in ops {
+                let target = match kind {
+                    0 => SeekFrom::Start(magnitude as u64 % (len as u64 + 1)),
+                    // Deliberately signed both ways: a negative delta past the start must fail and
+                    // leave the position alone.
+                    1 => SeekFrom::Current(magnitude - 50_000),
+                    _ => SeekFrom::End(-(magnitude % (len as i64 + 1))),
+                };
+                let model = match target {
+                    SeekFrom::Start(o) => Some(o),
+                    SeekFrom::Current(d) => pos.checked_add_signed(d),
+                    SeekFrom::End(d) => (len as u64).checked_add_signed(d),
+                };
+                match model {
+                    Some(want) => {
+                        let got = reader.seek(target).expect("a representable target must seek");
+                        proptest::prop_assert_eq!(got, want);
+                        pos = want;
+                    }
+                    None => proptest::prop_assert!(
+                        reader.seek(target).is_err(),
+                        "a target before byte 0 must be refused"
+                    ),
+                }
+                proptest::prop_assert_eq!(reader.position(), pos);
+
+                let mut got = Vec::new();
+                Read::by_ref(&mut reader)
+                    .take(take as u64)
+                    .read_to_end(&mut got)
+                    .expect("an in-memory source cannot fail");
+                let lo = (pos as usize).min(len);
+                let hi = pos.saturating_add(take as u64).min(len as u64) as usize;
+                proptest::prop_assert_eq!(&got[..], &data[lo..hi]);
+                pos += got.len() as u64;
+                proptest::prop_assert_eq!(reader.position(), pos);
+            }
+        }
+    }
 }

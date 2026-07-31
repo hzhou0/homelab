@@ -27,7 +27,7 @@ use hypha_core::meta;
 
 use super::get::facts_from_tombstone;
 use super::{ts_ms, Hypha};
-use crate::bucket::Readiness;
+use crate::bucket::{Readiness, WriteGuard};
 use crate::gc::Plaintext;
 use crate::tier::RemoteFacts;
 
@@ -138,12 +138,13 @@ impl Hypha {
     }
 
     /// The semantics `bucket`'s writes run under right now (§7). Not simply the deployment's
-    /// configured mode — see [`WriteMode::Durable`]. An absent bucket is `NoSuchBucket`.
-    pub(super) async fn write_mode(&self, bucket: &str) -> S3Result<WriteMode> {
+    /// configured mode — see [`WriteMode::Durable`].
+    pub(super) async fn write_mode(&self, bucket: &str) -> S3Result<(WriteGuard, WriteMode)> {
+        let gate = self.enter_write(bucket)?;
         match self.buckets.readiness(bucket) {
             Readiness::Absent => Err(Error::NoSuchBucket.into()),
-            Readiness::Ready if self.mode == Mode::Cached => Ok(WriteMode::Cached),
-            _ => Ok(WriteMode::Durable),
+            Readiness::Ready if self.mode == Mode::Cached => Ok((gate, WriteMode::Cached)),
+            _ => Ok((gate, WriteMode::Durable)),
         }
     }
 
@@ -151,20 +152,27 @@ impl Hypha {
     /// (§7). Serving is never gated: a `Restoring` bucket first has K materialized from the remote
     /// into the cache — under K's lock so it doesn't race the write's own bracket — leaving a correct
     /// entry for conditional evaluation.
-    pub(super) async fn prepare_write(&self, bucket: &str, key: &str) -> S3Result<WriteMode> {
+    pub(super) async fn prepare_write(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<(WriteGuard, WriteMode)> {
+        let gate = self.enter_write(bucket)?;
         match self.buckets.readiness(bucket) {
             Readiness::Absent => Err(Error::NoSuchBucket.into()),
-            Readiness::Ready if self.mode == Mode::Cached => Ok(WriteMode::Cached),
-            Readiness::Ready => Ok(WriteMode::Durable),
+            Readiness::Ready if self.mode == Mode::Cached => Ok((gate, WriteMode::Cached)),
+            Readiness::Ready => Ok((gate, WriteMode::Durable)),
             Readiness::Restoring => {
                 let _guard = self.tier.locks.lock(key).await;
                 // The background restore provisions the projections and rebuilds the namespace, but
                 // a write can beat it here — have the actor provision on demand so K's
                 // materialization lands. Coalesced there, so a burst of writes into a lost-volume
-                // bucket costs one round, not one per request.
+                // bucket costs one round, not one per request. Safe to create projections a delete
+                // might be draining only because the gate above is held: the drain cannot have
+                // started while this write is inside it.
                 self.buckets.provision(bucket).await?;
                 self.tier.materialize_absent_locked(bucket, key).await?;
-                Ok(WriteMode::Durable)
+                Ok((gate, WriteMode::Durable))
             }
         }
     }
@@ -172,11 +180,21 @@ impl Hypha {
     /// Validate a bucket exists, kicking its restore if unreconciled — the overlay hook for ops
     /// that route around the cache entirely (the multipart part path, §7) and so have no key
     /// state to materialize.
-    pub(super) async fn check_bucket(&self, bucket: &str) -> S3Result<()> {
+    pub(super) async fn check_bucket(&self, bucket: &str) -> S3Result<WriteGuard> {
+        let gate = self.enter_write(bucket)?;
         match self.buckets.readiness(bucket) {
             Readiness::Absent => Err(Error::NoSuchBucket.into()),
-            _ => Ok(()),
+            _ => Ok(gate),
         }
+    }
+
+    /// The write's claim on the bucket existing, held for the whole op (§7). Taken *before* the
+    /// readiness read, which is what makes the pair meaningful: readiness is a load, so on its own
+    /// it says nothing about the bucket still being there by the time the write commits.
+    fn enter_write(&self, bucket: &str) -> S3Result<WriteGuard> {
+        self.buckets
+            .enter_write(bucket)
+            .ok_or_else(|| Error::NoSuchBucket.into())
     }
 
     /// Project a remote LIST page into client-visible entries while the cache restores (§7): each

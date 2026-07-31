@@ -38,7 +38,8 @@ impl Hypha {
         let key = req.input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        if let WriteMode::Cached = self.prepare_write(&bucket, &key).await? {
+        let (_gate, mode) = self.prepare_write(&bucket, &key).await?;
+        if let WriteMode::Cached = mode {
             self.commit_cached_delete(&bucket, &key).await?;
             return Ok(S3Response::new(DeleteObjectOutput::default()));
         }
@@ -87,7 +88,8 @@ impl Hypha {
                 "DeleteObjects takes between 1 and 1000 objects"
             ));
         }
-        if let WriteMode::Cached = self.write_mode(&bucket).await? {
+        let (_gate, mode) = self.write_mode(&bucket).await?;
+        if let WriteMode::Cached = mode {
             return self
                 .op_delete_objects_cached(bucket, quiet, requested)
                 .await;
@@ -99,8 +101,9 @@ impl Hypha {
         let keys = valid_sorted_keys(&requested, &mut failed);
 
         // Each key materialized before any is marked, so the batch runs against correct entries.
+        // The per-key gate is dropped at once — the batch's own, taken above, covers the whole op.
         for key in &keys {
-            self.prepare_write(&bucket, key).await?;
+            let (_, _) = self.prepare_write(&bucket, key).await?;
         }
 
         // Sequentially, in sorted order — the deadlock-freedom argument is the acquisition order.
@@ -165,8 +168,9 @@ impl Hypha {
 
         let keys = valid_sorted_keys(&requested, &mut failed);
 
+        // Its caller's gate is held across this whole call, so the per-key ones add nothing.
         for key in &keys {
-            self.prepare_write(&bucket, key).await?;
+            let (_, _) = self.prepare_write(&bucket, key).await?;
         }
 
         let bucket = bucket.as_str();
@@ -197,7 +201,15 @@ impl Hypha {
     async fn commit_cached_delete(&self, bucket: &str, key: &str) -> Result<(), Error> {
         let _guard = self.write_lock(bucket, key).await;
 
-        self.data().delete(bucket, key).await?;
+        if let Err(e) = self.data().delete(bucket, key).await {
+            // Indeterminate, not a rollback: the cache may have removed K and lost the response,
+            // leaving the key client-absent with no DELETE marker behind it — and so a remote object
+            // nothing would ever propagate the delete to. Withdrawing the bucket's accounting (§6) is
+            // what puts R2 on the remote-only sighting next run, instead of a clean marker telling it
+            // there is nothing to look for.
+            self.buckets.unaccount(bucket);
+            return Err(e);
+        }
         self.markers.owe(bucket, key, meta::delete_marker_body());
         // A deleted K can never name a shadow's generation again, so any shadow it had is orphaned (§8).
         self.orphans.owe(bucket, key);

@@ -174,7 +174,9 @@ same table primitive, separate instance. Same-key reconcile work must not overla
 unserialized older upload finishing after a newer one leaves the remote stale with an empty
 pending set — §7), but a replication upload mutates no client-visible state, so it must only ever
 exclude *other reconciles of the same key*, never make a conditional PUT queue behind a multi-second
-transfer.
+transfer. The sweep's **delete** branch is the exception that proves it: it takes K's write lock as
+well, because it destroys a generation rather than adding one, and two small round trips queue
+nothing worth avoiding (§7).
 
 That exclusion is **`try_lock`, and a pass that loses it drops its attempt** — pending same-key
 uploads coalesce onto the in-flight one rather than queuing behind it. A waiter would be redundant:
@@ -532,17 +534,24 @@ the trailer into. It is a nonce rather than the `retag` because the retained byt
 costs one field on a record that already exists to disambiguate re-uploads.
 
 Encoding the facts in the key means a re-uploaded part (legal in S3, last-write-wins) writes a
-*new* key rather than overwriting, so several records can coexist for one part number. They are
-disambiguated at complete by the one authority that already resolved the race — **the remote's own
-`ListParts`**, which returns the winning `(n → retag, size)` for the in-progress upload. hypha
-matches each winning `retag` to the record carrying it (a ciphertext MD5 ⇒ the match is exact),
-takes that record's `pmd5` (and its `nonce`, where a fold needs the retained bytes), and ignores
-the losing orphans (swept with the rest of the upload's records). All of an upload's records share
-the prefix `0x01 0x01 m ‖ <upload-id> ‖ 0x01`, so that one LIST is a prefix scan and the sweep is a
-prefix range.
+*new* key rather than overwriting, so several records can coexist for one part number. **The client's
+own part ETag is what disambiguates them**, which is S3's model rather than hypha's convenience:
+`CompleteMultipartUpload` names each part by the ETag `UploadPart` returned, and for hypha that ETag
+*is* the `pmd5`. So the requested `pmd5` selects the record, the record's `retag` names the ciphertext
+the remote holds for that generation (a ciphertext MD5 ⇒ the match is exact), and that same `retag`
+is what the native complete is handed — one generation, chosen once, by the caller, and carried
+through body, facts and fold alike. The losing orphans resolve nothing and are swept with the rest of
+the upload's records. All of an upload's records share the prefix
+`0x01 0x01 m ‖ <upload-id> ‖ 0x01`, so that one LIST is a prefix scan and the sweep is a prefix range.
 This is why no hypha-minted version counter is needed: `UploadPart` returns no ordering token, and
 a durable monotonic counter across the active/passive pods would be its own distributed problem —
 the remote's retag *is* the version. Survives process restarts across a multi-hour upload.
+
+> **The remote's `ListParts` is not asked which upload of a part number won.** It is asked only which
+> `(n, retag)` pairs are live and how big each is. S3 and MinIO answer the stronger question too —
+> they keep one entry per part number — but SeaweedFS keeps every upload of one and lists them all
+> (§12), so a `part → retag` map built from that listing silently keeps whichever duplicate came last
+> in it. Resolving from the client's ETag needs no such map and is identical on both.
 
 > **Cleanup is deferred to GC (§8), not run inline at complete/abort.** These records carry `0x01`
 > (range A), so they can't be batch-deleted (§11 carve-out) — a maxed 10 000-part upload would cost
@@ -828,12 +837,13 @@ apply).
 **CompleteMultipartUpload** — under K's write lock:
 
 1. **One LIST** of the upload's mpu records (facts in the keys, §6) and **one `ListParts`** of the
-   remote upload (authoritative winning `(n → retag, size)`, last-write-wins already resolved).
-   For each client part number, match the remote's winning `retag` to its mpu record to recover
-   `pmd5` — no per-part HEAD, and the remote-held bytes are the source of truth for part geometry.
-   Compose the client ETag `md5(concat pmd5s)-N` (`meta::composite_etag`), each `plen` from the
-   remote's part `size` + `HLEN`, and the cumulative-offset **parts table**. Reject if a requested
-   part is absent from `ListParts`, or its client-supplied ETag doesn't match the matched `pmd5`.
+   remote upload (each live `(n, retag)`'s ciphertext size). For each requested part, its
+   client-supplied ETag is the `pmd5` that selects the record, and that record's `retag` selects the
+   remote ciphertext (§6) — no per-part HEAD, and the remote-held bytes are the source of truth for
+   part geometry. Compose the client ETag `md5(concat pmd5s)-N` (`meta::composite_etag`), each `plen`
+   from the remote's part `size` + `HLEN`, and the cumulative-offset **parts table**. Reject
+   (`InvalidPart`) if the ETag names no upload of that part number, or the record it names is no
+   longer live on the remote.
 2. Build the **terminating trailer** (§6) — `table ‖ facts ‖ tag ‖ version` — and place it as the
    object's final bytes. The trailer's content is identical either way; only its placement varies,
    on the one question of whether a part can follow the highest client part:
@@ -845,9 +855,9 @@ apply).
      it). Both mean the same thing, and take the same remedy: **fold** the trailer into that part —
      re-upload it as `part ‖ trailer`, keeping it final. This is why UploadPart retains exactly
      these parts' ciphertext (§7, *UploadPart* step 3): an in-progress part can't be read back. The
-     fold takes the retained copy the remote's `ListParts` winner points at — winning `retag` → mpu
-     record → `nonce` → retained ciphertext — so a re-uploaded part folds *that* generation and
-     never a divergent cache last-writer.
+     fold takes the retained copy of the generation step 1 already resolved — `retag` → mpu record →
+     `nonce` → retained ciphertext — so the bytes folded are exactly the ones the composite ETag was
+     computed over, and never a divergent cache last-writer.
 
    The committed object K is **byte-identical** either way — the same `age₁…ageₙ ‖ trailer`
    concatenation — so the read path is unaffected.
@@ -918,11 +928,22 @@ page is filtered against the client uploads hypha knows about — **one** cache 
 `0x01 0x01 m` with `delimiter=0x01`, whose common prefixes carry the upload ids in the key
 names, so membership is a set test with no per-entry fetch.
 
-**ListParts** (both modes): proxy the remote's `ListParts` (the winning `(n → retag, size)`),
-match each `retag` to its mpu record for `pmd5`, and emit `Part{PartNumber n, ETag = hex(pmd5),
-Size = plaintext_len_from(size, HLEN), LastModified}`; the trailer part, when it rides its own (> every client part), is
-filtered, re-uploaded duplicates resolve exactly as at complete (§6), and `part-number-marker`/
-`max-parts` forward the remote's pagination.
+**ListParts** (both modes): proxy the remote's `ListParts` (each live `(n, retag, size)`), match each
+`retag` to its mpu record for `pmd5`, and emit `Part{PartNumber n, ETag = hex(pmd5),
+Size = plaintext_len_from(size, HLEN), LastModified}`; the trailer part, when it rides its own
+(> every client part), is filtered, and `part-number-marker`/`max-parts` forward the remote's
+pagination. **One entry per part number**, chosen here rather than taken from the listing: newest
+`LastModified`, `retag` breaking the tie. A backend that lists every upload of a number (§12) would
+otherwise hand a client a part list no complete request can be built from; the tie-break is what
+makes the ETag a client reads back one that complete will still resolve, since second granularity
+cannot order two uploads racing inside one second.
+
+**ListMultipartUploads** (both modes): proxy the remote, sorting each page by `(key, upload_id)` and
+forwarding the remote's own markers. S3 orders by key; SeaweedFS orders by upload id, which is also
+the cursor it paginates on (§12) — so within a page the order is S3's and across pages it is the
+remote's. Global order would mean draining the whole listing into memory on a client-triggered path,
+which is the worse trade for an op nothing inside hypha reads (§8's debris sweep collects upload ids
+into a set).
 
 ### CopyObject
 
@@ -1106,8 +1127,8 @@ arrival order while distinct buckets proceed concurrently, bounded by a global c
 Three request classes ride the queue:
 
 - **Client CreateBucket / DeleteBucket** — request-reply, serialized per bucket, **never coalesced**:
-  each returns the remote's own result, because a double-delete's loser must see `NoSuchBucket` and
-  a create must not merge with a same-name delete. The caller pushes (non-blocking) and awaits its
+  each answers for itself, because a double-delete's loser must see `NoSuchBucket` and a create must
+  not merge with a same-name delete. The caller pushes (non-blocking) and awaits its
   reply.
 - **Provisioning** — request-reply and **coalesced by waiter list**: the data plane needs the
   `<data>`/`<meta>` projections to exist before a write to an unreconciled bucket can materialize its
@@ -1182,12 +1203,56 @@ state, re-triggered on the next access.
   commit** — and writes the marker (a fresh empty namespace is trivially reconciled → immediately
   `Ready`). A duplicate create of a live bucket returns the remote's result and leaves cache and
   marker untouched (it may be mid-restore).
-- **DeleteBucket**: routed to the actor. It deletes the remote first — the commit that makes the
-  bucket cease to exist, and the **emptiness gate** (the remote holds every committed object, so a
-  non-empty bucket is rejected here) — then best-effort drains and deletes both cache buckets and
-  clears the ready set. A failure or crash after the remote delete leaves a cache-without-remote
-  orphan a later restore/GC drops — never a remote bucket the client believes is gone. Leftover
-  twins/markers/marks are hypha's own state: drained, never allowed to block the delete.
+- **DeleteBucket**: routed to the actor, and it decides both of the questions a client's delete turns
+  on rather than delegating either to the backend. *Existence* comes from the state map, whose
+  `Absent` is definitive (above). *Emptiness* is hypha's own listing of the client namespace — the
+  same source a LIST of the bucket reads, so `<data>` once the bucket is `Ready` and the remote while
+  it is `Restoring` — because SeaweedFS ships `allowDeleteBucketNotEmpty` **on** and would answer a
+  misdirected `DeleteBucket` by recursively deleting the contents (§12). Only then does the remote
+  delete commit; both cache buckets are drained best-effort after, and the ready set cleared. The
+  remote is drained alongside them, since "empty" is a claim about the *client* namespace: a cached
+  bucket whose deletes have not propagated is client-empty with remote bodies still standing, and
+  they are exactly as stale as the bucket now is. A failure or crash after the remote delete leaves a
+  cache-without-remote orphan a later restore/GC drops — never a remote bucket the client believes is
+  gone. Leftover twins/markers/marks are hypha's own state: drained, never allowed to block the
+  delete.
+
+  **The emptiness read is only a fact about the instant it ran.** A readiness check is a *load*, not
+  a hold: a write that passed one and then spent the body upload on the wire carries a verdict that
+  stopped being true, and no re-check closes that — the commit is a network round trip, so there is
+  always a gap between the last check and the wire. So the delete has to establish two things
+  *together*: the namespace is empty, and nothing is in a position to add to it.
+
+  Both live in one `AtomicU64` per bucket — `[ closed:1 | epoch:31 | count:32 ]`, where `count` is
+  writes admitted and unfinished and `epoch` counts admissions ever. Every write's admission is one
+  CAS that fails if `closed`, so it always moves both. The delete is then straight-line, with no
+  waiting anywhere: **load the word** (a non-zero `count` ⇒ refuse), **list the namespace**, **CAS
+  that exact word to `closed`**. The CAS succeeds only if nothing was admitted across the listing,
+  so the three writes that could invalidate it are each excluded by a different step — one that
+  finished before the load is *in* the listing, one still running at the load fails the first check,
+  one admitted during the listing moves the epoch and fails the CAS. The epoch is what makes it
+  ABA-safe: a write admitted and completed inside the window returns `count` to zero, and without it
+  the CAS could not tell that word from the one it read.
+
+  What that buys is that **the gate closes only past the point of no return**, so nothing is
+  disturbed on any path ending in a refusal. That is the difference from both alternatives
+  considered: a barrier writes queue on, and a flag published ahead of the listing, each have to
+  close the bucket *before* knowing whether the delete will commit — and a delete that is then
+  refused has spent `NoSuchBucket` on a bucket that goes on existing, which is a lie about a live
+  bucket and not something a shorter window fixes. A delete that loses either race answers
+  `OperationAborted`, S3's own retryable code for a conflicting operation, and the client retries.
+
+  Every producer into the bucket's namespaces takes the gate, not just client ops — the reconcile
+  sweep holds it per *key*, so a delete's chance of finding the bucket quiescent is not hostage to a
+  whole bucket's marker drain. A committed delete leaves the gate **closed**, and `CreateBucket`
+  discards it so a new incarnation of the name gets a fresh one; discarding at delete time would
+  instead let the next writer install a fresh *open* gate and walk in behind the drain. The one
+  reopen left is RAII on the closed gate itself, covering a remote drain that fails after the CAS —
+  a live bucket must not be left refusing every write for the rest of the run.
+
+  The gate also subsumes the provisioning refusal: `prepare_write` takes it above the readiness
+  check, so a write cannot re-create the projections a drain is removing. The actor's own
+  provisioning needs nothing, being per-bucket serialized with the delete already.
 
 **Restore follow-ups** (open, deliberately deferred):
 
@@ -1303,11 +1368,27 @@ The upload path for acked cache writes — a continual duty of the active (phase
    In every case the CAS is what licenses acting on a listing that may already be stale. A marker
    raised since the LIST has a different ETag, so it survives untouched and the pass takes no view
    of it.
-4. **Delete branch**, under the same upload lock: HEAD the marker to reject a stale LIST result,
-   HEAD the remote object for its current ETag, then `DeleteObject If-Match: R_etag`. A remote
-   overwrite between those calls returns 412 and leaves the marker to retry. On success, delete the
-   marker with `If-Match: M_etag`; a concurrent create that rewrote it leaves its upload obligation
-   standing.
+4. **Delete branch**, under the upload lock **and K's write lock**: check K in `<data>` first, then
+   HEAD the marker to reject a stale LIST result, HEAD the remote object for its current ETag, and
+   `DeleteObject If-Match: R_etag`. A remote overwrite between those calls returns 412 and leaves the
+   marker to retry. On success, delete the marker with `If-Match: M_etag`; a concurrent create that
+   rewrote it leaves its upload obligation standing.
+
+   **This is the one branch that takes K's write lock**, and the one that checks K at all. The upload
+   branch must not (above: it would queue conditional writes behind a transfer), and does not need
+   to — an upload racing a newer write is self-correcting, since the newer write's own marker is
+   still standing. A delete is two small round trips and is the only reconcile action that
+   *destroys* a generation, so it pays nothing for the lock and cannot do without it. Under the lock,
+   K decides: absent ⇒ this marker really is the record of the delete and the remote must be told;
+   a **transition tombstone** ⇒ a bracket owns K, so leave the marker to its commit; a live body or
+   an **eviction tombstone** ⇒ K exists again, the delete has been superseded, so clear the marker
+   under its CAS and destroy nothing.
+
+   That last case is not hypothetical, and it is why the check exists: **multipart is always durable**
+   (below), so a `CompleteMultipartUpload` commits to the remote and settles K *without raising a
+   marker of its own* — the one write path that does not supersede a marker already standing at K.
+   Without the check, a cached DELETE's unswept marker would be discharged against the composite the
+   client was just told was committed (§12).
 
 **The marker queue.** Every acked cached write hands its marker here (§7, *PutObject*) and a single
 worker writes them, coalesced per key and retried for the life of the process. FIFO preserves
@@ -2061,12 +2142,28 @@ passive that failed its probe could not be promoted into.
   tamper/truncate/foreign-bytes/wrong-key ⇒ verify failure) and offset-table encode/decode +
   tiling validation; the trailing-bytes guard (age's EOF-delimited reader is why decrypt paths
   bound before the trailer);
-  offset-arithmetic proptests against the fixed chunk size; a fuzz target
-  for `RangeReader` seeks; criterion benches for the §5 threshold. (Largely built.)
+  offset-arithmetic proptests against the fixed chunk size; a proptest fuzzing `RangeReader` seek
+  sequences against a slice (its three paths — re-open, short-forward discard, continue — are
+  selected by *distance*, which is what a generator picks better than a person); criterion benches
+  for the §5 threshold. (Built, except the stock-`rage` interop read.)
+- **The backend's conditional operations** (`backend.rs`, built): hypha's coordination is `If-Match`
+  on the store rather than locks over it, so the backend's precondition semantics are part of the
+  correctness argument — and an unenforced precondition does not fail, it silently succeeds. Nothing
+  else in the suite can see that, because every test that *drives* a 412 injects it rather than
+  earning it. Conditional **writes** are enforced by MinIO and pinned here. The conditional **delete**
+  is **not** — it is the marker CAS (§7), the cached DELETE branch's generation-bound remote delete
+  (§7), and both shadow reclaims (§8), and on MinIO all three degrade to unconditional deletes.
+  SeaweedFS 4.37 does enforce it, so what this pins is the distance between the test backend and the
+  deployed one. The same file pins the two divergences that run the other way — a non-empty
+  `DeleteBucket` and an emptied common prefix — so hypha's not depending on *either* backend's
+  answer is a checked claim rather than an intention. See §12.
 - **Concurrency**: hammer conditional writes against one active over real SeaweedFS; assert
   linearizability (no double-create, no lost update) including against tombstoned keys (metadata
-  ETag resolution). Pins SeaweedFS `If-Match` (§9). Bursty same-key overwrites: remote converges
-  to the last-acked ETag within one reconcile pass.
+  ETag resolution) — built against MinIO (`cached.rs`, `load.rs`) and, through the fixture, against
+  SeaweedFS, which is where the CAS-dependent paths meet a backend that actually enforces the
+  precondition (§9). Bursty same-key overwrites: remote converges to the last-acked ETag within one
+  reconcile pass — `#[ignore]`d because on MinIO it reproduces the unenforced conditional delete, and
+  **passing** under `scripts/test-seaweedfs.sh`, which runs it with `--include-ignored`.
 - **The two recoveries** (`recovery.rs`, built): the write-mode gate — a write taken during a
   namespace restore commits on the remote, settles an eviction tombstone rather than a live body, and
   owes no marker — plus the regression it exists for: a second, conditional write to that key must
@@ -2084,15 +2181,54 @@ passive that failed its probe could not be promoted into.
   that the window is still open when the write lands — startup resolves and owes the restore, so it
   is no longer the first request that opens one — and each asserts something only a write *inside*
   the window produces, so a window that closed early fails loudly instead of passing vacuously.
-- **Marker/reconcile**: (a) PUT marker + absent remote ⇒ upload + CAS marker delete; (b) overwrite
-  mid-upload ⇒ marker CAS 412s, next pass uploads the newer body; (c) DELETE marker ⇒ remote HEAD +
-  conditional delete + marker CAS; (d) a remote generation change between HEAD and delete ⇒ 412 and
-  retry. Kill the active mid-sweep ⇒ the new active resumes from the marker LIST, no drops, no
-  eviction before resolution. Cache-volume wipe ⇒ loss bounded by the pending set.
-- **Eviction vs. writers**: sustained PUTs against a key under eviction; assert the §8 layering
-  (marker skip, remote-generation confirm, `If-Match` abort) never tombstones an
+- **Marker/reconcile** (`cached.rs`, built): (a) PUT marker + absent remote ⇒ upload + CAS marker
+  delete; (b) overwrite mid-upload ⇒ marker CAS 412s, next pass uploads the newer body; (c) DELETE
+  marker ⇒ remote HEAD + conditional delete + marker CAS; (d) a remote generation change between HEAD
+  and delete ⇒ 412 and retry. Kill the active with an upload demonstrably in flight ⇒ the next run
+  resumes from the same marker LIST and drops nothing — the pending set is the marker range, so no
+  part of it lives in the process. Cache-volume wipe ⇒ loss bounded by the pending set, asserted from
+  both sides of one wipe: a key the sweep had uploaded survives, a key it could not is a clean
+  absence. "No eviction before resolution" is the accounting gate, and it is asserted where it can
+  actually be observed — see the eviction bullet.
+- **Eviction vs. writers** (`evict.rs`, built): sustained PUTs against a key under eviction; assert
+  the §8 layering (marker skip, remote-generation confirm, `If-Match` abort) never tombstones an
   acked-but-unuploaded body, including the prior-generation-marker case and a remote holding an
-  *older* generation of the same key.
+  *older* generation of the same key. The property that catches a broken gate is not "the last write
+  survives" but that every read's bytes hash to the ETag served with them: a tombstone written over
+  an unuploaded generation *is* a read that returns one generation's plaintext under another's facts,
+  and stating it that way needs no knowledge of which write won the race.
+- **A broken backing store** — two suites, because the failure has two shapes and neither subsumes
+  the other.
+  `exhaustion.rs` (`scripts/test-seaweedfs-tiny.sh`) puts a **real store out of room**: a SeaweedFS
+  with one-megabyte volumes and a handful of them, wired to *one* role while the other stays on a
+  healthy MinIO — undersizing both would only prove "everything fails". A full store is what a proxy
+  cannot imitate: it refuses for as long as the condition lasts rather than a counted number of
+  times, it refuses every path at once, and it keeps serving reads throughout. Durable mode with a
+  full remote must refuse every write, keep every acked object byte-exact — including across a failed
+  overwrite of its own key, which is the §7 bracket's contract stated against a real failure — and
+  keep LIST agreeing with the acked set. Cached mode splits: a full **remote** must not stop the ack
+  (the cache is the commit point) and must leave the obligation standing across a restart, while a
+  full **cache** must refuse the ack outright, since an ack with nowhere to put the commit is the
+  worst failure the system has. None of it is an invariant violation, so the halt marker must stay
+  absent, and the process must still be answering `/readyz` at the end.
+  `chaos.rs` is the other half: a **share of every backend call** fails at random, including faults
+  injected *after* the backend acted, so hypha meets refusals on paths no test named. The oracle is a
+  **set** rather than a value — an ack narrows a key to one state, an error widens it by the state
+  that was attempted, because a faulted operation is indeterminate — and the check is membership,
+  plus the things that need no model at all: the ETag served must be the one that write would have
+  produced (a plaintext MD5, or `md5(concat pmd5s)-N` for a composite), HEAD must agree with GET, and
+  LIST must name exactly the keys that read back. Cached mode adds convergence once the storm lifts,
+  and asserts it **across a restart** rather than within the run — a cached commit that landed and
+  lost its response owes no marker, so no sweep can fix the divergence it leaves; what the run does
+  instead is decline to vouch for the bucket, which is an instruction to the next run's R2. So the
+  property is: the pending set drains, hypha is restarted, R2 rebuilds whatever the storm cost, no key
+  has changed what it holds, and the two tiers agree about every one of them. That last wait is on the
+  *property*, not on an empty pending set — straight after a restart the set is empty because R2 has
+  not raised anything yet, and waiting on emptiness samples that and calls it converged.
+  The third test runs the real binary at a punishing fault rate purely to assert the process is still
+  alive, still ready, and still able to drain gracefully — a panic in a handler is invisible
+  in-process, and one in a background actor quieter still.
+  **Both found real bugs**; see §12.
 - **Marker obligation & the clean marker**: a marker write that fails leaves the object acked and
   live, and the queue's retry lands the marker afterwards (fault-injecting cache wrapper — MinIO
   cannot fail one write selectively). Kill the active without a drain ⇒ no clean marker ⇒ next run
@@ -2101,33 +2237,51 @@ passive that failed its probe could not be promoted into.
   dropped, not retried** — its `<meta>` projection is gone, so it can never land, and retrying it
   would withhold every *other* bucket's clean marker for the rest of the run; assert that deleting a
   bucket with a marker in flight still leaves the surviving buckets clean at drain. The drop is
-  gated on the state map agreeing the bucket is gone, so assert the other side too: a `<meta>`
-  projection removed underneath a *live* bucket raises **I6** rather than quietly shortening a
-  pending set the run still vouches for. The quiescence ordering is the part
+  decided by the state map **before** the write, not out of its error — a backend that creates the
+  bucket a PUT addresses would otherwise have the marker queue resurrect a projection the delete just
+  drained, and report nothing. That leaves the backend's own `NoSuchBucket` meaning something
+  narrower, and worth asserting on its own: a `<meta>` projection removed underneath a bucket the map
+  still calls live raises **I6** rather than quietly shortening a pending set the run still vouches
+  for. The quiescence ordering is the part
   worth asserting directly: a write committed but not yet marked must never coexist with a clean
   marker, so drive a body write concurrent with SIGTERM and assert the marker set and the clean
   marker cannot disagree. Assert the **default** too, since it is the property a future change is
-  most likely to break: after startup completes, no bucket's marker is present on disk; killing at
-  each step of the drain produces none; and a bucket left dirty by a previous run and untouched by
-  this one is still dirty after this one drains gracefully — it was never scanned, so this run
-  cannot vouch for it.
-- **Twin coherence**: crash-inject every point of twin sequences (delete-stale → write →
-  tombstone; rehydrate's body-then-twin-delete); LIST never reports wrong facts — a twin next to
-  a non-evict entry is ignored and swept, an evict tombstone with a missing twin HEAD-falls-back,
-  ≤ 1 twin per key; shadow-body probe/evict races; lexicographic order holds with prefix-key
-  populations (`a`, `a!b`, `a/b`).
+  most likely to break: after startup completes, no bucket's marker is present on disk, and a kill
+  leaves none. The marker is **positive evidence and nothing else**, so the case that pins it is a
+  bucket whose pending-set rebuild could not finish (its remote cursor refused): it ends the run
+  dirty however cleanly the run drains, while a bucket the same run created empty still ends clean —
+  one bucket's doubt must not spread, or a single unrecoverable bucket would send the next run into a
+  full rebuild of every other one. (Startup owes a rebuild to *every* dirty bucket, so "untouched by
+  this run" is not a state a bucket can be left in; the doubt has to come from a rebuild that failed.)
+- **Twin coherence** (`bracket.rs`, built): cut the twin sequences at each point — the settle whose
+  twin write fails leaves K marked with **no** twin at all, since the stale one is deleted first, and
+  LIST's per-key HEAD fallback is what carries the entry until a repair rebuilds one. LIST never
+  reports wrong facts: a twin next to a live body is never consulted (only tombstones fetch twins)
+  and is swept, an evict tombstone with a missing twin HEAD-falls-back *stably* — nothing rebuilds a
+  twin nobody asked to write — and ≤ 1 twin per key holds across a whole generation sequence,
+  including the rehydrate that drops a twin without replacing it. Lexicographic order with prefix-key
+  populations (`a`, `a!b`, `a/b`) is `conformance.rs`.
 - **LIST pagination**: a twin-diluted population paginated at several `MaxKeys` — pages may be
   short (dilution), but following the forwarded continuation token covers every key exactly once in
   order, never over `MaxKeys`, with `IsTruncated`/`NextContinuationToken` consistent. (Built —
   `conformance.rs`.) Keys with control bytes (`0x02`–`0x1f`, tab) and the `0x01`
   twin separator round-trip through the `encoding-type=url` LIST and decode back byte-exact.
-- **Transition bracket**: crash-inject at every step of the §7 durable PUT / DELETE / complete
-  brackets and assert the contract — readers never see hybrid facts/bytes, an unacked op leaves
-  the old object fully readable or the new one fully committed, and repair settles K
-  idempotently from the remote regardless of where the writer died.
+- **Transition bracket** (`bracket.rs`, built): crash-inject at every step of the §7 durable PUT /
+  DELETE / complete brackets and assert the contract — readers never see hybrid facts/bytes, an
+  unacked op leaves the old object fully readable or the new one fully committed, and repair settles K
+  idempotently from the remote regardless of where the writer died. The cuts that matter are the ones
+  *after* the commit, and the client cannot make them: the mark and the settle's tombstone are both
+  `<data>` writes at K, so failing "the second write to K" means suspending the bracket at its commit,
+  arming the fault, and releasing — which is also the only window in which a hybrid read is possible
+  at all. Two readers, deliberately: **LIST** is the lock-free one (a marked entry costs it a remote
+  HEAD), while a **GET** of a marked key repairs K when the lock is free, so under a standing
+  cache-write cut it cannot answer — which is why the cut is lifted before the GET assertions, where
+  the read is itself the repair. A cut must also *stand* rather than fire once: the SDK retries, so a
+  one-shot fault is served from the retry and the step completes after all.
 - **Multipart**: out-of-order / parallel / re-uploaded parts — assert the re-upload's superseded
-  mpu record is resolved away at complete by the remote's `ListParts` (winning `retag` matched to
-  its `pmd5` record; orphan ignored and swept), including two concurrent same-part uploads;
+  mpu record is resolved away at complete by the client's own part ETag (`pmd5` → record → `retag`;
+  orphan ignored and swept), including two concurrent same-part uploads, where what is asserted is
+  that the ETag `ListParts` reports and the bytes complete lands are the same generation;
   process restart mid-upload (`pmd5` recovered from mpu state); composite ETag correctness;
   single-stream composite GET + ranged GET across part boundaries (uniform and ragged part sizes)
   driven off the trailer's offset table; abort cleanup — asserted against the §8 sweep, which is the
@@ -2138,14 +2292,62 @@ passive that failed its probe could not be promoted into.
 - **Integration** (`hypha/tests/`, built): an in-process harness drives hypha over an ephemeral
   port with a real `aws-sdk-s3` client against a throwaway **MinIO** serving as *both* cache and
   remote (kept disjoint by the per-role bucket names under one `bucket_prefix`); every fixture is stateless and tears
-  down its MinIO + data dir on drop. Covers the durable S3 conformance surface incl. twin-diluted
-  **LIST pagination** (`conformance.rs`),
+  down its MinIO + data dir on drop. A builder composes the axes that were beginning to multiply —
+  mode, fault proxies, in-process vs. the real binary, a usage source, and the §8 knobs a test needs
+  to move — since naming their product was already producing near-duplicate constructors. Covers the
+  durable S3 conformance surface incl. twin-diluted **LIST pagination** (`conformance.rs`),
   the multipart scenarios above including the small-final-part **trailer fold** (`multipart.rs`),
   the two recoveries and their invariants (`recovery.rs`),
+  selective cache/remote fault injection for marker persistence, transition brackets, multipart
+  bookkeeping, response loss, reconcile CAS races, and drain ordering,
   model-based **proptest fuzzing** of random op sequences against a `BTreeMap` oracle (`fuzz.rs`),
-  and an `#[ignore]`d **load/concurrency** suite — throughput, no-double-create-under-contention,
-  parallel multipart (`load.rs`). Still to add: SeaweedFS as the cache backend, and a real zero-loss
-  client (ZeroFS) against the durable endpoint.
+  **indiscriminate** fault injection against an allowed-set oracle (`chaos.rs`) and a real store out
+  of room (`exhaustion.rs`), and an `#[ignore]`d **load/concurrency** suite — throughput,
+  no-double-create-under-contention, parallel multipart (`load.rs`).
+  **`TEST_S3_ENDPOINT` points the same suite at a backend it does not own**, which
+  `scripts/test-seaweedfs.sh` uses to run the CAS-dependent parts against a throwaway SeaweedFS
+  (compose up → test → `down -v`, so the volume is the only residue and it goes with the run).
+  Isolation is then the per-harness `bucket_prefix` rather than a server each — `list_buckets`
+  filters by it (§9) — and parallelism is bounded, since every fixture's client path, sweep and GC
+  actor now land on one server. `scripts/test-seaweedfs-tiny.sh` reuses the same compose file with
+  its volume limits turned down, one fixture per test, for the exhaustion suite above. Three things
+  that fixture immediately taught, all now settled: a
+  SeaweedFS `server` needs its volume ceiling raised (a bucket is a collection, and a suite makes
+  thousands) and **identities configured**, since with none it serves anonymous requests but refuses
+  signed ones; and a test that reads `<meta>` must list with `encoding-type=url` exactly as
+  `Backend::list` does, or the `0x01` twin separator comes back as U+FFFD — matching nothing, and
+  silently, since the two print alike. **The whole workspace passes against it**, which is what the
+  script now runs. Still to add: a real zero-loss client (ZeroFS) against the durable endpoint.
+- **Eviction** (`evict.rs`, built): everything here needs a **pressure source**, which is why none of
+  it could exist before — MinIO reports no usage, so the plain harness has no measure of pressure and
+  its passes sweep debris forever without evicting. The harness serves the figure itself, and
+  *serving* rather than measuring it is what makes an **unmeetable** target expressible: a real cache
+  shrinks as GC evicts, so no pass could otherwise be observed escalating past the rung its first
+  reclaim satisfied. The three gates are each driven from the side that loses data — a state in which
+  the body must *not* be tombstoned — and each asserts both halves: eviction declines now, and
+  proceeds once the reason to decline is gone. A gate that had silently stopped working passes the
+  first half of every one of them. Covered: a pending marker defers; a body the remote does not hold
+  owes a marker instead of a tombstone, and the sweep then makes it evictable; a remote holding an
+  *older* generation of the same plaintext length is refused at the trailer's `cetag` (the length
+  triage settles every other case on one HEAD); a bucket whose pending-set rebuild has not finished is
+  not evicted from at all; durable mode evicts a planted live body never, under pressure, with passes
+  demonstrably running. Ordering is the ring's: a body displaced past the ring's depth goes while one
+  in the current window stays. The **ladder** is asserted through the binary's exposition, since that
+  is the only place its position is observable: against an unmeetable target it climbs every cheap
+  rung before the age threshold and returns to base in one step when usage drops. Phase 5's two exit
+  scenarios close the file — scavenge → rehydrate, and cache wipe → restore → rehydrate → evict →
+  rehydrate, lossless throughout.
+- **Orphaned shadow bodies** (`shadow.rs`, built): the obligation whose failure is pure silence — a
+  superseded shadow is unreachable *and* unrankable, so nothing ever touches it for the ring to have
+  an opinion about. Each of the three pieces is tested from the side that leaks, plus the one
+  assertion that keeps over-deletion honest (a shadow K still names survives all three). The marker
+  tests are the load-bearing ones, because a marker written when it should not be vouches for a
+  bucket that has an orphan in it and no later run looks again: the marker's presence must **stop**
+  the startup sweep and its absence must **cause** one, and asserting only the second would pass just
+  as well if the marker were never read. An unsettleable reclaim withholds it, and the next run's
+  backstop is the hand-off rather than a loose end. A shadow reclaimed under pressure leaves K's
+  tombstone and its single twin untouched — disturbing either would push every LIST of that key onto
+  the per-key HEAD fallback.
 - **GC's quiet paths** (`gc.rs`, built): the ones whose failure is *silent*, which is why they are
   tested ahead of the deferred §8 pass — a recency slice that never reaches GC's bucket, an mpu range
   never reclaimed, an orphan twin diluting every LIST that covers it, a transition mark costing a
@@ -2198,6 +2400,104 @@ passive that failed its probe could not be promoted into.
 
 ## 12. Risks
 
+- **The conditional delete is a backend requirement, and MinIO does not meet it** (`backend.rs`).
+  Three paths bind a delete to a generation they observed: the reconcile sweep's marker CAS (§7), the
+  cached DELETE branch's `If-Match` remote delete (§7), and the two shadow reclaims (§8). Where the
+  precondition is ignored each becomes an unconditional delete of whatever is there *now*, and the
+  first two are not cosmetic: a sweep can clear a marker a newer write raised while it ran, leaving
+  the remote holding an older generation with an **empty pending set** — permanently stale, since
+  nothing revisits a key no marker names — and the delete branch can remove a remote object that
+  landed between its own HEAD and its delete. Reproduced against MinIO in roughly one run in three
+  under load (`cached.rs`, `#[ignore]`d).
+  **SeaweedFS 4.37 — the deployment's backend on both legs (§9) — does enforce it**: a stale-ETag
+  `DeleteObject` is refused 412 and the object survives, so the mechanism is sound where it ships and
+  the exposure is confined to the test backend. `scripts/test-seaweedfs.sh` is what closes the
+  testing half: it runs the CAS-dependent suites against a throwaway SeaweedFS, where the convergence
+  test above passes.
+- **Three SeaweedFS behaviours that MinIO does not share**, found by that fixture and confirmed
+  upstream. Each was a place hypha had delegated a decision to the backend; the first two are
+  **closed** by taking the decision back, and `tests/backend.rs` now pins all three so that not
+  depending on them is a checked claim:
+  - **`DeleteBucket` succeeds on a non-empty bucket**, where S3 and MinIO answer `BucketNotEmpty`
+    (`allowDeleteBucketNotEmpty` defaults *on*, and it deletes the contents too). §7 had used the
+    remote's refusal *as* the emptiness gate, which on SeaweedFS made a misdirected `DeleteBucket` a
+    recursive delete. `BucketTask::delete` now lists the client namespace itself — the same source a
+    LIST of the bucket reads — and only then commits. Emptiness is a claim about the *client*
+    namespace, so a cached bucket whose deletes have not propagated deletes too, draining the
+    remote's stale bodies along with it. Taking the decision back also required taking the *timing*
+    back: a listing is only a fact about the moment it ran, so the delete now brackets it between a
+    read and a CAS of a per-bucket write gate (§7). Reviewing the first fix is what surfaced that —
+    the phase flag it shipped with stops writes that arrive during the delete, but a write already
+    past its readiness check is inside the window the flag was meant to close.
+  - **A PUT into a bucket that does not exist creates it.** Two paths read `NoSuchBucket` as a fact
+    about the world: the marker queue drops an obligation whose bucket is gone, and **I6** is raised
+    when it is *not* gone (§7). Neither signal can arrive from SeaweedFS. Both now read the **state
+    map** — whose `Absent` is definitive (§7) — before the write rather than out of its error, and
+    the reconcile sweep takes its bucket set from the map instead of from listing `<meta>` buckets,
+    so a projection re-created by an in-flight marker write is inert debris rather than a bucket the
+    sweep pushes at a remote that no longer has one. One consequence stands: **I6 loses its fast
+    detector** on SeaweedFS — a marker write into a vanished `<meta>` projection lands instead of
+    reporting, so the loss is caught by the volume watchdog on its own interval (30 s) rather than at
+    the next marker. Same verdict, later; `a_marker_owed_to_a_live_bucket_whose_projection_vanished_halts`
+    is MinIO-only for that reason and `a_sync_marker_vanishing_mid_run_halts` covers both.
+  - **A delimited LIST keeps reporting a subtree as a `CommonPrefix` after its last key is deleted**
+    (the filer holds real directory entries; upstream deprecated and now ignores the
+    `allowEmptyFolder` flag that once controlled it). hypha forwards the backend's prefixes verbatim
+    and reads none of them, so this costs a client a phantom folder and hypha nothing — the only
+    alternative is a probe LIST per prefix on every delimited page. Accepted and pinned.
+  The same gate needed one ordering change: `DeleteBucket` publishes itself on the state map
+  **before** the emptiness read, so every write path sees the bucket as already gone for the duration
+  of the commit. Without it a write that cleared its readiness check a moment earlier could land in a
+  namespace the gate had judged empty — and, on a backend that creates the bucket a PUT addresses,
+  resurrect the bucket behind the delete.
+- **Two more of the same shape in native multipart**, found once the fixture ran the whole workspace,
+  and closed the same way — by not asking the backend a question it does not answer alike:
+  - **A re-uploaded part number is not replaced.** S3 and MinIO keep one entry per part number;
+    SeaweedFS keeps every upload of one and `ListParts` reports them all, in neither arrival nor any
+    other stable order. Complete built its `part → retag` map straight from that listing, so a
+    `HashMap` collect silently kept whichever duplicate came last — and since `ListParts` and complete
+    could land on different ones, complete refused the client's own part ETag (`InvalidPart`, "part
+    etag mismatch") and a concurrent same-part upload could have folded a trailer onto bytes the
+    composite ETag was not computed over. **Complete now resolves the generation from the client's
+    part ETag**, which is S3's own model: `CompleteMultipartUpload` names parts by the ETags
+    `UploadPart` returned (for hypha, plaintext MD5s), so the requested pmd5 selects the record, the
+    record's `retag` names the ciphertext, and that same `retag` goes to the native complete — one
+    generation, chosen once, by the caller. `ListParts` reports one entry per number (newest
+    `LastModified`, `retag` breaking the tie), so nothing reads a winner out of the listing any more.
+    Sound on both because `CompleteMultipartUpload` honours whichever entry it is handed — pinned in
+    `tests/backend.rs`, including that SeaweedFS completes against a *superseded* generation on
+    request.
+  - **`ListMultipartUploads` is ordered by upload id, not by key** — which is also the cursor
+    SeaweedFS paginates on (`NextUploadIdMarker`, no `NextKeyMarker`; a `key-marker` filters rather
+    than resumes). Pagination is sound: the cursor advances and terminates, so a client echoing the
+    markers back sees every upload once, and §8's debris sweep only collects upload ids into a set.
+    hypha **sorts each page** — S3's order within the 1000-upload default page, the remote's across
+    pages. Draining the whole listing to sort it globally is the only alternative, and an unbounded
+    in-memory gather on a client-triggered path is the worse trade for an administrative op nothing
+    inside hypha reads.
+- **Two data-path bugs the fault suites found, both fixed** (`chaos.rs` found them; each has a
+  deterministic reproduction in `cached.rs` that fails without the fix):
+  - **A multipart complete could be destroyed by the delete it superseded.** Multipart is always
+    durable (§7), so `CompleteMultipartUpload` commits to the remote and settles K *without raising a
+    pending marker* — making it the one write path that does not supersede a marker already standing
+    at K. With a cached DELETE's marker still unswept, the sweep's delete branch went on to HEAD the
+    remote, find the freshly completed composite, and delete it: the client was told the upload
+    committed, and the object was gone. Nothing about faults was required — only a sweep slower than
+    a delete-then-multipart on one key. Fixed by having the delete branch take **K's write lock** and
+    re-check K's cache state under it: absent ⇒ propagate, transit mark ⇒ leave it to the bracket's
+    commit, live body or eviction tombstone ⇒ the delete has been superseded, so clear the marker
+    under its CAS and destroy nothing. The upload branch deliberately keeps *not* taking that lock
+    (§4 — it must not queue conditional writes behind a transfer); a delete is two small round trips
+    and is the only reconcile action that destroys a generation, so the asymmetry is the point.
+  - **A cached commit whose response was lost dropped its obligation silently.** Both cached commits
+    queue their marker *after* the backend call (§7, deliberately — the ack must not depend on the
+    marker), so a cache that acts and then loses its response returns an error from between the two:
+    K is committed and nothing is queued behind it. The client is not lied to, but the remote is left
+    holding an object no delete will ever reach — or missing one no upload ever will — and the run
+    still ended **clean**, so the next run's R2 never looked. Fixed by withdrawing the bucket's
+    accounting on an indeterminate commit, which is the mechanism `markers.rs` already uses for
+    "cannot vouch": no clean marker, and R2 rebuilds the set from both namespaces next run. A
+    `BadDigest` is exempt — the cache validated the body and refused it, so nothing landed.
 - **`hypha-fence` is the load-bearing bespoke piece** — its ordered fence→confirm→drain→promote
   *is* the single-writer guarantee. Spike early on real Cilium: per-endpoint policy-revision
   observability and **established-connection reset on deny** (without which the settle delay must
@@ -2232,10 +2532,13 @@ Each phase's mechanism is specified in §§1–10 above; this section tracks sco
 
 Per-phase exit criteria live with their test suites (§11) rather than restated here; phases 1–4's
 suites are `hypha-format`'s round-trip/bench tests and `hypha/tests/{conformance,fuzz,multipart,
-copy,cached,recovery}.rs` plus the s3s-e2e pass (§11). Phase 5's exit is the scavenge/rehydrate and
-cache-wipe → restore → rehydrate scenarios — still outstanding, with `gc.rs`/`admin.rs` covering only
-the paths that would fail silently; phase 6's is the §11 partition harness; phase 7's
-is both endpoints live behind the shared Gateway.
+copy,cached,recovery,bracket,backend}.rs` plus the s3s-e2e pass (§11). Phase 5's exit — the
+scavenge/rehydrate and cache-wipe → restore → rehydrate scenarios — is met by `evict.rs`, with
+`shadow.rs` covering the orphan mechanism and `gc.rs`/`admin.rs` the paths that fail silently. One
+exposure crosses out of the phases entirely and into §12: the backend's **conditional delete** is
+unenforced on MinIO, so the marker CAS is currently an assumption — that has to be closed against
+SeaweedFS before phase 7 puts either endpoint in front of a client. Phase 6's exit is the §11
+partition harness; phase 7's is both endpoints live behind the shared Gateway.
 
 **Phase 5a's correction generalizes past its own two features.** Both dropped items — a persisted
 prefix-distribution hint, and sharding the namespace restore — existed to make a *listing* faster,

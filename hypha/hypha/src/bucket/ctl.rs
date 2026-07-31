@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
+use super::gate::{WriteGates, WriteGuard};
 use super::{rebuild, restore};
 use crate::gc::orphans;
 use crate::halt::{Invariant, Violation};
@@ -166,6 +167,7 @@ enum BucketMsg {
 pub struct BucketCtl {
     tx: mpsc::UnboundedSender<BucketMsg>,
     states: BucketStates,
+    gates: WriteGates,
 }
 
 impl BucketCtl {
@@ -178,8 +180,8 @@ impl BucketCtl {
         .await
     }
 
-    /// The remote delete is the emptiness gate, so a non-empty bucket surfaces here as the remote's
-    /// own error.
+    /// hypha applies the emptiness gate itself, so a non-empty bucket answers `BucketNotEmpty`
+    /// whatever the backend would have done with the request.
     pub async fn delete(&self, bucket: &str) -> Result<()> {
         self.request(|reply| BucketMsg::Delete {
             bucket: bucket.to_string(),
@@ -207,6 +209,7 @@ impl BucketCtl {
     /// Publishing `Restoring` is both the readiness answer for the window and the record that the
     /// bucket exists at all.
     pub(crate) fn restore(&self, bucket: &str) {
+        self.gates.install(bucket);
         update(&self.states, bucket, set_restoring);
         self.owe(bucket, Recovery::Restore);
     }
@@ -233,11 +236,25 @@ impl BucketCtl {
         self.state(bucket).readiness
     }
 
+    /// Admit a write into `bucket`, or refuse because a `DeleteBucket` has closed its gate
+    /// ([`WriteGates`]). Every producer into a bucket's namespaces goes through here — not just
+    /// client ops: a reconcile upload that landed after the drain would resurrect the bucket exactly
+    /// as a late `PutObject` would.
+    ///
+    /// The guard is the write's whole claim on the bucket's existence, so it must be held until the
+    /// write has committed and raised whatever it owes. `readiness` is still checked afterwards and
+    /// still decides `NoSuchBucket` for a bucket that was never there — the gate only answers for
+    /// one that is going away underneath.
+    pub fn enter_write(&self, bucket: &str) -> Option<WriteGuard> {
+        self.gates.enter(bucket)
+    }
+
     fn state(&self, bucket: &str) -> BucketState {
         self.states.load().get(bucket).copied().unwrap_or_default()
     }
 
     pub fn mark_ready(&self, bucket: &str) {
+        self.gates.install(bucket);
         update(&self.states, bucket, mark_ready);
     }
 
@@ -388,12 +405,14 @@ async fn take_marker(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
 pub fn spawn(tier: Tiering, shutdown: CancellationToken) -> (BucketCtl, JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let states: BucketStates = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+    let gates = WriteGates::default();
     let actor = BucketActor {
         rx,
         tx: tx.clone(),
         shutdown,
         tier,
         states: states.clone(),
+        gates: gates.clone(),
         sem: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         queued: HashMap::new(),
         batches: JoinSet::new(),
@@ -402,7 +421,7 @@ pub fn spawn(tier: Tiering, shutdown: CancellationToken) -> (BucketCtl, JoinHand
         provisioning: HashMap::new(),
     };
     let task = tokio::spawn(actor.run());
-    (BucketCtl { tx, states }, task)
+    (BucketCtl { tx, states, gates }, task)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -451,6 +470,7 @@ struct Provisioning {
 
 struct BucketActor {
     rx: mpsc::UnboundedReceiver<BucketMsg>,
+    gates: WriteGates,
     /// Handed to each task so a recovery that could not run can re-queue itself.
     tx: mpsc::UnboundedSender<BucketMsg>,
     shutdown: CancellationToken,
@@ -541,12 +561,8 @@ impl BucketActor {
     /// idempotently, and only for a bucket the readiness probe already saw on the remote. Bucket
     /// *lifecycle* (whether a bucket should exist at all) stays the tasks' alone.
     fn provision(&mut self, bucket: String, reply: oneshot::Sender<Result<()>>) {
-        if self
-            .states
-            .load()
-            .get(&bucket)
-            .is_some_and(|s| s.provisioned)
-        {
+        let state = self.states.load().get(&bucket).copied().unwrap_or_default();
+        if state.provisioned {
             let _ = reply.send(Ok(()));
             return;
         }
@@ -646,6 +662,7 @@ impl BucketActor {
             let task = BucketTask {
                 tier: self.tier.clone(),
                 states: self.states.clone(),
+                gates: self.gates.clone(),
                 sem: self.sem.clone(),
                 requeue: self.tx.clone(),
             };
@@ -658,6 +675,7 @@ impl BucketActor {
 struct BucketTask {
     tier: Tiering,
     states: BucketStates,
+    gates: WriteGates,
     sem: Arc<Semaphore>,
     requeue: mpsc::UnboundedSender<BucketMsg>,
 }
@@ -714,6 +732,9 @@ impl BucketTask {
                 self.reset_cache(bucket).await?;
                 self.write_sync_marker(bucket).await?;
                 self.tier.remote.create_bucket(bucket).await?;
+                // The gate is published with the phase, and before it: a bucket that is `Ready` with
+                // no gate would refuse every write.
+                self.gates.install(bucket);
                 update(&self.states, bucket, mark_ready);
                 // A bucket this run created starts empty, so every write it can ever hold went
                 // through the marker queue — which the drain proves empty before writing any clean
@@ -731,18 +752,89 @@ impl BucketTask {
         self.states.load().get(bucket).copied().unwrap_or_default()
     }
 
-    /// The remote delete is the commit and the emptiness gate; cache is drained best-effort after —
-    /// a leftover projection is a cache-without-remote orphan a later restore/GC drops.
+    /// Existence and emptiness are both decided **here**, not borrowed from the backend's answer to
+    /// `DeleteBucket`:
+    ///
+    /// - *Existence* from the state map, whose `Absent` is definitive ([`super`]) — a backend that
+    ///   re-creates the bucket a request addresses cannot report it either way.
+    /// - *Emptiness* from the client namespace hypha itself serves ([`Self::namespace_empty`]).
+    ///   SeaweedFS ships `allowDeleteBucketNotEmpty` on, so delegating the gate would turn a
+    ///   client's `DeleteBucket` into a recursive delete of everything the bucket held.
+    ///
+    /// The remote delete is still the commit; the cache is drained best-effort after — a leftover
+    /// projection is a cache-without-remote orphan a later restore/GC drops. The remote is drained
+    /// alongside it because "empty" is a claim about the *client* namespace: a cached-mode bucket
+    /// whose deletes have not propagated yet is client-empty with remote objects still standing, and
+    /// they are exactly as stale as the bucket now is.
     async fn delete(&self, bucket: &str) -> Result<()> {
-        self.tier.remote.delete_bucket(bucket).await?;
-        // The commit already landed, so everything this process believed about the bucket is stale
-        // no matter how the drain fares — retire it before, not after, or a failed drain would leave
-        // reads trusting a dead bucket (and a stale `Restoring` would keep serving from a remote
-        // bucket that is gone instead of answering `NoSuchBucket`).
+        if self.state(bucket).readiness == Readiness::Absent {
+            return Err(Error::NoSuchBucket);
+        }
+        // Steps 1 and 3 of the gate protocol, with the listing between them ([`gate`]). Both
+        // refusals leave the bucket exactly as they found it — a delete that will not commit must
+        // not cost a concurrent write so much as a spurious error.
+        let Some(quiescent) = self.gates.quiescent(bucket) else {
+            return Err(Error::OperationAborted);
+        };
+        if !self.namespace_empty(bucket).await? {
+            return Err(Error::BucketNotEmpty);
+        }
+        let Some(closed) = quiescent.close() else {
+            return Err(Error::OperationAborted);
+        };
+
+        // Past the point of no return: nothing was in flight when the listing ran, nothing was
+        // admitted while it ran, and nothing can be admitted now, so the namespace it reported is
+        // still the namespace being deleted.
+        drain_and_delete_if_exists(&self.tier.remote, bucket).await?;
+        // Only now is the gate's closure permanent — a write addressed to a deleted bucket should be
+        // refused. Dropping it uncommitted above (a failed remote drain, or a panic) reopens instead,
+        // rather than leaving a live bucket that refuses every write for the rest of the run.
+        closed.commit();
+
+        // The commit landed, so everything this process believed about the bucket is stale no matter
+        // how the cache drain fares. The gate goes with the phase — an absent gate refuses, so
+        // dropping it is what a deleted bucket should leave behind.
         retire(&self.states, bucket);
+        self.gates.retire(bucket);
         drain_and_delete_if_exists(&self.tier.data, bucket).await?;
         drain_and_delete_if_exists(&self.tier.meta, bucket).await?;
         Ok(())
+    }
+
+    /// Whether the bucket holds any client-visible object, read from the same source a LIST of it
+    /// would use (§7): the cache namespace once the bucket is `Ready`, the remote while it is
+    /// `Restoring`. Reserved keys are hypha's own and no client can see them, so they do not hold a
+    /// bucket open — which is why the remote arm pages rather than trusting one entry.
+    async fn namespace_empty(&self, bucket: &str) -> Result<bool> {
+        if self.state(bucket).readiness == Readiness::Ready {
+            let page = self
+                .tier
+                .data
+                .list(bucket, None, None, None, None, Some(1))
+                .await?;
+            return Ok(page.contents.unwrap_or_default().is_empty());
+        }
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .tier
+                .remote
+                .list(bucket, None, None, token, None, None)
+                .await?;
+            let mut keys = page
+                .contents
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|o| o.key);
+            if keys.any(|k| !meta::is_reserved_remote_key(&k)) {
+                return Ok(false);
+            }
+            token = page.next_continuation_token;
+            if page.is_truncated != Some(true) || token.is_none() {
+                return Ok(true);
+            }
+        }
     }
 
     /// Run `pass`, re-queueing it on the actor's own channel if it could not run.

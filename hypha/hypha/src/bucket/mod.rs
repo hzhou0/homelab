@@ -44,8 +44,10 @@
 //! one recovery slot per bucket and one task draining it, so even a retry cannot put two in flight.
 
 mod ctl;
+mod gate;
 mod rebuild;
 mod restore;
 
 pub(crate) use ctl::resolve_all;
 pub use ctl::{spawn, BucketCtl, Readiness};
+pub use gate::WriteGuard;

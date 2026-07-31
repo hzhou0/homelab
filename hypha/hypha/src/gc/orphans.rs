@@ -43,7 +43,7 @@ use tokio::task::JoinSet;
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
-use crate::bucket::BucketCtl;
+use crate::bucket::{BucketCtl, Readiness};
 use crate::tier::{quote, Tiering};
 
 const DRAIN_BATCH: usize = 256;
@@ -215,6 +215,12 @@ impl OrphanActor {
                 .push(superseded);
         }
         for (bucket, batch) in by_bucket {
+            // The state map, not the backend, decides a bucket is gone — the same rule
+            // [`crate::markers`] follows, and here it also spares a listing that can only 404.
+            if self.queue.buckets.readiness(&bucket) == Readiness::Absent {
+                tracing::info!(bucket, "shadow obligations dropped; the bucket was deleted");
+                continue;
+            }
             let shadows = match list_shadows(&self.queue.tier, &bucket, RANGE_PAGES).await {
                 Ok(shadows) => shadows,
                 // The bucket is gone, so its whole `<meta>` projection went with it (§7) and there is

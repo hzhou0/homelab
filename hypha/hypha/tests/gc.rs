@@ -46,19 +46,11 @@ async fn gc_keys(h: &Harness, prefix: &str) -> Vec<String> {
     keys_in(h, h.gc_bucket(), prefix).await
 }
 
+/// Via [`raw_list`], which asks for `encoding-type=url` and decodes: every key read here carries the
+/// `0x01` control byte, which XML cannot represent, and a backend that emits it raw hands back a key
+/// whose separator has become U+FFFD — matching nothing, and silently, since the two print alike.
 async fn keys_in(h: &Harness, bucket: String, prefix: &str) -> Vec<String> {
-    h.raw()
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .send()
-        .await
-        .expect("list")
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|o| o.key)
-        .collect()
+    raw_list(&h.raw(), &bucket, Some(prefix)).await
 }
 
 /// The ring's whole persistence path, end to end: the touch feed, the fill-driven rotation, and the

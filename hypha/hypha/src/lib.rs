@@ -171,6 +171,7 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), Bo
     let replication = (config.mode == Mode::Cached).then(|| {
         let replication = replication::ReplicationTask::new(
             app.tier.clone(),
+            app.buckets.clone(),
             Duration::from_millis(config.reconcile.interval_ms),
             config.reconcile.concurrency,
         );

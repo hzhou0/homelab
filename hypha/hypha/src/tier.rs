@@ -426,15 +426,50 @@ impl Tiering {
         Ok(UploadOutcome::Uploaded)
     }
 
-    /// **DELETE branch** of the reconcile sweep (§7), under K's upload lock. Confirm the listed
-    /// marker is still current, then bind the delete to the remote generation returned by HEAD.
-    /// Either CAS moving leaves the marker for the operation that superseded this one.
+    /// **DELETE branch** of the reconcile sweep (§7). Confirm the listed marker is still current and
+    /// that K is still absent, then bind the delete to the remote generation returned by HEAD. Any of
+    /// those CASes moving leaves the marker for the operation that superseded this one.
+    ///
+    /// **This branch takes K's write lock**, unlike the upload branch beside it. The reason the
+    /// upload branch does not is a transfer it must not queue conditional writes behind (§4); a
+    /// delete is two small round trips, so it pays nothing for the lock — and it needs it, because it
+    /// is the only reconcile action that *destroys* a generation. The upload branch racing a newer
+    /// write is self-correcting (the newer write's own marker is still standing, so it is uploaded
+    /// next pass); a delete racing one is not.
+    ///
+    /// And racing one is possible without any of the usual interleaving: **multipart is always
+    /// durable** (§7), so a `CompleteMultipartUpload` commits to the remote and settles K *without
+    /// raising a marker of its own*. It is therefore the one write path that does not supersede a
+    /// marker already standing at K — a cached DELETE's marker, still in flight, would otherwise be
+    /// discharged against the composite the client was just told was committed. Hence the K check
+    /// under the lock: a marker whose key exists again is superseded, whatever wrote it.
     pub(crate) async fn propagate_delete_locked(
         &self,
         bucket: &str,
         key: &str,
         m_etag: &str,
     ) -> Result<()> {
+        let _guard = self.locks.lock(key).await;
+        match self.data.head(bucket, key).await {
+            // The genuine case: K is absent, so this marker is the record of the delete that made it
+            // so, and the remote still has to be told.
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+            Ok(head) => {
+                let md = head.metadata.clone().unwrap_or_default();
+                return match meta::tomb_kind(&md) {
+                    // A bracket owns K and will settle it; whatever it commits decides the remote's
+                    // contents, so this obligation is neither dischargeable nor stranded yet. Same
+                    // reasoning as the upload branch's transit arm.
+                    Some(meta::TombKind::Transit) => Ok(()),
+                    // A live body or an eviction tombstone: K exists again, so the delete this marker
+                    // records has been superseded by whatever wrote it. Clearing under the CAS is
+                    // what makes that safe — a write that raised its own marker moved the ETag, so
+                    // only the markerless case (a multipart complete) is cleared here.
+                    _ => self.clear_marker_cas(bucket, key, m_etag).await,
+                };
+            }
+        }
         let current_marker = match self.meta.head(bucket, meta::pending_marker_key(key)).await {
             Ok(head) => head
                 .e_tag()

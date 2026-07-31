@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
+use hypha_core::backend::RemotePart;
 use hypha_core::error::Error;
 use hypha_core::meta;
 use hypha_format::offset::{ciphertext_len, plaintext_len_from, HLEN};
@@ -57,7 +58,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.check_bucket(&bucket).await?;
+        let _gate = self.check_bucket(&bucket).await?;
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
 
         let created = self
@@ -104,7 +105,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.check_bucket(&bucket).await?;
+        let _gate = self.check_bucket(&bucket).await?;
         let part_number = input.part_number;
         if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
             return Err(s3_error!(
@@ -312,7 +313,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.check_bucket(&bucket).await?;
+        let _gate = self.check_bucket(&bucket).await?;
 
         let part_number = input.part_number;
         if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
@@ -433,7 +434,7 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.prepare_write(&bucket, &key).await?;
+        let (_gate, _) = self.prepare_write(&bucket, &key).await?;
         let upload_id = input.upload_id.clone();
 
         let requested = input
@@ -474,21 +475,33 @@ impl Hypha {
         // 1. Recover per-part facts and geometry, then compose the client ETag, total plaintext
         //    length, and offset table. Two reads, no per-part HEAD (§6/§7):
         //    · one LIST of the upload's records → `(part, retag) → pmd5` (facts live in the keys);
-        //    · one `ListParts` of the remote upload → the winning `(part → retag, size)`, with
-        //      last-write-wins on re-uploaded parts already resolved by the remote.
-        //    Matching a winner's `retag` to its record yields the surviving upload's `pmd5`; stale
-        //    re-upload records simply never match and are swept at settle.
+        //    · one `ListParts` of the remote upload → each live `(part, retag)`'s ciphertext size.
+        //
+        //    **The client's own part ETag selects the generation**, which is S3's model rather than
+        //    hypha's convenience: `CompleteMultipartUpload` names the parts by the ETags `UploadPart`
+        //    returned, and for hypha those are plaintext MD5s. So the requested `pmd5` resolves to
+        //    the record that issued it, that record's `retag` names the ciphertext on the remote, and
+        //    the native complete is handed that same `retag` — one generation chosen once, by the
+        //    caller, and carried through. Nothing here asks the backend which upload of a part number
+        //    won: SeaweedFS keeps them all and lists them all (§12), so a `part → retag` map built
+        //    from that listing would silently keep whichever entry came last in it. Stale records
+        //    simply resolve nothing and are swept at settle.
         let pmd5_by_part = self.load_part_pmd5s(&bucket, &upload_id).await?;
-        let winners: HashMap<i32, (String, u64)> = self
+        let retag_by_etag: HashMap<(i32, String), String> = pmd5_by_part
+            .iter()
+            .map(|((n, retag), (pmd5, _))| ((*n, pmd5.clone()), retag.clone()))
+            .collect();
+        let live: HashMap<(i32, String), u64> = self
             .remote()
             .list_parts(&bucket, &key, &upload_id)
             .await?
             .into_iter()
-            .map(|(n, retag, size)| (n, (retag, size)))
+            .map(|p| ((p.number, p.etag), p.size))
             .collect();
 
         let mut pmd5s = Vec::with_capacity(requested.len());
         let mut remote_parts = Vec::with_capacity(requested.len());
+        let mut resolved = Vec::with_capacity(requested.len());
         let mut total_plen: u64 = 0;
         // Parts table (§6): cumulative ciphertext end-offset after each part, taken from the
         // remote's own part sizes — the exact bytes the native complete will concatenate.
@@ -498,28 +511,28 @@ impl Hypha {
             let n = cp
                 .part_number
                 .ok_or_else(|| s3_error!(InvalidPart, "part entry missing part number"))?;
-            let (retag, size) = winners
-                .get(&n)
-                .ok_or_else(|| s3_error!(InvalidPart, "no such uploaded part"))?;
-            let (pmd5, _) = pmd5_by_part
-                .get(&(n, retag.clone()))
-                .cloned()
-                .ok_or_else(|| Error::Backend(format!("no local pmd5 for winning part {n}")))?;
-            // S3 verifies the caller's part ETags against what the uploads returned — for hypha
-            // those are the plaintext part MD5s.
-            let e = cp
+            let pmd5 = cp
                 .e_tag
                 .as_ref()
-                .ok_or_else(|| s3_error!(InvalidPart, "part entry missing etag"))?;
-            if e.value().trim_matches('"') != pmd5 {
-                return Err(s3_error!(InvalidPart, "part etag mismatch"));
-            }
-            let plen = plaintext_len_from(*size, HLEN).ok_or_else(|| {
+                .ok_or_else(|| s3_error!(InvalidPart, "part entry missing etag"))?
+                .value()
+                .trim_matches('"')
+                .to_string();
+            // An ETag naming no upload of this part number is the same client error as naming a part
+            // that was never uploaded — S3 answers `InvalidPart` to both.
+            let retag = retag_by_etag
+                .get(&(n, pmd5.clone()))
+                .ok_or_else(|| s3_error!(InvalidPart, "part etag mismatch"))?;
+            let size = *live
+                .get(&(n, retag.clone()))
+                .ok_or_else(|| s3_error!(InvalidPart, "no such uploaded part"))?;
+            let plen = plaintext_len_from(size, HLEN).ok_or_else(|| {
                 Error::Backend(format!("part {n} size {size} inconsistent with HLEN"))
             })?;
             total_plen += plen;
-            ct_acc += *size;
+            ct_acc += size;
             table.push(ct_acc);
+            resolved.push((n, retag.clone(), size));
             pmd5s.push(pmd5);
             remote_parts.push(
                 aws_sdk_s3::types::CompletedPart::builder()
@@ -555,14 +568,14 @@ impl Hypha {
         // ciphertext had to be retained, which is what makes the fold possible at all: an
         // in-progress part cannot be read back. K is byte-identical either way (same
         // concatenation), so reads are unaffected (§7).
-        let last_n = requested.last().and_then(|p| p.part_number).unwrap_or(0);
-        let (last_retag, last_size) = winners
-            .get(&last_n)
+        let (last_n, last_retag, last_size) = resolved
+            .last()
             .cloned()
-            .unwrap_or_else(|| (String::new(), 0));
+            .expect("requested is non-empty, so resolved is too");
         if meta::admits_no_successor(last_n, last_size, MIN_REMOTE_PART) {
-            // The winning generation's own retained copy: its record carries the nonce naming it,
-            // so a re-uploaded part folds exactly what `ListParts` picked (§6).
+            // The generation the caller named, not whichever the listing offered: its record carries
+            // the nonce naming the ciphertext retained for it, so the fold re-uploads exactly the
+            // bytes the composite ETag was just computed over (§6).
             let (_, nonce) = pmd5_by_part
                 .get(&(last_n, last_retag.clone()))
                 .cloned()
@@ -671,7 +684,7 @@ impl Hypha {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         let input = req.input;
-        self.check_bucket(&input.bucket).await?;
+        let _gate = self.check_bucket(&input.bucket).await?;
         match self
             .remote()
             .abort_multipart(&input.bucket, &input.key, &input.upload_id)
@@ -707,7 +720,7 @@ impl Hypha {
             )
             .await?;
 
-        let uploads = raw
+        let mut uploads: Vec<MultipartUpload> = raw
             .uploads
             .unwrap_or_default()
             .into_iter()
@@ -721,6 +734,14 @@ impl Hypha {
                 ..Default::default()
             })
             .collect();
+        // S3 orders uploads by key then upload id; SeaweedFS orders them by upload id alone (§12),
+        // which is also the cursor it paginates on. Sorting the page is therefore all hypha can do
+        // without draining the whole listing into memory on a client-triggered path: within a page —
+        // 1000 uploads by default, so every bucket that has not accumulated abandoned ones — the
+        // order is S3's, while across pages it stays the remote's. Nothing inside hypha reads this
+        // op (the debris sweep collects upload ids into a set, §8), and the remote's cursor is
+        // forwarded untouched, so a paginating client still sees every upload exactly once.
+        uploads.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
 
         let resp = ListMultipartUploadsOutput {
             bucket: Some(input.bucket),
@@ -745,11 +766,19 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// **ListParts** (§7): the remote's `ListParts` is authoritative for the winning part set and
-    /// its ciphertext sizes; each winner's `retag` matches the mpu record holding that part's
-    /// plaintext MD5 — the ETag the client saw at upload, and the one datum the remote cannot
-    /// reproduce. Sizes convert back to plaintext through the closed form over the constant `HLEN`,
-    /// and the reserved trailer part (above every client part) is filtered out.
+    /// **ListParts** (§7): the remote's `ListParts` supplies the live part set and its ciphertext
+    /// sizes; each entry's `retag` matches the mpu record holding that part's plaintext MD5 — the
+    /// ETag the client saw at upload, and the one datum the remote cannot reproduce. Sizes convert
+    /// back to plaintext through the closed form over the constant `HLEN`, and the reserved trailer
+    /// part (above every client part) is filtered out.
+    ///
+    /// **One entry per part number, chosen here.** S3 replaces a re-uploaded part; SeaweedFS keeps
+    /// every upload of one and lists them all (§12), and reporting duplicates would hand a client a
+    /// part list no `CompleteMultipartUpload` request can be built from. The newest `LastModified`
+    /// wins, with the `retag` breaking a tie — second granularity cannot order two uploads racing
+    /// inside one second, and for those "which won" is the caller's own race to lose. What the tie
+    /// break buys is that hypha answers the *same* one every time, so the ETag a client reads back
+    /// here is one `op_complete` will still resolve.
     pub(super) async fn op_list_parts(
         &self,
         req: S3Request<ListPartsInput>,
@@ -761,28 +790,41 @@ impl Hypha {
         self.require_upload(&bucket, &input.upload_id).await?;
 
         let pmd5_by_part = self.load_part_pmd5s(&bucket, &input.upload_id).await?;
-        let mut parts: Vec<Part> = Vec::new();
-        for (n, retag, size) in self
+        let mut current: HashMap<i32, RemotePart> = HashMap::new();
+        for p in self
             .remote()
             .list_parts(&bucket, &key, &input.upload_id)
             .await?
         {
             // The trailer's own part, when it has one, sits above every client part.
-            if n > meta::MAX_CLIENT_PART {
+            if p.number > meta::MAX_CLIENT_PART {
                 continue;
             }
-            // A winning part with no record lost its cache state; its plaintext ETag is gone and
-            // cannot be re-derived from ciphertext, so there is nothing truthful to report for it.
-            let Some((pmd5, _)) = pmd5_by_part.get(&(n, retag)) else {
+            // A part with no record lost its cache state; its plaintext ETag is gone and cannot be
+            // re-derived from ciphertext, so there is nothing truthful to report for it.
+            if !pmd5_by_part.contains_key(&(p.number, p.etag.clone())) {
                 continue;
-            };
-            parts.push(Part {
-                part_number: Some(n),
-                e_tag: Some(ETag::Strong(pmd5.clone())),
-                size: plaintext_len_from(size, HLEN).map(|p| p as i64),
-                ..Default::default()
-            });
+            }
+            match current.get(&p.number) {
+                Some(held)
+                    if (held.last_modified_ms, &held.etag) >= (p.last_modified_ms, &p.etag) => {}
+                _ => {
+                    current.insert(p.number, p);
+                }
+            }
         }
+        let mut parts: Vec<Part> = current
+            .into_values()
+            .map(|p| {
+                let (pmd5, _) = &pmd5_by_part[&(p.number, p.etag.clone())];
+                Part {
+                    part_number: Some(p.number),
+                    e_tag: Some(ETag::Strong(pmd5.clone())),
+                    size: plaintext_len_from(p.size, HLEN).map(|n| n as i64),
+                    ..Default::default()
+                }
+            })
+            .collect();
         parts.sort_by_key(|p| p.part_number);
 
         // Parts cap at 10000, so the winning set is already in hand and small — paginate over it

@@ -30,20 +30,23 @@ use tokio_util::sync::CancellationToken;
 use hypha_core::error::Result;
 use hypha_core::meta;
 
+use crate::bucket::BucketCtl;
 use crate::tier::{Tiering, UploadOutcome};
 
 const MARKER_PAGE: i32 = 1000;
 
 pub struct ReplicationTask {
     tier: Tiering,
+    buckets: BucketCtl,
     interval: Duration,
     concurrency: usize,
 }
 
 impl ReplicationTask {
-    pub fn new(tier: Tiering, interval: Duration, concurrency: usize) -> Self {
+    pub fn new(tier: Tiering, buckets: BucketCtl, interval: Duration, concurrency: usize) -> Self {
         Self {
             tier,
+            buckets,
             interval,
             concurrency: concurrency.max(1),
         }
@@ -63,22 +66,22 @@ impl ReplicationTask {
                 () = tokio::time::sleep(self.interval) => {}
             }
             let started = std::time::Instant::now();
-            match self.pass().await {
-                // The pending count is the pass's own census — the markers it enumerated — so it is
-                // the size of the set *before* this pass drained it (§10).
-                Ok(pending) => crate::metrics::reconcile_pass(pending, started.elapsed()),
-                Err(e) => {
-                    tracing::warn!(error = %e, "reconcile pass could not enumerate buckets; retrying")
-                }
-            }
+            // The pending count is the pass's own census — the markers it enumerated — so it is the
+            // size of the set *before* this pass drained it (§10).
+            crate::metrics::reconcile_pass(self.pass().await, started.elapsed());
         }
     }
 
-    /// One sweep across every cache-backed bucket. The `<meta>` bucket exists if hypha provisioned
-    /// the bucket, so listing those names is the bucket set to reconcile.
-    async fn pass(&self) -> Result<usize> {
+    /// One sweep across every bucket this process serves from its cache. The set comes from the
+    /// state map, not from listing `<meta>` buckets: a projection can outlive the bucket it belonged
+    /// to — a marker write already in flight when a `DeleteBucket` drains it re-creates it on a
+    /// backend that creates the bucket a PUT addresses — and reconciling that debris would push its
+    /// markers at a remote bucket that no longer exists. A bucket the map does not call `Ready` has
+    /// no pending set to drain: markers are raised only by cached writes into a ready bucket, and a
+    /// restore rebuilds its namespace with the set empty (§7).
+    async fn pass(&self) -> usize {
         let mut pending = 0;
-        for (bucket, _) in self.tier.meta.list_buckets().await? {
+        for bucket in self.buckets.ready() {
             match self.reconcile_bucket(&bucket).await {
                 Ok(seen) => pending += seen,
                 Err(e) => {
@@ -86,7 +89,7 @@ impl ReplicationTask {
                 }
             }
         }
-        Ok(pending)
+        pending
     }
 
     /// Drain one bucket's pending markers. The flat LIST past the `0x01` block yields only range-C
@@ -151,7 +154,16 @@ impl ReplicationTask {
     /// re-uploads in turn, so the newest generation's upload starts only once the whole redundant
     /// queue drains, and a key written faster than it uploads never converges — an unbounded loss
     /// window. Unlike a rehydrate, an upload holds no write lock, so a client write can't cancel it.
+    ///
+    /// The bucket's write gate is held for the key, not for the pass: the sweep is a producer into
+    /// the bucket's namespaces exactly as a client PUT is, so a `DeleteBucket` must be able to wait
+    /// it out — but holding the gate across a whole bucket's markers would stall the delete behind
+    /// an arbitrarily long drain. A key refused here belongs to a bucket already going away, whose
+    /// `<meta>` (and this marker with it) the delete is about to drain.
     async fn reconcile_key(&self, bucket: &str, key: &str, m_etag: &str) -> Result<()> {
+        let Some(_gate) = self.buckets.enter_write(bucket) else {
+            return Ok(());
+        };
         let Some(_up) = self.tier.upload_locks.try_lock(key) else {
             return Ok(());
         };

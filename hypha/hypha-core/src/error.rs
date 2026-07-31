@@ -14,6 +14,17 @@ pub enum Error {
     NotFound,
     #[error("no such bucket")]
     NoSuchBucket,
+    /// A `DeleteBucket` whose client namespace still holds objects. hypha decides this itself rather
+    /// than delegating to the backend's refusal — SeaweedFS deletes a non-empty bucket and its
+    /// contents outright (`allowDeleteBucketNotEmpty` defaults on), so a delegated gate is no gate.
+    #[error("bucket not empty")]
+    BucketNotEmpty,
+    /// A `DeleteBucket` that raced a write into the same bucket. Retryable, and deliberately not
+    /// resolved by waiting: blocking the delete would make its client pay for the write, and
+    /// refusing the *write* instead would answer `NoSuchBucket` for a bucket that is about to keep
+    /// existing (§7).
+    #[error("a conflicting write is in progress")]
+    OperationAborted,
     /// An `If-Match` / `If-None-Match` precondition did not hold.
     #[error("precondition failed")]
     PreconditionFailed,
@@ -49,6 +60,7 @@ impl Error {
                 Error::NotFound
             }
             Some("NoSuchBucket") => Error::NoSuchBucket,
+            Some("BucketNotEmpty") => Error::BucketNotEmpty,
             Some("PreconditionFailed") | Some("412") => Error::PreconditionFailed,
             Some("BadDigest") | Some("InvalidDigest") => Error::BadDigest,
             _ => Error::Backend(format!("{err:?}")),
@@ -61,6 +73,8 @@ impl From<Error> for S3Error {
         let code = match &e {
             Error::NotFound => S3ErrorCode::NoSuchKey,
             Error::NoSuchBucket => S3ErrorCode::NoSuchBucket,
+            Error::BucketNotEmpty => S3ErrorCode::BucketNotEmpty,
+            Error::OperationAborted => S3ErrorCode::OperationAborted,
             Error::PreconditionFailed => S3ErrorCode::PreconditionFailed,
             Error::BadDigest => S3ErrorCode::BadDigest,
             Error::Invalid(_) => S3ErrorCode::InvalidRequest,

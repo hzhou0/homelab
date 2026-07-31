@@ -3,7 +3,8 @@
 //! reconcile upload, cached delete propagation (remove-then-propagate), conditional-write
 //! linearization on the cache, `Content-MD5` validation, the marker scan staying `O(pending)`
 //! (evicted keys untouched), and rehydrate on a tombstoned read — single-part back into K and a
-//! composite into the shadow body.
+//! composite into the shadow body. Faulted paths cover failed marker writes, reconcile generation
+//! races, conditional remote deletes, and the marker/clean-seal ordering during shutdown.
 
 mod common;
 
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::*;
+use hypha_core::config::Mode;
 use hypha_core::meta;
 
 const B: &str = "cached";
@@ -91,7 +93,14 @@ async fn cached_put_serves_from_cache_and_reconciles() {
 
     // Served from the live cache body before any reconcile could run.
     assert_eq!(get_all(&c, B, "obj").await, body);
-    assert!(marker_present(&h, B, "obj").await, "marker written on ack");
+    // Waited for rather than asserted outright: the marker is handed to the queue *after* the commit
+    // (§7), precisely so a marker failure cannot turn an acked write into an error, so its presence
+    // is never synchronous with the ack. On a fast backend it lands within the same millisecond,
+    // which is what made an immediate assertion look sound.
+    wait_until(5_000, "the queue to land the write's marker", || async {
+        marker_present(&h, B, "obj").await
+    })
+    .await;
     assert!(
         data_class(&h, B, "obj").await.is_none(),
         "cache holds a live body"
@@ -111,6 +120,194 @@ async fn cached_put_serves_from_cache_and_reconciles() {
         body,
         "still readable post-reconcile"
     );
+}
+
+/// A marker backend failure cannot turn an already-committed cached PUT into a client error. The
+/// marker actor retains the obligation and retries it until the remote catches up.
+#[tokio::test]
+async fn failed_marker_write_is_retried_after_the_put_ack() {
+    let h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let key = "marker-fault";
+    let body = pattern(32_000);
+    let failed = h.cache_faults().fail_times(
+        hyper::Method::PUT,
+        format!("/{}/{key}", h.meta_bucket(B)),
+        hyper::StatusCode::FORBIDDEN,
+        8,
+    );
+
+    let etag = put(&h.client(), B, key, &body).await;
+    assert_eq!(etag, md5_hex(&body), "the committed PUT must be acked");
+    let intercepted = tokio::time::timeout(Duration::from_secs(5), failed)
+        .await
+        .expect("marker write was never attempted")
+        .expect("fault proxy stopped before failing the marker");
+    assert_eq!(intercepted.method, hyper::Method::PUT);
+    assert_eq!(
+        get_all(&h.client(), B, key).await,
+        body,
+        "the failed marker write must not roll back the cache commit"
+    );
+
+    wait_until(6_000, "marker retry to make the PUT durable", || async {
+        remote_present(&h, B, key).await && !marker_present(&h, B, key).await
+    })
+    .await;
+}
+
+/// A reconcile already carrying one generation may finish after a newer cached PUT. Its marker
+/// clear must lose the CAS, leaving the newer generation enumerable for the next pass.
+#[tokio::test]
+async fn overwrite_during_reconcile_preserves_the_newer_marker() {
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let key = "overwrite-during-reconcile";
+    let v1 = pattern_seeded(48_000, 1);
+    let v2 = pattern_seeded(48_000, 2);
+    let path = format!("/{}/{key}", h.remote_bucket(B));
+    let faults = h.remote_faults();
+
+    let mut first_upload = faults.pause_next(hyper::Method::PUT, &path);
+    put(&h.client(), B, key, &v1).await;
+    tokio::time::timeout(Duration::from_secs(5), first_upload.reached())
+        .await
+        .expect("the first reconcile upload was never attempted");
+    let old_marker_etag = h
+        .raw()
+        .head_object()
+        .bucket(h.meta_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("head first marker")
+        .e_tag()
+        .expect("first marker ETag")
+        .to_string();
+
+    put(&h.client(), B, key, &v2).await;
+    let new_marker_etag = h
+        .raw()
+        .head_object()
+        .bucket(h.meta_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("head replacement marker")
+        .e_tag()
+        .expect("replacement marker ETag")
+        .to_string();
+    assert_ne!(
+        old_marker_etag, new_marker_etag,
+        "the overwrite must replace the operation marker"
+    );
+
+    let mut old_clear = h.cache_faults().pause_next_then_fail(
+        hyper::Method::DELETE,
+        format!("/{}/{key}", h.meta_bucket(B)),
+        hyper::StatusCode::PRECONDITION_FAILED,
+    );
+    let mut second_upload = faults.pause_next(hyper::Method::PUT, &path);
+    first_upload.release();
+    let clear = tokio::time::timeout(Duration::from_secs(5), old_clear.reached())
+        .await
+        .expect("the first generation never attempted to clear its marker");
+    assert_eq!(
+        clear
+            .headers
+            .get(hyper::header::IF_MATCH)
+            .and_then(|v| v.to_str().ok()),
+        Some(old_marker_etag.as_str()),
+        "the first upload must clear only the marker generation it observed"
+    );
+    old_clear.release();
+    tokio::time::timeout(Duration::from_secs(5), second_upload.reached())
+        .await
+        .expect("the replacement generation was never reconciled");
+    assert!(
+        marker_present(&h, B, key).await,
+        "finishing the old upload must not clear the replacement marker"
+    );
+    let standing_marker_etag = h
+        .raw()
+        .head_object()
+        .bucket(h.meta_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("head standing replacement marker")
+        .e_tag()
+        .expect("standing marker ETag")
+        .to_string();
+    assert_eq!(standing_marker_etag, new_marker_etag);
+    second_upload.release();
+
+    wait_until(
+        6_000,
+        "replacement generation to settle remotely",
+        || async { remote_present(&h, B, key).await && !marker_present(&h, B, key).await },
+    )
+    .await;
+
+    h.stop_hypha().await;
+    drop_backend_bucket(&h, &h.cache_bucket(B)).await;
+    drop_backend_bucket(&h, &h.meta_bucket(B)).await;
+    h.start_hypha().await;
+    assert_eq!(
+        get_all(&h.client(), B, key).await,
+        v2,
+        "the remote must end on the replacement generation"
+    );
+}
+
+/// Emptiness is a claim about the **client** namespace, so a cached bucket whose deletes have not
+/// reached the remote yet still deletes: the cache is what the client can see, and the remote bodies
+/// standing behind it are exactly as stale as the bucket now is. hypha drains them itself rather
+/// than leaving the remote to refuse the delete (§7) — which is also what makes the gate independent
+/// of whether the backend refuses one at all.
+#[tokio::test]
+async fn a_cached_bucket_deletes_before_its_deletes_have_propagated() {
+    let mut h = Harness::builder(hypha_core::config::Mode::Cached)
+        // Long enough that the DELETE marker cannot propagate on its own — the remote must still
+        // hold the body when the bucket delete runs, or the test proves nothing.
+        .tune(|c| c.reconcile.interval_ms = 600_000)
+        .start()
+        .await;
+    h.create_bucket(B).await;
+    let key = "pending-delete";
+    put(&h.client(), B, key, b"body").await;
+    // Written straight to the remote by the harness's own client so the pending state under test is
+    // the *delete*, not an upload the paused sweep never made.
+    h.raw()
+        .put_object()
+        .bucket(h.remote_bucket(B))
+        .key(key)
+        .body(ByteStream::from_static(b"stale"))
+        .send()
+        .await
+        .expect("plant a remote body the sweep has not caught up with");
+
+    h.client()
+        .delete_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect("cached delete");
+    h.client()
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect("a client-empty bucket deletes whatever the remote still holds");
+
+    for gone in [h.remote_bucket(B), h.cache_bucket(B), h.meta_bucket(B)] {
+        assert!(
+            h.raw().head_bucket().bucket(&gone).send().await.is_err(),
+            "{gone} outlived the delete"
+        );
+    }
+    h.stop_hypha().await;
 }
 
 /// A cached delete removes K immediately, including from delimiter grouping, and the reconcile
@@ -151,10 +348,6 @@ async fn cached_delete_removes_then_propagates() {
         .send()
         .await
         .expect("delimited list after delete");
-    assert!(
-        listed.common_prefixes().is_empty(),
-        "an absent subtree must not survive as a common prefix"
-    );
     let listed_v1 = c
         .list_objects()
         .bucket(B)
@@ -162,10 +355,20 @@ async fn cached_delete_removes_then_propagates() {
         .send()
         .await
         .expect("delimited v1 list after delete");
-    assert!(
-        listed_v1.common_prefixes().is_empty(),
-        "v1 must project the same absent subtree"
-    );
+    assert!(listed.contents().is_empty() && listed_v1.contents().is_empty());
+    // Only where the backend has no directories to leave behind: SeaweedFS keeps the emptied prefix
+    // and hypha forwards common prefixes verbatim. tests/backend.rs states that divergence, and why
+    // nothing here works around it.
+    if external_backend().is_none() {
+        assert!(
+            listed.common_prefixes().is_empty(),
+            "an absent subtree must not survive as a common prefix"
+        );
+        assert!(
+            listed_v1.common_prefixes().is_empty(),
+            "v1 must project the same absent subtree"
+        );
+    }
 
     wait_until(6000, "delete propagates to the remote", || async {
         !remote_present(&h, B, key).await && !marker_present(&h, B, key).await
@@ -176,6 +379,98 @@ async fn cached_delete_removes_then_propagates() {
         sdk_err_code(&got.unwrap_err()).as_deref(),
         Some("NoSuchKey")
     );
+}
+
+/// The remote generation can change after DELETE's HEAD. `DeleteObject If-Match` must reject that
+/// first attempt, leave the marker standing, then retry against the replacement generation.
+#[tokio::test]
+async fn cached_delete_retries_when_the_remote_generation_moves() {
+    let h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let key = "delete-cas";
+    put(&h.client(), B, key, b"old").await;
+    wait_until(6_000, "initial generation to settle remotely", || async {
+        remote_present(&h, B, key).await && !marker_present(&h, B, key).await
+    })
+    .await;
+    let old_etag = h
+        .raw()
+        .head_object()
+        .bucket(h.remote_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("head old remote generation")
+        .e_tag()
+        .expect("old remote ETag")
+        .trim_matches('"')
+        .to_string();
+
+    let faults = h.remote_faults();
+    let path = format!("/{}/{key}", h.remote_bucket(B));
+    let mut first_delete = faults.pause_next_then_fail(
+        hyper::Method::DELETE,
+        &path,
+        hyper::StatusCode::PRECONDITION_FAILED,
+    );
+    h.client()
+        .delete_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect("cached delete");
+    let first = tokio::time::timeout(Duration::from_secs(5), first_delete.reached())
+        .await
+        .expect("conditional delete was never attempted");
+    assert_eq!(
+        first
+            .headers
+            .get(hyper::header::IF_MATCH)
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("\"{old_etag}\"").as_str()),
+        "the delete must be bound to the generation returned by HEAD"
+    );
+
+    let replacement = h
+        .raw()
+        .put_object()
+        .bucket(h.remote_bucket(B))
+        .key(key)
+        .body(bytes_body(b"replacement generation"))
+        .send()
+        .await
+        .expect("race a replacement remote generation");
+    let replacement_etag = replacement
+        .e_tag()
+        .expect("replacement ETag")
+        .trim_matches('"')
+        .to_string();
+
+    let mut retry_delete = faults.pause_next(hyper::Method::DELETE, &path);
+    first_delete.release();
+    let retry = tokio::time::timeout(Duration::from_secs(5), retry_delete.reached())
+        .await
+        .expect("delete was not retried after the remote CAS failed");
+    assert!(
+        marker_present(&h, B, key).await,
+        "a 412 must leave the DELETE marker standing"
+    );
+    assert!(remote_present(&h, B, key).await, "the replacement survived");
+    assert_eq!(
+        retry
+            .headers
+            .get(hyper::header::IF_MATCH)
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("\"{replacement_etag}\"").as_str()),
+        "the retry must bind itself to the replacement generation"
+    );
+    retry_delete.release();
+
+    wait_until(6_000, "retried delete to settle", || async {
+        !remote_present(&h, B, key).await && !marker_present(&h, B, key).await
+    })
+    .await;
 }
 
 /// Conditional writes linearize on the cache in cached mode (§4): `If-None-Match: *` creates only
@@ -624,6 +919,437 @@ async fn clean_marker_present(h: &Harness, client_bucket: &str) -> bool {
     raw_exists(h, &h.meta_bucket(client_bucket), &meta::clean_marker_key()).await
 }
 
+/// The drain must wait for a handler that has not committed yet, then put its newly owed marker
+/// ahead of the seal. Otherwise the same shutdown could leave a committed body beside a clean
+/// marker that falsely vouches for an incomplete pending set.
+#[tokio::test]
+async fn drain_orders_a_concurrent_commit_before_the_clean_marker() {
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let key = "commit-during-drain";
+    let body = pattern(64_000);
+    let data_bucket = h.cache_bucket(B);
+    let meta_bucket = h.meta_bucket(B);
+    let remote_bucket = h.remote_bucket(B);
+    let raw = h.raw();
+    let faults = h.cache_faults();
+    let mut body_write = faults.pause_next(hyper::Method::PUT, format!("/{data_bucket}/{key}"));
+    let mut marker_write = faults.pause_next(hyper::Method::PUT, format!("/{meta_bucket}/{key}"));
+    let client = h.client();
+    let submitted = body.clone();
+    let request = tokio::spawn(async move {
+        client
+            .put_object()
+            .bucket(B)
+            .key(key)
+            .body(bytes_body(&submitted))
+            .content_length(submitted.len() as i64)
+            .send()
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), body_write.reached())
+        .await
+        .expect("the cache commit was never attempted");
+
+    let stop = h.stop_hypha();
+    tokio::pin!(stop);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut stop)
+            .await
+            .is_err(),
+        "the drain finished while a request had not committed"
+    );
+    body_write.release();
+
+    let marker_request = tokio::select! {
+        biased;
+        () = &mut stop => panic!("the drain sealed before the committed write's marker"),
+        reached = tokio::time::timeout(Duration::from_secs(5), marker_write.reached()) => {
+            reached.expect("the committed write never raised its marker")
+        }
+    };
+    assert_eq!(marker_request.method, hyper::Method::PUT);
+    assert!(
+        raw.head_object()
+            .bucket(&data_bucket)
+            .key(key)
+            .send()
+            .await
+            .is_ok(),
+        "the body must already be committed while its marker is in flight"
+    );
+    assert!(
+        raw.head_object()
+            .bucket(&meta_bucket)
+            .key(meta::clean_marker_key())
+            .send()
+            .await
+            .is_err(),
+        "the clean marker must remain absent until the marker obligation settles"
+    );
+
+    marker_write.release();
+    stop.await;
+    request
+        .await
+        .expect("PUT task panicked")
+        .expect("the drained PUT must retain its acknowledgement");
+
+    assert!(
+        raw.head_object()
+            .bucket(&meta_bucket)
+            .key(meta::clean_marker_key())
+            .send()
+            .await
+            .is_ok(),
+        "the completed drain must vouch for the now-indexed write"
+    );
+    let marker_stands = raw
+        .head_object()
+        .bucket(&meta_bucket)
+        .key(key)
+        .send()
+        .await
+        .is_ok();
+    let remote_settled = raw
+        .head_object()
+        .bucket(&remote_bucket)
+        .key(key)
+        .send()
+        .await
+        .is_ok();
+    assert!(
+        marker_stands || remote_settled,
+        "a clean drain must leave the write either pending and indexed or already remote"
+    );
+}
+
+/// A seal proves that every obligation was handed to the actor, not that every backend write
+/// succeeded. If the final marker attempt still fails, no clean marker may be written.
+#[tokio::test]
+async fn marker_still_owed_at_drain_withholds_the_clean_marker() {
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let key = "owed-at-drain";
+    let data_bucket = h.cache_bucket(B);
+    let meta_bucket = h.meta_bucket(B);
+    let raw = h.raw();
+    let faults = h.cache_faults();
+    let marker_path = format!("/{meta_bucket}/{key}");
+    let mut first_attempt = faults.pause_next_then_fail(
+        hyper::Method::PUT,
+        &marker_path,
+        hyper::StatusCode::PRECONDITION_FAILED,
+    );
+    let client = h.client();
+    let request = tokio::spawn(async move {
+        client
+            .put_object()
+            .bucket(B)
+            .key(key)
+            .body(bytes_body(b"committed"))
+            .content_length(9)
+            .send()
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), first_attempt.reached())
+        .await
+        .expect("the marker actor never received the obligation");
+    let stop = h.stop_hypha();
+    tokio::pin!(stop);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut stop)
+            .await
+            .is_err(),
+        "the drain finished while the marker actor was blocked"
+    );
+
+    let _final_failures = faults.fail_times(
+        hyper::Method::PUT,
+        &marker_path,
+        hyper::StatusCode::PRECONDITION_FAILED,
+        2,
+    );
+    first_attempt.release();
+    stop.await;
+    request
+        .await
+        .expect("PUT task panicked")
+        .expect("the marker failure must not retract the acknowledged PUT");
+
+    assert!(
+        raw.head_object()
+            .bucket(&data_bucket)
+            .key(key)
+            .send()
+            .await
+            .is_ok(),
+        "the client-visible commit must remain live"
+    );
+    assert!(
+        raw.head_object()
+            .bucket(&meta_bucket)
+            .key(key)
+            .send()
+            .await
+            .is_err(),
+        "all marker attempts were rejected"
+    );
+    assert!(
+        raw.head_object()
+            .bucket(&meta_bucket)
+            .key(meta::clean_marker_key())
+            .send()
+            .await
+            .is_err(),
+        "an owed marker must leave the run dirty"
+    );
+}
+
+/// **A multipart complete must survive the delete it superseded.** Multipart is always durable (§7),
+/// so a complete commits to the remote and settles K without raising a pending marker — which makes
+/// it the one write path that does not supersede a marker already standing at K. If a cached DELETE's
+/// marker has not been swept yet when the complete lands, the sweep is left holding an obligation for
+/// a key that exists again, and the generation it would discharge it against is the one the client
+/// was just told was committed.
+///
+/// Set up with the sweep effectively switched off, so the interleaving is a fact of the state rather
+/// than a race the test has to win: the marker and the completed composite are made to coexist, and
+/// only then is a sweep allowed to run.
+#[tokio::test]
+async fn a_multipart_complete_survives_the_delete_marker_it_superseded() {
+    let mut h = Harness::builder(Mode::Cached)
+        .tune(|c| c.reconcile.interval_ms = 600_000)
+        .start()
+        .await;
+    h.create_bucket(B).await;
+    let c = h.client();
+    let key = "superseded-delete";
+
+    // The generation the stale marker will name. Put on the remote directly: the sweep is off, so
+    // nothing would upload it, and what this test needs is only that the delete branch finds
+    // something there to bind to.
+    put(&c, B, key, &pattern_seeded(20_000, 3)).await;
+    h.raw()
+        .put_object()
+        .bucket(h.remote_bucket(B))
+        .key(key)
+        .body(ByteStream::from_static(
+            b"the generation the delete was for",
+        ))
+        .send()
+        .await
+        .expect("plant the remote generation");
+
+    c.delete_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect("cached delete");
+    assert!(
+        marker_present(&h, B, key).await,
+        "the delete's obligation must be standing"
+    );
+
+    // K is taken again by the one path that raises no marker of its own, so nothing supersedes the
+    // marker the sweep is about to read.
+    let body = pattern_seeded(30_000, 4);
+    let up = create_mpu(&c, B, key).await;
+    let part = upload_part(&c, B, key, &up, 1, &body).await;
+    let composite = complete_mpu(&c, B, key, &up, &[(1, part)]).await;
+    assert_eq!(composite, expected_composite_etag(&[&body]));
+    assert!(
+        marker_present(&h, B, key).await,
+        "and the multipart complete must not have cleared it on its way past"
+    );
+
+    // Now let a sweep run against exactly that state.
+    h.stop_hypha().await;
+    h.config.reconcile.interval_ms = 100;
+    h.start_hypha().await;
+
+    wait_until(
+        6_000,
+        "the sweep to resolve the superseded marker",
+        || async { !marker_present(&h, B, key).await },
+    )
+    .await;
+    assert_eq!(
+        get_all(&h.client(), B, key).await,
+        body,
+        "the completed multipart upload must survive the delete it superseded"
+    );
+    assert!(
+        remote_present(&h, B, key).await,
+        "and its remote generation with it"
+    );
+}
+
+/// **A cached commit whose response was lost may have landed**, and the obligation that would have
+/// followed it did not. A cached DELETE removes K and *then* queues its marker (§7 — the queue sits
+/// after the commit so a marker failure cannot turn an acked write into an error); a cache that takes
+/// the delete and loses the response returns an error from between those two steps, leaving the key
+/// client-absent with nothing to propagate the delete to the remote.
+///
+/// The remedy is the one the design already has for "cannot vouch": the run withdraws the bucket's
+/// accounting, so the drain writes no clean marker and the next run's R2 rebuilds the pending set
+/// from both namespaces — where the remote-only key reads as exactly what it is, an interrupted
+/// delete. Without that, the run would end clean over a hole and the orphan would never be found.
+#[tokio::test]
+async fn a_cached_delete_that_lost_its_response_leaves_the_bucket_unaccounted() {
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+    let key = "lost-response";
+
+    put(&c, B, key, &pattern_seeded(8_000, 5)).await;
+    wait_until(6_000, "the write to reach the remote", || async {
+        remote_present(&h, B, key).await && !marker_present(&h, B, key).await
+    })
+    .await;
+
+    // The cache takes the delete and the response never comes back — standing, because the SDK
+    // retries and a one-shot loss is simply served from the retry.
+    let faults = h.cache_faults();
+    let lost = faults.fail_response_times(
+        hyper::Method::DELETE,
+        format!("/{}/{key}", h.cache_bucket(B)),
+        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+        // A cut must *stand*: the SDK retries, and every retry of an already-committed delete
+        // succeeds at the backend, so the loss has to outlast the whole retry budget.
+        1_000,
+    );
+    let refused = c.delete_object().bucket(B).key(key).send().await;
+    assert!(
+        refused.is_err(),
+        "the lost response must surface as an error"
+    );
+    tokio::time::timeout(Duration::from_secs(5), lost)
+        .await
+        .expect("the delete was never attempted")
+        .expect("fault proxy stopped before losing the response");
+    faults.clear();
+
+    // It landed all the same, so the key is gone client-side while the remote still holds it.
+    assert!(
+        !raw_exists(&h, &h.cache_bucket(B), key).await,
+        "the delete reached the cache despite the error"
+    );
+    assert!(
+        remote_present(&h, B, key).await,
+        "and the remote still has it"
+    );
+
+    // No clean marker: this run cannot account for a pending set it may be missing an entry from.
+    h.stop_hypha().await;
+    assert!(
+        !clean_marker_present(&h, B).await,
+        "a run that may have dropped an obligation must not vouch for its pending set"
+    );
+
+    // R2 then finds the remote-only key and re-indexes it as the interrupted delete it is, which the
+    // sweep propagates.
+    h.start_hypha().await;
+    wait_until(10_000, "R2 and the sweep to finish the delete", || async {
+        !remote_present(&h, B, key).await
+    })
+    .await;
+    assert_eq!(
+        sdk_err_code(
+            &h.client()
+                .get_object()
+                .bucket(B)
+                .key(key)
+                .send()
+                .await
+                .unwrap_err()
+        )
+        .as_deref(),
+        Some("NoSuchKey")
+    );
+}
+
+/// A marker owed to a deleted bucket must be discarded, not retried: one permanently owed marker
+/// withholds the clean marker of *every* bucket at drain (§6). The obligation is dropped on the
+/// state map's verdict rather than on the backend's error, so it does not matter what the backend
+/// makes of a write into a bucket that is gone.
+///
+/// Which is a real difference: a marker write already at the backend when the delete drains its
+/// projection **re-creates that projection** on SeaweedFS (tests/backend.rs). That leftover is inert
+/// — startup does not resolve a cache bucket with no remote bucket, and the reconcile sweep takes
+/// its bucket set from the state map — so what this pins is the client-visible half: the delete
+/// stands, and the unrelated bucket still ends clean.
+#[tokio::test]
+async fn marker_for_a_deleted_bucket_does_not_withhold_surviving_clean_markers() {
+    const DELETED: &str = "deleted-marker";
+    const SURVIVOR: &str = "surviving-marker";
+
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(DELETED).await;
+    h.create_bucket(SURVIVOR).await;
+    let deleted_meta = h.meta_bucket(DELETED);
+    let survivor_meta = h.meta_bucket(SURVIVOR);
+    let raw = h.raw();
+    let key = "pending";
+    let mut marker_write = h
+        .cache_faults()
+        .pause_next(hyper::Method::PUT, format!("/{deleted_meta}/{key}"));
+
+    put(&h.client(), DELETED, key, b"body").await;
+    tokio::time::timeout(Duration::from_secs(5), marker_write.reached())
+        .await
+        .expect("the deleted bucket's marker was never attempted");
+    // The bucket has to be emptied to be deletable (§7's emptiness gate), which does not settle the
+    // marker: the actor is still blocked on the held write, so the obligation stays owed across the
+    // delete — which is the state under test.
+    h.client()
+        .delete_object()
+        .bucket(DELETED)
+        .key(key)
+        .send()
+        .await
+        .expect("empty the bucket");
+    h.client()
+        .delete_bucket()
+        .bucket(DELETED)
+        .send()
+        .await
+        .expect("delete bucket while its marker is in flight");
+    marker_write.release();
+
+    h.stop_hypha().await;
+    assert!(
+        raw.head_bucket()
+            .bucket(h.remote_bucket(DELETED))
+            .send()
+            .await
+            .is_err(),
+        "the delete must stand — the remote bucket is the client-visible one"
+    );
+    if external_backend().is_none() {
+        assert!(
+            raw.head_bucket()
+                .bucket(&deleted_meta)
+                .send()
+                .await
+                .is_err(),
+            "a backend that refuses the held write leaves no projection behind either"
+        );
+    }
+    assert!(
+        raw.head_object()
+            .bucket(&survivor_meta)
+            .key(meta::clean_marker_key())
+            .send()
+            .await
+            .is_ok(),
+        "the unrelated accounted bucket must still end clean"
+    );
+}
+
 /// A graceful drain writes each accounted-for bucket's clean marker, and the next startup deletes
 /// every one of them **before serving** — so the on-disk default is always "dirty" (§6/§7). Absence
 /// is what buys a recovery scan, so a marker that outlived a startup would silently skip one.
@@ -720,4 +1446,228 @@ async fn ungraceful_stop_rebuilds_missing_markers_on_the_next_run() {
         !marker_present(&h, B, "durable").await,
         "a key the remote already holds in this generation is not re-marked"
     );
+}
+
+/// The active dies with a sweep in flight. Nothing about the pending set lives in the process — it is
+/// the marker range itself — so the next run resumes from the same LIST and drops nothing, whichever
+/// key the dead sweep was in the middle of.
+///
+/// The pause is what makes "mid-sweep" a fact rather than a hope: the kill happens with one key's
+/// upload demonstrably in flight and the rest of the set still enumerable.
+#[tokio::test]
+async fn killing_the_active_mid_sweep_loses_no_pending_key() {
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let bodies: Vec<Vec<u8>> = (0..6u8)
+        .map(|i| pattern_seeded(8_192 + i as usize, i))
+        .collect();
+    let keys: Vec<String> = (0..bodies.len()).map(|i| format!("sweep/{i}")).collect();
+
+    let mut in_flight = h.remote_faults().pause_next(
+        hyper::Method::PUT,
+        format!("/{}/{}", h.remote_bucket(B), keys[0]),
+    );
+    for (key, body) in keys.iter().zip(&bodies) {
+        put(&h.client(), B, key, body).await;
+    }
+    tokio::time::timeout(Duration::from_secs(10), in_flight.reached())
+        .await
+        .expect("no upload was in flight, so nothing was killed mid-sweep");
+
+    h.kill_hypha().await;
+    in_flight.release();
+    h.start_hypha().await;
+
+    for (key, body) in keys.iter().zip(&bodies) {
+        wait_until(
+            20_000,
+            &format!("{key} to be reconciled by the new run"),
+            || async { remote_present(&h, B, key).await && !marker_present(&h, B, key).await },
+        )
+        .await;
+        assert_eq!(
+            &get_all(&h.client(), B, key).await,
+            body,
+            "{key} came back as a different generation"
+        );
+    }
+}
+
+/// The bounded loss window (§7): a cache volume that goes takes exactly the keys the pending set names
+/// and nothing else. That is the whole durability claim of cached mode, and the pending set is what
+/// makes it a *bound* rather than a hope — so both sides are asserted from one wipe, a key the sweep
+/// had already uploaded and a key it could not.
+#[tokio::test]
+async fn a_cache_volume_wipe_loses_exactly_the_pending_set() {
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(B).await;
+    let durable = pattern_seeded(4_096, 1);
+    let pending = pattern_seeded(4_096, 2);
+
+    put(&h.client(), B, "reconciled", &durable).await;
+    wait_until(10_000, "the first key to reach the remote", || async {
+        remote_present(&h, B, "reconciled").await && !marker_present(&h, B, "reconciled").await
+    })
+    .await;
+
+    // The second key acks in the cache and can never reach the remote, so it is exactly what the
+    // pending marker is standing for when the volume goes.
+    h.remote_faults().fail_prefix_times(
+        hyper::Method::PUT,
+        format!("/{}/unreconciled", h.remote_bucket(B)),
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        10_000,
+    );
+    put(&h.client(), B, "unreconciled", &pending).await;
+    assert!(marker_present(&h, B, "unreconciled").await);
+
+    // Stopped gracefully, not killed, and the difference is the harness rather than the subject: an
+    // in-process `kill` abandons the serving task but leaves the run's background actors on the
+    // runtime, so the volume wipe below would be observed by the *previous* run's watchdog — which
+    // correctly reads a ready bucket's vanished sync marker as I6 and takes the test process down
+    // with it. The drain is irrelevant to what this asserts: the marker is owed to a remote that
+    // still refuses it, so this run vouches for nothing either way.
+    h.stop_hypha().await;
+    h.remote_faults().clear();
+    for bucket in [h.cache_bucket(B), h.meta_bucket(B)] {
+        drop_backend_bucket(&h, &bucket).await;
+    }
+    h.start_hypha().await;
+    let c = h.client();
+
+    wait_until(20_000, "the namespace restore to complete", || async {
+        raw_exists(&h, &h.meta_bucket(B), &meta::sync_marker_key()).await
+    })
+    .await;
+    assert_eq!(
+        get_all(&c, B, "reconciled").await,
+        durable,
+        "everything the sweep had uploaded survives the volume"
+    );
+    let lost = c
+        .get_object()
+        .bucket(B)
+        .key("unreconciled")
+        .send()
+        .await
+        .expect_err("a cache-only generation cannot survive its cache");
+    assert_eq!(
+        sdk_err_code(&lost).as_deref(),
+        Some("NoSuchKey"),
+        "and the loss is a clean absence, not a key that reads as something else"
+    );
+    assert!(
+        !marker_present(&h, B, "unreconciled").await,
+        "a restored namespace owes nothing: the marker range went with the volume"
+    );
+}
+
+/// The clean marker is **positive evidence** and nothing else: a bucket whose pending-set rebuild
+/// never completed ends the run dirty, however cleanly the run drains. And one bucket's doubt must not
+/// spread — a bucket this run established itself still ends clean, or a single unrecoverable bucket
+/// would send the next run into a full rebuild of every other one.
+#[tokio::test]
+async fn a_bucket_whose_rebuild_never_completed_ends_the_run_dirty() {
+    const DOUBTED: &str = "rebuild-doubted";
+    const FRESH: &str = "rebuild-fresh";
+
+    let mut h = Harness::cached_with_faults().await;
+    h.create_bucket(DOUBTED).await;
+    put(&h.client(), DOUBTED, "k", &pattern(1_024)).await;
+
+    // A kill leaves the bucket dirty, so the next run owes it a rebuild…
+    h.kill_hypha().await;
+    // …which cannot finish: the rebuild is a two-cursor join, and this is the remote cursor. Object
+    // reads are unaffected — the path here is the bucket's own, without a key.
+    // The bucket-scoped LIST, and only it: path-style renders it with a trailing slash, so this
+    // matches no object read. `refused` is checked below, since a path that drifted would make the
+    // whole test pass vacuously.
+    let refused = h.remote_faults().fail_times(
+        hyper::Method::GET,
+        format!("/{}/", h.remote_bucket(DOUBTED)),
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        10_000,
+    );
+    h.start_hypha().await;
+    h.await_ready().await;
+    h.create_bucket(FRESH).await;
+    put(&h.client(), FRESH, "k", &pattern(1_024)).await;
+
+    tokio::time::timeout(Duration::from_secs(10), refused)
+        .await
+        .expect("the rebuild never listed the remote, so nothing was held back")
+        .expect("fault proxy stopped before the rebuild's listing");
+
+    h.stop_hypha().await;
+    assert!(
+        !clean_marker_present(&h, DOUBTED).await,
+        "a bucket whose pending set this run could not account for must end dirty"
+    );
+    assert!(
+        clean_marker_present(&h, FRESH).await,
+        "a bucket this run created empty is accounted by construction, and one doubted bucket must \
+         not withhold its marker"
+    );
+}
+
+/// Bursty same-key overwrites: the sweep coalesces onto whatever generation is current when it wins
+/// the upload lock, so the remote must converge on the **last acked** one — not on whichever upload
+/// happened to finish last. An unserialized sweep would leave an older generation standing with an
+/// empty pending set, which no later pass would ever revisit.
+///
+/// Which generation the remote holds is read off its framed length: every body here has a distinct
+/// plaintext length, and the framed size is a closed form of it (§6), so the byte count names the
+/// generation without decrypting anything.
+///
+/// The claim is **convergence**, so it is asserted as one: an empty pending set is not by itself the
+/// end state to wait for. A marker is written after its write acks (§7), so between an ack and the
+/// queue landing its marker there is a moment when the key is genuinely owed and genuinely unmarked,
+/// and sampling a single instant can catch exactly that moment.
+///
+/// **`#[ignore]`d because it does not pass against MinIO, and the reason is not the test.** The sweep's
+/// marker clear is a conditional delete, and MinIO ignores `If-Match` on `DeleteObject`
+/// (`backend.rs`) — so a clear issued for the generation a pass listed also removes the marker a
+/// newer write raised while that pass ran. The remote is then left holding an older generation with an
+/// empty pending set, which nothing revisits: this test reproduces that in roughly one run in three
+/// under load. SeaweedFS 4.37 — the deployed backend — enforces the precondition, so this is the
+/// first test to un-ignore once the harness can be pointed at one.
+#[tokio::test]
+#[ignore = "needs a backend that enforces If-Match on DeleteObject (SeaweedFS does, MinIO does not); see tests/backend.rs"]
+async fn bursty_same_key_overwrites_converge_on_the_last_acked_generation() {
+    let h = Harness::cached().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+    let key = "burst";
+
+    let mut last = Vec::new();
+    for i in 0..16u8 {
+        let body = pattern_seeded(20_000 + i as usize * 97, i);
+        put(&c, B, key, &body).await;
+        last = body;
+    }
+    // Every body has a distinct plaintext length and the framed size is a closed form of it (§6), so
+    // the remote object's byte count names the generation without decrypting anything.
+    let framed =
+        hypha_format::offset::ciphertext_len(last.len() as u64, hypha_format::offset::HLEN)
+            + hypha_format::SINGLE_TRAILER_LEN as u64;
+
+    wait_until(
+        15_000,
+        "the remote to converge on the last acked generation",
+        || async {
+            let settled = h
+                .raw()
+                .head_object()
+                .bucket(h.remote_bucket(B))
+                .key(key)
+                .send()
+                .await
+                .ok()
+                .and_then(|head| head.content_length())
+                .is_some_and(|len| len as u64 == framed);
+            settled && !marker_present(&h, B, key).await
+        },
+    )
+    .await;
+    assert_eq!(get_all(&c, B, key).await, last);
 }

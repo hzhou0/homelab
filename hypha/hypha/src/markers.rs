@@ -240,15 +240,27 @@ impl MarkerActor {
     /// the clean marker of *every* bucket at drain, so a single deleted bucket would send the next
     /// run into a full rebuild of buckets it had no reason to doubt.
     ///
-    /// **Which is only true if the bucket really is gone**, so the backend's answer is checked
-    /// against what this process believes. `DeleteBucket` retires the bucket from the state map
-    /// *before* draining its projections (§7), so in a real delete the map has already caught up by
-    /// the time a marker write can see the 404. A map that still calls the bucket live means the
-    /// `<meta>` projection vanished underneath it — the cache volume loss of invariant **I6** — and
-    /// dropping the marker there would silently shorten a pending set the run still vouches for.
+    /// "Gone" is read from the **state map**, before the write rather than out of its error:
+    /// `DeleteBucket` retires the bucket there before draining its projections (§7), so the map has
+    /// already caught up by the time a marker for it could be written — and a backend that re-creates
+    /// the bucket a PUT addresses (SeaweedFS) would otherwise have this path resurrect a `<meta>`
+    /// projection the delete had just drained, and never report a thing.
+    ///
+    /// The backend's own `NoSuchBucket` therefore means something narrower: the map still calls the
+    /// bucket live, so its `<meta>` projection vanished underneath a running process — the cache
+    /// volume loss of invariant **I6**. (The map is re-read there because a delete may have retired
+    /// the bucket while the write was in flight.)
     async fn write_all(&self, owed: &mut HashMap<(String, String), OwedMarker>) {
         let failed: Vec<OwedMarker> = futures::stream::iter(owed.drain().map(|(_, r)| r))
             .map(|r| async move {
+                if self.queue.buckets.readiness(&r.bucket) == Readiness::Absent {
+                    tracing::info!(
+                        bucket = r.bucket,
+                        key = r.key,
+                        "marker dropped; its bucket was deleted"
+                    );
+                    return None;
+                }
                 match self
                     .queue
                     .tier

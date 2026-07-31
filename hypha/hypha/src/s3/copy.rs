@@ -63,7 +63,7 @@ impl Hypha {
 
         // Overlay (§7): the destination bucket must exist; a restoring one has K_dst materialized
         // from the remote first, so this copy's bracket then overwrites a correct tombstone.
-        self.prepare_write(&bucket, &key).await?;
+        let (_gate, _) = self.prepare_write(&bucket, &key).await?;
 
         // Resolve the source's facts + cache-side user metadata through the restore overlay, exactly
         // as a read would: a live cache body reports natively, anything else resolves remote-side.

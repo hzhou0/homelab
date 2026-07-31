@@ -29,6 +29,23 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_AL
 use crate::config::S3Endpoint;
 use crate::error::{Error, Result};
 
+/// One entry of a `ListParts` page.
+///
+/// A struct rather than a `(number, etag, size)` tuple because **the part number is not a key**: S3
+/// replaces a re-uploaded part, but SeaweedFS keeps every upload of one and lists them all, so a
+/// caller has to say which entry of a number it means. `last_modified` is the only ordering signal
+/// the protocol carries, and it is second-granular — enough to separate a deliberate re-upload,
+/// never enough to order a race.
+#[derive(Clone, Debug)]
+pub struct RemotePart {
+    pub number: i32,
+    /// The backend's own ETag for this upload of the part — its last-write-wins token everywhere in
+    /// hypha, and what `CompleteMultipartUpload` selects the entry by.
+    pub etag: String,
+    pub size: u64,
+    pub last_modified_ms: i64,
+}
+
 /// One key's failure inside a batch delete. S3 models `DeleteObjects` outcomes per key, so a
 /// batch can partially succeed and the caller decides whether that is fatal.
 #[derive(Clone, Debug)]
@@ -511,7 +528,7 @@ impl Backend {
         bucket: &str,
         key: &str,
         upload_id: &str,
-    ) -> Result<Vec<(i32, String, u64)>> {
+    ) -> Result<Vec<RemotePart>> {
         let mut out = Vec::new();
         let mut marker: Option<String> = None;
         loop {
@@ -528,8 +545,15 @@ impl Backend {
                 .map_err(Error::from_sdk)?;
             for p in page.parts() {
                 if let (Some(n), Some(sz)) = (p.part_number(), p.size()) {
-                    let etag = p.e_tag().unwrap_or_default().trim_matches('"').to_string();
-                    out.push((n, etag, sz.max(0) as u64));
+                    out.push(RemotePart {
+                        number: n,
+                        etag: p.e_tag().unwrap_or_default().trim_matches('"').to_string(),
+                        size: sz.max(0) as u64,
+                        last_modified_ms: p
+                            .last_modified()
+                            .and_then(|t| t.to_millis().ok())
+                            .unwrap_or_default(),
+                    });
                 }
             }
             if page.is_truncated() != Some(true) {

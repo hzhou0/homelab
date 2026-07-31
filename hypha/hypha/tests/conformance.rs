@@ -1,7 +1,8 @@
 //! Phase-2 exit: the durable S3 surface end-to-end against a real backend (MinIO), driven over
 //! HTTP with a real `aws-sdk-s3` client. Covers PUT/GET/HEAD/DELETE round-trips, ranges, the
 //! conditional-write preconditions, LIST classification, buckets, control-byte keys, and the
-//! ciphertext-at-rest guarantee. Every test owns its MinIO and cleans up on drop.
+//! ciphertext-at-rest guarantee. Durable transition faults cover definite remote refusal and a
+//! committed operation whose response is lost. Every test owns its MinIO and cleans up on drop.
 
 mod common;
 
@@ -84,6 +85,263 @@ async fn list_buckets_hides_backend_projections() {
             "bucket {gone} outlived delete: {after:?}"
         );
     }
+}
+
+/// `DeleteBucket` refuses a bucket that still holds objects, and hypha is what refuses it: the gate
+/// is its own listing of the client namespace, not the backend's answer (§7). SeaweedFS deletes a
+/// non-empty bucket **and everything in it** by default (`allowDeleteBucketNotEmpty`), so delegating
+/// this would turn a misdirected `DeleteBucket` into silent data loss on the backend hypha deploys
+/// on (tests/backend.rs pins the divergence).
+///
+/// The refusal also has to leave the bucket serving — it is a rejected request, not a half-delete.
+#[tokio::test]
+async fn delete_bucket_refuses_a_non_empty_bucket() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    put(&client, B, "obj", &pattern(64)).await;
+
+    let err = client
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect_err("a non-empty bucket must not delete");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("BucketNotEmpty"));
+
+    assert_eq!(get_all(&client, B, "obj").await, pattern(64));
+    put(&client, B, "obj2", &pattern(32)).await;
+
+    for key in ["obj", "obj2"] {
+        client
+            .delete_object()
+            .bucket(B)
+            .key(key)
+            .send()
+            .await
+            .expect("empty the bucket");
+    }
+    client
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect("an emptied bucket deletes");
+}
+
+/// The window the emptiness gate opens: between judging the namespace empty and committing the
+/// delete, a write must not be able to put something back. A write *arriving* now meets the closed
+/// gate (§7) — which on a backend that creates the bucket a PUT addresses (SeaweedFS, again
+/// backend.rs) is the difference between a resurrected bucket and a refused request. The refusal is
+/// also immediate: the write is told `NoSuchBucket` rather than queued behind the whole drain.
+#[tokio::test]
+async fn a_write_cannot_slip_into_a_bucket_whose_delete_is_committing() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let remote = h.remote_bucket(B);
+
+    // The remote DeleteBucket is the commit, so pausing it holds the delete open past its gate.
+    // The bucket is empty, so no other DELETE under this prefix can be taken for it.
+    let mut committing = h
+        .remote_faults()
+        .pause_next_prefix(hyper::Method::DELETE, format!("/{remote}"));
+    let client = h.client();
+    let deleting = tokio::spawn(async move { client.delete_bucket().bucket(B).send().await });
+    committing.reached().await;
+
+    let err = h
+        .client()
+        .put_object()
+        .bucket(B)
+        .key("late")
+        .body(pattern(16).into())
+        .send()
+        .await
+        .expect_err("a write into a committing delete must be refused");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("NoSuchBucket"));
+
+    committing.release();
+    deleting
+        .await
+        .expect("delete task")
+        .expect("the paused delete still commits");
+    assert!(
+        h.raw().head_bucket().bucket(&remote).send().await.is_err(),
+        "the delete must carry the remote bucket away, not the late write's re-creation of it"
+    );
+}
+
+/// The other half, and the one a phase check cannot cover: a write that passed its readiness check
+/// **before** the delete began. Readiness is a load, not a hold, so that write is already past every
+/// gate an announcement could raise — the delete has to observe it.
+///
+/// It observes it and **refuses**, immediately and without touching anything. The alternative, a
+/// barrier the delete waits on, has to close the bucket to writes before it knows whether it will
+/// commit — and a delete that is then refused has spent `NoSuchBucket` on a bucket that goes on
+/// existing. That is the property this test is really about: through the whole refused delete, the
+/// bucket keeps serving writes as if nothing had happened.
+///
+/// `CompleteMultipartUpload` is the write to use. It takes its claim up front and then spends the
+/// whole part-resolution round trip with `<data>` still empty, so unlike a single PUT — whose transit
+/// mark makes the bucket read non-empty from the moment it is bracketed — there is nothing here for
+/// an emptiness listing to see. Only the in-flight count knows.
+#[tokio::test]
+async fn a_delete_refuses_rather_than_race_a_write_already_in_flight() {
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let remote = h.remote_bucket(B);
+    let client = h.client();
+
+    let body = pattern(64);
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(B)
+        .key("composite")
+        .send()
+        .await
+        .expect("create the upload")
+        .upload_id()
+        .expect("upload id")
+        .to_string();
+    let etag = client
+        .upload_part()
+        .bucket(B)
+        .key("composite")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(body.clone().into())
+        .send()
+        .await
+        .expect("upload the part")
+        .e_tag()
+        .expect("part etag")
+        .to_string();
+
+    // Complete resolves its parts against the remote before it brackets the key, so pausing that
+    // read holds the write in flight with the client namespace still empty.
+    let mut completing = h
+        .remote_faults()
+        .pause_next_prefix(hyper::Method::GET, format!("/{remote}/composite"));
+    let writing_client = h.client();
+    let writer = tokio::spawn(async move {
+        writing_client
+            .complete_multipart_upload()
+            .bucket(B)
+            .key("composite")
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                    .build(),
+            )
+            .send()
+            .await
+    });
+    completing.reached().await;
+
+    let err = h
+        .client()
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect_err("a delete racing a write in flight must refuse");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("OperationAborted"));
+
+    // The refusal cost the bucket nothing: it is not "being deleted", and never was.
+    put(&h.client(), B, "unaffected", &pattern(16)).await;
+    assert_eq!(get_all(&h.client(), B, "unaffected").await, pattern(16));
+
+    completing.release();
+    writer
+        .await
+        .expect("complete task")
+        .expect("the write the delete refused to race must still commit");
+    assert_eq!(get_all(&h.client(), B, "composite").await, body);
+
+    // Quiescent now, so the delete gets a real answer about a namespace nothing can change under it.
+    let err = h
+        .client()
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect_err("the bucket holds the objects it was told about");
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("BucketNotEmpty"));
+
+    for key in ["composite", "unaffected"] {
+        h.client()
+            .delete_object()
+            .bucket(B)
+            .key(key)
+            .send()
+            .await
+            .expect("empty the bucket");
+    }
+    h.client()
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect("an emptied, quiescent bucket deletes");
+}
+
+/// A bucket recreated under a name that was deleted must start empty. The delete's cache drain is
+/// best-effort by design, so this is the assertion that catches a projection surviving it — the
+/// shape the pre-barrier race left behind, where `delete_bucket` refused the late write's object
+/// and the next create inherited it and served it as its own.
+#[tokio::test]
+async fn a_recreated_bucket_inherits_nothing_from_the_name_it_reuses() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    put(&client, B, "before", &pattern(32)).await;
+    client
+        .delete_object()
+        .bucket(B)
+        .key("before")
+        .send()
+        .await
+        .expect("empty the bucket");
+    client
+        .delete_bucket()
+        .bucket(B)
+        .send()
+        .await
+        .expect("an emptied bucket deletes");
+
+    h.create_bucket(B).await;
+    let listed = client
+        .list_objects_v2()
+        .bucket(B)
+        .send()
+        .await
+        .expect("list the recreated bucket");
+    assert!(
+        listed.contents().is_empty(),
+        "a recreated bucket must not serve the previous incarnation's objects"
+    );
+    assert_eq!(
+        sdk_err_code(
+            &client
+                .get_object()
+                .bucket(B)
+                .key("before")
+                .send()
+                .await
+                .expect_err("the old key must be gone")
+        )
+        .as_deref(),
+        Some("NoSuchKey")
+    );
+
+    // The fresh gate the create installed admits writes — a closed one inherited from the delete
+    // would refuse every write to the new incarnation for the life of the process.
+    put(&client, B, "after", &pattern(48)).await;
+    assert_eq!(get_all(&client, B, "after").await, pattern(48));
 }
 
 /// A bucket whose cache was lost is detected unreconciled on restart (its sync marker gone), served
@@ -475,6 +733,157 @@ async fn roundtrip_sizes_etag_and_encryption_at_rest() {
     );
 }
 
+/// A durable PUT can commit remotely while its response is lost. The client sees an error, but the
+/// transition mark must be repaired to the committed generation before the request returns.
+#[tokio::test]
+async fn durable_put_lost_response_repairs_the_committed_generation() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "fault/put";
+    put(&client, B, key, b"old").await;
+    let new = pattern_seeded(64 * 1024, 101);
+
+    let lost = h.remote_faults().fail_response_times(
+        hyper::Method::PUT,
+        format!("/{}/{key}", h.remote_bucket(B)),
+        hyper::StatusCode::FORBIDDEN,
+        8,
+    );
+    client
+        .put_object()
+        .bucket(B)
+        .key(key)
+        .body(bytes_body(&new))
+        .content_length(new.len() as i64)
+        .send()
+        .await
+        .expect_err("the injected response loss must fail the client request");
+    tokio::time::timeout(std::time::Duration::from_secs(5), lost)
+        .await
+        .expect("remote PUT was never intercepted")
+        .expect("fault proxy stopped before the remote PUT");
+
+    assert_eq!(
+        get_all(&client, B, key).await,
+        new,
+        "repair must project the generation that actually committed"
+    );
+    let head = client
+        .head_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect("head repaired PUT");
+    assert_eq!(
+        head.e_tag().map(|e| e.trim_matches('"')),
+        Some(md5_hex(&new).as_str())
+    );
+    let cached = h
+        .raw()
+        .head_object()
+        .bucket(h.cache_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("cache projection after PUT repair");
+    assert_eq!(
+        cached
+            .metadata()
+            .and_then(|md| md.get(hypha_core::meta::TOMB))
+            .map(String::as_str),
+        Some(hypha_core::meta::TOMB_EVICT)
+    );
+}
+
+/// A definite remote failure is the other side of the transition bracket: repair must restore the
+/// prior generation after both a refused PUT and a refused DELETE.
+#[tokio::test]
+async fn durable_remote_failures_restore_the_previous_generation() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "fault/refused-mutations";
+    let old = pattern_seeded(32 * 1024, 102);
+    let replacement = pattern_seeded(32 * 1024, 103);
+    put(&client, B, key, &old).await;
+    let path = format!("/{}/{key}", h.remote_bucket(B));
+    let faults = h.remote_faults();
+
+    let refused_put = faults.fail_times(
+        hyper::Method::PUT,
+        &path,
+        hyper::StatusCode::PRECONDITION_FAILED,
+        8,
+    );
+    client
+        .put_object()
+        .bucket(B)
+        .key(key)
+        .body(bytes_body(&replacement))
+        .content_length(replacement.len() as i64)
+        .send()
+        .await
+        .expect_err("the injected remote PUT failure must reach the client");
+    tokio::time::timeout(std::time::Duration::from_secs(5), refused_put)
+        .await
+        .expect("remote PUT was never intercepted")
+        .expect("fault proxy stopped before refusing the PUT");
+    assert_eq!(
+        get_all(&client, B, key).await,
+        old,
+        "a failed remote PUT must restore the previous generation"
+    );
+
+    let refused_delete = faults.fail_times(
+        hyper::Method::DELETE,
+        &path,
+        hyper::StatusCode::PRECONDITION_FAILED,
+        8,
+    );
+    client
+        .delete_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect_err("the injected remote DELETE failure must reach the client");
+    tokio::time::timeout(std::time::Duration::from_secs(5), refused_delete)
+        .await
+        .expect("remote DELETE was never intercepted")
+        .expect("fault proxy stopped before refusing the DELETE");
+    assert_eq!(
+        get_all(&client, B, key).await,
+        old,
+        "a failed remote DELETE must restore the object"
+    );
+
+    let cached = h
+        .raw()
+        .head_object()
+        .bucket(h.cache_bucket(B))
+        .key(key)
+        .send()
+        .await
+        .expect("cache projection after failed mutations");
+    assert_eq!(
+        cached
+            .metadata()
+            .and_then(|md| md.get(hypha_core::meta::TOMB))
+            .map(String::as_str),
+        Some(hypha_core::meta::TOMB_EVICT),
+        "repair must leave no transition mark"
+    );
+    assert_eq!(
+        cached
+            .metadata()
+            .and_then(|md| md.get(hypha_core::meta::CETAG))
+            .map(String::as_str),
+        Some(md5_hex(&old).as_str())
+    );
+}
+
 /// Ranged GET: offsets, open-ended, suffix, and a range straddling a chunk boundary.
 #[tokio::test]
 async fn ranged_reads() {
@@ -659,6 +1068,51 @@ async fn delete_semantics() {
         .send()
         .await
         .expect("idempotent delete of absent key");
+}
+
+/// A durable DELETE can commit while its response is lost. Repair must remove the transition mark
+/// and expose the committed absence even though the caller received an error.
+#[tokio::test]
+async fn durable_delete_lost_response_repairs_the_committed_absence() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    let key = "fault/delete";
+    put(&client, B, key, b"present").await;
+
+    let lost = h.remote_faults().fail_response_times(
+        hyper::Method::DELETE,
+        format!("/{}/{key}", h.remote_bucket(B)),
+        hyper::StatusCode::FORBIDDEN,
+        8,
+    );
+    client
+        .delete_object()
+        .bucket(B)
+        .key(key)
+        .send()
+        .await
+        .expect_err("the injected response loss must fail the client request");
+    tokio::time::timeout(std::time::Duration::from_secs(5), lost)
+        .await
+        .expect("remote DELETE was never intercepted")
+        .expect("fault proxy stopped before the remote DELETE");
+
+    let get = client.get_object().bucket(B).key(key).send().await;
+    assert_eq!(
+        sdk_err_code(&get.expect_err("committed delete must remain absent")).as_deref(),
+        Some("NoSuchKey")
+    );
+    assert!(
+        h.raw()
+            .head_object()
+            .bucket(h.cache_bucket(B))
+            .key(key)
+            .send()
+            .await
+            .is_err(),
+        "repair must remove the transition mark"
+    );
 }
 
 /// LIST: prefix filtering, delimiter/common-prefixes, pagination, and `start-after`, with
