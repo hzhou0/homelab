@@ -1,6 +1,3 @@
-//! `S3Auth` for hypha's *own* client credentials — the access-key/secret its S3 clients present,
-//! distinct from the backend credentials in [`hypha_core::config::S3Endpoint`] (§2).
-
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::{S3Error, S3ErrorCode, S3Result};
 

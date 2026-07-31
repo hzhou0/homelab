@@ -1,20 +1,7 @@
-//! The §7 transition bracket, cut at each of its steps, and the twin coherence that rides on it.
+//! Transition-bracket crash cuts and twin coherence.
 //!
-//! The bracket's contract is not "the write succeeds". It is that **no interleaving is observable**:
-//! a reader sees the old object whole or the new one whole, never facts from one with bytes from the
-//! other, and whatever the writer died before finishing, the repair rule settles K from the remote —
-//! which is the commit point — with no knowledge of what the writer had been doing.
-//!
-//! The interesting cuts are the ones *after* the commit, and they need a cut the client cannot make:
-//! the mark and the settle's tombstone are both `<data>` writes at K, so failing "the second PUT to
-//! K" means suspending the bracket at its commit, arming the fault, and letting it go. That is what
-//! [`PausedRequest`] is for here, and it also gives the one window in which a hybrid read would be
-//! possible at all.
-//!
-//! Where a cut is already covered elsewhere it is not repeated: a failed or lost *commit* is
-//! `conformance.rs` (PUT and DELETE) and `multipart.rs` (complete), and the GC sweep's repair of a
-//! mark nothing reads is `gc.rs`. The repairs here are driven off the write path, which repairs
-//! under K's lock and so is deterministic.
+//! Each cut asserts that readers observe one complete generation and that repair settles from the
+//! remote commit point without needing to know what the failed writer attempted.
 
 mod common;
 
@@ -22,7 +9,6 @@ use common::*;
 use hyper::{Method, StatusCode};
 use hypha_core::meta;
 
-/// The status every injected cut here uses.
 const CUT: StatusCode = StatusCode::FORBIDDEN;
 
 /// How many attempts a cut refuses. A cut has to **stand** rather than fire once: the SDK retries a

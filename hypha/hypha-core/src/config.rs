@@ -1,22 +1,16 @@
-//! Typed configuration, layered file + env via figment and validated at boot so a bad value
-//! fails the process rather than surfacing as a runtime 500 on the hot path.
+//! Typed and boot-validated configuration.
 
 use serde::Deserialize;
 
-/// How a deployment moves writes to the remote. Both modes use the cache; the difference is
-/// timing and whether the cache retains bodies (see the unified tiering design).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Durable: upload to the remote inline, tombstone immediately, never restore to cache.
-    /// Writes ack only once persisted on the remote — zero data loss on cache failure.
+    /// Acknowledge only after the remote commit.
     Durable,
-    /// Cached: ack after the cache write, upload via background reconcile, GC tombstones under
-    /// pressure, tombstoned GET rehydrates. (Phases 4–5.)
+    /// Acknowledge the cache commit and reconcile asynchronously.
     Cached,
 }
 
-/// One S3 endpoint hypha talks to (remote, or the optional cache — same shape, §2).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3Endpoint {
@@ -48,8 +42,6 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-/// The access-key/secret hypha's own clients authenticate with — distinct from the backend
-/// credentials above (§2, `S3Auth`).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAuth {
@@ -82,8 +74,6 @@ fn default_offload() -> usize {
     1024 * 1024
 }
 
-/// The cached-mode reconcile sweep's cadence (§7, §9). Ignored in durable mode, which has no
-/// pending set to drain.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reconcile {
@@ -91,7 +81,6 @@ pub struct Reconcile {
     /// that an idle cache isn't polled hot.
     #[serde(default = "default_reconcile_interval_ms")]
     pub interval_ms: u64,
-    /// Pending keys uploaded/propagated concurrently within one pass.
     #[serde(default = "default_reconcile_concurrency")]
     pub concurrency: usize,
 }
@@ -112,9 +101,6 @@ impl Default for Reconcile {
     }
 }
 
-/// Bounds on the background-transition actor (§8, §9) — the queue every discardable per-key
-/// transition is dispatched through — rehydrate; GC eviction runs inside a GC pass instead (§8).
-/// Cached mode only: durable mode never rehydrates, so nothing is ever submitted.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Background {
@@ -145,13 +131,8 @@ impl Default for Background {
     }
 }
 
-/// The scavenger (§8, §9). Both modes: durable mode evicts nothing but still accumulates the debris
-/// every mode produces.
-///
-/// `interval_ms`/`concurrency` are the **unpressured base**, and the two bounds are how far §8's
-/// escalation ladder may push them before it starts spending the age threshold instead. The bounds
-/// are not tuning: the scavenger shares the remote with the client path and the reconcile sweep, so
-/// `max_concurrency` is what keeps an emergency reclaim from starving the reads it exists to protect.
+/// GC's unpressured settings and escalation bounds. The upper concurrency bound prevents emergency
+/// reclaim from starving client reads.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gc {
@@ -163,13 +144,10 @@ pub struct Gc {
     /// running walk.
     #[serde(default = "default_gc_min_interval_ms")]
     pub min_interval_ms: u64,
-    /// Buckets swept concurrently with no pressure.
     #[serde(default = "default_gc_concurrency")]
     pub concurrency: usize,
-    /// The ceiling pressure may raise concurrency to (rung 2).
     #[serde(default = "default_gc_max_concurrency")]
     pub max_concurrency: usize,
-    /// Usage fraction at which a pass starts evicting.
     #[serde(default = "default_gc_high_water")]
     pub high_water: f64,
     /// Usage fraction a pressured pass reclaims down to — the difference from `high_water` is the
@@ -198,7 +176,7 @@ pub struct Gc {
     pub recency: Recency,
 }
 
-/// The cache's usage source (§8). Physical bytes rather than the sum of live object sizes, because
+/// Physical bytes rather than live object sizes, because
 /// dead bytes awaiting compaction are exactly what makes a cache fill with nobody writing to it.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "lowercase")]
@@ -206,7 +184,6 @@ pub enum Usage {
     /// SeaweedFS: the master's topology names the volume servers, each server's disk status is the
     /// measurement, and the master's vacuum is the dead-byte reclaim.
     Seaweedfs {
-        /// Master HTTP base URL, e.g. `http://seaweedfs-master:9333`.
         master: String,
         /// Dead-byte fraction a volume must exceed before a vacuum rewrites it. The master applies
         /// this per volume, so a compaction request costs nothing when nothing is dirty enough.
@@ -314,8 +291,7 @@ impl Default for Gc {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub remote: S3Endpoint,
-    /// Required in both modes: the cache is the ETag/namespace source of truth even for the
-    /// `durable` deployment, where it holds only tombstones (unified tiering design).
+    /// Required in durable mode too, where it remains the namespace and ETag projection.
     pub cache: S3Endpoint,
     /// This deployment's own prefix, ahead of the fixed role segment ([`DATA_ROLE`] and friends) on
     /// every backend bucket it touches. Two deployments sharing one account stay in disjoint
@@ -323,21 +299,13 @@ pub struct Config {
     pub bucket_prefix: String,
     pub mode: Mode,
     pub auth: ClientAuth,
-    /// The 256-bit random passphrase age's scrypt recipient wraps every file key to (§6),
-    /// delivered via a Secret. One passphrase for the whole remote; the string form here lives
-    /// for the process lifetime.
     pub master_passphrase: String,
     #[serde(default)]
     pub serving: Serving,
-    /// Cached-mode reconcile cadence (§7). Present in both modes for config uniformity; the sweep
-    /// only runs when `mode == cached`.
     #[serde(default)]
     pub reconcile: Reconcile,
-    /// Bounds on the background-transition actor (§8). Present in both modes for config uniformity;
-    /// only cached mode submits anything.
     #[serde(default)]
     pub background: Background,
-    /// The scavenger's cadence (§8). Runs in both modes.
     #[serde(default)]
     pub gc: Gc,
     /// How often to re-check that each `Ready` bucket still has its sync marker (§7). One HEAD per
@@ -362,8 +330,6 @@ impl Default for Serving {
 }
 
 impl Config {
-    /// Load `hypha.toml` (if present) then overlay `HYPHA_`-prefixed env vars (double underscore
-    /// nests: `HYPHA_REMOTE__BUCKET`).
     // `figment::Error` is ~208 bytes; box it so the (boot-only, cold) error path doesn't bloat
     // this `Result`.
     pub fn load() -> Result<Self, Box<figment::Error>> {
@@ -380,16 +346,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The prefix every backend bucket of `role` carries: this deployment's prefix, the role, and
-    /// the separator the client bucket name follows. Disjointness across roles is structural — the
-    /// role segment is fixed and single-character, so no two can overlap however the deployment
-    /// prefix is set, and all four may share one endpoint (the integration harness's single MinIO
-    /// does).
     pub fn role_prefix(&self, role: &str) -> String {
         format!("{}-{role}-", self.bucket_prefix)
     }
 
-    /// GC's single bucket (§8) — a whole bucket name, not a prefix, since nothing is appended.
     pub fn gc_bucket(&self) -> String {
         format!("{}-{GC_ROLE}", self.bucket_prefix)
     }

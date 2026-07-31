@@ -1,27 +1,7 @@
-//! Library entrypoint shared by the `hypha` binary and the integration tests: build the s3s
-//! service from a validated [`Config`] and serve it with graceful connection draining. The binary
-//! ([`main`](../main.rs)) is a thin wrapper that loads config, wires signal-driven shutdown, and
-//! calls [`serve`]; the tests build the same service in-process and drive it with a real S3 client.
+//! Service construction and graceful lifecycle management.
 //!
-//! # Shutdown
-//!
-//! Three phases, each with its own budget, run in an order that follows what the work *owes* rather
-//! than where it lives:
-//!
-//! 1. **The API closes.** The accept loop stops and hyper drains the live connections, after which
-//!    every handler has returned and no new one can start — step 1 of §7's quiescence proof.
-//! 2. **Obligations are settled** ([`Lifecycle::seal`]): the startup shadow sweeps are joined, then
-//!    the two sealed actors write what the run has earned. This precedes the rest deliberately — the
-//!    clean markers are the run's durability-relevant output and must not queue behind a bucket
-//!    recovery that could run for minutes.
-//! 3. **Every remaining actor quiesces** ([`Lifecycle::quiesce`]): the shutdown token is cancelled,
-//!    the last handles are dropped so each queue closes, and each actor is *joined* — it finishes the
-//!    messages it already holds and returns on its own. Nothing is aborted while it still has work,
-//!    which is the point: a task killed mid-call leaves debris that is recoverable but real (a twin
-//!    beside a live body, a half-drained bucket).
-//!
-//! A phase that overruns its budget logs and aborts what is left, since the alternative is
-//! overrunning the pod's `terminationGracePeriod` and being killed mid-call anyway (§9).
+//! Shutdown first drains request handlers, then seals durability evidence before waiting for
+//! potentially long recovery actors. Each bounded phase aborts only after its budget expires.
 
 mod admin;
 mod auth;
@@ -58,11 +38,6 @@ pub use s3::Hypha;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
-/// Build the s3s `S3Service` — hypha's client auth over the `Hypha` app — from a validated config,
-/// alongside the [`Lifecycle`] [`serve`] needs to bracket it: the startup marker clear and the
-/// drain-time quiescence proof (§7). The age envelope and trailer key both derive from
-/// `master_passphrase` (§6). The persistent halt check precedes every actor spawn, so a halted
-/// deployment does no background work on its way back out.
 pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError> {
     let env = hypha_format::Envelope::new(&config.master_passphrase)
         .map_err(|e| format!("parsing master passphrase: {e}"))?;
@@ -71,12 +46,8 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), Bo
 
     let remote = Backend::connect(&config.remote, config.role_prefix(REMOTE_ROLE));
     halt::exit_if_marked(&remote).await?;
-    // The cache carries three roles on one endpoint (§6, §8): <data> holds client bodies +
-    // tombstones, <meta> hypha's twins/markers/mpu records, and GC's own bucket the recency ring.
     let data = Backend::connect(&config.cache, config.role_prefix(DATA_ROLE));
     let meta = data.with_prefix(config.role_prefix(META_ROLE));
-    // A whole bucket name, not a prefix — nothing is appended to it — so the backend it goes
-    // through must not prepend one either.
     let gc_backend = data.with_prefix(String::new());
 
     let halt = halt::Halt::new(remote.clone());

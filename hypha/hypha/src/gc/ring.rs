@@ -1,33 +1,8 @@
-//! The recency sketch (§8) — the only thing GC knows about what clients want.
+//! Deployment-wide Bloom-ring recency sketch.
 //!
-//! Plain state with no interior mutability: [`super::GcActor`] writes it and a running pass probes it,
-//! both under the one lock [`super`] holds it behind. What keeps it off the *request* path is the
-//! touch queue in [`super`], not anything in this file.
-//!
-//! Recency is a **Bloom-ring sketch**: one filter per *fill window*, retained `depth` deep behind
-//! the current one. A probe answers with the newest slice holding the key, which is a quantized
-//! last-access age — `depth + 1` buckets from the current window down to [`Age::Miss`], colder than
-//! anything the ring remembers.
-//!
-//! **Denominated in distinct keys, never in time.** A slice rotates when its distinct-key fill
-//! reaches the design point, so recency is relative to *competing traffic*: an idle cache holds its
-//! working set indefinitely, and nothing ages out except by displacement. Rotating on fill also
-//! bounds each slice's false-positive rate by construction — no read rate can silently saturate a
-//! slice into reporting every key as recent, which is the protect-everything failure this mechanism
-//! exists to avoid. Fill stays exact because `insert` reports whether the key was already present,
-//! so a hot key touched a thousand times advances it once.
-//!
-//! **One ring for the deployment**, keyed by fully qualified `<bucket>/<key>` and persisted to GC's
-//! own bucket rather than per-bucket `<meta>`. Recency is competition-relative, so the competition
-//! has to be the whole deployment's traffic: a per-bucket ring would let a quiet bucket keep its
-//! working set warm indefinitely while a busy one aged its own out, and the two would then be
-//! compared against a single eviction threshold as though the numbers meant the same thing.
-//!
-//! **Advisory, and only advisory.** A ring that is lost, cold, or stale (first boot, a failover
-//! without a persisted ring, a parameter change that invalidates the slices on disk) collapses every
-//! key into one bucket, and eviction ordering degrades to LastModified for a churnier cycle. It
-//! never degrades to incorrectness: the correctness gates that decide whether a key *may* be evicted
-//! are elsewhere and absolute (§8).
+//! Slices rotate by distinct-key fill rather than time, so idle working sets age only through
+//! competing traffic and filters cannot silently saturate. The sketch is advisory: losing it
+//! degrades eviction order, never correctness.
 
 use std::collections::VecDeque;
 

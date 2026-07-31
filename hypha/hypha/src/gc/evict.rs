@@ -1,17 +1,8 @@
-//! The eviction gates (§8) — the only place in hypha that removes a body a client can still ask for.
+//! Eviction correctness gates.
 //!
-//! **Write-awareness is a property of the remote, not of process memory.** The hazard is one step:
-//! tombstoning a body the remote does not hold *in that generation*. An in-flight-PUT counter used to
-//! guard it, but the window no longer belongs to a single request (§7 — the marker write outlives the
-//! ack), and a counter never covered a marker owed by a process that has since died. So the guard is
-//! entirely cache-and-remote observable, and one check subsumes three hazards: a markerless
-//! just-written body, a marker lost to a crash, and the corruption a bare *presence* check would
-//! allow — where the remote holds an older generation, the tombstone is stamped with the cache body's
-//! facts, and reads then return the old plaintext under the new ETag and length.
-//!
-//! The three gates layer marker → remote generation → conditional CAS, which is what makes every
-//! interleaving auto-healing rather than lossy: a writer landing anywhere between them has moved the
-//! ETag, so the CAS fails and eviction simply retries next pass.
+//! Marker absence, matching remote generation, and a final cache CAS replace process-local
+//! write-awareness. This also covers marker loss across crashes and prevents an older remote
+//! generation from being projected under newer cache facts.
 
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;

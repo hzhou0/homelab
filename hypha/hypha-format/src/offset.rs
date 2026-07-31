@@ -1,4 +1,4 @@
-//! Closed-form plaintext-byte ⇄ ciphertext-byte arithmetic for the age v1 payload.
+//! Closed-form byte-offset arithmetic for the age v1 payload.
 //!
 //! Layout of an age file: `header ‖ payload_nonce(16) ‖ chunk₀ ‖ chunk₁ ‖ …` where every chunk
 //! is 64 KiB of plaintext + a 16-byte Poly1305 tag, except the last (shorter, never empty —

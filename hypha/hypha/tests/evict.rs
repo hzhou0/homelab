@@ -1,11 +1,4 @@
-//! Phase-5's other half: **eviction** (§8) — the only path in hypha that removes a body a client can
-//! still ask for, and the only one that answers to a byte target rather than to a cost argument.
-//!
-//! Everything here needs a pressure source, which is why none of it existed before: MinIO reports no
-//! usage, so the plain harness has no measure of pressure and its passes sweep debris forever without
-//! evicting (`gc.rs` is that half). The harness's [`CacheUsage`] supplies the figure, and supplying it
-//! rather than measuring it is what makes an **unmeetable** target expressible — a real cache shrinks
-//! as GC evicts, so no pass could be observed escalating past the rung its first reclaim satisfied.
+//! Pressure-driven eviction and its correctness gates.
 //!
 //! The three gates are asserted one at a time and from the failing side, because that is the side
 //! that loses data: each test drives a state in which the body must *not* be tombstoned and asserts
@@ -22,8 +15,6 @@ use hypha_core::meta;
 
 const B: &str = "evictbucket";
 
-/// Cache capacity the usage source reports. Round and small: every target below is arithmetic on it,
-/// and the bodies a test writes have to be able to meet one.
 const CAPACITY: u64 = 1_000_000;
 
 /// Water marks that put the byte target within reach of a handful of test objects. The production

@@ -1,26 +1,7 @@
-//! Per-key async lock table — the shared serialization primitive (§4). Same-key holders never
-//! overlap or reorder while distinct keys run fully in parallel. Instantiated twice: the *write*
-//! lock (conditional writes, the durable finalize, GC tombstone transitions) and — in phase 4 —
-//! the reconcile-only *upload* lock, kept separate so a replication upload only ever excludes other
-//! reconciles of its key, never a client's conditional PUT.
+//! Sharded per-key async locks.
 //!
-//! The table stores **weak** references, so it never keeps a mutex alive: the [`KeyGuard`] returned
-//! by `lock`/`try_lock` is the only strong owner. Two concurrent lockers of the same key both
-//! upgrade the *same* live `Weak`, so they serialize; a locker arriving after all guards dropped
-//! upgrades a dead `Weak`, gets `None`, and installs a fresh mutex.
-//!
-//! Cleanup is **remove-on-drop**, O(1), not a periodic sweep: when a guard drops it releases the
-//! async mutex, then removes the key iff it is the sole remaining owner (`strong_count == 1`, i.e.
-//! no other holder or parked waiter). So the table holds exactly the set of currently
-//! held-or-awaited keys, with no dangling entries to sweep. The one backstop for the
-//! essentially-impossible orphan (a `lock` future cancelled between install and acquire — the
-//! fresh-mutex acquire never suspends, so this can't actually happen) is that `mutex_for`
-//! overwrites any dead `Weak` it finds, so a stray entry self-heals on the key's next use.
-//!
-//! `DashMap` rather than one `Mutex<HashMap>`: every write op takes and releases a key lock, so a
-//! single table lock is a process-wide serialization point on the write path — sharding scopes each
-//! acquisition to one of the map's shards. Keys are `Arc<str>` shared with the table entry, so a
-//! second locker of a held key allocates nothing.
+//! Weak table entries let idle keys disappear on guard drop without a sweep. Separate table
+//! instances keep reconcile uploads from serializing client writes.
 
 use std::sync::{Arc, Weak};
 

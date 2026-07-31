@@ -1,8 +1,4 @@
-//! The `s3s::S3` trait implementation, split by op group (§3). Each submodule adds an
-//! `impl Hypha` block; this module owns the struct and the trait wiring that dispatches to them.
-//!
-//! Phase 2 is the **durable** surface: writes go through the cache but ack only after the remote
-//! is durable. Phase 4 adds cached mode (ack after cache write, async background upload).
+//! S3 operation dispatch and shared request-path state.
 
 mod buckets;
 mod copy;
@@ -34,25 +30,15 @@ use crate::tier::Tiering;
 
 #[derive(Clone)]
 pub struct Hypha {
-    /// Shared tiering machinery: cache + remote backends, the age envelope, and the per-key lock
-    /// table. Every data-path op reaches the backends through here.
     pub tier: Tiering,
-    /// The bucket-control actor — sole writer of the cache substrate (§7 *Buckets*). Bucket
-    /// lifecycle and repair route here; object reads/writes never do, beyond the 503 repair kick.
     pub(crate) buckets: BucketCtl,
-    /// The background-transition actor (§8) — rehydrate. Client writes reach it only through
-    /// [`Hypha::write_lock`], which cancels K's transition before queuing.
     pub(crate) background: Background,
-    /// Pending-marker obligations (§7). A cached write acks on its body write and raises the marker
-    /// here; the ack never depends on the marker landing.
     pub(crate) markers: Markers,
     /// The GC actor (§8). Every op that resolves or lands a single key touches it — reads *and*
     /// writes, since a write is the strongest statement of interest a key gets. LIST and DELETE
     /// deliberately do not: a full listing would mark the whole keyspace hot, and a delete leaves no
     /// body to protect.
     pub(crate) gc: Gc,
-    /// Shadow-orphan obligations (§8). Every cached write that could have superseded a composite hands
-    /// its key over; the actor is what decides whether there was a shadow to reclaim.
     pub(crate) orphans: Orphans,
     pub mode: Mode,
     /// Longest configured bucket prefix, charged against S3's 63-byte cap so the client-visible

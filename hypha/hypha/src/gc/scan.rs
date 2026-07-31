@@ -1,17 +1,8 @@
-//! §8's probabilistic scan — how the scavenger finds eviction candidates without walking the
-//! keyspace.
+//! Probabilistic eviction-candidate discovery.
 //!
-//! **Sampling, not a walk.** A *probe* lists from a random position and reads a few pages. Nothing
-//! tracks a cursor, and the position is fresh every time: a rotating cursor would make eviction
-//! pressure correlate with key *name* — keys early in the keyspace examined on every boot, keys late
-//! in it only under sustained pressure — and would have both replicas sweep in lockstep after a
-//! failover. Sampling also keeps scan cost proportional to the pressure rather than to the keyspace,
-//! which is what a full loop over a cold, mostly-untouched bucket spends its round trips on.
-//!
-//! **The position is biased, and the bias is corrected downstream.** `start-after` takes a key, so a
-//! random position is a random key-shaped string and the probe lands on the first key at or after it
-//! — uniform over the *keyspace*, not over keys, which favours regions sitting behind large gaps.
-//! [`Yields`] corrects it across buckets and [`Prefixes`] within one.
+//! Fresh random probes avoid correlating reclaim with key order and keep scan cost proportional to
+//! pressure. Because start-after samples keyspace gaps rather than keys uniformly, yield feedback
+//! corrects the bias across buckets and observed prefixes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,8 +24,6 @@ const YIELD_SMOOTHING: f64 = 0.3;
 /// is sampled before it has earned it rather than after.
 const UNPROBED_YIELD: f64 = 1.0;
 
-/// Something a probe found that holds reclaimable plaintext, with everything eviction needs to judge
-/// it and to CAS it.
 pub(super) struct Candidate {
     /// Shared with the probe that found it rather than copied per candidate: one probe can return
     /// thousands, and they all came from the same bucket.

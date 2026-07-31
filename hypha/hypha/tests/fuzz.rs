@@ -1,11 +1,4 @@
-//! Property fuzzing: random sequences of PUT/overwrite/DELETE against hypha over real MinIO,
-//! checked against an in-memory `BTreeMap` oracle. A small key alphabet forces frequent
-//! overwrites and delete-then-recreate; sizes straddle the 64 KiB chunk boundary. After each
-//! sequence, every surviving key must GET/HEAD/range byte-exact and LIST must equal the model's
-//! keyset; every absent key must 404. Complements `hypha-format`'s in-crate `RangeReader` fuzzing.
-//!
-//! proptest is synchronous, so a `TestRunner` is driven by hand over a locally-owned runtime and
-//! harness — both drop at the end of the test, so the MinIO process and its data are cleaned up.
+//! Model-based random PUT, overwrite, and DELETE sequences against a real backend.
 
 mod common;
 

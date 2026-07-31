@@ -1,25 +1,7 @@
-//! **R2 — the pending-set rebuild** (§7): re-derive a bucket's pending markers by walking the
-//! namespace it can already trust.
+//! Re-derives a cached bucket's pending set from an authoritative cache namespace.
 //!
-//! That the namespace is **authoritative** is the whole difference from a restore, and it is what
-//! confines this pass to writing markers. It never materializes a key from the remote (rebuilding
-//! one would resurrect a deleted object) and never settles a cache entry from a listing (which is
-//! what would roll an acked write back).
-//!
-//! **Every marker this pass raises is raised under K's lock, off a re-read.** The bucket keeps
-//! serving throughout, so a cursor page is a snapshot of a keyspace that is still moving, and a
-//! marker records an *operation* — inferring one from a stale sighting can retype the operation a
-//! client just acked. The lock plus the re-read make the inference current at the moment it is
-//! written; the sweep's CAS on the marker's own ETag then keeps a redundant one harmless. The two
-//! paths about to declare an invariant violation lock for the same reason: a stale snapshot must not
-//! be allowed to halt a healthy deployment.
-//!
-//! Cached mode only: durable writes commit on the remote, so there is no pending set (invariant I3).
-//!
-//! §6 is what licenses re-deriving the set at all — *"what makes a cached write pending is a state
-//! of the world, not a record hypha keeps"* — and the marker's only job is to make that set
-//! enumerable in `O(pending)` rather than `O(keyspace)`. This pass is the `O(keyspace)` fallback for
-//! when the index is known incomplete, which is the one time it is worth paying.
+//! It writes markers only—materializing remote keys could resurrect deletes. Every inference is
+//! made from a locked re-read so a stale listing cannot retype a concurrent client operation.
 
 use std::cmp::Ordering as KeyOrder;
 use std::collections::VecDeque;

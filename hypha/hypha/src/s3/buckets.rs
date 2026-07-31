@@ -1,14 +1,4 @@
-//! Bucket ops. Like multipart (§7), these route by the **remote as source of truth** and are
-//! **always durable** — synchronous to the remote regardless of mode, no cache/marker machinery.
-//! Existence and listing are answered from the remote; the cache bucket exists only so object-side
-//! state (bodies, tombstones, twins, mpu records) has somewhere to live, so it is created/deleted
-//! alongside but is never the authority.
-//!
-//! Lifecycle (Create/Delete) is owned by the bucket-control actor ([`crate::bucket`]), the sole
-//! writer of the cache substrate: these ops validate, then hand off and await the remote's own
-//! result. The remote create/delete is the commit; the cache projections are provisioned/drained
-//! around it. The client's bucket passes through, mapped under each backend's own prefix
-//! (backend.rs).
+//! Durable bucket operations with the remote as the existence authority.
 
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};

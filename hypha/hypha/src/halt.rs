@@ -1,28 +1,8 @@
-//! Invariant violations, and the halt they put the deployment into.
+//! Persistent deployment halt for violated storage invariants.
 //!
-//! Nothing but hypha writes these buckets, and the recovery machinery (§7) rests on properties that
-//! therefore cannot be false. A violation of one does not mean a request failed — it means hypha's
-//! picture of its own data is wrong, so every later answer is suspect and the recoveries themselves
-//! become unsafe to run: a restore would rebuild from a namespace it has just been told is not the
-//! one it thinks.
-//!
-//! So a violation is not an error to propagate. The order matters:
-//!
-//! 1. the server shuts down, so nothing further is served on data hypha has just declared wrong;
-//! 2. the violation is recorded, retried until it lands — losing the record would let the next
-//!    process silently resume serving the same wrong data. Nothing is being served in the meantime,
-//!    so there is no deadline worth beating;
-//! 3. only then does the process end. Every later run exits from [`exit_if_marked`], so the
-//!    deployment presents as an ordinary crashloop — the failure mode operator tooling already
-//!    alerts on. hypha is active-passive with a single active, so there is no replica to coordinate
-//!    with.
-//!
-//! [`std::process::exit`], not a panic: a panic in a spawned task unwinds that task alone and leaves
-//! the rest of the process serving, which is the state this exists to prevent.
-//!
-//! Clearing is an operator action: delete the marker object and restart. Clearing without fixing
-//! what diverged re-trips on the next pass, which is intended — the marker records a fact about the
-//! data, not about the process.
+//! A violation makes later answers and recovery unsafe. Serving stops before the marker is retried
+//! to durability, then the process exits rather than panicking a single task. Future runs refuse to
+//! start until an operator clears the marker.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

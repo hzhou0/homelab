@@ -1,14 +1,7 @@
-//! What the cache is physically holding (§8) — the one input that tells GC whether it is under
-//! pressure at all.
+//! Physical cache usage and backend compaction.
 //!
-//! **Physical bytes, not the sum of live object sizes.** Dead bytes awaiting compaction are exactly
-//! what makes a cache fill up with nobody writing to it, and a scavenger that cannot see them evicts
-//! live bodies to recover space a compaction would have returned for free.
-//!
-//! No source configured means no eviction, ever: with nothing measuring pressure there is no byte
-//! target to evict against, and evicting on a guess spends rehydration latency for nothing. A source
-//! that is configured but *failing* degrades the same way, which is why a sample error is a warning
-//! rather than a pass failure — GC keeps sweeping debris at its base cadence.
+//! Missing or failed measurements disable eviction rather than guessing at pressure; debris
+//! reclaim continues independently.
 
 use std::time::Duration;
 
@@ -18,7 +11,6 @@ use serde::Deserialize;
 use hypha_core::config;
 use hypha_core::error::{Error, Result};
 
-/// A cache backend's own accounting of the space it occupies.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Usage {
     pub(super) used: u64,

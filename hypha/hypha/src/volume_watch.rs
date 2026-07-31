@@ -1,25 +1,7 @@
-//! The cache-volume watchdog: the one failure a *running* process has to keep checking for.
+//! Detects live loss of an authoritative cache namespace.
 //!
-//! Startup resolves every bucket from its sync marker and is done with the question
-//! ([`crate::bucket::resolve_all`]). That answer stays true for the rest of the run under one
-//! assumption the run cannot simply hold — that the cache volume does not vanish underneath a live
-//! process. A `Ready` bucket whose cache is gone answers **404 for objects that exist**, silently:
-//! the phase's central claim ([`crate::bucket`]) turned into a lie. Every other divergence is either
-//! impossible while hypha owns both backends or is caught by the pass that would act on it.
-//!
-//! Halting on the marker's disappearance is the correct outcome rather than a harsh one — the
-//! process cannot re-derive what the volume held, and the restart it forces resolves the bucket as
-//! `Restoring` and rebuilds it from the remote.
-//!
-//! **`Ready` is the whole set, and that is not a gap.** It is the only phase that claims anything
-//! falsifiable about the cache. A `Restoring` bucket serves from the remote, so losing its volume
-//! costs the restore its progress and nothing else — nothing acked lives only in the cache during
-//! that window, and the pass is additive and idempotent. There is no assertion to invalidate, so
-//! there is nothing to poll for.
-//!
-//! Deliberately *not* a repair. Flipping the bucket back to `Restoring` in place would be serving
-//! through a volume loss the run has already answered 404s from, with no way to know which answers
-//! were wrong or who saw them.
+//! A ready bucket may already have served false 404s before loss is detected, so the watcher halts
+//! instead of attempting in-place repair. Restart reclassifies the bucket and restores remotely.
 
 use std::time::Duration;
 

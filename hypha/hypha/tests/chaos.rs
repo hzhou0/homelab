@@ -1,11 +1,4 @@
-//! Random faults, indiscriminately, across every backend call — and the properties that must hold
-//! anyway.
-//!
-//! The rest of the suite injects faults the author chose: this method, this path, this many times.
-//! That is what makes those tests readable, and also what bounds them to failures somebody already
-//! thought of. Here a share of *everything* fails — a HEAD hypha takes for a reason no test names, a
-//! twin write, a marker clear, the second leg of a bracket — and instead of asserting a specific
-//! outcome, the tests assert the contract that has to survive whatever happened.
+//! Model properties under random faults across all backend operations.
 //!
 //! **The oracle is a set, not a value.** A faulted operation is *indeterminate*: the SDK retries, and
 //! a fault injected after the backend acted (`lose_responses`) lands the operation and reports
@@ -15,9 +8,8 @@
 //! is everything that matters: a value nobody wrote, a body that disagrees with the ETag served
 //! beside it, a LIST that disagrees with GET, and any hybrid of two generations.
 //!
-//! Faults are lifted before anything is verified. During the storm hypha is *expected* to fail
-//! requests; the claim is about the state it leaves behind, and reading that state needs a backend
-//! that answers.
+//! Verification runs after faults clear because the subject is the converged state, not availability
+//! during the storm.
 
 mod common;
 

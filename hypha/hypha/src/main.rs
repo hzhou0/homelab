@@ -1,7 +1,4 @@
-//! hypha serving binary: load config, build the s3s service, and serve over plain HTTP (TLS is
-//! terminated at the cluster gateway). Signal handling drains in-flight connections on
-//! SIGTERM/Ctrl-C. The service construction and accept loop live in the library ([`hypha`]) so the
-//! integration tests can build and drive the same service in-process.
+//! Hypha process entry point.
 
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -9,7 +6,6 @@ use tokio_util::sync::CancellationToken;
 use hypha::{build_service, serve, BoxError};
 use hypha_core::Config;
 
-/// Wrap an error with a bootstrap-context message (stands in for `anyhow::Context`).
 fn ctx<E: std::fmt::Display>(msg: &str) -> impl FnOnce(E) -> BoxError + '_ {
     move |e| format!("{msg}: {e}").into()
 }

@@ -1,11 +1,4 @@
-//! Phase-3 exit: the multipart path end-to-end (§7). Parts route around the cache onto the
-//! remote's native multipart upload as independent age files; complete lands a terminating trailer
-//! part carrying the facts + parts table, and reads recover every part boundary from that trailer
-//! alone. Covers out-of-order/parallel parts, re-upload last-write-wins resolution, composite ETag
-//! correctness, single-stream + ranged composite GET (uniform and ragged parts), abort cleanup,
-//! process restart mid-upload, the part-number range, the two fold conditions, the in-progress
-//! listing ops, failed part-record persistence, pre/post-commit completion failures, and
-//! trailer-based recovery after both a mid-complete crash mark and total cache-volume loss.
+//! Multipart completion, retry, recovery, and composite read behavior.
 
 mod common;
 

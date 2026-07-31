@@ -1,24 +1,7 @@
-//! §8's escalation ladder — the control law that decides how hard GC pushes back on pressure.
+//! GC pressure escalation.
 //!
-//! Pressure has four answers and the order they are spent in *is* the design. How **often** the
-//! scavenger passes, how **wide** each pass runs, and only then how **warm** a key it will take.
-//! Rungs 1 and 2 spend nothing but work — round trips, bandwidth, CPU the deployment already has,
-//! all of it given back the moment pressure drops. Rung 3 spends the quality of the decision: a
-//! warmer key is likelier to be wanted back, and that bill is paid later, by a client, as
-//! rehydration latency and a re-upload. So exhaust what costs work before spending what costs the
-//! client. (Rung 0 — debris and dead-byte compaction — needs no state here: every pass does it.)
-//!
-//! **One position, not three knobs.** The rungs are laid out once as a single ordered list of
-//! settings, and the ladder is an index into it. Climbing is `+1`, and descending is `-1` — which is
-//! LIFO *by construction*, so the expensive rung can never outlive the evidence that justified it
-//! without the descent having to be reasoned about separately.
-//!
-//! Movement is capped at one step per completed pass, a pass being one round of probes across the
-//! sampled buckets — the unit of evidence a sampling scan can offer. That cap is what damps the
-//! control: nothing moves faster than the scan can observe what the previous setting yielded.
-//! Deliberately not a proportional map from pressure onto a rung, which would pick an aggressive
-//! threshold on a spike even when the keyspace is full of misses that would have met the target on
-//! their own.
+//! The ladder spends extra cadence and concurrency before evicting warmer data, and moves at most
+//! one rung per completed pass so each change is evaluated before the next.
 
 use std::time::Duration;
 

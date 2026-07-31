@@ -1,19 +1,7 @@
-//! The restore overlay: one interface every data op routes through so a bucket mid-restore is served
-//! from the remote instead of its half-rebuilt cache (§7 *Buckets*).
+//! Routes operations around a half-restored cache namespace.
 //!
-//! A bucket's [`Readiness`] ([`crate::bucket`]) selects the source every op resolves against, at the
-//! cost of one atomic load:
-//!
-//! - **Reads** ([`Hypha::resolve_key`], [`Hypha::project_remote_page`]) resolve a key's facts — and a
-//!   LIST page's entries — from the cache tombstone namespace once `Ready`, or straight from the
-//!   remote (facts off each object's authenticated tail trailer, §6) while `Restoring`.
-//! - **Writes** ([`Hypha::prepare_write`]) are never gated: a write to a `Restoring` bucket first
-//!   materializes its key from the remote into the cache, so the normal §4 bracket then runs against
-//!   a correct tombstone. The background restore fills the rest and writes the marker.
-//!
-//! Keeping the cache-vs-remote fork behind these three entry points means the op handlers carry one
-//! `match` each, and the whole overlay is one place to revisit when cached-mode (Phase 4) adds its
-//! pending overlay to the `Restoring` arms.
+//! Reads resolve remotely while restoring. Writes materialize the destination's remote state first
+//! and use durable semantics so they never commit into a namespace readers are ignoring.
 
 use std::collections::HashMap;
 
@@ -34,36 +22,19 @@ use crate::tier::RemoteFacts;
 /// Bounded fan-out for the per-key trailer reads a remote-served LIST page needs (§7).
 const REMOTE_LIST_FANOUT: usize = 16;
 
-/// Which write semantics an op runs under (§4/§7) — deliberately a property of the *bucket*, not of
-/// the deployment.
+/// Write semantics are a bucket property because cached deployments use durable writes during
+/// restore.
 pub(super) enum WriteMode {
-    /// The remote is the commit point: bracket the write, upload inline, ack once durable.
-    ///
-    /// A cached deployment runs this too, for the whole of a bucket's namespace restore. The
-    /// restore's premise is that the cache holds nothing authoritative — that is what lets the
-    /// remote be the read source of truth, and what lets the restore be purely additive — and a
-    /// cached write would falsify it the moment it acked, leaving committed state in a namespace
-    /// every reader is being told to ignore. Running durable for the window is what makes the
-    /// premise true rather than merely hoped for; the cost is remote latency on writes into a
-    /// bucket that is already rebuilding.
     Durable,
-    /// The cache write is the commit: ack on it, and owe the remote a pending marker (§7).
     Cached,
 }
 
-/// The resolved state of a key, source-agnostic (§7). `Remote` and `CacheBody` both carry the
-/// cache-side metadata (`md`) the facts share — empty when resolved from the remote mid-restore,
-/// since the trailer carries facts and nothing else.
 pub(super) enum KeyState {
-    /// Client-visibly absent (deleted, or never existed).
     Absent,
-    /// A remote-resident object (tombstoned, mid-bracket, or restore-time): serve/HEAD from remote.
     Remote {
         facts: RemoteFacts,
         md: HashMap<String, String>,
     },
-    /// A live plaintext body in the cache (cached mode). Carries the HEAD it was resolved from so
-    /// callers reuse its native size/ETag/mtime (boxed — it dwarfs the other variants).
     CacheBody {
         head: Box<HeadObjectOutput>,
         md: HashMap<String, String>,

@@ -1,39 +1,8 @@
-//! The background-transition actor (§8) — the owner of every *discardable* per-key transition.
+//! Bounded, deduplicated, cancellable best-effort rehydration.
 //!
-//! A rehydrate is best-effort by construction: the read that raised it is already being served from
-//! the remote, so abandoning one costs the next read of that key a remote fetch and nothing else.
-//! That is what makes the write lock safe to hand back mid-transition, and it is why these
-//! transitions belong on one bounded queue rather than in a detached `tokio::spawn` per read:
-//!
-//! - **Bounded.** A burst of reads against evicted keys can otherwise spawn an unbounded number of
-//!   whole-object downloads. Here they queue, `background.concurrency` run at once, and a full queue
-//!   sheds new work instead of blocking the reads that raised it.
-//! - **Deduped.** One live transition per key. The registry entry *is* the dedup set, so N
-//!   concurrent reads of one evicted key enqueue one transition, not N that each take the write
-//!   lock in turn. ([`Tiering::shadow_is_current`] still guards the *other* case — a transition
-//!   submitted after an earlier one already landed that generation.)
-//! - **Cancellable.** §8 has rehydrate hold K's write lock across the whole fetch + decrypt + land,
-//!   which would park a same-key conditional PUT, DELETE, or CompleteMultipartUpload behind a
-//!   multi-minute transfer. Every client write instead cancels K's background transition first (see
-//!   [`crate::s3::Hypha::write_lock`]) and the holder drops the lock at its next await — abandoned
-//!   wholesale, never half-applied, since a completing rehydrate still did every step under the
-//!   lock. The cancel needs no acknowledgement: a transition registers its token *before* it ever
-//!   attempts the lock, so a transition blocking a client necessarily holds the lock and has a live
-//!   token to find, while a transition registering after the cancel hasn't taken the lock yet and
-//!   blocks nobody — the lock handoff is the rendezvous, so `cancel` is a fire-and-forget map
-//!   lookup on the write path.
-//!
-//! Lifecycle mirrors [`crate::bucket`]: the task holds a [`Tiering`], never a `Hypha`, so the queue
-//! closes when the service drops. At the drain it sheds what is still queued and waits out what is
-//! running — see [`TransitionActor::run`] for why those two get opposite treatment.
-//!
-//! **Eviction is deliberately not here**, though it is equally discardable. §8's rung 2 makes GC's
-//! own concurrency the bound on per-key eviction work, so that work has to belong to a GC pass or
-//! raising it under pressure would move nothing — and a pass has to count the bytes it reclaimed,
-//! which is the evidence the whole ladder moves on. Eviction needs none of this module's other
-//! properties either: it holds K's write lock across a twin refresh and a 16-byte conditional PUT,
-//! not across a transfer, so a client write simply takes the lock next and the CAS fails the
-//! eviction that lost.
+//! Reads already succeed remotely, so overload may shed queued work. A transition registers its
+//! cancellation token before taking the key lock; that lock handoff lets client writes cancel
+//! without waiting for an acknowledgement or risking a half-applied rehydrate.
 
 use std::sync::Arc;
 
@@ -80,8 +49,6 @@ fn registry_key(bucket: &str, key: &str) -> String {
 /// occupied entry means this key already has a transition, and a second would duplicate its work.
 type LiveTransitions = Arc<DashMap<String, CancellationToken>>;
 
-/// Handle onto the actor. Cloneable and cheap — the queue sender plus the registry — so every
-/// `Hypha` clone shares one actor.
 #[derive(Clone)]
 pub struct Background {
     tx: mpsc::Sender<(Transition, CancellationToken)>,

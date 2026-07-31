@@ -1,25 +1,12 @@
-//! What the backend's conditional operations actually **do** — the assumption every CAS in hypha
-//! rests on, made executable.
+//! Executable backend contract for conditional operations and multipart replacement.
 //!
-//! §4's linearizability, §7's marker CAS and §8's three eviction gates are all conditional
-//! operations: hypha's coordination is not locks over a shared store, it is `If-Match` on the store
-//! itself. That makes the backend's precondition semantics part of hypha's correctness argument, and
-//! an unenforced one does not fail — it silently succeeds, which is the failure mode no other test
-//! in this suite can see, because every test that *drives* a precondition failure injects the 412
-//! rather than earning it.
-//!
-//! These tests take one round trip each and are the cheapest thing in the suite. They belong here
-//! rather than folded into the tests that depend on them for exactly the reason above: a test whose
-//! subject is a race reports "the backend did not refuse" as a flake.
-//!
-//! Cache-dialect probes run against the configured cache. Multipart probes run against the remote,
-//! whose replacement and ordering semantics are part of hypha's backend contract.
+//! These tests earn backend precondition failures instead of injecting them; silently ignored
+//! conditions would otherwise make higher-level race tests misleading.
 
 mod common;
 
 use common::*;
 
-/// A distinct bucket per test, so the two never race each other's objects.
 async fn probe_bucket(h: &Harness, raw: &aws_sdk_s3::Client, name: &str) -> String {
     let bucket = format!("{}-{name}", h.gc_bucket());
     raw.create_bucket()

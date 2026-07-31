@@ -1,19 +1,7 @@
-//! **R1 — the namespace restore** (§7): rebuild a bucket's cache projection from the remote.
+//! Additively rebuilds a bucket's cache projection from the remote.
 //!
-//! **Additive, and only additive.** A key the cache *does* hold is left untouched, because during a
-//! restore there are only two ways for it to have one, and both are current:
-//!
-//! - a tombstone this restore — or an earlier, crashed run of it — already settled from the remote;
-//! - the settle of a write committed during the window. Writes run durable for the whole restore, so
-//!   a committed write has already recorded itself in the cache and an uncommitted one has not.
-//!
-//! That is what makes the pass idempotent across crashes and safe to run while the bucket is served,
-//! and why the absence check needs no cache listing to correlate against — it is made under K's own
-//! lock, where nothing can move K between the look and the write.
-//!
-//! It is also why the restore can leave the bucket **accounted** for (§6): durable-mode writes owe
-//! no pending markers, so at the moment the sync marker lands the pending set is empty — complete by
-//! construction rather than by enumeration.
+//! Existing cache entries are current either from an earlier restore attempt or a durable write
+//! during this restore, so leaving them untouched makes the pass crash-idempotent.
 
 use futures::TryStreamExt as _;
 

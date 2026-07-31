@@ -1,17 +1,6 @@
-//! The bucket-control actor: the sole writer of the cache substrate, and where a bucket's phase
-//! ([`super`]) is decided and published.
-//!
-//! Rather than guard the three-way divergence with locks, every substrate *mutation* — CreateBucket,
-//! DeleteBucket, provisioning, and recovery — is funnelled through this one actor, which makes its
-//! serialization structural: per-bucket-serial (one task drains a bucket's requests in arrival
-//! order) and cross-bucket-parallel (distinct buckets proceed at once, bounded by
-//! [`MAX_CONCURRENT`]). Reads never enter here; they read the actor's published
-//! [state map](BucketCtl::state) instead, which costs one atomic load and no lock.
-//!
-//! Client Create/Delete are request-reply and never coalesced — each returns the remote's own
-//! result, so a double-delete's loser still sees `NoSuchBucket`. Recoveries are fire-and-forget and
-//! deduped: the op that triggered one already resolves from the remote meanwhile, so there is no
-//! waiter, and a storm of triggers for one bucket collapses to a single pass.
+//! Serializes cache-substrate mutations per bucket while publishing lock-free readiness snapshots.
+//! Client lifecycle requests retain individual replies; recovery triggers coalesce because reads
+//! already fall back to the remote while recovery is pending.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -48,11 +37,7 @@ const RECOVERY_RETRY: Duration = Duration::from_secs(5);
 /// the map holds tens of entries and is read once or twice per request.
 type BucketStates = Arc<ArcSwap<HashMap<String, BucketState>>>;
 
-/// What the data plane knows about one bucket (§7). Keeping the facts in one value is what makes a
-/// transition a single atomic publish — `Ready` replacing `Restoring` can't be observed half-applied,
-/// and no ordering convention between separate sets has to be maintained by hand. It is also why
-/// [`Self::accounted`] lives here rather than in [`crate::markers`]: retiring a deleted bucket then
-/// drops its accounting for free, instead of leaving a second structure to remember to clear.
+/// Keeping readiness and accounting together makes lifecycle changes one atomic publication.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct BucketState {
     readiness: Readiness,
@@ -70,15 +55,11 @@ pub(crate) struct BucketState {
     shadows_accounted: bool,
 }
 
-/// A bucket's source of truth for the data plane, and the whole of what the overlay branches on.
-/// Each phase is a claim the rest of the crate relies on; [`super`] states them.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Readiness {
     #[default]
     Absent,
-    /// Sync marker absent: a restore is owed or in flight.
     Restoring,
-    /// Sync marker observed.
     Ready,
 }
 
@@ -101,8 +82,6 @@ fn set_restoring(state: &mut BucketState) {
     state.readiness = Readiness::Restoring;
 }
 
-/// The sync marker is present: the cache namespace is authoritative. Supersedes `Restoring` in the
-/// same publish, so no reader can see the bucket as neither.
 fn mark_ready(state: &mut BucketState) {
     state.readiness = Readiness::Ready;
 }
@@ -161,8 +140,6 @@ enum BucketMsg {
     },
 }
 
-/// Handle onto the actor. Cloneable and cheap — the queue sender plus the published state map — so
-/// every `Hypha` clone shares one actor and one view of which buckets are cache-authoritative.
 #[derive(Clone)]
 pub struct BucketCtl {
     tx: mpsc::UnboundedSender<BucketMsg>,
@@ -171,7 +148,6 @@ pub struct BucketCtl {
 }
 
 impl BucketCtl {
-    /// Answers with the remote create's own result, so a duplicate create surfaces the remote's error.
     pub async fn create(&self, bucket: &str) -> Result<()> {
         self.request(|reply| BucketMsg::Create {
             bucket: bucket.to_string(),

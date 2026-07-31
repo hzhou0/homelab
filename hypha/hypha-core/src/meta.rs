@@ -1,12 +1,7 @@
-//! The cache-side structures plaintext facts travel through (§6): eviction/transition tombstones in
-//! the `<data>` bucket, and — in the `<meta>` bucket, keyed apart by the two control bytes client keys
-//! may not use — facts twins, pending markers, and mpu records. Plus the composite-ETag arithmetic
-//! and key admission.
+//! Cache metadata formats, internal keyspaces, and client-name admission.
 //!
-//! The *remote* carrier of an object's facts is the authenticated trailer behind its age
-//! ciphertext (`hypha_format::trailer`), landed atomically with every commit; nothing here is
-//! stamped onto remote objects. The cache copies below (tombstone metadata, twins) are
-//! projections serving steady-state HEAD/LIST without touching the remote.
+//! Remote facts live only in the authenticated ciphertext trailer. Tombstones and twins are cache
+//! projections used to answer HEAD and LIST without reading the remote.
 
 /// User-metadata key names on cache objects. The SDK adds the `x-amz-meta-` prefix on the wire.
 pub const PLEN: &str = "plen";
@@ -25,7 +20,6 @@ pub const CTYPE: &str = "ct";
 
 pub const STANDARD: &str = "STANDARD";
 
-/// Tombstone kinds (value of the [`TOMB`] metadata key).
 pub const TOMB_EVICT: &str = "evict";
 pub const TOMB_TRANSIT: &str = "transit";
 
@@ -39,7 +33,7 @@ pub const EVICT_SENTINEL: [u8; 16] = [
 pub const DELETE_MARKER_SENTINEL: [u8; 16] = [
     0x64, 0x58, 0x6a, 0xf5, 0x7f, 0xc3, 0xf6, 0x22, 0xf3, 0x00, 0xd3, 0xbb, 0x42, 0xb8, 0x72, 0x6d,
 ];
-/// K is mid-bracket (§7): cache facts are distrusted and readers resolve K from the remote.
+/// A transition body forces readers to distrust the cache until the write bracket settles.
 pub const TRANSIT_SENTINEL: [u8; 16] = [
     0xd9, 0xa5, 0xc8, 0x7a, 0x7c, 0x7e, 0x03, 0xc8, 0x04, 0x6c, 0x1a, 0xbf, 0x7c, 0x49, 0x0c, 0x65,
 ];
@@ -92,7 +86,6 @@ pub fn classify_entry(size: i64, etag: &str) -> Option<TombKind> {
         .find(|k| k.sentinel_etag() == etag)
 }
 
-/// Tombstone kind from an object's user-metadata (the HEAD-path classification).
 pub fn tomb_kind(metadata: &std::collections::HashMap<String, String>) -> Option<TombKind> {
     match metadata.get(TOMB).map(String::as_str) {
         Some(TOMB_EVICT) => Some(TombKind::Evict),
@@ -124,43 +117,17 @@ pub fn transit_sentinel_etag() -> String {
     TombKind::Transit.sentinel_etag()
 }
 
-/// A composite's client ETag is `hash-N`; a single-part's is a bare MD5. The suffix is the
-/// read path's composite dispatch (a composite body is per-part age files, not one).
 pub fn is_composite_etag(cetag: &str) -> bool {
     cetag.contains('-')
 }
 
-// ── Client user-metadata, namespaced (§7) ───────────────────────────────────────────────────
-//
-// A client's `x-amz-meta-*` and hypha's own facts share one carrier — the cache object's
-// user-metadata — so they need a namespace split, or a client key named `plen` would shadow the
-// tombstone's. hypha's keys stay bare and the client's ride under [`USER_PREFIX`], which is not a
-// prefix of any hypha key. Only the cache holds them: the remote's sole facts carrier is the
-// trailer (§6), so a repair or restore that rebuilds K from the remote drops the user metadata and
-// the storage class back to their defaults — the accepted durability limit of this carrier.
-// [`CTYPE`] is the exception, and rides the remote object's native `Content-Type` because a wrong
-// media type is a wrong answer rather than a lost label.
-
-/// Namespace for pass-through client metadata on a cache object.
+// Client metadata shares the tombstone carrier with internal facts, so it needs a disjoint prefix.
+// Content-Type also rides the remote natively because restoring the wrong media type is a wrong
+// answer rather than merely a lost label.
 pub const USER_PREFIX: &str = "u-";
 
-/// Client metadata values are percent-encoded at rest so a non-ASCII or control byte survives the
-/// backend's own header round trip byte-exact. (The *client* wire leg is RFC 2047, which s3s
-/// encodes and decodes for us — hypha only ever sees decoded values.)
-///
-/// The set is deliberately **narrow**: this carrier is capped at S3's 2 KB for all user metadata,
-/// and hypha shares it with the client, so every byte the encoding adds is a byte of the client's
-/// budget spent. Escaping everything outside `[A-Za-z0-9]` cost up to 3× and put hypha's effective
-/// limit at roughly a third of S3's — an invisible conformance shortfall. Ordinary ASCII now passes
-/// through unchanged and only genuinely unsafe bytes expand:
-///
-/// - **controls and `DEL`** — illegal in an HTTP header value,
-/// - **space** — SigV4 canonicalization collapses runs of whitespace in a header value, so an
-///   unescaped double space would sign differently than it transmits, and leading/trailing
-///   whitespace is trimmed outright,
-/// - **`%`** — what keeps the encoding self-delimiting.
-///
-/// Non-ASCII needs no entry: `utf8_percent_encode` always escapes bytes above `0x7F`.
+/// Escape only bytes unsafe in headers or SigV4 canonicalization. A broader escape set would consume
+/// the client's shared 2 KiB metadata budget without improving correctness.
 const META_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b' ').add(b'%');
 
 pub fn encode_user_metadata(
@@ -174,7 +141,6 @@ pub fn encode_user_metadata(
     })
 }
 
-/// hypha's own keys don't carry [`USER_PREFIX`], so they drop out.
 pub fn decode_user_metadata(
     stored: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
@@ -204,11 +170,8 @@ pub fn content_type(stored: &std::collections::HashMap<String, String>) -> Optio
     )
 }
 
-/// The client-visible pass-through carried on a tombstone: its `x-amz-meta-*` (under [`USER_PREFIX`])
-/// and echoed storage class ([`SCLASS`]), dropping hypha's own facts (`tomb`/`plen`/`cetag`/`mtime`).
-/// Used when rehydrate promotes an eviction tombstone back to a live cache body (§8): the facts
-/// become native (size/ETag/mtime), but the pass-through must survive, and a stray `tomb` key would
-/// make [`tomb_kind`] mis-classify the live body as a tombstone.
+/// Drop internal facts when promoting a tombstone; carrying `tomb` onto the live body would
+/// misclassify it on subsequent reads.
 pub fn passthrough_metadata(
     metadata: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
@@ -219,8 +182,6 @@ pub fn passthrough_metadata(
         .collect()
 }
 
-/// The storage class recorded on a cache object, defaulting to [`STANDARD`] — the value for
-/// anything written before the class was tracked, and for a key rebuilt from the remote.
 pub fn storage_class(metadata: &std::collections::HashMap<String, String>) -> String {
     metadata
         .get(SCLASS)
@@ -228,13 +189,8 @@ pub fn storage_class(metadata: &std::collections::HashMap<String, String>) -> St
         .unwrap_or_else(|| STANDARD.to_string())
 }
 
-// ── The `<meta>` bucket keyspace (§6) ─────────────────────────────────────────────────────────
-//
-// hypha's object-side state lives in a *separate* cache bucket (`<meta><b>`) from client bodies
-// (`<data><b>`), so the client keyspace stays clean — no reserved prefix, no twin dilution, and a
-// LIST page whose last key is always a client key (which is what makes v1's `NextMarker`
-// expressible, §7). Within `<meta><b>`, two control bytes — both inadmissible in client keys
-// ([`validate_client_key`]) — carve three non-interleaving ranges:
+// Two inadmissible control bytes split the metadata bucket into three ordered, non-interleaving
+// ranges:
 //
 //   0x01 0x01 <tag> …       range A: mpu state (`m`), and phase-4/5 sync (`s`) / recency (`r`) /
 //                                    shadow-body (`b`) records — prefix-scanned per tag.
@@ -243,28 +199,19 @@ pub fn storage_class(metadata: &std::collections::HashMap<String, String>) -> St
 //   <K>                     range C: pending markers, **bare** — zero overhead, so every
 //                                    admissible key has one (a marker is a durability signal, §6).
 //
-// The ranges sort A < B < C and never interleave, so the reconcile sweep reaches the markers with
-// one flat `start_after` past the 0x01 block — `O(pending)`, never `O(evicted)` (§7).
+// This ordering lets reconcile enumerate only pending markers with one start-after boundary.
 
 /// The control byte both `<meta>` ranges and the twin separator are built from; forbidden in client
 /// keys so the split is structural, not probabilistic.
 pub const CTRL: u8 = 0x01;
 
-/// Range-A tag for multipart-upload records.
 const TAG_MPU: char = 'm';
-
-/// Range-A tag for the per-bucket sync marker.
 const TAG_SYNC: char = 's';
-
-/// Range-A tag for the per-bucket clean marker.
 const TAG_CLEAN: char = 'c';
 
 const TAG_HALT: char = 'h';
 
-/// Range-A tag for rehydrated composites' shadow bodies.
 const TAG_SHADOW: char = 'b';
-
-/// Range-A tag for the per-bucket shadow-clean marker.
 const TAG_SHADOW_CLEAN: char = 'o';
 
 /// **Remote** (`<remote><b>`): the halt marker — the record of an invariant violation, written by
@@ -281,28 +228,16 @@ pub fn halt_marker_key() -> String {
     format!("{c}{c}{TAG_HALT}", c = CTRL as char)
 }
 
-/// Whether a key returned by a **remote** listing is hypha's own rather than a client object.
-///
-/// Client keys cannot contain `0x01` ([`validate_client_key`]), so the leading control byte is a
-/// complete test. Every path that reads the remote as a client keyspace must apply it — a listing
-/// that does not would hand a reserved key to a trailer read, and a reserved key carries no
-/// trailer, which is itself an invariant violation (`hypha::halt`).
+/// A leading control byte is a complete test because client keys cannot contain one.
 pub fn is_reserved_remote_key(key: &str) -> bool {
     key.starts_with(CTRL as char)
 }
 
-/// Cache (`<meta><b>`): the sync marker (§6). Present iff this bucket's cache namespace has been
-/// reconciled from the remote and is therefore authoritative; its absence puts reads on the remote
-/// until the restore sweep rewrites it (§7). The presence is the whole signal — the body is empty.
 pub fn sync_marker_key() -> String {
     format!("{c}{c}{TAG_SYNC}", c = CTRL as char)
 }
 
-/// Cache (`<meta><b>`): the clean marker (§6). Present iff this bucket's pending-marker range is a
-/// *complete* account of its pending set — not an empty one; pending markers beside it are the
-/// steady state. Written only by a graceful drain, deleted for every bucket at startup before the
-/// first request is served, so its absence (the default everywhere) costs a recovery scan rather
-/// than a silently non-durable write. Presence is the whole signal — the body is empty.
+/// Clean means the pending-marker range is complete, not empty.
 pub fn clean_marker_key() -> String {
     format!("{c}{c}{TAG_CLEAN}", c = CTRL as char)
 }
@@ -313,8 +248,6 @@ fn mpu_range(upload_id: &str) -> String {
     format!("{c}{c}{TAG_MPU}{upload_id}{c}", c = CTRL as char)
 }
 
-/// Cache (`<meta>`): an upload's own record — the client key as the body (keys may exceed what an
-/// ASCII metadata header can carry).
 pub fn mpu_upload_key(upload_id: &str) -> String {
     format!("{}u", mpu_range(upload_id))
 }
@@ -326,8 +259,6 @@ pub fn mpu_fold_key(upload_id: &str) -> String {
     format!("{}f", mpu_range(upload_id))
 }
 
-/// Every upload's records at once — what the §8 debris sweep scans, since no upload id is known to
-/// it in advance.
 pub fn mpu_scan_prefix() -> String {
     format!("{c}{c}{TAG_MPU}", c = CTRL as char)
 }
@@ -360,7 +291,6 @@ pub fn parse_mpu_upload_id(key: &str) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-/// The facts an mpu part record carries in its key (§6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MpuPart<'a> {
     pub part_number: i32,
@@ -430,7 +360,6 @@ pub fn mpu_stash_key(upload_id: &str, part_number: i32, nonce: &str) -> String {
     format!("{}c{part_number:05};{nonce}", mpu_range(upload_id))
 }
 
-/// Highest part number a client may use — S3's own limit, which hypha does not reduce (§7).
 pub const MAX_CLIENT_PART: i32 = 10_000;
 
 /// Whether a part **admits no successor**, so that committing it makes it the object's final part.
@@ -467,8 +396,6 @@ pub fn shadow_key(key: &str) -> String {
     )
 }
 
-/// Every shadow body at once — what §8's shadow probe scans, since it holds no client key to derive
-/// one from.
 pub fn shadow_scan_prefix() -> String {
     format!("{c}{c}{TAG_SHADOW}", c = CTRL as char)
 }
@@ -512,10 +439,7 @@ pub fn shadow_clean_marker_key() -> String {
     format!("{c}{c}{TAG_SHADOW_CLEAN}", c = CTRL as char)
 }
 
-/// Cache (`<meta><b>`): the pending marker for `key` — **bare K**, range C (§6). Its body is the PUT
-/// body's ETag or [`delete_marker_body`]; its own S3 ETag identifies the operation and is the
-/// reconciler's CAS handle. Bare because a marker is a durability signal, not an optimization —
-/// every admissible key has one, no threshold. Returned borrowed since it *is* the client key.
+/// Pending markers are bare client keys so every admissible key can have one.
 pub fn pending_marker_key(key: &str) -> &str {
     key
 }
@@ -536,7 +460,6 @@ pub fn marker_scan_start_after() -> String {
     s
 }
 
-// ── LIST facts twins (§6) ───────────────────────────────────────────────────────────────────
 //
 // A twin is a zero-byte object in the `<meta>` bucket at `0x01 ‖ base_key ‖ 0x01 ‖ facts` (range B
 // above). Both `0x01`s are inadmissible in client keys, which makes the twin range
@@ -579,10 +502,8 @@ const FACTS_BITS_COUNT: u32 = 14;
 /// The facts a twin projects for LIST: exactly what LIST must emit for an evicted key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Facts {
-    /// Client-visible ETag (single-part MD5 or composite `hash-N`).
     pub client_etag: String,
     pub plen: u64,
-    /// Original client-write mtime, unix milliseconds — eviction must not move LastModified.
     pub mtime_ms: i64,
 }
 
@@ -702,11 +623,8 @@ pub fn composite_etag(part_md5s_hex: &[String]) -> Option<String> {
     ))
 }
 
-/// S3's max key length; hypha does not reduce it (§6) now that twins live in a separate bucket.
 pub const MAX_KEY_LEN: usize = 1024;
 
-/// S3's max bucket-name length. The configured bucket prefix (§2) is charged against it, so the
-/// client-visible cap is `S3_MAX_BUCKET_NAME − max(prefix length)` (§7 *Buckets*).
 pub const S3_MAX_BUCKET_NAME: usize = 63;
 
 /// Key admission (§6): S3's own 1024-byte cap plus the one structural rule the `<meta>` ranges rest
@@ -724,9 +642,6 @@ pub fn validate_client_key(key: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Client bucket-name admission (§7 *Buckets*): the prefix is charged against S3's 63-byte cap, so
-/// reject up front with a clean error rather than an opaque backend failure once `max_prefix_len`
-/// characters of prefix are prepended.
 pub fn validate_bucket_name(name: &str, max_prefix_len: usize) -> Result<(), String> {
     if name.len() + max_prefix_len > S3_MAX_BUCKET_NAME {
         return Err(format!(

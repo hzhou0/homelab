@@ -1,6 +1,4 @@
-//! §10's per-request span, end to end. Its own test binary because a capturing subscriber is
-//! process-global: installing one here keeps it out of every other suite, and one test in the file
-//! means nothing races it for the buffer.
+//! Per-request span fields with an isolated process-global subscriber.
 //!
 //! Worth a test for the reason the metrics endpoint is: the fields are recorded by name from several
 //! places at once — the macro table declares them, the handlers fill `bytes` and `cache_hit` in — and
@@ -13,7 +11,6 @@ use std::sync::{Arc, Mutex};
 
 use common::*;
 
-/// A `MakeWriter` handing every line to one shared buffer.
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
 

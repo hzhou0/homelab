@@ -1,14 +1,5 @@
-//! Debris sweeps (§8): the reclaims that have no owner on the client path.
-//!
-//! Three classes, and they divide on how they are *found* rather than on what they are. An upload's
-//! record range is self-describing — one prefix names the whole set — so it is swept exhaustively.
-//!
-//! The other two ride the pass's own probes ([`scan`]), which already list both namespaces and
-//! already classify every entry they read: a transition mark falls out of the `<data>` walk and an
-//! orphan twin out of the `<meta>` one. Neither earns a listing of its own — a mark is repaired by
-//! any read of its key anyway (§7), and a twin costs only page dilution — and taking them from a
-//! walk that is happening regardless is what lets the sweep be standing in **both modes** without
-//! spending anything extra for it.
+//! Reclaims upload records exhaustively and collects marks and twins opportunistically from
+//! existing probes, avoiding dedicated listings for harmless debris.
 
 use std::collections::{HashMap, HashSet};
 

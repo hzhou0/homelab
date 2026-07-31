@@ -1,11 +1,4 @@
-//! Per-bucket write gate: what makes a `DeleteBucket`'s emptiness check a fact about the *future*
-//! rather than about the instant the listing ran.
-//!
-//! A readiness check is a load, not a hold. A write that read `Ready` and then spent a body upload on
-//! the wire carries a verdict that stopped being true, and no amount of re-checking closes that — the
-//! commit is a network round trip, so there is always a gap between the last check and the wire. So
-//! the delete has to establish two things *together*: the namespace is empty, and nothing is in a
-//! position to add to it.
+//! Makes `DeleteBucket` atomic with writes that already passed readiness.
 //!
 //! Both live in one `AtomicU64`:
 //!
@@ -13,27 +6,9 @@
 //! [ closed:1 | epoch:31 | count:32 ]
 //! ```
 //!
-//! `count` is writes admitted and unfinished; `epoch` counts admissions ever. A writer's admission is
-//! one CAS that fails if `closed`, so it always moves both. The delete then runs straight-line, with
-//! no waiting anywhere:
-//!
-//! 1. load the word — a non-zero `count` means a write is in flight, so **refuse and touch nothing**;
-//! 2. list the namespace;
-//! 3. CAS that exact word to `closed`.
-//!
-//! The CAS is the whole design. It succeeds only if no writer was admitted between the load and it,
-//! which is precisely the interval the listing spans — so the three writers that could invalidate the
-//! listing are each excluded by a different step: one that finished before the load is *in* the
-//! listing, one still running at the load fails step 1, and one admitted during the listing moves the
-//! epoch and fails step 3. The epoch is what makes it ABA-safe: a write that is admitted and
-//! completes inside the window returns `count` to zero, and without it the CAS could not tell that
-//! word from the one it read.
-//!
-//! What this buys is that **the gate closes only past the point of no return**. Nothing is disturbed
-//! on any path that ends in a refusal, so no client is ever told a live bucket is absent — the reason
-//! this is a CAS and not a barrier writes queue on, and not a flag published ahead of the listing.
-//! Both of those refuse writes speculatively, and a delete that is then refused itself has spent
-//! `NoSuchBucket` on a bucket that still exists.
+//! `count` detects writes already in flight. `epoch` makes the final close CAS detect a write that
+//! starts and finishes during the emptiness listing, avoiding the zero-count ABA. Refused deletes
+//! leave the gate untouched, so writes are never rejected speculatively for a bucket that survives.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,14 +16,11 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-/// Top bit: a delete has taken the bucket, and no further write is admitted.
 const CLOSED: u64 = 1 << 63;
 /// Bits 32..62. Wrapping within its own field is deliberate — only *change* is ever asked of it, and
 /// a wrap would need 2³¹ admissions inside one listing.
 const EPOCH_MASK: u64 = 0x7fff_ffff_0000_0000;
 const EPOCH_ONE: u64 = 1 << 32;
-/// Bits 0..31: in-flight writes, so bounded by concurrent requests rather than by anything
-/// cumulative. Saturating it would take 4·10⁹ of them at once.
 const COUNT_MASK: u64 = 0x0000_0000_ffff_ffff;
 
 fn count(state: u64) -> u64 {
@@ -165,7 +137,6 @@ impl WriteGates {
     }
 }
 
-/// A bucket observed with no write inside it, and the proof — the word that said so.
 pub(super) struct Quiescent {
     gate: Arc<Gate>,
     state: u64,

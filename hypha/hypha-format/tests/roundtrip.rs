@@ -1,7 +1,4 @@
-//! Round-trip, adversarial, and offset-arithmetic properties, exercised through hypha's own
-//! wrapper (not re-testing age itself): encrypt→decrypt identity; corrupt/truncate/splice must
-//! fail authentication; the closed-form offset math must agree with real ciphertext produced by
-//! the real crate — this is what pins the 64 KiB / 65552 constants.
+//! Encryption round trips, authentication failures, and offset arithmetic against real ciphertext.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -17,8 +14,6 @@ fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-/// A fixed passphrase for the round-trip tests: encrypt and decrypt through the same one, so any
-/// static string works. Cross-key tests (`wrong_identity_fails`) use distinct literals instead.
 fn env() -> Envelope {
     Envelope::new("hypha-format roundtrip test passphrase").unwrap()
 }

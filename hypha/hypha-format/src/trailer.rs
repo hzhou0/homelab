@@ -1,5 +1,4 @@
-//! The authenticated facts+table trailer at the tail of every remote object (§6 — rationale for a
-//! trailer over S3-native metadata/tags is there). Physical tail order is
+//! Authenticated object facts and multipart geometry. Physical tail order is
 //! `table ‖ facts ‖ tag(16) ‖ version(2)`; the fixed-size facts struct sits at a known offset from
 //! the end, so its `count` sizes the table and the 2-byte version dispatches the format.
 //!
@@ -48,13 +47,10 @@ pub enum FooterKind {
     Composite = 1,
 }
 
-/// Object facts, decoded from (and encoded to) the trailer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Footer {
     pub kind: FooterKind,
-    /// Client part count ([`FooterKind::Composite`]; 1 for single-part).
     pub count: u32,
-    /// Total plaintext length of the object.
     pub plen: u64,
     /// Original client-write mtime, unix ms (a composite's is its completion time).
     pub mtime_ms: i64,

@@ -1,8 +1,8 @@
-//! Encryptor/Decryptor construction over age's native scrypt recipient (§6).
+//! Age encryption with a deployment passphrase.
 //!
 //! File keys are wrapped by `age::scrypt` with the work factor **pinned to the minimum** —
-//! load-bearing, not an optimization: the crate's default auto-tunes toward ~1 s and ~256 MiB
-//! *per file*, fatal for a small-object namespace (rationale for why that's safe here is §6).
+//! the default auto-tunes toward roughly one second and 256 MiB per file, which is untenable for
+//! small objects.
 
 use std::io::{Read, Write};
 
@@ -32,13 +32,7 @@ impl Envelope {
         })
     }
 
-    /// Wrap `writer` in an encrypting writer. Each call generates a fresh random file key —
-    /// the coordination-free property parallel PUT/UploadPart workers rely on — wrapped by a
-    /// scrypt stanza with a fresh salt and the pinned work factor.
-    /// Callers must call `finish()` on the result to write the final (possibly short) chunk.
-    ///
-    /// The scrypt sole-stanza header is a fixed length ([`crate::offset::HLEN`]), so offset math
-    /// needs no per-file measurement.
+    /// Each call gets an independent file key, allowing parallel multipart encryption.
     pub fn encrypt<W: Write>(&self, writer: W) -> Result<StreamWriter<W>, Error> {
         let mut recipient = age::scrypt::Recipient::new(self.passphrase.clone());
         recipient.set_work_factor(PINNED_WORK_FACTOR);
@@ -47,8 +41,6 @@ impl Envelope {
         Ok(encryptor.wrap_output(writer)?)
     }
 
-    /// Decrypting reader over a full-file ciphertext stream. For ranged reads, hand it a
-    /// [`crate::RangeReader`] and use `Seek`.
     pub fn decrypt<R: Read>(&self, reader: R) -> Result<StreamReader<R>, Error> {
         let mut identity = age::scrypt::Identity::new(self.passphrase.clone());
         identity.set_max_work_factor(self.max_work_factor);

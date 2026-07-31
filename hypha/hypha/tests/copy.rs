@@ -1,5 +1,4 @@
-//! CopyObject (§7): durable ciphertext reuse and cached plaintext copy, including metadata,
-//! preconditions, in-place edits, generation races, and indeterminate cache responses.
+//! Durable and cached CopyObject behavior, races, and recovery.
 
 mod common;
 
@@ -8,7 +7,6 @@ use hypha_core::config::Mode;
 
 const B: &str = "cpy";
 
-/// Copy the destination ETag out of a `CopyObject`.
 async fn copy(client: &aws_sdk_s3::Client, dst: &str, src_bucket: &str, src_key: &str) -> String {
     client
         .copy_object()

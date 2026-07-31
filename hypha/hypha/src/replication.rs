@@ -1,25 +1,8 @@
-//! The cached-mode reconcile sweep (§7) — the remote propagation path for acked cache writes, a
-//! continual duty of the active replica. A cached PUT or DELETE commits in the cache and owes a
-//! bare-`K` pending marker ([`crate::markers`]); this task trails behind, executing the operation
-//! encoded by each marker:
+//! Propagates cached PUT and DELETE markers to the remote.
 //!
-//! - **PUT** → encrypt the current cache body and PUT it to the remote;
-//! - **DELETE** → delete the remote object while holding both lock domains.
-//!
-//! The markers are the range-C tail of `<meta><b>` (bare `K`, above the `0x01` block), so **one flat
-//! LIST** past [`meta::marker_scan_start_after`] enumerates the pending set — `O(pending)`, never
-//! `O(evicted)`. Each key is handled under its **upload** lock (§4), distinct from the write lock a
-//! client PUT takes, so a replication upload never queues a conditional write behind a multi-second
-//! transfer; a key already uploading is skipped, not queued
-//! ([`ReplicationTask::reconcile_key`]). The marker clear is conditional on the ETag the LIST
-//! returned, so a PUT that landed a newer body mid-pass simply defers that key to the next pass
-//! rather than being lost.
-//!
-//! The drain's shutdown token ends the loop between passes and lets the pass in flight finish (§9). A
-//! process crash
-//! loses nothing — acked bodies are on the cache, a marker that had not yet landed is rebuilt by the
-//! recovery scan ([`crate::markers`]), and the next active resumes from the same LIST. Only losing
-//! the cache *volume* with markers outstanding loses data (the bounded window, §7).
+//! Reconcile uses a separate upload lock so transfers do not block client writes. Marker deletion
+//! is conditional on the generation listed, making concurrent overwrites defer safely to a later
+//! pass.
 
 use std::time::Duration;
 
@@ -52,13 +35,7 @@ impl ReplicationTask {
         }
     }
 
-    /// Run passes on `interval` until the drain signals. The wait is interruptible so the drain does
-    /// not spend its budget on a sleeping task, while a pass already under way is left to finish: it
-    /// writes bodies to the remote and clears their markers, and stopping between the two would leave
-    /// the marker for the next run to redo.
-    ///
-    /// Each pass is best-effort: a bucket or key that errors is logged and the sweep moves on, since
-    /// every transition is idempotent and re-attempted next pass.
+    /// Shutdown interrupts only the wait between idempotent passes; an active pass finishes.
     pub async fn run(self, shutdown: CancellationToken) {
         loop {
             tokio::select! {

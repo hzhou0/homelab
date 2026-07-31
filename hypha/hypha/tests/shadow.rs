@@ -1,13 +1,4 @@
-//! Orphaned shadow bodies (§8) — the third obligation of the marker shape, and the one whose failure
-//! is pure silence.
-//!
-//! A shadow is a rehydrated composite's plaintext, keyed by the digest of K. A cached write that
-//! supersedes that composite leaves it unreachable *and* unrankable: nothing touches it again, so the
-//! recency ring never forms an opinion and eviction only ever takes it as an eventual miss — on a cache
-//! that never comes under pressure, never. So the mechanism is three pieces (queue, drain marker,
-//! startup backstop), and each is tested from the side that would leak rather than the side that
-//! would over-delete, plus the one assertion that keeps over-deletion honest: a shadow K still names
-//! must survive all three.
+//! Queue, drain evidence, and startup recovery for orphaned composite shadows.
 //!
 //! The marker tests are the load-bearing ones. A marker that is written when it should not be is worse
 //! than no marker at all — it vouches for a bucket that has an orphan in it, and no later run will ever
@@ -23,8 +14,6 @@ use hypha_core::meta;
 
 const B: &str = "shadowbucket";
 
-/// A key nothing ever wrote, so its shadow is reachable only through the `ck` back-pointer — which is
-/// the one thing the backstop reads and nothing else does.
 const GHOST: &str = "ghost/composite";
 
 async fn shadow_present(h: &Harness, key: &str) -> bool {

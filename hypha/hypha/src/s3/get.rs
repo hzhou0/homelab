@@ -1,13 +1,4 @@
-//! GET, cache-first, dispatched on K's classification (§7): live body served straight from the
-//! cache; eviction tombstone decrypted from the remote (durable mode never repopulates — the body
-//! would immediately be tombstoned again); absent → 404; transition mark → remote-as-truth
-//! (repaired opportunistically if the lock is free, else read through to the writer's in-flight
-//! commit — no hybrid reads either way).
-//!
-//! A composite's part boundaries and per-part plaintext lengths come from the **parts table in the
-//! object's own trailer** (§6), recovered in the one speculative tail read that also yields the
-//! facts — no remote part-index calls. A whole-object read decrypts every part from a single
-//! `[0, body_ct_len)` GET; a range read fetches only the parts it touches.
+//! Cache-first GET with authenticated remote fallback and range-aware composite decryption.
 
 use std::ops::Range as ByteRange;
 

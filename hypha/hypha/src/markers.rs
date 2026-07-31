@@ -1,25 +1,8 @@
-//! Pending-marker obligations and the clean marker (§6/§7 have the full rationale — a marker is an
-//! index over the pending set, not the durability record, so none of the paths here may turn a
-//! failed marker write into a client error).
+//! Pending-marker delivery and clean-shutdown evidence.
 //!
-//! Three pieces, in the order a run meets them:
-//!
-//! 1. **Startup** reads and clears the clean markers, but does it in
-//!    [`crate::bucket::resolve_all`], which is already reading the other marker of the same pair
-//!    and is the only place that can act on the answer.
-//! 2. **The queue** ([`Markers::owe`]) — a write hands its marker over and returns; the handover
-//!    cannot block or fail, which is the whole reason the queue is unbounded.
-//! 3. **The drain** ([`MarkerActor::run`]) writes clean markers, only for buckets this run accounted
-//!    for, and only if nothing was still owed when it sealed.
-//!
-//! **Ordering**, the part not fully spelled out in §7: hyper's connection drain resolves only once
-//! every handler has returned and no new one can start, and every other sender is handler-local —
-//! [`Markers::owe`] upgrades the weak handle, sends, and drops it before returning. So after the
-//! drain nothing but [`RunSeal`] can enqueue, and the [`MarkerMsg::Seal`] it sends is necessarily
-//! behind every marker of the run. The seal is a **message, not the channel closing**: the serving
-//! future owns the `Lifecycle` that owns the `RunSeal`, so an aborted or panicking server closes the
-//! channel exactly as a drain would, and closure alone must not authorize a clean marker — only a
-//! seal does.
+//! Marker failure cannot fail an already committed client write. The queue is therefore unbounded
+//! and handler-local senders are weak. Graceful shutdown sends an explicit FIFO seal after request
+//! drain; channel closure alone never authorizes clean markers because crashes close it too.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,8 +56,6 @@ struct MarkerQueue {
     buckets: BucketCtl,
 }
 
-/// The write path's handle: hand over owed markers, and (at startup) establish the per-bucket state
-/// the drain later decides on.
 #[derive(Clone)]
 pub(crate) struct Markers {
     queue: Arc<MarkerQueue>,
@@ -129,7 +110,6 @@ pub(crate) fn spawn(
 pub(crate) struct RunSeal(mpsc::UnboundedSender<MarkerMsg>);
 
 impl RunSeal {
-    /// End the run gracefully: [`MarkerActor`] writes clean markers only for a seal it received.
     pub(crate) fn seal(self) {
         let _ = self.0.send(MarkerMsg::Seal);
     }

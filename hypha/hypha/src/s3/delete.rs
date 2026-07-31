@@ -1,13 +1,6 @@
-//! DELETE, single and batch. Durable mode runs the §7 bracket under K's write lock: mark → remote
-//! delete (the commit; NotFound ⇒ already absent, still committed) → settle by removing K's cache
-//! entry and twins — absent is the authoritative 404. While marked, readers keep serving the object
-//! from the remote, so an unacked delete stays invisible. Cached mode commits by removing K locally
-//! and queues a DELETE marker for asynchronous remote propagation.
+//! Single and batch deletion using the same per-key commit bracket.
 //!
-//! `DeleteObjects` is that same bracket widened from one key to the batch: the invariant is
-//! per-key, so batching is a transport question, not a correctness one — only the *remote* leg
-//! collapses into one native call, and each key still gets its own mask, its own commit slice, and
-//! its own verdict in the reply.
+//! Only the remote leg batches; cache projection and error handling remain per key.
 
 use std::collections::HashMap;
 
@@ -22,7 +15,6 @@ use hypha_core::meta;
 use super::overlay::WriteMode;
 use super::Hypha;
 
-/// S3's hard cap on one `DeleteObjects` request.
 const MAX_BATCH_KEYS: usize = 1000;
 
 /// How many of a batch's per-key cache legs run at once. The keys are independent, but a 1000-key

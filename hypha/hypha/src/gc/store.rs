@@ -1,8 +1,4 @@
-//! GC's own bucket (§8): the recency ring's slices, and nothing client-facing.
-//!
-//! Held as a backend plus a name rather than a [`crate::tier::Tiering`] role, because it is one
-//! bucket for the whole deployment — there is no per-client-bucket mapping to apply, and none of the
-//! `<meta>` control-byte machinery to observe.
+//! Persistence for the deployment-wide recency ring.
 
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
@@ -49,7 +45,6 @@ impl GcStore {
         self.prune(depth).await
     }
 
-    /// The persisted slices, newest first, ready for [`super::ring::RecencyRing::install`].
     pub(super) async fn load(&self, depth: usize) -> Result<Vec<(u64, Vec<u8>)>> {
         let mut seqs: Vec<u64> = self
             .slice_keys()

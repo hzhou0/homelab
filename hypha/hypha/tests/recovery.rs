@@ -1,10 +1,4 @@
-//! The two recoveries (§7) and the invariants they enforce.
-//!
-//! hypha recovers from exactly two failures, one per marker: a lost cache volume (**sync** marker
-//! absent ⇒ namespace restore) and writes/deletes committed without their marker landing (**clean** marker
-//! absent ⇒ pending-set rebuild). Their premises are opposites — one may assume nothing about the
-//! cache namespace, the other that it is authoritative — so these tests are mostly about keeping
-//! each pass inside its own premise, and about what happens when the world contradicts one.
+//! Namespace restore, pending-set rebuild, and their invariant violations.
 //!
 //! The write-mode gate is the load-bearing piece: a cached deployment runs **durable** semantics for
 //! the whole of a bucket's restore, which is what makes "the cache holds nothing authoritative"
@@ -20,8 +14,6 @@ use futures::StreamExt as _;
 use hypha_core::meta;
 
 const B: &str = "recov";
-
-// ── helpers ───────────────────────────────────────────────────────────────────────────────────
 
 async fn wait_until<F, Fut>(ms: u64, what: &str, mut cond: F)
 where

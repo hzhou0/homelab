@@ -1,15 +1,7 @@
-//! Single-object PUT. Durable mode is the §7 transition bracket — precondition → mark →
-//! commit → settle, all under K's write lock — with the remote op as the commit point.
+//! Single-object durable and cached commits.
 //!
-//! The commit must land the body *and* its facts at K atomically (a committed object without
-//! facts would be indistinguishable from a foreign write and unrecoverable without decrypting).
-//! `cetag = MD5(plaintext)` is only known after the body has streamed, so the facts travel as
-//! the **footer behind the ciphertext** (§6) — computed inline and framed into the same single
-//! streaming `PutObject`. K is marked for the transfer's duration; readers of K meanwhile
-//! resolve from the remote, which atomically holds the old object until the PUT completes.
-//!
-//! The client's `x-amz-meta-*` and storage class ride the cache tombstone written at settle,
-//! namespaced apart from the facts sharing that carrier (§7).
+//! Durable PUT frames plaintext-derived facts into the same remote object so body and facts commit
+//! atomically. Cached PUT commits plaintext first and records the resulting remote obligation.
 
 use aws_sdk_s3::primitives::ByteStream;
 use s3s::dto::*;

@@ -1,12 +1,4 @@
-//! Thin `ObjectStore` wrapper over an `aws-sdk-s3` client. The cache and the remote are two
-//! independently-configured instances of this same type (§2); Phase 2 uses only the remote.
-//!
-//! Buckets map one-to-one client ⇄ cache ⇄ remote (§7): the client's bucket rides every call, and
-//! the wrapper prepends the deployment's **bucket prefix** so deployments sharing one remote
-//! account land in disjoint bucket namespaces (and strips it back off on `ListBuckets`). The other
-//! cross-cutting concern is the SDK-error → `hypha_core::Error` mapping. Everything else —
-//! encryption, ETag math, DTO translation — stays in the handlers so this layer is a mechanical
-//! passthrough.
+//! Prefixed AWS S3 backend client.
 
 use std::collections::HashMap;
 
@@ -49,8 +41,6 @@ pub struct RemotePart {
     pub last_modified_ms: i64,
 }
 
-/// One key's failure inside a batch delete. S3 models `DeleteObjects` outcomes per key, so a
-/// batch can partially succeed and the caller decides whether that is fatal.
 #[derive(Clone, Debug)]
 pub struct BatchDeleteError {
     pub key: String,
@@ -66,8 +56,6 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// The connection alone; the caller names the role prefix it wants with [`Self::with_prefix`],
-    /// since one endpoint carries several ([`crate::config::DATA_ROLE`] and friends).
     pub fn connect(cfg: &S3Endpoint, bucket_prefix: String) -> Self {
         let creds = Credentials::new(&cfg.access_key, &cfg.secret_key, None, None, "hypha");
         let conf = aws_sdk_s3::Config::builder()
@@ -85,9 +73,6 @@ impl Backend {
         }
     }
 
-    /// A sibling backend over the **same** endpoint/client but a different bucket prefix — the
-    /// cache's `<data>`/`<meta>` split (§6) is two prefixes on one cache endpoint, so the `<meta>`
-    /// backend shares the `<data>` backend's connection and only remaps bucket names.
     pub fn with_prefix(&self, bucket_prefix: String) -> Self {
         Self {
             client: self.client.clone(),

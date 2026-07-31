@@ -1,8 +1,4 @@
-//! Async↔sync bridges that drive the Phase-1 `hypha-format` codec (sync `std::io`) from the
-//! Tokio serving path. The pattern (§5): a `spawn_blocking` task runs the sync
-//! encrypt/decrypt loop and pumps bytes through a `tokio::io::duplex` pipe whose async half
-//! becomes the s3s / SDK streaming body. Per-request memory stays bounded by the pipe capacity,
-//! never the object size.
+//! Bounded async bridges around the synchronous encryption codec.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -38,19 +34,15 @@ pub struct SingleTrailer {
     pub mtime_ms: i64,
 }
 
-/// The client's `Content-MD5` did not match the body that arrived.
 #[derive(Debug)]
 pub struct DigestMismatch;
 
-/// Resolves once the plaintext body has fully streamed: its hex MD5, or [`DigestMismatch`].
 pub type EtagReceiver = oneshot::Receiver<Result<String, DigestMismatch>>;
 
-/// No copy — the bytes stream, via s3s-aws's own body bridge.
 pub fn blob_to_bytestream(blob: StreamingBlob) -> ByteStream {
     try_into_aws(blob).expect("StreamingBlob → ByteStream is Infallible")
 }
 
-/// No copy — the bytes stream, via s3s-aws's own body bridge.
 pub fn bytestream_to_blob(bs: ByteStream) -> StreamingBlob {
     try_from_aws(bs).expect("ByteStream → StreamingBlob is Infallible")
 }

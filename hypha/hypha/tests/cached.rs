@@ -1,10 +1,4 @@
-//! Phase-4 exit: cached mode over real MinIO (§7/§8). Writes ack after the cache write plus a
-//! bare-`K` pending marker; the reconcile sweep trails them onto the remote. Covers the marker +
-//! reconcile upload, cached delete propagation (remove-then-propagate), conditional-write
-//! linearization on the cache, `Content-MD5` validation, the marker scan staying `O(pending)`
-//! (evicted keys untouched), and rehydrate on a tombstoned read — single-part back into K and a
-//! composite into the shadow body. Faulted paths cover failed marker writes, reconcile generation
-//! races, remote-delete serialization, and the marker/clean-seal ordering during shutdown.
+//! Cached commits, reconciliation, rehydration, and shutdown accounting.
 
 mod common;
 
@@ -18,9 +12,6 @@ use hypha_core::meta;
 
 const B: &str = "cached";
 
-// ── small polling / inspection helpers ────────────────────────────────────────────────────────
-
-/// Poll `cond` every 50 ms until it holds or `ms` elapses (then panic with `what`).
 async fn wait_until<F, Fut>(ms: u64, what: &str, mut cond: F)
 where
     F: FnMut() -> Fut,

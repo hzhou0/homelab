@@ -1,8 +1,4 @@
-//! The shared tiering machinery: the §7 transition-bracket primitives (mark / settle / repair),
-//! encrypt-and-upload of a cache body, and tombstoning once ciphertext is durable on the remote.
-//! All of it serializes on the per-key lock ([`KeyLocks`]); the durable path calls these inline
-//! while holding the key lock, and the cached path's background reconcile, the two recoveries
-//! ([`crate::bucket`]), and GC call the same primitives.
+//! Shared transition-bracket, remote-upload, and tombstone machinery.
 
 use std::collections::HashMap;
 use std::ops::Range as ByteRange;
@@ -31,21 +27,12 @@ pub(crate) fn single_part_framed_len(plen: u64) -> Option<u64> {
         .checked_add(SINGLE_TRAILER_LEN as u64)
 }
 
-/// Every backend a key can move between, plus what it takes to move it: the crypto that frames a
-/// body on its way out, and the lock tables that decide who may. Three handles, two endpoints —
-/// `data` and `meta` are bucket namespaces on the same cache endpoint (§6), so a write that touches
-/// both is one round trip's worth of connection reuse, not two. Cloned into every task that touches
-/// storage (the S3 ops, `BucketTask`, `TransitionActor`, `ReplicationTask`); each field is itself a
-/// cheap handle, so a clone is refcount bumps.
 #[derive(Clone)]
 pub struct Tiering {
-    /// `<data>` cache bucket: client bodies and tombstones at bare `K` (§6).
     pub data: Backend,
-    /// `<meta>` cache bucket: facts twins, pending markers, mpu records (§6).
     pub meta: Backend,
     pub remote: Backend,
     pub env: Arc<Envelope>,
-    /// Keys the tail trailer's authentication tag (§6); derived once from the master passphrase.
     pub trailer_key: TrailerKey,
     /// The **write** lock table (§4): conditional writes, the durable finalize, GC tombstone
     /// transitions, and rehydrate all serialize on it.
@@ -56,16 +43,12 @@ pub struct Tiering {
     /// (which takes `locks`, not this). Held via `try_lock`: a pass that finds K busy coalesces onto
     /// the in-flight upload rather than queuing, so this table never accumulates waiters.
     pub upload_locks: KeyLocks,
-    /// Same-part multipart mutations serialize without suppressing parallel uploads of distinct
-    /// parts. Completion holds the last part here while it may replace that part with a folded form.
     pub mpu_part_locks: KeyLocks,
     /// Cached mode (§4). Decides who wins when a surviving cache entry and the remote disagree: in
     /// cached mode the cache write *is* the commit, so a generation the remote lacks is an acked
     /// write still owed to it — the pending set the clean marker accounts for (§6). Durable mode
     /// has no pending set at all.
     pub cached: bool,
-    /// Where an observed invariant violation goes (`crate::halt`). Carried here because the sites
-    /// that can observe one are the sites that read the backends.
     pub(crate) halt: Halt,
 }
 
@@ -82,7 +65,6 @@ pub(crate) enum UploadOutcome {
     Vanished,
 }
 
-/// The plaintext facts of a committed remote object, read off its tail footer (§6).
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteFacts {
     pub plen: u64,
@@ -91,8 +73,6 @@ pub(crate) struct RemoteFacts {
 }
 
 impl RemoteFacts {
-    /// A live cache body's facts, off its native HEAD: the cache body is plaintext, so the native
-    /// size/ETag/mtime already are the client-visible facts.
     pub(crate) fn from_cache_head(head: &HeadObjectOutput) -> Self {
         RemoteFacts {
             plen: head.content_length.unwrap_or(0).max(0) as u64,
@@ -111,8 +91,6 @@ impl RemoteFacts {
 }
 
 impl Tiering {
-    // ── The transition bracket (§7) ─────────────────────────────────────────────────────────
-
     /// **Mark**: overwrite K's cache entry with the transition tombstone. Readers resolve K from
     /// the remote until settle. Caller holds K's write lock — a mark is only ever *observed* by
     /// lock-free readers mid-bracket or by anyone after a crash.

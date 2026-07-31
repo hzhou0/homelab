@@ -1,14 +1,7 @@
-//! HEAD and LIST, both cache-served and reporting **plaintext** facts (§7). HEAD reads them off
-//! the `<data>` object directly. LIST is a **merge join** of two cursors (§6/§7): the client cursor
-//! over `<data><b>`, and the twin cursor over `<meta><b>`'s range B, delimiter mirrored. An eviction
-//! tombstone takes its facts from the twin matched **by base-key equality**, with a per-key `<data>`
-//! HEAD fallback when the twin is missing (crash window, page straddle, or a key over the §6 twin
-//! threshold).
+//! Plaintext HEAD and LIST projections.
 //!
-//! LIST is a **single page**, forwarded pagination — the client cursor drives it, and hypha
-//! deliberately does **not** backfill to fill a page: coalescing pages would require reusing a
-//! backend cursor across requests or resuming by a client-entry count, and both weaken S3's
-//! key-position guarantee under concurrent mutation.
+//! LIST merge-joins data entries with facts twins and forwards one backend page. It does not
+//! backfill short pages because doing so would weaken key-position pagination under mutation.
 
 use std::collections::HashMap;
 
@@ -23,8 +16,6 @@ use super::overlay::KeyState;
 use super::{ts_ms, Hypha};
 use crate::bucket::Readiness;
 
-/// The client-visible projection of one raw cache page — what both LIST versions put in `Contents`
-/// and `CommonPrefixes`. Pagination is not in here: the versions resume differently.
 struct PageView {
     entries: Vec<Object>,
     common_prefixes: Vec<CommonPrefix>,

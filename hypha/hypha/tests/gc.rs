@@ -1,12 +1,4 @@
-//! Phase-5 GC (§8). The §11 pass proper is still deferred; what lives here now are the paths that
-//! fail **silently** if they are wrong — a recency slice that never reaches `<meta>`, an mpu range
-//! that is never reclaimed, an orphan twin that dilutes every LIST page covering it, and a
-//! transition mark that quietly costs a remote round trip forever. None of them fails a request,
-//! which is exactly why none of them would be noticed.
-//!
-//! All of it runs against a **durable** harness on purpose: the sampled classes ride the pass's
-//! probes, and a durable deployment evicts nothing — so this is also the assertion that those probes
-//! are taken for the debris alone, in a mode where eviction would never call for them (§8).
+//! Silent GC outcomes: persisted recency and reclaim of upload records, twins, and stale marks.
 
 mod common;
 

@@ -1,5 +1,4 @@
-//! The hypha encryption envelope: a thin wrapper around the `age` crate plus the
-//! offset arithmetic and seekable-reader adapter that ranged GETs need.
+//! Encryption envelope, authenticated trailer, and ranged-read support.
 pub mod envelope;
 pub mod offset;
 pub mod stream;
@@ -12,7 +11,6 @@ pub use trailer::{
     MAX_TAIL_LEN, SINGLE_TRAILER_LEN, TAG_LEN, VERSION_LEN,
 };
 
-// transparent so a printed error chain doesn't repeat the inner error's prefix.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid age identity: {0}")]

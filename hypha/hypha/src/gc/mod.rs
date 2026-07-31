@@ -1,38 +1,9 @@
-//! The GC actor (§8) — the active replica's standing duty to reclaim what the client path
-//! deliberately left behind, and the sole owner of everything GC remembers.
+//! GC owns recency state, debris sweeps, and pressure-driven eviction.
 //!
-//! Several paths ack a client before their cleanup is done, on purpose: complete and abort leave an
-//! upload's whole record range in place rather than pay a large multi-object delete on the client
-//! path (§6, *Multipart upload state*), and every crash-window sequence in §6/§7 is ordered to leave
-//! *debris* rather than a hybrid state — a twin beside a live body, a transition mark nobody came
-//! back for. Nothing there is a durability obligation; every item is something a reader already
-//! ignores, which is what makes the sweep's cadence a cost question rather than a correctness one.
-//! Eviction is the other half, and the opposite: it takes bodies a client can still ask for, so it
-//! answers to a byte target and to the gates in [`evict`].
-//!
-//! **The queue is for outside callers only.** The rest of the crate holds a [`Gc`], whose whole API is
-//! [`Gc::touch`]: a request states interest in a key and returns, with no lock to contend on and no
-//! I/O to wait for. The filter bits, the rotation and the encode of the retired slice all happen on
-//! this task, so a request never carries the rotation its own touch happened to trigger — which, at
-//! the design fill target, means copying out a megabyte-scale filter. A pass is not an outside caller:
-//! it is GC's own work, so it reads the ring directly under its lock instead of round-tripping through
-//! the queue it would otherwise be competing with.
-//!
-//! **The loop itself never awaits I/O.** Every pass is dispatched as its own task; the actor picks the
-//! moment, refuses to start a second one, and folds the finished pass's report back into the ladder and
-//! the yields. Doing the pass inline would stall the touch queue for the length of a listing-heavy
-//! round of probes and shed exactly the traffic GC most wants to remember.
-//!
-//! Both modes sweep debris. Durable mode evicts nothing — it holds no bodies to evict — so it never
-//! probes, and its passes are rung 0 alone.
-//!
-//! Only `Ready` buckets are swept. A bucket mid-restore has no cache namespace worth reading (§7),
-//! and its recovery is additive, so debris there is either already gone with the volume or about to
-//! be judged against a namespace that is still being rebuilt. Eviction narrows that further to
-//! buckets this run **accounts for**: before a bucket's pending-set rebuild completes, the pending set
-//! on disk is known incomplete, and a scavenger reading it as exhaustive is the one way an acked write
-//! is lost. [`evict`]'s generation check independently refuses those bodies, so this is the second of
-//! two locks on the same door rather than the only one.
+//! Touches are queued so request paths never rotate or persist Bloom filters. Passes run in separate
+//! tasks so listing I/O cannot stall that queue. Debris is always safe to reclaim; eviction is
+//! limited to ready buckets whose pending set is accounted and independently verifies the remote
+//! generation before removing plaintext.
 
 mod debris;
 mod evict;
@@ -71,12 +42,8 @@ const TOUCH_QUEUE_DEPTH: usize = 1024;
 /// path, so one wake-up should take whatever a burst deposited.
 const TOUCH_BATCH: usize = 256;
 
-/// The rest of the crate's view of GC. Cheap to clone, holds no GC state, and offers nothing but a
-/// touch — every decision GC makes is its own.
 #[derive(Clone)]
 pub(crate) struct Gc {
-    /// Fully qualified keys to record. One message shape, because a touch is the only thing anyone
-    /// outside GC ever asks of it.
     tx: mpsc::Sender<String>,
 }
 

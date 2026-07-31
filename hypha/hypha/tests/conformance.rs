@@ -1,8 +1,4 @@
-//! Phase-2 exit: the durable S3 surface end-to-end against a real backend (MinIO), driven over
-//! HTTP with a real `aws-sdk-s3` client. Covers PUT/GET/HEAD/DELETE round-trips, ranges, the
-//! conditional-write preconditions, LIST classification, buckets, control-byte keys, and the
-//! ciphertext-at-rest guarantee. Durable transition faults cover definite remote refusal and a
-//! committed operation whose response is lost. Every test owns its MinIO and cleans up on drop.
+//! Durable S3 behavior and commit-failure semantics against a real backend.
 
 mod common;
 

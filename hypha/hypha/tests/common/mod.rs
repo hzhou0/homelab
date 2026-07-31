@@ -1,12 +1,4 @@
-//! Integration-test harness. Every test is fully self-contained and stateless: it normally starts
-//! one MinIO server for both backend roles, runs hypha in-process over an ephemeral port, and drives
-//! it with a real `aws-sdk-s3` client. The SeaweedFS run replaces only the cache, matching the
-//! deployed topology while each test keeps its own MinIO remote.
-//!
-//! One MinIO **per test**: the cheapest thing that is unconditionally clean. Tests run in parallel
-//! (each `#[tokio::test]` on its own runtime), each on its own ports and data dir.
-//! Faulted harnesses interpose independent cache and remote proxies so a test can reject, pause, or
-//! lose the response to one backend operation without changing MinIO's behavior for other calls.
+//! Isolated real-backend integration harness with independent cache and remote fault proxies.
 //!
 //! **`TEST_CACHE_S3_ENDPOINT` replaces only the cache** with a server this process does not own.
 //! `TEST_S3_ENDPOINT` remains the focused backend-contract mode where both roles use that server.

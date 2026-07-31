@@ -1,14 +1,4 @@
-//! §10's Prometheus surface, as a vocabulary rather than a facade: every export is a named function
-//! taking the numbers a caller already has, so a call site reads as the thing that happened and the
-//! metric name, unit and label set have exactly one home.
-//!
-//! **Installed by the binary, absent everywhere else.** The `metrics` facade with no recorder is a
-//! no-op, so the integration harness — many hyphas in one process — gets no shared global state and
-//! no port to bind. Nothing here can fail a request or change behaviour; a metric is a report.
-//!
-//! What is *not* here is as deliberate: an invariant violation gets no metric, because the process
-//! exits on one (`crate::halt`) and a gauge nobody is left to scrape is a worse signal than the
-//! crashloop and the halt marker it becomes.
+//! Prometheus metric definitions and recording helpers.
 
 use std::time::Duration;
 
@@ -22,8 +12,6 @@ const LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
-/// Install the process-wide recorder and return the handle that renders it. Called once, by the
-/// binary — a second call fails rather than silently shadowing the first.
 pub fn install() -> Result<PrometheusHandle, BuildError> {
     let handle = PrometheusBuilder::new()
         .set_buckets(LATENCY_BUCKETS)?
@@ -102,8 +90,6 @@ pub(crate) fn s3_request(op: &'static str, failed: bool, elapsed: Duration) {
     histogram!("hypha_s3_request_seconds", "op" => op).record(elapsed.as_secs_f64());
 }
 
-/// A read that resolved against the cache's own plaintext, or one the remote had to serve — the
-/// ratio §10 asks for, and in cached mode the thing eviction is spending.
 pub(crate) fn cache_read(hit: bool) {
     let result = if hit { "hit" } else { "miss" };
     counter!("hypha_cache_reads_total", "result" => result).increment(1);

@@ -1,7 +1,4 @@
-//! §10's operational surface, against the real binary. In-process harnesses install no recorder and
-//! bind no admin port (`hypha::metrics`), so this is the only place the wiring exists at all — and
-//! its failure mode is a deployment that scrapes nothing and probes nothing while serving perfectly,
-//! which no other test can see.
+//! Operational endpoints against the real binary, which alone installs the metrics recorder.
 
 mod common;
 

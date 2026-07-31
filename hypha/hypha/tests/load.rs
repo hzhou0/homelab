@@ -1,14 +1,4 @@
-//! Load / concurrency stress. `#[ignore]` by default — run explicitly, ideally in release:
-//!
-//! ```text
-//! cargo test -p hypha --test load --release -- --ignored --nocapture
-//! ```
-//!
-//! Angles: sustained mixed throughput across many workers (zero errors, reported ops/sec);
-//! a linearizability assertion (N racing `If-None-Match:*` creates on one key ⇒ exactly one wins,
-//! the rest 412 — no double-create); parallel multipart uploads that must all commit and read back
-//! correctly; and per-operation **latency** percentiles, both idle and under concurrent load. Owns
-//! its MinIO + hypha; cleans up on drop.
+//! Ignored concurrency, throughput, and latency exercises.
 //!
 //! The reported numbers are indicative only — one MinIO backs both cache and remote on a temp dir,
 //! so they measure hypha's coordination overhead against a shared local backend, not a production

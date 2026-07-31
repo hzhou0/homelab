@@ -1,20 +1,7 @@
-//! The operational surface (§10): `/metrics`, `/healthz`, `/readyz`, on a listener of their own.
+//! Metrics and health endpoints on their unauthenticated internal listener.
 //!
-//! Separate from the S3 port because the two answer to different clients. The S3 port is
-//! authenticated and reached through the gateway; these are unauthenticated, scraped and probed
-//! from inside the cluster, and must keep answering while the S3 port is refusing — a readiness
-//! probe that fails only because the thing it reports on is unhealthy tells an operator nothing.
-//!
-//! **Bound by the binary, never by the library.** The integration harness builds many hyphas in one
-//! process, and a fixed admin port would make that a port conflict; the metrics recorder is global
-//! for the same reason (`crate::metrics`).
-//!
-//! Readiness is deliberately narrow. It reports the things that make a served answer *wrong* rather
-//! than slow: a startup that has not finished, so a bucket's clean marker may not yet be cleared and
-//! a restore not yet owed (§7); a drain that has begun, which takes the pod out of rotation before
-//! its connections are cut rather than after; and a remote hypha cannot reach, which in either mode
-//! is the authority behind every read it cannot serve from cache. Active/passive is **not** in it —
-//! a passive that failed its probe could not be promoted into.
+//! Readiness reports conditions that can make answers wrong, not merely slow, and remains reachable
+//! while the S3 listener is draining.
 
 use std::convert::Infallible;
 use std::future::Future;

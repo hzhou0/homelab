@@ -1,17 +1,8 @@
-//! CopyObject (§7). The age body ciphertext is **key-independent** (per-file keys, §6) and reused
-//! verbatim across keys; only the trailer, MAC-bound to the object key, is re-minted for the
-//! destination. Durable copy is PUT's mark → commit → settle bracket with the body sourced from the
-//! remote instead of the client:
+//! Representation-aware CopyObject.
 //!
-//! - **Large body** (source body ciphertext ≥ the 5 MiB part minimum): native multipart at `K_dst`
-//!   — `UploadPartCopy` over `[0, body_ct_len)` (trailer excluded), then a fresh `K_dst`-bound
-//!   trailer as the sole final part, then complete.
-//! - **Small body**: a copy part can't stand alone as non-final and can't absorb the trailer, so
-//!   re-encrypt — source GET → decrypt → one `PutObject` at `K_dst` with the trailer inline.
-//!
-//! Preconditions evaluate against the **source's** current client ETag / mtime
-//! (`x-amz-copy-source-if-*`) only: s3s 0.14.1's `CopyObjectInput` predates the destination
-//! `If-[None-]Match` fields (§2), so there is nothing to evaluate there yet.
+//! Live plaintext uses an atomic cache copy. Remote-resident ciphertext is key-independent, so
+//! large bodies use multipart server-side copy with a new destination-bound trailer; small bodies
+//! are re-encrypted because a non-final copy part cannot be below the multipart minimum.
 
 use std::collections::HashMap;
 use std::ops::Range;

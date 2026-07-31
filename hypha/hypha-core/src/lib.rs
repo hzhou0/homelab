@@ -1,5 +1,4 @@
-//! Shared library for the hypha binaries: backend S3 client wrapper, object/tombstone metadata
-//! model, config, and the error → `s3s::S3Error` mapping (§3).
+//! Shared backend, metadata, configuration, and error types.
 
 pub mod backend;
 pub mod config;

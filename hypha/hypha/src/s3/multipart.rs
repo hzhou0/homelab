@@ -1,15 +1,8 @@
-//! Multipart (§7) — one path, both modes. Parts route **around the cache** onto the remote's own
-//! native multipart upload at K: each part is an independent, pure age file (fresh file key ⇒
-//! parallel and re-uploaded parts need no coordination), and the remote concatenates them at
-//! complete. The object's facts and parts table travel as a terminating trailer — its own part
-//! above every client part, or folded into the last client part when nothing can follow it (the
-//! fold decision in `op_complete_multipart_upload` below has the detail). Either way the commit
-//! lands body and facts in one op, and clients keep S3's full 1–10000 part range.
+//! Durable multipart shared by both modes.
 //!
-//! hypha's own state per upload is minimal and lives in the `<meta>` cache bucket's range A
-//! (`0x01 0x01 m …`, §6): per-part `{pmd5, retag}` facts, plus a fold intent while completion has
-//! temporarily replaced a client part. Its loss with the cache volume merely fails the eventual
-//! complete — never-acked, the client retries.
+//! Independently encrypted parts go directly to the remote. Completion atomically adds the facts
+//! trailer, folding it into a terminal client part when S3 would reject a separate small part.
+//! Fold intent makes retries distinguish an already-replaced terminal part.
 
 use std::collections::HashMap;
 

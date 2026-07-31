@@ -1,24 +1,12 @@
-//! What hypha does when a backing store **runs out of room** — the failure every other faulted test
-//! in this suite only imitates.
-//!
-//! The fault proxy can return a 500, but it cannot reproduce a store that has genuinely stopped
-//! accepting bytes: writes fail for as long as the condition lasts rather than for a counted number
-//! of attempts, they fail *everywhere at once* rather than on one path a test picked, and reads keep
-//! working throughout. A deliberately undersized SeaweedFS (`scripts/test-seaweedfs-tiny.sh`, one
-//! megabyte per volume and a handful of volumes) produces exactly that, and produces it stably —
-//! SeaweedFS does not reclaim a deleted object's space without a vacuum, so once the fixture is full
-//! it stays full for the rest of the test.
+//! Behavior when a real backing store runs out of space.
 //!
 //! Which role is undersized is the point of each test, so the fixture is wired to **one** of them and
 //! the other stays on the harness's own MinIO. That separation is what makes the cached-mode claims
 //! sharp: a full remote must not stop hypha acking (the cache is the commit point), and a full cache
 //! must stop it acking (there is nowhere for the commit to land).
 //!
-//! Every test here asserts the same three things beyond its own subject, because they are what
-//! "handles a broken backend" actually means: the client gets an **S3 error** rather than a hang or a
-//! truncated response, no **invariant** is violated (running out of space is not corruption — the
-//! halt marker must stay absent), and anything the store already **acked** is still byte-exact
-//! afterwards.
+//! Each case requires a protocol error rather than a hang, no invariant halt, and preservation of
+//! previously acknowledged data.
 
 mod common;
 

@@ -1,37 +1,8 @@
-//! Orphaned shadow bodies (§8) — the same three-piece mechanism [`crate::markers`] uses for the
-//! pending set, applied to a reclaim rather than to a durability record.
+//! Reclaims plaintext shadows made unreachable by later writes.
 //!
-//! A shadow body is a rehydrated composite's plaintext, keyed by `sha256(K)` (§6). A client write that
-//! supersedes that composite — a PUT, a DELETE, a fresh CompleteMultipartUpload at K — leaves the
-//! shadow **unreachable**: reads serve one only against K's current tombstone `cetag`. Unreachable and
-//! also *unrankable*, because nothing touches it again, so the recency ring never forms an opinion and
-//! §8's pressure scan only ever takes it as an eventual miss. On a cache that never comes under
-//! pressure it simply accumulates.
-//!
-//! The three pieces, in the order a run meets them:
-//!
-//! 1. **Startup** reads and clears the shadow-clean marker in [`crate::bucket::resolve_all`], beside
-//!    the two markers of the same shape, and owes a [`sweep`] for every bucket that had none.
-//! 2. **The queue** ([`Orphans::owe`]) — a cached write hands K over and returns. Unbounded and
-//!    infallible for the same reason the marker queue is: it sits after the commit, so it can neither
-//!    block the ack nor turn into an error.
-//! 3. **The drain** ([`OrphanActor::run`]) writes the shadow-clean markers, only for buckets this run
-//!    accounted for and only if nothing was still owed when it sealed.
-//!
-//! **The obligation is unconditional, and that is forced.** An unconditional cached PUT deliberately
-//! takes no lock and never reads K (§7) — it is fenced against eviction by the remote-generation
-//! confirm, not by a lock — so it *cannot* know whether it superseded a composite. Making it look would
-//! undo that design. So every cached write owes here, exactly as every cached write owes a pending
-//! marker, and the actor is what resolves whether an obligation means anything.
-//!
-//! **One listing settles a whole batch, and that ordering is load-bearing.** A shadow this run
-//! orphaned necessarily existed *before* the write that orphaned it — a shadow landing afterwards
-//! belongs to a later generation and is legitimately live. So a shadow-range listing taken after a
-//! batch was received is exact for every obligation in it, and the actor needs no cached set (a cache
-//! held across batches could miss a newly landed shadow, drop the obligation, and let the drain write a
-//! marker that vouches for an orphan — the one thing a marker must never do). Shadows exist only for
-//! composites something read back after eviction, so for almost every bucket that listing comes back
-//! empty and the whole batch resolves with no further call.
+//! Cached writes cannot cheaply know whether they superseded a composite, so all of them enqueue an
+//! obligation. Listing after receiving a batch is load-bearing: any shadow in that snapshot predates
+//! the write, while a later shadow belongs to a newer generation and must remain live.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
