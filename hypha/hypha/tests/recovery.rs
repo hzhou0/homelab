@@ -209,13 +209,9 @@ async fn writes_during_a_restore_commit_to_the_remote() {
     assert_eq!(get_all(&c, B, "k").await, body);
 }
 
-/// The other half of the write-mode gate, and the one a readiness *load* cannot cover: a read that
-/// committed to the remote must not be answered stale by a cached write that lands after the flip.
-///
-/// The read's ticket is the whole mechanism. It is taken in the same CAS that classifies the read
-/// `Restoring` and held until the remote answer is computed, so a write admitted in that window sees
-/// it and commits remote-first. Without it the write acks off the cache alone, and this read — long
-/// since committed to the remote — hands the client back the body it superseded.
+/// A read committed to the remote must not be answered stale by a cached write landing after the
+/// flip. The ticket — taken with the read's `Restoring` classification and held until the remote
+/// answer is computed — is what forces that write to commit remote-first.
 #[tokio::test]
 async fn a_remote_read_across_the_flip_is_never_answered_stale() {
     let mut h = Harness::cached_with_faults().await;
@@ -230,9 +226,8 @@ async fn a_remote_read_across_the_flip_is_never_answered_stale() {
 
     h.stop_hypha().await;
     destroy_cache(&h).await;
-    // Park the restore on the `<data>` listing it opens with, before it has materialized anything, so
-    // the bucket stays `Restoring` until released. Nothing else reads `<data>` in that window — a
-    // restoring bucket serves every client read off the remote.
+    // Park the restore on its opening `<data>` listing so the bucket stays `Restoring` until
+    // released.
     let restoring = h
         .cache_faults()
         .pause_next_prefix(hyper::Method::GET, format!("/{}", h.cache_bucket(B)));
@@ -243,8 +238,8 @@ async fn a_remote_read_across_the_flip_is_never_answered_stale() {
 
     let reader = h.client();
     let read = tokio::spawn(async move { get_all(&reader, B, "k").await });
-    // Reaching the remote *is* the proof the read classified `Restoring` and took its ticket: a
-    // `Ready` bucket would have served this from the cache and never come here.
+    // Reaching the remote proves the read took the ticket — a `Ready` bucket would have served from
+    // the cache.
     tokio::time::timeout(Duration::from_secs(15), reading.reached())
         .await
         .expect("the read must resolve against the remote while the bucket restores");
@@ -255,8 +250,7 @@ async fn a_remote_read_across_the_flip_is_never_answered_stale() {
     })
     .await;
 
-    // Past the flip, so a cached deployment would ordinarily commit this cache-first. The ticket
-    // still out defers it to durable semantics instead.
+    // Past the flip, so cache-first is the norm — the ticket still out defers it to durable instead.
     let fresh = pattern(8192);
     put(&h.client(), B, "k", &fresh).await;
 

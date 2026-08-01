@@ -76,10 +76,8 @@ impl Hypha {
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
         let bucket = input.bucket.clone();
-        // While the cache restores, the remote is the read source of truth (§7); it holds the same
-        // client keyspace, so pagination forwards identically.
-        // The ticket is held until the page is projected, for the reason [`Hypha::resolve_key`]
-        // spells out: a cached-mode write admitted while it is out commits remote-first.
+        // The ticket is held until the page is projected, so a cached-mode write admitted while it
+        // is out commits remote-first.
         let ticket = self.buckets.read_ticket(&bucket).map_err(refuse)?;
         let restoring = matches!(ticket, Readout::Remote(_));
         let source = if restoring {
@@ -147,8 +145,8 @@ impl Hypha {
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
         let bucket = input.bucket.clone();
-        // The ticket is held until the page is projected, for the reason [`Hypha::resolve_key`]
-        // spells out: a cached-mode write admitted while it is out commits remote-first.
+        // The ticket is held until the page is projected, so a cached-mode write admitted while it
+        // is out commits remote-first.
         let ticket = self.buckets.read_ticket(&bucket).map_err(refuse)?;
         let restoring = matches!(ticket, Readout::Remote(_));
         let source = if restoring {

@@ -1,37 +1,29 @@
-//! One `AtomicU64` per bucket carrying its lifecycle and both in-flight counts:
+//! One `AtomicU64` per bucket: the lifecycle word and both in-flight counts in a single CAS, so a
+//! decision is *made* by the transition, never by a second load that could move underneath it.
 //!
 //! ```text
 //! [ ready:1 | closed:1 | epoch:30 | rcount:16 | wcount:16 ]
 //! ```
 //!
-//! Every transition is one CAS, and the CAS **is** the classification — a write learns whether it may
-//! run cache-first from the very word it was admitted on, never from a second load that could have
-//! moved underneath it. `epoch` moves on every write admission so a write that starts *and* finishes
-//! inside a delete's emptiness listing is still visible to the close (the zero-count ABA). `rcount` is
-//! masked out of that compare, because deletes deliberately never wait on readers — an unmasked close
-//! would let a reader passing during the listing block the delete through the back door.
-//!
-//! Counter widths are deliberately small: 2¹⁶ concurrent in-flight ops on one bucket is not a state
-//! this process can reach, and refusing on saturation beats letting an increment carry into the
-//! neighbouring field, which would corrupt the delete's evidence or admit a cache-first write into a
-//! namespace a restoring read is about to look at.
+//! `epoch` moves on every write admission so a write that starts and finishes inside a delete's
+//! emptiness listing still defeats the close (zero-count ABA). `rcount` is masked out of the close
+//! because deletes never wait on readers. Counts saturate and refuse rather than carry into a
+//! neighbour, which would corrupt the close's evidence.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const READY: u64 = 1 << 63;
 const CLOSED: u64 = 1 << 62;
-/// Bits 32..61. Wrapping within its own field is deliberate — only *change* is ever asked of it, and
-/// a wrap would need 2³⁰ admissions inside one listing.
+/// Wrapping is fine: only *change* is ever asked of it, and a wrap needs 2³⁰ admissions in one listing.
 const EPOCH_MASK: u64 = 0x3fff_ffff_0000_0000;
 const EPOCH_ONE: u64 = 1 << 32;
 const RCOUNT_MASK: u64 = 0x0000_0000_ffff_0000;
 const RCOUNT_ONE: u64 = 1 << 16;
 const WCOUNT_MASK: u64 = 0x0000_0000_0000_ffff;
 
-/// A bucket's visible state — the whole of it, for the internal passes that only need to know
-/// whether a bucket is still there. `Absent` is the one value that is not a bit pattern: it is the
-/// map having no entry at all.
+/// The whole of a bucket's visible state. `Absent` is not a bit pattern: it is the map having no
+/// entry at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BucketStatus {
     /// Deleted, or never known. Definitive.
@@ -42,36 +34,32 @@ pub enum BucketStatus {
     Ready,
 }
 
-/// Where a read must go for its answer, decided atomically with taking (or not taking) a ticket.
+/// Where a read must go for its answer, decided atomically with its ticket.
 pub enum Readout {
-    /// The cache is authoritative. No ticket: `Ready` is monotonic, so nothing can take it back.
+    /// No ticket — `Ready` never reverts.
     Cache,
-    /// The cache is not authoritative yet. Holding the ticket for the whole of the remote answer is
-    /// what keeps a cached-mode write from committing cache-first into a namespace this read is
-    /// about to report on.
+    /// Held for the whole remote answer, so a cached-mode write admitted meanwhile cannot commit
+    /// cache-first into it.
     Remote(ReadGuard),
 }
 
 /// What a write may do, decided by the CAS that admitted it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// `Ready` with no restoring read in flight: a cached deployment may commit cache-first.
+    /// `Ready` with no restoring read in flight.
     CachedEligible,
-    /// Everything else — still `Restoring`, or `Ready` with a straggler's ticket out, where
-    /// cache-first would let that read answer stale. The write is never blocked; it just runs under
-    /// the stronger semantics for this one op, and materializes its key from the remote first so its
-    /// bracket overwrites a correct tombstone.
+    /// `Restoring`, or `Ready` with a straggler's ticket out — cache-first there would let that
+    /// read answer stale. Never blocked, just forced remote-first for this one op.
     Durable,
 }
 
-/// Why the gate refused an op — the *same* two answers for reads and writes, so the data plane maps
-/// them to status codes in exactly one place.
+/// Why the gate refused an op — one answer shared by reads and writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// No gate, so no bucket. Definitive.
     Absent,
-    /// The gate is closed — or, unreachably, saturated. Either way the right answer is "retry": the
-    /// delete may still fail, and a permanent `NoSuchBucket` would be a lie the client caches.
+    /// A delete mid-flight: retryable, since the delete may still fail. (Unreachably, saturation
+    /// refuses the same way.)
     Closed,
 }
 
@@ -83,15 +71,13 @@ fn wcount(word: u64) -> u64 {
     word & WCOUNT_MASK
 }
 
-// ── the transition table ──────────────────────────────────────────────────────────────────────
-//
-// One function per row: the precondition and the word it installs. [`Gate::advance`] re-runs the row
-// on a lost race, which is what makes the CAS *be* the classification rather than a check-then-act.
-// A row that returns `None` refuses, and the word it refused on is handed back as the answer.
+/// ── the transition table ────
+///
+/// One row per transition; [`Gate::advance`] re-runs a row on a lost race, so the CAS *is* the
+/// classification. A row that returns `None` refuses, and the word it refused on is the answer.
 
-/// `wcount + 1`, and `epoch` moved so the delete's CAS sees this admission even if the write also
-/// finishes before that CAS runs — the zero-count ABA. Saturation refuses rather than carry into the
-/// epoch and corrupt the delete's evidence.
+/// `wcount + 1`, with the epoch moved so a write that finishes before the close CAS still defeats it
+/// (ABA). Saturation refuses rather than carry into the epoch.
 fn admit_write(word: u64) -> Option<u64> {
     (word & CLOSED == 0 && wcount(word) != WCOUNT_MASK).then(|| {
         (word & !(EPOCH_MASK | WCOUNT_MASK))
@@ -100,23 +86,20 @@ fn admit_write(word: u64) -> Option<u64> {
     })
 }
 
-/// `rcount + 1`, and deliberately **no** epoch move: `rcount` is masked out of the close anyway, and
-/// moving the epoch here would fail closes on readers — the very thing that mask exists to prevent.
+/// `rcount + 1`, no epoch move — one would fail closes on readers, the very thing the mask is for.
 fn take_ticket(word: u64) -> Option<u64> {
     (word & (READY | CLOSED) == 0 && rcount(word) != RCOUNT_MASK).then_some(word + RCOUNT_ONE)
 }
 
-/// The flip. Refuses an already-`Ready` gate and a `closed` one — a delete's emptiness listing must
-/// not be contradicted by a flip that makes the bucket serviceable again — and tolerates whatever the
-/// counters hold.
+/// The flip (`Restoring` → `Ready`). Refuses `closed` — a flip must not contradict a delete's
+/// emptiness listing — and tolerates whatever the counters hold.
 fn set_ready(word: u64) -> Option<u64> {
     (word & (READY | CLOSED) == 0).then_some(word | READY)
 }
 
-/// The delete's close, valid only while nothing the listing depended on has changed. `rcount` is
-/// masked out: deletes never wait on readers, so a reader passing through the listing must not fail
-/// it. A flip landing in the window *does* fail it — the listing read the remote namespace, and a
-/// `Ready` bucket's is the cache's.
+/// The delete's close, valid only while nothing the listing depended on changed. `rcount` is masked
+/// — deletes never wait on readers — but a flip in the window fails it: the listing read the remote
+/// namespace, a `Ready` bucket's is the cache's.
 fn set_closed(observed: u64) -> impl Fn(u64) -> Option<u64> {
     move |word| (word & !RCOUNT_MASK == observed & !RCOUNT_MASK).then_some(word | CLOSED)
 }
@@ -136,12 +119,11 @@ impl Gate {
         }
     }
 
-    /// Run one row of the transition table. `Ok` carries the word the winning decision was made on —
-    /// the pre-image — and `Err` the word that refused; either way the caller reads its answer off
-    /// that word rather than loading again, which is what keeps the CAS *being* the classification.
+    /// Run one row of the table. `Ok`/`Err` carry the pre-image / refusing word, so the caller's
+    /// answer is the CAS itself, never a fresh load.
     ///
-    /// `AcqRel` throughout: a writer getting in ahead of a delete must see what the delete published
-    /// before closing, and a delete's later load must happen-after the writes it is allowed to miss.
+    /// `AcqRel` on success: an op admitted ahead of a delete sees what it published; a delete's later
+    /// load happens-after the writes it is allowed to miss.
     fn advance(&self, row: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
         let mut current = self.state.load(Ordering::Acquire);
         loop {
@@ -169,17 +151,15 @@ impl Gate {
         }
     }
 
-    /// Admit a write and classify it in the same CAS. The guard must be held until the write has
-    /// committed **and** raised whatever it owes: it is the write's whole claim on the bucket
-    /// existing, and a delete that observes it gone treats the namespace as settled.
+    /// Admit a write, classifying it in the same CAS. The guard is the write's whole claim on the
+    /// bucket existing — hold it until the write has committed and raised whatever it owes.
     pub(super) fn enter_write(self: &Arc<Self>) -> Result<(WriteGuard, Admission), Refusal> {
         let observed = self.advance(admit_write).map_err(|_| Refusal::Closed)?;
         Ok((WriteGuard { gate: self.clone() }, admission(observed)))
     }
 
-    /// Classify a read, taking a ticket if the answer has to come from the remote. A refused ticket
-    /// is not a failure to interpret later — the word it refused on already says which: `ready` means
-    /// the cache became authoritative, anything else means the delete got there first.
+    /// Classify a read, taking a ticket if the answer must come from the remote. The refusal needs
+    /// no re-check — the word it refused on already says which.
     pub(super) fn read_ticket(self: &Arc<Self>) -> Result<Readout, Refusal> {
         match self.advance(take_ticket) {
             Ok(_) => Ok(Readout::Remote(ReadGuard { gate: self.clone() })),
@@ -189,15 +169,14 @@ impl Gate {
         }
     }
 
-    /// End a restore. Idempotent, one-way, and non-blocking — it keeps the gate its in-flight writes
-    /// are counted in, so a delete reading those counts across the flip cannot see zero.
+    /// End a restore. In-place and one-way, so a delete reading the counts across the flip cannot
+    /// see zero.
     pub(super) fn flip(&self) {
         let _ = self.advance(set_ready);
     }
 
-    /// Step 1 of a delete: `Some` only if nothing is closing or writing. Records the exact word it
-    /// saw, which [`Quiescent::close`] must still find there. Nothing is mutated, so a `None` costs
-    /// the bucket nothing at all.
+    /// Step 1 of a delete: `Some` only if nothing is closing or writing. Records the word
+    /// [`Quiescent::close`] must still find. Nothing is mutated.
     pub(super) fn quiescent(self: &Arc<Self>) -> Option<Quiescent> {
         let observed = self.state.load(Ordering::Acquire);
         (observed & CLOSED == 0 && wcount(observed) == 0).then(|| Quiescent {
@@ -207,9 +186,8 @@ impl Gate {
     }
 }
 
-/// Read off the pre-image of a successful admission, which is what makes it atomic with it. `ready`
-/// never reverts, so a write that observed it can be sure no further ticket will be taken: any
-/// restoring read still to answer is already counted here.
+/// Read off the admission's pre-image, so it is atomic with it. `ready` never reverts, so any
+/// restoring read still to answer is already counted.
 fn admission(observed: u64) -> Admission {
     if observed & READY != 0 && rcount(observed) == 0 {
         Admission::CachedEligible
@@ -224,9 +202,8 @@ pub(super) struct Quiescent {
 }
 
 impl Quiescent {
-    /// Step 3: close the gate if nothing the listing depended on has changed. `None` means a write
-    /// arrived — or the restore flipped — while the caller was listing, so the listing is stale and
-    /// the delete must refuse, again without having touched anything.
+    /// Step 3: close iff nothing the listing depended on changed. `None` means a write or flip
+    /// landed mid-listing — the delete must refuse, again without touching anything.
     pub(super) fn close(self) -> Option<ClosedGate> {
         self.gate.advance(set_closed(self.observed)).ok()?;
         Some(ClosedGate {
@@ -236,9 +213,8 @@ impl Quiescent {
     }
 }
 
-/// A closed gate, held across the delete's commit. Reopens on drop unless [`Self::commit`] takes it,
-/// so a commit that fails — or a panic between the two — returns the bucket to service rather than
-/// leaving a live bucket that refuses every op for the rest of the run.
+/// Held across the delete's commit; reopens on drop unless [`Self::commit`] took it, so a failed
+/// commit returns the bucket to service.
 #[must_use = "dropping this reopens the gate"]
 pub(super) struct ClosedGate {
     gate: Arc<Gate>,
@@ -259,8 +235,7 @@ impl Drop for ClosedGate {
     }
 }
 
-/// One admitted write. Release on drop so a delete's later load happens-after this write's commit —
-/// that load is what has to see a namespace this write has finished changing.
+/// Release on drop, so a delete's later load happens-after this write's commit.
 #[must_use = "dropping the guard releases the write's claim on the bucket"]
 pub struct WriteGuard {
     gate: Arc<Gate>,
@@ -272,7 +247,7 @@ impl Drop for WriteGuard {
     }
 }
 
-/// One restoring read, held until its remote answer is fully computed.
+/// One restoring read, held until its remote answer is computed.
 #[must_use = "dropping the ticket lets cached writes commit cache-first again"]
 pub struct ReadGuard {
     gate: Arc<Gate>,
@@ -289,12 +264,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// A bucket mid-restore, as [`super::super::BucketCtl::restore`] publishes one.
+    /// A bucket mid-restore.
     fn restoring() -> Arc<Gate> {
         Arc::new(Gate::new(BucketStatus::Restoring))
     }
 
-    /// A bucket serving from its cache, as a create or a finished restore leaves one.
+    /// A bucket serving from its cache.
     fn ready() -> Arc<Gate> {
         Arc::new(Gate::new(BucketStatus::Ready))
     }
@@ -332,9 +307,8 @@ mod tests {
         );
     }
 
-    // The ABA case, and the whole reason for the epoch: the racer is gone by the time the CAS runs,
-    // so `wcount` is back to zero and only a moved epoch distinguishes this word from the one
-    // observed.
+    // The ABA case, and the whole reason for the epoch: only a moved epoch distinguishes this word
+    // once the racer is gone.
     #[test]
     fn a_write_that_starts_and_finishes_during_the_listing_defeats_the_close() {
         let gate = ready();
@@ -346,8 +320,7 @@ mod tests {
         );
     }
 
-    // The mask, from the other side: deletes never wait on readers, so neither a reader still inside
-    // the listing nor one that came and went during it may fail the close.
+    // The mask, from the other side: deletes never wait on readers.
     #[test]
     fn readers_never_defeat_the_close() {
         let gate = restoring();
@@ -414,8 +387,7 @@ mod tests {
         drop(closed);
     }
 
-    // The straggler's other half: a read that loses the CAS to the flip is redirected to the cache by
-    // the failure itself, with no classification after the fact.
+    // The straggler's other half: the CAS failure itself redirects the read to the cache.
     #[test]
     fn a_restoring_read_is_redirected_to_the_cache_once_the_flip_lands() {
         let gate = restoring();
@@ -450,8 +422,7 @@ mod tests {
         );
     }
 
-    // The flip is an in-place CAS on the gate the writes are counted in — never a fresh one, or a
-    // delete reading the counts during the flip would see zero while writes are still landing.
+    // The flip must be in-place: a fresh gate would hide the counts a delete reads across it.
     #[test]
     fn the_flip_keeps_the_writes_already_counted() {
         let gate = restoring();
@@ -465,10 +436,9 @@ mod tests {
         assert!(gate.quiescent().is_some());
     }
 
-    // Under real contention the only outcome that must never occur is a close that succeeds while a
-    // write is inside — that is the one the emptiness listing would be wrong about. Closers keep
-    // trying until the writers are done, so the run is guaranteed to contain successful closes: a
-    // gate that simply refused every one would pass the safety assertion while proving nothing.
+    // The only forbidden outcome is a close winning over a live write. Closers keep trying until
+    // writers are done, so the run must contain successful closes — a gate refusing every one would
+    // pass the safety assertion while proving nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_close_never_wins_against_a_live_write() {
         const WRITERS: usize = 6;
@@ -490,8 +460,7 @@ mod tests {
                         inside.fetch_sub(1, Ordering::AcqRel);
                         drop(guard);
                     }
-                    // Leaves quiescent windows for a closer to find; without them the writers simply
-                    // hand the gate to each other and no close ever gets a look.
+                    // Leaves quiescent windows for a closer to find.
                     tokio::task::yield_now().await;
                 }
                 retired.fetch_add(1, Ordering::AcqRel);
@@ -508,7 +477,7 @@ mod tests {
                         tokio::task::yield_now().await;
                         continue;
                     };
-                    // Stands in for the emptiness listing: the window the CAS has to cover.
+                    // Stands in for the emptiness listing: the window the close CAS must cover.
                     tokio::task::yield_now().await;
                     let Some(closed) = seen.close() else {
                         continue;

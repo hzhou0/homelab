@@ -16,10 +16,9 @@ pub enum Error {
     /// contents outright (`allowDeleteBucketNotEmpty` defaults on), so a delegated gate is no gate.
     #[error("bucket not empty")]
     BucketNotEmpty,
-    /// A `DeleteBucket` that raced a write into the same bucket, or the write that lost that race
-    /// once the delete committed to closing its gate. Both sides retry: a refused delete leaves the
-    /// bucket serving, and a refused write learns the settled truth on retry — `NoSuchBucket` if the
-    /// delete went through, success if it did not (§7).
+    /// A `DeleteBucket` racing a write, or the write that lost once the delete committed to closing.
+    /// Both sides retry: the refused delete leaves the bucket serving, and the refused write learns
+    /// the settled truth on retry (§7).
     #[error("a conflicting write is in progress")]
     OperationAborted,
     #[error("reduce your request rate")]

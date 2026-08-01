@@ -1,6 +1,5 @@
-//! Bucket operations. The remote is the commit for Create/Delete; the state map is what every
-//! other op reads, since only it distinguishes a bucket that is gone from one whose delete has not
-//! decided yet ([`Hypha::require_bucket`]).
+//! Bucket operations. The remote commits Create/Delete; the state map answers everything else,
+//! since only it distinguishes a gone bucket from one whose delete has not decided.
 
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
