@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
-use crate::bucket::{BucketCtl, Readiness};
+use crate::bucket::{BucketCtl, BucketStatus};
 use crate::halt::{Invariant, Violation};
 use crate::tier::Tiering;
 
@@ -58,7 +58,7 @@ impl VolumeWatch {
         // the one benign way to see this is to have raced one. Re-reading the map after the failed
         // HEAD is what tells the two apart — and it is enough, since nothing else removes the marker
         // and nothing rewrites it while a bucket is `Ready`.
-        if self.buckets.readiness(bucket) != Readiness::Ready {
+        if self.buckets.status(bucket) != BucketStatus::Ready {
             return Ok(());
         }
         self.tier

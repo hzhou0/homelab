@@ -182,22 +182,39 @@ obligation cannot be cleared.
 
 ### Bucket write gate
 
-Every write holds a per-bucket admission guard until its commit and follow-up obligation are
-established. The gate is one `AtomicU64` containing:
+Every data-plane op — write or read — that touches a bucket crosses a per-bucket admission gate, one
+`AtomicU64` stored beside the accounting in the state map's entry, so the readiness/delete word and
+the memos are one atomic publication and one lifecycle. The word is:
 
 ```text
-closed:1 | admission-epoch:31 | in-flight-count:32
+[ ready:1 | closed:1 | epoch:30 | rcount:16 | wcount:16 ]
 ```
+
+`ready` is the flip that ends a restore (`Restoring` → `Ready`); `closed` is a `DeleteBucket` past
+its emptiness check; `epoch` makes an admission that begins and ends during the emptiness listing
+visible to the close's CAS; `wcount` counts writes in flight; `rcount` counts reads that committed
+to the remote while the bucket was `Restoring`.
 
 `DeleteBucket`:
 
-1. refuses if a write is already in flight;
+1. refuses if a write is already in flight (`wcount > 0`);
 2. checks the client-visible namespace is empty;
 3. closes the exact observed gate state with CAS.
 
-The epoch makes an admission that begins and ends during the namespace listing visible to the CAS.
-The gate never blocks ordinary writes, and a refused delete leaves it unchanged. Once closed, no
-write can recreate a backend bucket behind deletion.
+`rcount` is masked out of the close's compare: deletes do not wait on readers, so a reader passing
+during the listing must not fail the close. The epoch makes a come-and-go write visible even with
+`wcount` back at zero — the ABA case. The gate never blocks ordinary writes, and a refused delete
+leaves it unchanged. An uncommitted close (failed remote drain, or a panic between the two) reopens
+on drop, rather than leaving a live bucket that refuses every op for the rest of the run. Once
+closed and committed, everything addressed to the bucket answers the retryable `OperationAborted`
+rather than a permanent `NoSuchBucket` — the delete may still fail.
+
+Writes are admitted through a CAS that classifies the write at the same time: a `Ready` bucket with
+no restoring reader in flight admits a cached-mode deployment's cache-first write; everything else —
+`Restoring`, or `Ready` with a reader in flight — commits durably. Reads take a ticket when
+`Restoring` and hold it for the whole remote answer, which is what keeps a cached-mode write from
+committing into a namespace a remote read is about to look at. The flip is idempotent, never
+reverts, and keeps the gate its in-flight writes are counted in.
 
 Bucket lifecycle is serialized by the bucket-control actor. It determines existence from its
 remote-derived state map and emptiness from Hypha's client namespace rather than relying on backend

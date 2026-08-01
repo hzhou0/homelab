@@ -1,4 +1,6 @@
-//! Durable bucket operations with the remote as the existence authority.
+//! Bucket operations. The remote is the commit for Create/Delete; the state map is what every
+//! other op reads, since only it distinguishes a bucket that is gone from one whose delete has not
+//! decided yet ([`Hypha::require_bucket`]).
 
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
@@ -33,7 +35,7 @@ impl Hypha {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        self.remote().head_bucket(&req.input.bucket).await?;
+        self.require_bucket(&req.input.bucket)?;
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
@@ -66,7 +68,7 @@ impl Hypha {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        self.remote().head_bucket(&req.input.bucket).await?;
+        self.require_bucket(&req.input.bucket)?;
         let resp = GetBucketVersioningOutput {
             status: None,
             mfa_delete: Some(MFADeleteStatus::from_static(MFADeleteStatus::DISABLED)),
@@ -78,7 +80,7 @@ impl Hypha {
         &self,
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        self.remote().head_bucket(&req.input.bucket).await?;
+        self.require_bucket(&req.input.bucket)?;
         let resp = GetBucketLocationOutput {
             location_constraint: Some(BucketLocationConstraint::from(
                 self.remote().region().to_string(),

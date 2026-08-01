@@ -80,7 +80,7 @@ impl Hypha {
                 "DeleteObjects takes between 1 and 1000 objects"
             ));
         }
-        let (_gate, mode) = self.write_mode(&bucket).await?;
+        let (_gate, mode) = self.write_mode(&bucket)?;
         if let WriteMode::Cached = mode {
             return self
                 .op_delete_objects_cached(bucket, quiet, requested)

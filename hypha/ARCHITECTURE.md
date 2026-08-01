@@ -269,8 +269,10 @@ completion-time re-encryption pass.
   per-entry HEAD fan-out.
   Buckets map one-to-one across cache and remote, but — like multipart — the **remote is their
   source of truth** and they are **always durable**: create/delete are synchronous to both sides
-  (acked only once both confirm) regardless of mode, and `HeadBucket`/`ListBuckets` are answered
-  from the remote, not the cache.
+  (acked only once both confirm) regardless of mode, and `ListBuckets` is answered from the remote,
+  not the cache. `HeadBucket` is answered from the process's own bucket map instead — it is derived
+  from the remote at startup and maintained by create/delete since, and it is the only source that
+  distinguishes a deleted bucket from one whose delete has not yet decided.
 - **DELETE** → in a cached deployment, remove the local body at K and ack, then queue a DELETE
   marker. The background reconcile HEADs the remote object and conditionally deletes that exact
   generation before clearing the marker. If the marker is lost to a crash, the intact sync marker

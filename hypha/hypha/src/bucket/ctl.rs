@@ -1,4 +1,4 @@
-//! Serializes cache-substrate mutations per bucket while publishing lock-free readiness snapshots.
+//! Serializes cache-substrate mutations per bucket while publishing a lock-free state map.
 //! Client lifecycle requests retain individual replies; recovery triggers coalesce because reads
 //! already fall back to the remote while recovery is pending.
 
@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
-use super::gate::{Refusal, WriteGates, WriteGuard};
+use super::gate::{Admission, BucketStatus, Gate, Readout, Refusal, WriteGuard};
 use super::{rebuild, restore};
 use crate::gc::orphans;
 use crate::halt::{Invariant, Violation};
@@ -39,10 +39,13 @@ const RECOVERY_RETRY: Duration = Duration::from_secs(5);
 /// the map holds tens of entries and is read once or twice per request.
 type BucketStates = Arc<ArcSwap<HashMap<String, BucketState>>>;
 
-/// Keeping readiness and accounting together makes lifecycle changes one atomic publication.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// Keeping the gate and the accounting together makes lifecycle changes one atomic publication, and
+/// gives them one lifecycle: an entry is born by [`birth`], dropped by [`retire`], and its gate is
+/// the shared `Arc` the data plane races against.
+#[derive(Clone)]
 pub(crate) struct BucketState {
-    readiness: Readiness,
+    /// The bucket's status, the delete's closure, and both in-flight counts, in one word.
+    gate: Arc<Gate>,
     /// Both cache projections are known to exist, so a write can skip asking the actor.
     provisioned: bool,
     /// This run accounts for the bucket's pending-marker set (§6) — its clean marker was present at
@@ -57,59 +60,63 @@ pub(crate) struct BucketState {
     shadows_accounted: bool,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum Readiness {
-    #[default]
-    Absent,
-    Restoring,
-    Ready,
+/// Publish a bucket this process serves. Idempotent, and an existing entry is left **exactly** as it
+/// is: its gate must stay the one its in-flight writes are counted in, or a delete would read zero
+/// while writes are still landing.
+///
+/// `Restoring` is only ever a genuine restore. A bucket this run *created* is born `Ready` — its
+/// cache work all precedes the remote commit and an empty namespace is trivially authoritative — and
+/// publishing it `Restoring` would route reads to a remote 404 for keys the cache already holds.
+fn birth(states: &BucketStates, bucket: &str, status: BucketStatus) {
+    states.rcu(|current| {
+        let mut next = HashMap::clone(current);
+        next.entry(bucket.to_string())
+            .or_insert_with(|| BucketState {
+                gate: Arc::new(Gate::new(status)),
+                provisioned: false,
+                accounted: false,
+                shadows_accounted: false,
+            });
+        Arc::new(next)
+    });
 }
 
-/// Apply `f` to one bucket's state and publish the result. The closure may run more than once (the
-/// CAS retries under contention), so it must be pure. An entry that lands back at the default is
-/// dropped, keeping the map to buckets this process actually knows something about.
+/// Apply `f` to one bucket's memos and publish the result. The closure may run more than once (the
+/// CAS retries under contention), so it must be pure.
+///
+/// Mutate-only: a bucket the map has never heard of is left alone rather than conjured, because the
+/// create path's provisional work must not publish a bucket before its remote commit.
 fn update(states: &BucketStates, bucket: &str, f: impl Fn(&mut BucketState)) {
     states.rcu(|current| {
         let mut next = HashMap::clone(current);
-        let entry = next.entry(bucket.to_string()).or_default();
-        f(entry);
-        if *entry == BucketState::default() {
-            next.remove(bucket);
+        if let Some(entry) = next.get_mut(bucket) {
+            f(entry);
         }
         Arc::new(next)
     });
 }
 
-fn set_restoring(state: &mut BucketState) {
-    state.readiness = Readiness::Restoring;
+/// The shared word the data plane races against — `None` is the bucket being absent, which every
+/// caller reads as definitively gone.
+fn gate(states: &BucketStates, bucket: &str) -> Option<Arc<Gate>> {
+    states.load().get(bucket).map(|s| s.gate.clone())
 }
 
-fn mark_ready(state: &mut BucketState) {
-    state.readiness = Readiness::Ready;
+/// End a restore: the cache namespace is authoritative from here. The flip is a CAS on the gate the
+/// bucket's in-flight writes are already counted in, so it publishes nothing and a bucket retired
+/// underneath the restore simply has nothing to flip.
+fn flip_ready(states: &BucketStates, bucket: &str) {
+    if let Some(gate) = gate(states, bucket) {
+        gate.flip();
+    }
 }
 
-fn set_provisioned(state: &mut BucketState) {
-    state.provisioned = true;
+fn status(states: &BucketStates, bucket: &str) -> BucketStatus {
+    gate(states, bucket).map_or(BucketStatus::Absent, |g| g.status())
 }
 
-fn clear_provisioned(state: &mut BucketState) {
-    state.provisioned = false;
-}
-
-fn set_accounted(state: &mut BucketState) {
-    state.accounted = true;
-}
-
-fn clear_accounted(state: &mut BucketState) {
-    state.accounted = false;
-}
-
-fn set_shadows_accounted(state: &mut BucketState) {
-    state.shadows_accounted = true;
-}
-
-fn clear_shadows_accounted(state: &mut BucketState) {
-    state.shadows_accounted = false;
+fn provisioned(states: &BucketStates, bucket: &str) -> bool {
+    states.load().get(bucket).is_some_and(|s| s.provisioned)
 }
 
 /// Forget a bucket entirely — it no longer exists, so the next access re-classifies from scratch and
@@ -146,7 +153,6 @@ enum BucketMsg {
 pub struct BucketCtl {
     tx: mpsc::UnboundedSender<BucketMsg>,
     states: BucketStates,
-    gates: WriteGates,
 }
 
 impl BucketCtl {
@@ -174,7 +180,7 @@ impl BucketCtl {
     /// for one bucket all wait on a single head+create pair. A flood of writes into a lost-volume
     /// bucket therefore costs the backend one provisioning round, not one per request.
     pub async fn provision(&self, bucket: &str) -> Result<()> {
-        if self.state(bucket).provisioned {
+        if provisioned(&self.states, bucket) {
             return Ok(());
         }
         self.request(|reply| BucketMsg::Provision {
@@ -184,17 +190,21 @@ impl BucketCtl {
         .await
     }
 
-    /// Publishing `Restoring` is both the readiness answer for the window and the record that the
+    /// Publishing `Restoring` is both the classification for the window and the record that the
     /// bucket exists at all.
-    pub(crate) fn restore(&self, bucket: &str) {
-        self.gates.install(bucket);
-        update(&self.states, bucket, set_restoring);
+    fn restore(&self, bucket: &str) {
+        birth(&self.states, bucket, BucketStatus::Restoring);
         self.owe(bucket, Recovery::Restore);
+    }
+
+    /// Publish a bucket whose cache namespace is already authoritative.
+    fn serve(&self, bucket: &str) {
+        birth(&self.states, bucket, BucketStatus::Ready);
     }
 
     /// The bucket stays `Ready` — its namespace is authoritative throughout, and only the pending
     /// index is in doubt.
-    pub(crate) fn rebuild_pending(&self, bucket: &str) {
+    fn rebuild_pending(&self, bucket: &str) {
         self.owe(bucket, Recovery::RebuildPending);
     }
 
@@ -207,34 +217,37 @@ impl BucketCtl {
         });
     }
 
-    /// This process's current view of a bucket — one atomic load, no lock, on a path every request
-    /// crosses. The overlay's whole classification (§7), with no backend call behind it: the map is
-    /// resolved in full at startup ([`resolve_all`]) and maintained by Create/Delete since.
-    pub fn readiness(&self, bucket: &str) -> Readiness {
-        self.state(bucket).readiness
+    /// This process's current view of a bucket — one atomic load, no lock, for ops that resolve no
+    /// key and so need no ticket. The map is resolved in full at startup ([`resolve_all`]) and
+    /// maintained by Create/Delete since, so it, not the backend, is the existence authority.
+    pub fn status(&self, bucket: &str) -> BucketStatus {
+        status(&self.states, bucket)
     }
 
-    /// Admit a write into `bucket`, or refuse. Every producer into a bucket's namespaces goes
-    /// through here — not just client ops: a reconcile upload that landed after the drain would
-    /// resurrect the bucket exactly as a late `PutObject` would.
+    /// Classify a read, taking a ticket if the answer has to come from the remote (§7). The ticket is
+    /// held for the whole of that answer: a cached-mode write admitted while it is out defers to
+    /// durable semantics, so the remote can never answer a read stale.
+    pub fn read_ticket(&self, bucket: &str) -> std::result::Result<Readout, Refusal> {
+        gate(&self.states, bucket)
+            .ok_or(Refusal::Absent)?
+            .read_ticket()
+    }
+
+    /// Admit a write into `bucket` and classify it in the same CAS, or refuse. Every producer into a
+    /// bucket's namespaces goes through here — not just client ops: a reconcile upload that landed
+    /// after the drain would resurrect the bucket exactly as a late `PutObject` would.
     ///
     /// The guard is the write's whole claim on the bucket's existence, so it must be held until the
-    /// write has committed and raised whatever it owes. [`Refusal::Absent`] — no gate, so the bucket
-    /// was never here or its delete committed — is a definitive `NoSuchBucket`; [`Refusal::Closed`]
-    /// is a delete still deciding, so the write answers `OperationAborted` and may retry. `readiness`
-    /// is still checked afterwards for a bucket whose gate is installed but whose phase has not been
-    /// published yet.
-    pub fn enter_write(&self, bucket: &str) -> std::result::Result<WriteGuard, Refusal> {
-        self.gates.enter(bucket)
-    }
-
-    fn state(&self, bucket: &str) -> BucketState {
-        self.states.load().get(bucket).copied().unwrap_or_default()
-    }
-
-    pub fn mark_ready(&self, bucket: &str) {
-        self.gates.install(bucket);
-        update(&self.states, bucket, mark_ready);
+    /// write has committed and raised whatever it owes. [`Refusal::Absent`] is a definitive
+    /// `NoSuchBucket`; [`Refusal::Closed`] is a delete still deciding, so the write answers
+    /// `OperationAborted` and may retry.
+    pub fn enter_write(
+        &self,
+        bucket: &str,
+    ) -> std::result::Result<(WriteGuard, Admission), Refusal> {
+        gate(&self.states, bucket)
+            .ok_or(Refusal::Absent)?
+            .enter_write()
     }
 
     /// Every bucket currently serving from its cache — the set the volume watchdog polls.
@@ -242,7 +255,7 @@ impl BucketCtl {
         self.states
             .load()
             .iter()
-            .filter(|(_, s)| s.readiness == Readiness::Ready)
+            .filter(|(_, s)| s.gate.status() == BucketStatus::Ready)
             .map(|(bucket, _)| bucket.clone())
             .collect()
     }
@@ -251,13 +264,13 @@ impl BucketCtl {
     /// whose clean marker was present; the task calls it for a bucket a pass rebuilt or a create
     /// established empty.
     pub(crate) fn account_for(&self, bucket: &str) {
-        update(&self.states, bucket, set_accounted);
+        update(&self.states, bucket, |s| s.accounted = true);
     }
 
     /// Withdraw the accounting — the run can no longer vouch for the bucket's pending set, so it
     /// must end dirty. No evidence, no clean marker.
     pub(crate) fn unaccount(&self, bucket: &str) {
-        update(&self.states, bucket, clear_accounted);
+        update(&self.states, bucket, |s| s.accounted = false);
     }
 
     /// Every bucket this run accounts for, and no other — the drain's whole condition for writing a
@@ -275,11 +288,11 @@ impl BucketCtl {
     /// The shadow-range equivalent (§8): its marker was present at startup, or this run's backstop
     /// sweep judged every shadow in it.
     pub(crate) fn account_shadows_for(&self, bucket: &str) {
-        update(&self.states, bucket, set_shadows_accounted);
+        update(&self.states, bucket, |s| s.shadows_accounted = true);
     }
 
     pub(crate) fn unaccount_shadows(&self, bucket: &str) {
-        update(&self.states, bucket, clear_shadows_accounted);
+        update(&self.states, bucket, |s| s.shadows_accounted = false);
     }
 
     pub(crate) fn shadows_accounted(&self) -> Vec<String> {
@@ -335,7 +348,7 @@ pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<J
             buckets.restore(&bucket);
             continue;
         }
-        buckets.mark_ready(&bucket);
+        buckets.serve(&bucket);
         if accounted {
             buckets.account_for(&bucket);
         } else if tier.cached {
@@ -384,14 +397,12 @@ async fn take_marker(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
 pub fn spawn(tier: Tiering, shutdown: CancellationToken) -> (BucketCtl, JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let states: BucketStates = Arc::new(ArcSwap::from_pointee(HashMap::new()));
-    let gates = WriteGates::default();
     let actor = BucketActor {
         rx,
         tx: tx.clone(),
         shutdown,
         tier,
         states: states.clone(),
-        gates: gates.clone(),
         sem: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         queued: HashMap::new(),
         batches: JoinSet::new(),
@@ -400,7 +411,7 @@ pub fn spawn(tier: Tiering, shutdown: CancellationToken) -> (BucketCtl, JoinHand
         provisioning: HashMap::new(),
     };
     let task = tokio::spawn(actor.run());
-    (BucketCtl { tx, states, gates }, task)
+    (BucketCtl { tx, states }, task)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -449,7 +460,6 @@ struct Provisioning {
 
 struct BucketActor {
     rx: mpsc::UnboundedReceiver<BucketMsg>,
-    gates: WriteGates,
     /// Handed to each task so a recovery that could not run can re-queue itself.
     tx: mpsc::UnboundedSender<BucketMsg>,
     shutdown: CancellationToken,
@@ -546,11 +556,10 @@ impl BucketActor {
     /// Attach a waiter to the bucket's in-flight provisioning, starting it if this is the first.
     /// Provisioning bypasses the queueing machinery — it neither serializes against the bucket's
     /// task nor waits for it — so it is safe only because it exclusively *creates*,
-    /// idempotently, and only for a bucket the readiness probe already saw on the remote. Bucket
+    /// idempotently, and only for a bucket the state map already holds. Bucket
     /// *lifecycle* (whether a bucket should exist at all) stays the tasks' alone.
     fn provision(&mut self, bucket: String, reply: oneshot::Sender<Result<()>>) {
-        let state = self.states.load().get(&bucket).copied().unwrap_or_default();
-        if state.provisioned {
+        if provisioned(&self.states, &bucket) {
             let _ = reply.send(Ok(()));
             return;
         }
@@ -593,7 +602,7 @@ impl BucketActor {
             return;
         };
         if result.is_ok() {
-            update(&self.states, &bucket, set_provisioned);
+            update(&self.states, &bucket, |s| s.provisioned = true);
         }
         for reply in self
             .provisioning
@@ -650,7 +659,6 @@ impl BucketActor {
             let task = BucketTask {
                 tier: self.tier.clone(),
                 states: self.states.clone(),
-                gates: self.gates.clone(),
                 sem: self.sem.clone(),
                 requeue: self.tx.clone(),
             };
@@ -663,7 +671,6 @@ impl BucketActor {
 struct BucketTask {
     tier: Tiering,
     states: BucketStates,
-    gates: WriteGates,
     sem: Arc<Semaphore>,
     requeue: mpsc::UnboundedSender<BucketMsg>,
 }
@@ -697,7 +704,7 @@ impl BucketTask {
     /// untouched (it may be mid-restore). Safe without a lock: the actor is the sole writer (§7).
     async fn create(&self, bucket: &str) -> Result<()> {
         match self.tier.remote.head_bucket(bucket).await {
-            Ok(()) if self.state(bucket).readiness == Readiness::Absent => {
+            Ok(()) if status(&self.states, bucket) == BucketStatus::Absent => {
                 // Invariant I5: hypha is the only writer of either backend, and the startup
                 // resolution accounted for every bucket the remote held, so a remote bucket the map
                 // has no phase for was created by something that is not this deployment.
@@ -720,24 +727,23 @@ impl BucketTask {
                 self.reset_cache(bucket).await?;
                 self.write_sync_marker(bucket).await?;
                 self.tier.remote.create_bucket(bucket).await?;
-                // The gate is published with the phase, and before it: a bucket that is `Ready` with
-                // no gate would refuse every write.
-                self.gates.install(bucket);
-                update(&self.states, bucket, mark_ready);
-                // A bucket this run created starts empty, so every write it can ever hold went
-                // through the marker queue — which the drain proves empty before writing any clean
-                // marker (§6). Accounted by construction, and only on this branch: a duplicate
-                // create of a pre-existing bucket establishes nothing about a pending set that may
-                // predate the run.
-                update(&self.states, bucket, set_accounted);
+                // Born `Ready`: the cache work above all precedes this commit and the namespace is
+                // empty, so it is trivially authoritative.
+                birth(&self.states, bucket, BucketStatus::Ready);
+                // Both memos are re-applied here because `update` cannot create an entry, so the
+                // work above them recorded nothing. A bucket this run created starts empty, so
+                // every write it can ever hold went through the marker queue — which the drain
+                // proves empty before writing any clean marker (§6). Accounted by construction, and
+                // only on this branch: a duplicate create of a pre-existing bucket establishes
+                // nothing about a pending set that may predate the run.
+                update(&self.states, bucket, |s| {
+                    s.provisioned = true;
+                    s.accounted = true;
+                });
                 Ok(())
             }
             Err(e) => Err(e),
         }
-    }
-
-    fn state(&self, bucket: &str) -> BucketState {
-        self.states.load().get(bucket).copied().unwrap_or_default()
     }
 
     /// Existence and emptiness are both decided **here**, not borrowed from the backend's answer to
@@ -755,13 +761,13 @@ impl BucketTask {
     /// whose deletes have not propagated yet is client-empty with remote objects still standing, and
     /// they are exactly as stale as the bucket now is.
     async fn delete(&self, bucket: &str) -> Result<()> {
-        if self.state(bucket).readiness == Readiness::Absent {
+        let Some(gate) = gate(&self.states, bucket) else {
             return Err(Error::NoSuchBucket);
-        }
+        };
         // Steps 1 and 3 of the gate protocol, with the listing between them ([`gate`]). Both
         // refusals leave the bucket exactly as they found it — a delete that will not commit must
         // not cost a concurrent write so much as a spurious error.
-        let Some(quiescent) = self.gates.quiescent(bucket) else {
+        let Some(quiescent) = gate.quiescent() else {
             return Err(Error::OperationAborted);
         };
         if !self.namespace_empty(bucket).await? {
@@ -781,10 +787,9 @@ impl BucketTask {
         closed.commit();
 
         // The commit landed, so everything this process believed about the bucket is stale no matter
-        // how the cache drain fares. The gate goes with the phase — an absent gate refuses, so
-        // dropping it is what a deleted bucket should leave behind.
+        // how the cache drain fares. The gate rides the entry out with it — an absent entry refuses,
+        // which is what a deleted bucket should leave behind.
         retire(&self.states, bucket);
-        self.gates.retire(bucket);
         for (role, backend) in [("data", &self.tier.data), ("meta", &self.tier.meta)] {
             if let Err(error) = drain_and_delete_if_exists(backend, bucket).await {
                 tracing::warn!(
@@ -803,7 +808,7 @@ impl BucketTask {
     /// `Restoring`. Reserved keys are hypha's own and no client can see them, so they do not hold a
     /// bucket open — which is why the remote arm pages rather than trusting one entry.
     async fn namespace_empty(&self, bucket: &str) -> Result<bool> {
-        if self.state(bucket).readiness == Readiness::Ready {
+        if status(&self.states, bucket) == BucketStatus::Ready {
             let page = self
                 .tier
                 .data
@@ -885,7 +890,7 @@ impl BucketTask {
             tracing::warn!(bucket, error = %e, "sync marker not written; retrying");
             return Outcome::Retry;
         }
-        update(&self.states, bucket, set_accounted);
+        update(&self.states, bucket, |s| s.accounted = true);
         tracing::info!(bucket, "namespace restore complete");
         Outcome::Done
     }
@@ -893,7 +898,7 @@ impl BucketTask {
     async fn run_rebuild_pending(&self, bucket: &str) -> Outcome {
         match rebuild::pending_set(&self.tier, bucket).await {
             Ok(raised) => {
-                update(&self.states, bucket, set_accounted);
+                update(&self.states, bucket, |s| s.accounted = true);
                 tracing::info!(bucket, markers = raised, "pending-set rebuild complete");
                 Outcome::Done
             }
@@ -905,7 +910,7 @@ impl BucketTask {
     }
 
     async fn reset_cache(&self, bucket: &str) -> Result<()> {
-        update(&self.states, bucket, clear_provisioned);
+        update(&self.states, bucket, |s| s.provisioned = false);
         drain_and_delete_if_exists(&self.tier.data, bucket).await?;
         drain_and_delete_if_exists(&self.tier.meta, bucket).await?;
         self.provision(bucket).await
@@ -916,7 +921,7 @@ impl BucketTask {
     async fn provision(&self, bucket: &str) -> Result<()> {
         ensure_cache_bucket(&self.tier.data, bucket).await?;
         ensure_cache_bucket(&self.tier.meta, bucket).await?;
-        update(&self.states, bucket, set_provisioned);
+        update(&self.states, bucket, |s| s.provisioned = true);
         Ok(())
     }
 
@@ -937,7 +942,7 @@ impl BucketTask {
 
     async fn mark_reconciled(&self, bucket: &str) -> Result<()> {
         self.write_sync_marker(bucket).await?;
-        update(&self.states, bucket, mark_ready);
+        flip_ready(&self.states, bucket);
         Ok(())
     }
 }

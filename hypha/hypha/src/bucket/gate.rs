@@ -1,184 +1,244 @@
-//! Makes `DeleteBucket` atomic with writes that already passed readiness.
-//!
-//! Both live in one `AtomicU64`:
+//! One `AtomicU64` per bucket carrying its lifecycle and both in-flight counts:
 //!
 //! ```text
-//! [ closed:1 | epoch:31 | count:32 ]
+//! [ ready:1 | closed:1 | epoch:30 | rcount:16 | wcount:16 ]
 //! ```
 //!
-//! `count` detects writes already in flight. `epoch` makes the final close CAS detect a write that
-//! starts and finishes during the emptiness listing, avoiding the zero-count ABA. Refused deletes
-//! leave the gate untouched, so writes are never rejected speculatively for a bucket that survives;
-//! a delete that is going ahead closes the gate, and the write refused there gets a retryable
-//! `OperationAborted` rather than a permanent `NoSuchBucket` — the delete may still fail.
+//! Every transition is one CAS, and the CAS **is** the classification — a write learns whether it may
+//! run cache-first from the very word it was admitted on, never from a second load that could have
+//! moved underneath it. `epoch` moves on every write admission so a write that starts *and* finishes
+//! inside a delete's emptiness listing is still visible to the close (the zero-count ABA). `rcount` is
+//! masked out of that compare, because deletes deliberately never wait on readers — an unmasked close
+//! would let a reader passing during the listing block the delete through the back door.
+//!
+//! Counter widths are deliberately small: 2¹⁶ concurrent in-flight ops on one bucket is not a state
+//! this process can reach, and refusing on saturation beats letting an increment carry into the
+//! neighbouring field, which would corrupt the delete's evidence or admit a cache-first write into a
+//! namespace a restoring read is about to look at.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-
-const CLOSED: u64 = 1 << 63;
-/// Bits 32..62. Wrapping within its own field is deliberate — only *change* is ever asked of it, and
-/// a wrap would need 2³¹ admissions inside one listing.
-const EPOCH_MASK: u64 = 0x7fff_ffff_0000_0000;
+const READY: u64 = 1 << 63;
+const CLOSED: u64 = 1 << 62;
+/// Bits 32..61. Wrapping within its own field is deliberate — only *change* is ever asked of it, and
+/// a wrap would need 2³⁰ admissions inside one listing.
+const EPOCH_MASK: u64 = 0x3fff_ffff_0000_0000;
 const EPOCH_ONE: u64 = 1 << 32;
-const COUNT_MASK: u64 = 0x0000_0000_ffff_ffff;
+const RCOUNT_MASK: u64 = 0x0000_0000_ffff_0000;
+const RCOUNT_ONE: u64 = 1 << 16;
+const WCOUNT_MASK: u64 = 0x0000_0000_0000_ffff;
 
-fn count(state: u64) -> u64 {
-    state & COUNT_MASK
+/// A bucket's visible state — the whole of it, for the internal passes that only need to know
+/// whether a bucket is still there. `Absent` is the one value that is not a bit pattern: it is the
+/// map having no entry at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BucketStatus {
+    /// Deleted, or never known. Definitive.
+    Absent,
+    /// A `DeleteBucket` is between its emptiness check and its commit; its fate is undecided.
+    Deleting,
+    Restoring,
+    Ready,
 }
 
-/// The word one admission later: `count` up by one, `epoch` moved so the delete's CAS can see that it
-/// happened even if this write also finishes before the CAS runs.
-fn admitted(state: u64) -> u64 {
-    (state & CLOSED) | (state.wrapping_add(EPOCH_ONE) & EPOCH_MASK) | (count(state) + 1)
+/// Where a read must go for its answer, decided atomically with taking (or not taking) a ticket.
+pub enum Readout {
+    /// The cache is authoritative. No ticket: `Ready` is monotonic, so nothing can take it back.
+    Cache,
+    /// The cache is not authoritative yet. Holding the ticket for the whole of the remote answer is
+    /// what keeps a cached-mode write from committing cache-first into a namespace this read is
+    /// about to report on.
+    Remote(ReadGuard),
 }
 
-#[derive(Default)]
-struct Gate {
+/// What a write may do, decided by the CAS that admitted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// `Ready` with no restoring read in flight: a cached deployment may commit cache-first.
+    CachedEligible,
+    /// Everything else — still `Restoring`, or `Ready` with a straggler's ticket out, where
+    /// cache-first would let that read answer stale. The write is never blocked; it just runs under
+    /// the stronger semantics for this one op, and materializes its key from the remote first so its
+    /// bracket overwrites a correct tombstone.
+    Durable,
+}
+
+/// Why the gate refused an op — the *same* two answers for reads and writes, so the data plane maps
+/// them to status codes in exactly one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// No gate, so no bucket. Definitive.
+    Absent,
+    /// The gate is closed — or, unreachably, saturated. Either way the right answer is "retry": the
+    /// delete may still fail, and a permanent `NoSuchBucket` would be a lie the client caches.
+    Closed,
+}
+
+fn rcount(word: u64) -> u64 {
+    word & RCOUNT_MASK
+}
+
+fn wcount(word: u64) -> u64 {
+    word & WCOUNT_MASK
+}
+
+// ── the transition table ──────────────────────────────────────────────────────────────────────
+//
+// One function per row: the precondition and the word it installs. [`Gate::advance`] re-runs the row
+// on a lost race, which is what makes the CAS *be* the classification rather than a check-then-act.
+// A row that returns `None` refuses, and the word it refused on is handed back as the answer.
+
+/// `wcount + 1`, and `epoch` moved so the delete's CAS sees this admission even if the write also
+/// finishes before that CAS runs — the zero-count ABA. Saturation refuses rather than carry into the
+/// epoch and corrupt the delete's evidence.
+fn admit_write(word: u64) -> Option<u64> {
+    (word & CLOSED == 0 && wcount(word) != WCOUNT_MASK).then(|| {
+        (word & !(EPOCH_MASK | WCOUNT_MASK))
+            | (word.wrapping_add(EPOCH_ONE) & EPOCH_MASK)
+            | (wcount(word) + 1)
+    })
+}
+
+/// `rcount + 1`, and deliberately **no** epoch move: `rcount` is masked out of the close anyway, and
+/// moving the epoch here would fail closes on readers — the very thing that mask exists to prevent.
+fn take_ticket(word: u64) -> Option<u64> {
+    (word & (READY | CLOSED) == 0 && rcount(word) != RCOUNT_MASK).then_some(word + RCOUNT_ONE)
+}
+
+/// The flip. Refuses an already-`Ready` gate and a `closed` one — a delete's emptiness listing must
+/// not be contradicted by a flip that makes the bucket serviceable again — and tolerates whatever the
+/// counters hold.
+fn set_ready(word: u64) -> Option<u64> {
+    (word & (READY | CLOSED) == 0).then_some(word | READY)
+}
+
+/// The delete's close, valid only while nothing the listing depended on has changed. `rcount` is
+/// masked out: deletes never wait on readers, so a reader passing through the listing must not fail
+/// it. A flip landing in the window *does* fail it — the listing read the remote namespace, and a
+/// `Ready` bucket's is the cache's.
+fn set_closed(observed: u64) -> impl Fn(u64) -> Option<u64> {
+    move |word| (word & !RCOUNT_MASK == observed & !RCOUNT_MASK).then_some(word | CLOSED)
+}
+
+pub(super) struct Gate {
     state: AtomicU64,
 }
 
 impl Gate {
-    fn enter(self: &Arc<Self>) -> Option<WriteGuard> {
-        let mut current = self.state.load(Ordering::Relaxed);
+    pub(super) fn new(status: BucketStatus) -> Self {
+        Gate {
+            state: AtomicU64::new(if status == BucketStatus::Ready {
+                READY
+            } else {
+                0
+            }),
+        }
+    }
+
+    /// Run one row of the transition table. `Ok` carries the word the winning decision was made on —
+    /// the pre-image — and `Err` the word that refused; either way the caller reads its answer off
+    /// that word rather than loading again, which is what keeps the CAS *being* the classification.
+    ///
+    /// `AcqRel` throughout: a writer getting in ahead of a delete must see what the delete published
+    /// before closing, and a delete's later load must happen-after the writes it is allowed to miss.
+    fn advance(&self, row: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
+        let mut current = self.state.load(Ordering::Acquire);
         loop {
-            // Refusing on a saturated count would reject a bucket that is merely busy, which is
-            // wrong — but letting the increment carry into the epoch would corrupt the delete's
-            // evidence, which is worse, and 2³² concurrent in-flight writes is not a state this
-            // process can reach.
-            if current & CLOSED != 0 || count(current) == COUNT_MASK {
-                return None;
-            }
-            // Acquire on success: whatever a delete published before closing is visible to a writer
-            // that gets in ahead of it.
+            let next = row(current).ok_or(current)?;
             match self.state.compare_exchange_weak(
                 current,
-                admitted(current),
+                next,
+                Ordering::AcqRel,
                 Ordering::Acquire,
-                Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(WriteGuard { gate: self.clone() }),
+                Ok(_) => return Ok(current),
                 Err(actual) => current = actual,
             }
         }
     }
 
-    /// Release so a delete's later load happens-after this write's commit — the load is what has to
-    /// see a namespace this write has finished changing.
-    fn leave(&self) {
-        self.state.fetch_sub(1, Ordering::Release);
-    }
-}
-
-/// The gates, keyed by client bucket, published as one immutable map — the same shape and the same
-/// lifecycle as [`super::BucketCtl`]'s phase map, because it *is* the same lifecycle: a gate is
-/// created with its bucket and dropped with it, and **an absent entry means the bucket is not
-/// there**, exactly as an absent phase does.
-///
-/// Modelling the two separately is what would create questions that have no good answer — whether a
-/// reader may install a gate it finds missing, what a deleted bucket's gate should be left saying.
-/// Here the actor is the sole writer and readers never mutate, so a read is one atomic load and
-/// nothing else. Copy-on-write costs a clone of a map holding tens of entries, paid once per bucket
-/// lifecycle event; a sharded concurrent map would be paying for churn this table does not have.
-type Gates = Arc<ArcSwap<HashMap<String, Arc<Gate>>>>;
-
-/// Why [`WriteGates::enter`] refused a write.
-#[derive(Debug)]
-pub enum Refusal {
-    /// No gate: the bucket is absent — deleted, or never known. Definitive.
-    Absent,
-    /// The gate is closed: a `DeleteBucket` is between its emptiness check and its commit, and the
-    /// bucket's fate is not yet decided.
-    Closed,
-}
-
-#[derive(Clone, Default)]
-pub struct WriteGates {
-    table: Gates,
-}
-
-impl WriteGates {
-    /// Admit a write. The guard must be held until the write has committed **and** raised whatever it
-    /// owes: it is the write's whole claim on the bucket existing, and a delete that observes it gone
-    /// treats the namespace as settled. Refusal distinguishes a bucket that is simply not there
-    /// ([`Refusal::Absent`]) from one a `DeleteBucket` is mid-flight on ([`Refusal::Closed`]).
-    pub fn enter(&self, bucket: &str) -> Result<WriteGuard, Refusal> {
-        let gate = self.gate(bucket).ok_or(Refusal::Absent)?;
-        gate.enter().ok_or(Refusal::Closed)
-    }
-
-    /// Step 1 of a delete: `Some` if no write is in flight. Records the exact word it saw, which
-    /// [`Quiescent::close`] must still find there. Nothing is mutated, so a `None` costs the bucket
-    /// nothing at all.
-    pub(super) fn quiescent(&self, bucket: &str) -> Option<Quiescent> {
-        let gate = self.gate(bucket)?;
-        let state = gate.state.load(Ordering::Acquire);
-        (state & CLOSED == 0 && count(state) == 0).then_some(Quiescent { gate, state })
-    }
-
-    /// Give `bucket` an open gate if it has none. Called wherever the actor publishes a bucket's
-    /// phase, so every bucket this process serves has one before it can be written to.
-    ///
-    /// Insert-*if-absent*, never replace: a bucket moving `Restoring` → `Ready` must keep the gate
-    /// its in-flight writes are counted in, and a fresh one there would leave a delete reading zero
-    /// while writes are still landing.
-    pub(super) fn install(&self, bucket: &str) {
-        if self.table.load().contains_key(bucket) {
-            return;
+    pub(super) fn status(&self) -> BucketStatus {
+        let word = self.state.load(Ordering::Acquire);
+        if word & CLOSED != 0 {
+            BucketStatus::Deleting
+        } else if word & READY != 0 {
+            BucketStatus::Ready
+        } else {
+            BucketStatus::Restoring
         }
-        self.table.rcu(|current| {
-            let mut next = HashMap::clone(current);
-            next.entry(bucket.to_string()).or_default();
-            Arc::new(next)
-        });
     }
 
-    /// Drop a deleted bucket's gate. Safe only because an absent entry refuses rather than installs:
-    /// a reader that could create one would walk in behind the drain.
-    pub(super) fn retire(&self, bucket: &str) {
-        self.table.rcu(|current| {
-            let mut next = HashMap::clone(current);
-            next.remove(bucket);
-            Arc::new(next)
-        });
+    /// Admit a write and classify it in the same CAS. The guard must be held until the write has
+    /// committed **and** raised whatever it owes: it is the write's whole claim on the bucket
+    /// existing, and a delete that observes it gone treats the namespace as settled.
+    pub(super) fn enter_write(self: &Arc<Self>) -> Result<(WriteGuard, Admission), Refusal> {
+        let observed = self.advance(admit_write).map_err(|_| Refusal::Closed)?;
+        Ok((WriteGuard { gate: self.clone() }, admission(observed)))
     }
 
-    fn gate(&self, bucket: &str) -> Option<Arc<Gate>> {
-        self.table.load().get(bucket).cloned()
+    /// Classify a read, taking a ticket if the answer has to come from the remote. A refused ticket
+    /// is not a failure to interpret later — the word it refused on already says which: `ready` means
+    /// the cache became authoritative, anything else means the delete got there first.
+    pub(super) fn read_ticket(self: &Arc<Self>) -> Result<Readout, Refusal> {
+        match self.advance(take_ticket) {
+            Ok(_) => Ok(Readout::Remote(ReadGuard { gate: self.clone() })),
+            // `closed` outranks `ready`: a cache-authoritative bucket being deleted must not serve.
+            Err(word) if word & CLOSED == 0 && word & READY != 0 => Ok(Readout::Cache),
+            Err(_) => Err(Refusal::Closed),
+        }
+    }
+
+    /// End a restore. Idempotent, one-way, and non-blocking — it keeps the gate its in-flight writes
+    /// are counted in, so a delete reading those counts across the flip cannot see zero.
+    pub(super) fn flip(&self) {
+        let _ = self.advance(set_ready);
+    }
+
+    /// Step 1 of a delete: `Some` only if nothing is closing or writing. Records the exact word it
+    /// saw, which [`Quiescent::close`] must still find there. Nothing is mutated, so a `None` costs
+    /// the bucket nothing at all.
+    pub(super) fn quiescent(self: &Arc<Self>) -> Option<Quiescent> {
+        let observed = self.state.load(Ordering::Acquire);
+        (observed & CLOSED == 0 && wcount(observed) == 0).then(|| Quiescent {
+            gate: self.clone(),
+            observed,
+        })
+    }
+}
+
+/// Read off the pre-image of a successful admission, which is what makes it atomic with it. `ready`
+/// never reverts, so a write that observed it can be sure no further ticket will be taken: any
+/// restoring read still to answer is already counted here.
+fn admission(observed: u64) -> Admission {
+    if observed & READY != 0 && rcount(observed) == 0 {
+        Admission::CachedEligible
+    } else {
+        Admission::Durable
     }
 }
 
 pub(super) struct Quiescent {
     gate: Arc<Gate>,
-    state: u64,
+    observed: u64,
 }
 
 impl Quiescent {
-    /// Step 3: close the gate if nothing has been admitted since the observation. `None` means a
-    /// write arrived while the caller was listing, so the listing is stale and the delete must
-    /// refuse — again without having touched anything.
+    /// Step 3: close the gate if nothing the listing depended on has changed. `None` means a write
+    /// arrived — or the restore flipped — while the caller was listing, so the listing is stale and
+    /// the delete must refuse, again without having touched anything.
     pub(super) fn close(self) -> Option<ClosedGate> {
-        self.gate
-            .state
-            .compare_exchange(
-                self.state,
-                self.state | CLOSED,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
-            .ok()
-            .map(|_| ClosedGate {
-                gate: self.gate,
-                committed: false,
-            })
+        self.gate.advance(set_closed(self.observed)).ok()?;
+        Some(ClosedGate {
+            gate: self.gate,
+            committed: false,
+        })
     }
 }
 
 /// A closed gate, held across the delete's commit. Reopens on drop unless [`Self::commit`] takes it,
 /// so a commit that fails — or a panic between the two — returns the bucket to service rather than
-/// leaving a live bucket that refuses every write for the life of the process.
+/// leaving a live bucket that refuses every op for the rest of the run.
 #[must_use = "dropping this reopens the gate"]
 pub(super) struct ClosedGate {
     gate: Arc<Gate>,
@@ -199,8 +259,8 @@ impl Drop for ClosedGate {
     }
 }
 
-/// One admitted write. Holds its gate by `Arc`, so a gate discarded by a concurrent create cannot
-/// strand the count it is still carrying.
+/// One admitted write. Release on drop so a delete's later load happens-after this write's commit —
+/// that load is what has to see a namespace this write has finished changing.
 #[must_use = "dropping the guard releases the write's claim on the bucket"]
 pub struct WriteGuard {
     gate: Arc<Gate>,
@@ -208,7 +268,19 @@ pub struct WriteGuard {
 
 impl Drop for WriteGuard {
     fn drop(&mut self) {
-        self.gate.leave();
+        self.gate.state.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// One restoring read, held until its remote answer is fully computed.
+#[must_use = "dropping the ticket lets cached writes commit cache-first again"]
+pub struct ReadGuard {
+    gate: Arc<Gate>,
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        self.gate.state.fetch_sub(RCOUNT_ONE, Ordering::Release);
     }
 }
 
@@ -217,115 +289,180 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// A gate table with `b` published, as the actor publishes a bucket it serves.
-    fn published() -> WriteGates {
-        let gates = WriteGates::default();
-        gates.install("b");
-        gates
+    /// A bucket mid-restore, as [`super::super::BucketCtl::restore`] publishes one.
+    fn restoring() -> Arc<Gate> {
+        Arc::new(Gate::new(BucketStatus::Restoring))
+    }
+
+    /// A bucket serving from its cache, as a create or a finished restore leaves one.
+    fn ready() -> Arc<Gate> {
+        Arc::new(Gate::new(BucketStatus::Ready))
+    }
+
+    fn admit(gate: &Arc<Gate>) -> (WriteGuard, Admission) {
+        gate.enter_write().expect("an open gate admits")
     }
 
     #[test]
     fn a_write_in_flight_refuses_the_delete_without_touching_the_gate() {
-        let gates = published();
-        let held = gates.enter("b").expect("open gate admits");
+        let gate = ready();
+        let held = admit(&gate);
 
-        assert!(gates.quiescent("b").is_none(), "a live write is visible");
+        assert!(gate.quiescent().is_none(), "a live write is visible");
         drop(held);
 
         // The refused observation cost the bucket nothing: writes never stopped being admitted.
-        assert!(gates.enter("b").is_ok(), "the gate was never closed");
-        assert!(gates.quiescent("b").is_some(), "and it is quiescent again");
+        assert!(gate.enter_write().is_ok(), "the gate was never closed");
+        assert!(gate.quiescent().is_some(), "and it is quiescent again");
     }
 
     #[test]
     fn a_write_admitted_during_the_listing_defeats_the_close() {
-        let gates = published();
-        let seen = gates.quiescent("b").expect("an idle bucket is quiescent");
-        let racer = gates.enter("b").expect("open gate admits");
+        let gate = ready();
+        let seen = gate.quiescent().expect("an idle bucket is quiescent");
+        let racer = admit(&gate);
         assert!(
             seen.close().is_none(),
             "the listing is stale; the delete must refuse"
         );
         drop(racer);
         assert!(
-            gates.enter("b").is_ok(),
+            gate.enter_write().is_ok(),
             "a defeated close must leave the gate open"
         );
     }
 
     // The ABA case, and the whole reason for the epoch: the racer is gone by the time the CAS runs,
-    // so `count` is back to zero and only a moved epoch distinguishes this word from the one
+    // so `wcount` is back to zero and only a moved epoch distinguishes this word from the one
     // observed.
     #[test]
     fn a_write_that_starts_and_finishes_during_the_listing_defeats_the_close() {
-        let gates = published();
-        let seen = gates.quiescent("b").expect("an idle bucket is quiescent");
-        drop(gates.enter("b").expect("open gate admits"));
+        let gate = ready();
+        let seen = gate.quiescent().expect("an idle bucket is quiescent");
+        drop(admit(&gate));
         assert!(
             seen.close().is_none(),
             "a write that came and went still invalidates the listing"
         );
     }
 
+    // The mask, from the other side: deletes never wait on readers, so neither a reader still inside
+    // the listing nor one that came and went during it may fail the close.
     #[test]
-    fn a_closed_gate_refuses_writes_and_further_deletes() {
-        let gates = published();
-        let seen = gates.quiescent("b").expect("an idle bucket is quiescent");
+    fn readers_never_defeat_the_close() {
+        let gate = restoring();
+        let seen = gate.quiescent().expect("an idle bucket is quiescent");
+        let Ok(Readout::Remote(held)) = gate.read_ticket() else {
+            panic!("a restoring bucket hands out a ticket");
+        };
+        drop(gate.read_ticket());
+        assert!(
+            seen.close().is_some(),
+            "a delete must not wait on readers, however they overlap it"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_closed_gate_refuses_every_op_and_further_deletes() {
+        let gate = ready();
+        let seen = gate.quiescent().expect("an idle bucket is quiescent");
         seen.close().expect("an idle gate closes").commit();
 
         assert!(
-            matches!(gates.enter("b"), Err(Refusal::Closed)),
-            "a closed gate admits nothing"
+            matches!(gate.enter_write(), Err(Refusal::Closed)),
+            "a closed gate admits no write"
         );
-        assert!(gates.quiescent("b").is_none(), "and is not quiescent");
+        assert_eq!(
+            gate.read_ticket().err(),
+            Some(Refusal::Closed),
+            "and no read"
+        );
+        assert_eq!(gate.status(), BucketStatus::Deleting);
+        assert!(gate.quiescent().is_none(), "and is not quiescent");
     }
 
     #[test]
     fn an_uncommitted_close_reopens() {
-        let gates = published();
-        let seen = gates.quiescent("b").expect("an idle bucket is quiescent");
+        let gate = ready();
+        let seen = gate.quiescent().expect("an idle bucket is quiescent");
         drop(seen.close().expect("an idle gate closes"));
         assert!(
-            gates.enter("b").is_ok(),
+            gate.enter_write().is_ok(),
             "a delete that failed to commit must return the bucket to service"
         );
+        assert_eq!(gate.status(), BucketStatus::Ready);
     }
 
-    // An unknown bucket has no gate, and a reader may not create one — that is what makes retiring
-    // a deleted bucket's gate safe, and what a recreated name relies on to start open.
     #[test]
-    fn a_retired_gate_refuses_until_the_bucket_is_published_again() {
-        let gates = published();
-        let seen = gates.quiescent("b").expect("an idle bucket is quiescent");
-        seen.close().expect("an idle gate closes").commit();
-        gates.retire("b");
+    fn the_flip_is_one_way_and_refuses_a_closing_bucket() {
+        let gate = restoring();
+        assert_eq!(gate.status(), BucketStatus::Restoring);
+        gate.flip();
+        gate.flip();
+        assert_eq!(gate.status(), BucketStatus::Ready, "the flip never reverts");
 
-        assert!(
-            matches!(gates.enter("b"), Err(Refusal::Absent)),
-            "an unknown bucket admits nothing"
+        let closing = restoring();
+        let seen = closing.quiescent().expect("an idle bucket is quiescent");
+        let closed = seen.close().expect("an idle gate closes");
+        closing.flip();
+        assert_eq!(
+            closing.status(),
+            BucketStatus::Deleting,
+            "a flip must not contradict the delete's emptiness listing"
         );
-        assert!(gates.quiescent("b").is_none(), "and cannot be deleted");
+        drop(closed);
+    }
 
-        gates.install("b");
-        assert!(
-            gates.enter("b").is_ok(),
-            "a recreated bucket starts with an open gate"
+    // The straggler's other half: a read that loses the CAS to the flip is redirected to the cache by
+    // the failure itself, with no classification after the fact.
+    #[test]
+    fn a_restoring_read_is_redirected_to_the_cache_once_the_flip_lands() {
+        let gate = restoring();
+        gate.flip();
+        assert!(matches!(gate.read_ticket(), Ok(Readout::Cache)));
+    }
+
+    #[test]
+    fn a_reader_in_flight_defers_the_cached_write_to_durable() {
+        let gate = restoring();
+        let Ok(Readout::Remote(ticket)) = gate.read_ticket() else {
+            panic!("a restoring bucket hands out a ticket");
+        };
+        assert_eq!(
+            admit(&gate).1,
+            Admission::Durable,
+            "a write admitted before the flip commits remotely"
+        );
+
+        gate.flip();
+        assert_eq!(
+            admit(&gate).1,
+            Admission::Durable,
+            "the straggler's ticket forces the stronger semantics"
+        );
+
+        drop(ticket);
+        assert_eq!(
+            admit(&gate).1,
+            Admission::CachedEligible,
+            "and cache-first returns the moment it drops"
         );
     }
 
-    // `Restoring` → `Ready` republishes the phase, and the gate must survive it holding the writes
-    // it has already counted.
+    // The flip is an in-place CAS on the gate the writes are counted in — never a fresh one, or a
+    // delete reading the counts during the flip would see zero while writes are still landing.
     #[test]
-    fn install_never_replaces_a_gate_that_is_counting_writes() {
-        let gates = published();
-        let held = gates.enter("b").expect("open gate admits");
-        gates.install("b");
+    fn the_flip_keeps_the_writes_already_counted() {
+        let gate = restoring();
+        let held = admit(&gate);
+        gate.flip();
         assert!(
-            gates.quiescent("b").is_none(),
-            "a republished phase must not lose the writes in flight"
+            gate.quiescent().is_none(),
+            "the flip must not lose the writes in flight"
         );
         drop(held);
-        assert!(gates.quiescent("b").is_some());
+        assert!(gate.quiescent().is_some());
     }
 
     // Under real contention the only outcome that must never occur is a close that succeeds while a
@@ -335,19 +472,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_close_never_wins_against_a_live_write() {
         const WRITERS: usize = 6;
-        let gates = published();
+        let gate = ready();
         let inside = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
         let retired = Arc::new(AtomicUsize::new(0));
 
         let mut tasks = Vec::new();
         for _ in 0..WRITERS {
-            let gates = gates.clone();
+            let gate = gate.clone();
             let inside = inside.clone();
             let retired = retired.clone();
             tasks.push(tokio::spawn(async move {
                 for _ in 0..2_000 {
-                    if let Ok(guard) = gates.enter("b") {
+                    if let Ok(guard) = gate.enter_write() {
                         inside.fetch_add(1, Ordering::AcqRel);
                         tokio::task::yield_now().await;
                         inside.fetch_sub(1, Ordering::AcqRel);
@@ -361,13 +498,13 @@ mod tests {
             }));
         }
         for _ in 0..3 {
-            let gates = gates.clone();
+            let gate = gate.clone();
             let inside = inside.clone();
             let closes = closes.clone();
             let retired = retired.clone();
             tasks.push(tokio::spawn(async move {
                 while retired.load(Ordering::Acquire) < WRITERS {
-                    let Some(seen) = gates.quiescent("b") else {
+                    let Some(seen) = gate.quiescent() else {
                         tokio::task::yield_now().await;
                         continue;
                     };

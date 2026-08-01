@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use hypha_core::error::Error;
 use hypha_core::meta;
 
-use crate::bucket::{BucketCtl, Readiness};
+use crate::bucket::{BucketCtl, BucketStatus};
 use crate::halt::{Invariant, Violation};
 use crate::tier::Tiering;
 
@@ -233,7 +233,7 @@ impl MarkerActor {
     async fn write_all(&self, owed: &mut HashMap<(String, String), OwedMarker>) {
         let failed: Vec<OwedMarker> = futures::stream::iter(owed.drain().map(|(_, r)| r))
             .map(|r| async move {
-                if self.queue.buckets.readiness(&r.bucket) == Readiness::Absent {
+                if self.queue.buckets.status(&r.bucket) == BucketStatus::Absent {
                     tracing::info!(
                         bucket = r.bucket,
                         key = r.key,
@@ -249,7 +249,7 @@ impl MarkerActor {
                 {
                     Ok(()) => None,
                     Err(Error::NoSuchBucket) => {
-                        if self.queue.buckets.readiness(&r.bucket) != Readiness::Absent {
+                        if self.queue.buckets.status(&r.bucket) != BucketStatus::Absent {
                             self.queue
                                 .tier
                                 .halt

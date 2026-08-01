@@ -14,7 +14,9 @@ use hypha_core::meta;
 use super::get::facts_from_tombstone;
 use super::overlay::KeyState;
 use super::{ts_ms, Hypha};
-use crate::bucket::Readiness;
+use crate::bucket::Readout;
+
+use super::overlay::refuse;
 
 struct PageView {
     entries: Vec<Object>,
@@ -76,11 +78,10 @@ impl Hypha {
         let bucket = input.bucket.clone();
         // While the cache restores, the remote is the read source of truth (§7); it holds the same
         // client keyspace, so pagination forwards identically.
-        let restoring = match self.buckets.readiness(&bucket) {
-            Readiness::Absent => return Err(Error::NoSuchBucket.into()),
-            Readiness::Ready => false,
-            Readiness::Restoring => true,
-        };
+        // The ticket is held until the page is projected, for the reason [`Hypha::resolve_key`]
+        // spells out: a cached-mode write admitted while it is out commits remote-first.
+        let ticket = self.buckets.read_ticket(&bucket).map_err(refuse)?;
+        let restoring = matches!(ticket, Readout::Remote(_));
         let source = if restoring {
             self.remote()
         } else {
@@ -146,11 +147,10 @@ impl Hypha {
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
         let bucket = input.bucket.clone();
-        let restoring = match self.buckets.readiness(&bucket) {
-            Readiness::Absent => return Err(Error::NoSuchBucket.into()),
-            Readiness::Ready => false,
-            Readiness::Restoring => true,
-        };
+        // The ticket is held until the page is projected, for the reason [`Hypha::resolve_key`]
+        // spells out: a cached-mode write admitted while it is out commits remote-first.
+        let ticket = self.buckets.read_ticket(&bucket).map_err(refuse)?;
+        let restoring = matches!(ticket, Readout::Remote(_));
         let source = if restoring {
             self.remote()
         } else {

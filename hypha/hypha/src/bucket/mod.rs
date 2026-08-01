@@ -11,5 +11,5 @@ mod rebuild;
 mod restore;
 
 pub(crate) use ctl::resolve_all;
-pub use ctl::{spawn, BucketCtl, Readiness};
-pub use gate::{Refusal, WriteGuard};
+pub use ctl::{spawn, BucketCtl};
+pub use gate::{Admission, BucketStatus, Readout, Refusal, WriteGuard};

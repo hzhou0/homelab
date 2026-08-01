@@ -15,12 +15,22 @@ use hypha_core::meta;
 
 use super::get::facts_from_tombstone;
 use super::{ts_ms, Hypha};
-use crate::bucket::{Readiness, Refusal, WriteGuard};
+use crate::bucket::{Admission, Readout, Refusal, WriteGuard};
 use crate::gc::Plaintext;
 use crate::tier::RemoteFacts;
 
 /// Bounded fan-out for the per-key trailer reads a remote-served LIST page needs (§7).
 const REMOTE_LIST_FANOUT: usize = 16;
+
+/// The gate's two refusals, in the one place they become status codes. `Absent` is definitive;
+/// `Closed` is a `DeleteBucket` that has not decided, so the client must be told to retry rather
+/// than handed a `NoSuchBucket` it would be entitled to cache.
+pub(super) fn refuse(refusal: Refusal) -> s3s::S3Error {
+    match refusal {
+        Refusal::Absent => Error::NoSuchBucket.into(),
+        Refusal::Closed => Error::OperationAborted.into(),
+    }
+}
 
 /// Write semantics are a bucket property because cached deployments use durable writes during
 /// restore.
@@ -43,11 +53,14 @@ pub(super) enum KeyState {
 
 impl Hypha {
     /// An absent *bucket* is `NoSuchBucket`; an absent *key* is [`KeyState::Absent`].
+    ///
+    /// The ticket a `Restoring` bucket hands out is held for the whole remote answer: a cached-mode
+    /// write admitted while it is out defers to durable semantics, so the remote cannot answer this
+    /// read with data the write has already superseded in the cache.
     pub(super) async fn resolve_key(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
-        let state = match self.buckets.readiness(bucket) {
-            Readiness::Absent => return Err(Error::NoSuchBucket.into()),
-            Readiness::Ready => self.resolve_key_cache(bucket, key).await?,
-            Readiness::Restoring => self.resolve_key_remote(bucket, key).await?,
+        let state = match self.buckets.read_ticket(bucket).map_err(refuse)? {
+            Readout::Cache => self.resolve_key_cache(bucket, key).await?,
+            Readout::Remote(_ticket) => self.resolve_key_remote(bucket, key).await?,
         };
         // The read half of §8's recency feed, here rather than at each caller because *this* is what
         // "an op that resolves a single key" means — GET, HEAD, GetObjectAttributes, and both copy
@@ -110,68 +123,68 @@ impl Hypha {
 
     /// The semantics `bucket`'s writes run under right now (§7). Not simply the deployment's
     /// configured mode — see [`WriteMode::Durable`].
-    pub(super) async fn write_mode(&self, bucket: &str) -> S3Result<(WriteGuard, WriteMode)> {
-        let gate = self.enter_write(bucket)?;
-        match self.buckets.readiness(bucket) {
-            Readiness::Absent => Err(Error::NoSuchBucket.into()),
-            Readiness::Ready if self.mode == Mode::Cached => Ok((gate, WriteMode::Cached)),
-            _ => Ok((gate, WriteMode::Durable)),
-        }
+    pub(super) fn write_mode(&self, bucket: &str) -> S3Result<(WriteGuard, WriteMode)> {
+        let (gate, admission) = self.enter_write(bucket)?;
+        Ok((gate, self.write_mode_for(admission)))
     }
 
     /// Ready a bucket+key for a write under the overlay, and report the semantics it must run under
-    /// (§7). Serving is never gated: a `Restoring` bucket first has K materialized from the remote
-    /// into the cache — under K's lock so it doesn't race the write's own bracket — leaving a correct
-    /// entry for conditional evaluation.
+    /// (§7). Serving is never gated: a durably-admitted write first has K materialized from the
+    /// remote into the cache — under K's lock so it doesn't race the write's own bracket — leaving a
+    /// correct entry for conditional evaluation.
     pub(super) async fn prepare_write(
         &self,
         bucket: &str,
         key: &str,
     ) -> S3Result<(WriteGuard, WriteMode)> {
-        let gate = self.enter_write(bucket)?;
-        match self.buckets.readiness(bucket) {
-            Readiness::Absent => Err(Error::NoSuchBucket.into()),
-            Readiness::Ready if self.mode == Mode::Cached => Ok((gate, WriteMode::Cached)),
-            Readiness::Ready => Ok((gate, WriteMode::Durable)),
-            Readiness::Restoring => {
-                let _guard = self.tier.locks.lock(key).await;
-                // The background restore provisions the projections and rebuilds the namespace, but
-                // a write can beat it here — have the actor provision on demand so K's
-                // materialization lands. Coalesced there, so a burst of writes into a lost-volume
-                // bucket costs one round, not one per request. Safe to create projections a delete
-                // might be draining only because the gate above is held: the drain cannot have
-                // started while this write is inside it.
-                self.buckets.provision(bucket).await?;
-                self.tier.materialize_absent_locked(bucket, key).await?;
-                Ok((gate, WriteMode::Durable))
-            }
+        let (gate, admission) = self.enter_write(bucket)?;
+        if admission == Admission::Durable {
+            let _guard = self.tier.locks.lock(key).await;
+            // The background restore provisions the projections and rebuilds the namespace, but a
+            // write can beat it here — have the actor provision on demand so K's materialization
+            // lands. Coalesced there, so a burst of writes into a lost-volume bucket costs one
+            // round, not one per request. Safe to create projections a delete might be draining
+            // only because the gate above is held: the drain cannot have started while this write
+            // is inside it.
+            self.buckets.provision(bucket).await?;
+            // Additive, so the other durable admission — a `Ready` bucket with a straggler's ticket
+            // out — costs at most one remote probe for a key the cache correctly has no entry for.
+            self.tier.materialize_absent_locked(bucket, key).await?;
+        }
+        Ok((gate, self.write_mode_for(admission)))
+    }
+
+    /// Validate a bucket exists — the overlay hook for ops that route around the cache entirely (the
+    /// multipart part path, §7) and so have no key state to materialize.
+    pub(super) fn check_bucket(&self, bucket: &str) -> S3Result<WriteGuard> {
+        Ok(self.enter_write(bucket)?.0)
+    }
+
+    /// The write's claim on the bucket existing, held for the whole op (§7). The `Admission` **is**
+    /// the classification, taken in the CAS that admitted the write, so nothing can move between the
+    /// two. A bucket whose gate is closed — a `DeleteBucket` between its emptiness check and its
+    /// commit — answers `OperationAborted`, not `NoSuchBucket`: its fate is undecided, and a
+    /// permanent `NoSuchBucket` would be wrong if the delete then fails.
+    fn enter_write(&self, bucket: &str) -> S3Result<(WriteGuard, Admission)> {
+        self.buckets.enter_write(bucket).map_err(refuse)
+    }
+
+    /// Cache-first only where the deployment asks for it *and* the gate says the namespace can take
+    /// it; a durable deployment never has a cache-first commit to offer.
+    fn write_mode_for(&self, admission: Admission) -> WriteMode {
+        match admission {
+            Admission::CachedEligible if self.mode == Mode::Cached => WriteMode::Cached,
+            _ => WriteMode::Durable,
         }
     }
 
-    /// Validate a bucket exists, kicking its restore if unreconciled — the overlay hook for ops
-    /// that route around the cache entirely (the multipart part path, §7) and so have no key
-    /// state to materialize.
-    pub(super) async fn check_bucket(&self, bucket: &str) -> S3Result<WriteGuard> {
-        let gate = self.enter_write(bucket)?;
-        match self.buckets.readiness(bucket) {
-            Readiness::Absent => Err(Error::NoSuchBucket.into()),
-            _ => Ok(gate),
-        }
-    }
-
-    /// The write's claim on the bucket existing, held for the whole op (§7). Taken *before* the
-    /// readiness read, which is what makes the pair meaningful: readiness is a load, so on its own
-    /// it says nothing about the bucket still being there by the time the write commits. A bucket
-    /// whose gate is closed — a `DeleteBucket` between its emptiness check and its commit — answers
-    /// `OperationAborted`, not `NoSuchBucket`: its fate is undecided, and a permanent `NoSuchBucket`
-    /// would be wrong if the delete then fails.
-    fn enter_write(&self, bucket: &str) -> S3Result<WriteGuard> {
-        self.buckets
-            .enter_write(bucket)
-            .map_err(|refusal| match refusal {
-                Refusal::Absent => Error::NoSuchBucket.into(),
-                Refusal::Closed => Error::OperationAborted.into(),
-            })
+    /// The bucket-metadata probes, which resolve no key: they need the gate's verdict and nothing
+    /// else, so they drop the ticket immediately. The state map is the existence authority — it is
+    /// resolved in full at startup and maintained by Create/Delete since, and it is the only source
+    /// that tells a bucket that is gone from one whose delete has not decided yet.
+    pub(super) fn require_bucket(&self, bucket: &str) -> S3Result<()> {
+        self.buckets.read_ticket(bucket).map_err(refuse)?;
+        Ok(())
     }
 
     /// Project a remote LIST page into client-visible entries while the cache restores (§7): each

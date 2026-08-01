@@ -153,7 +153,7 @@ impl ReplicationTask {
     /// an arbitrarily long drain. A key refused here belongs to a bucket already going away, whose
     /// `<meta>` (and this marker with it) the delete is about to drain.
     async fn reconcile_key(&self, bucket: &str, key: &str, m_etag: &str) -> Result<()> {
-        let Ok(_gate) = self.buckets.enter_write(bucket) else {
+        let Ok((_gate, _)) = self.buckets.enter_write(bucket) else {
             return Ok(());
         };
         let Some(_up) = self.tier.upload_locks.try_lock(key) else {
