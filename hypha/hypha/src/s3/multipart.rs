@@ -14,16 +14,13 @@ use hypha_core::meta;
 use hypha_format::offset::{ciphertext_len, plaintext_len_from, HLEN};
 use hypha_format::{encode_trailer, Footer, FooterKind};
 
-use super::copy::evaluate_copy_source_time;
-use super::overlay::KeyState;
-use super::put::evaluate_precondition;
 use super::{
     copied_part_retag, parse_content_md5, resolve_storage_class, ts_ms, write_metadata, Hypha,
     MAX_INLINE_PLAINTEXT,
 };
 use crate::codec;
 use crate::gc::Plaintext;
-use crate::tier::{self, RemoteFacts};
+use crate::tier;
 
 /// A fresh token naming one part's retained ciphertext ([`meta::mpu_stash_key`]). Minted before the
 /// part streams, since the remote's `retag` — which disambiguates re-uploads everywhere else —
@@ -126,12 +123,7 @@ impl Hypha {
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
         let _gate = self.check_bucket(&bucket)?;
         let part_number = input.part_number;
-        if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
-            return Err(s3_error!(
-                InvalidPart,
-                "part number must be between 1 and 10000"
-            ));
-        }
+        validate_part_number(part_number)?;
         let plen = input
             .content_length
             .filter(|&n| n >= 0)
@@ -419,6 +411,37 @@ impl Hypha {
         }
     }
 
+    /// The ciphertext retained for a final part (§7), size-verified against the recorded value — the
+    /// guard that a fold/unfold re-upload concatenates from exactly the bytes the ETag was computed
+    /// over. Absence means the upload never reached the retain path, so there is nothing to recover.
+    async fn retained_part_body(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: i32,
+        stash_nonce: &str,
+        expected_len: u64,
+        why: &str,
+    ) -> Result<aws_sdk_s3::primitives::ByteStream, Error> {
+        let stash_key = meta::mpu_stash_key(upload_id, part_number, stash_nonce);
+        let retained = match self.meta().get(bucket, &stash_key, None).await {
+            Ok(o) => o,
+            Err(Error::NotFound) => {
+                return Err(Error::Backend(format!(
+                    "final part {part_number} ciphertext not retained; {why}"
+                )))
+            }
+            Err(e) => return Err(e),
+        };
+        let len = retained.content_length().unwrap_or(0).max(0) as u64;
+        if len != expected_len {
+            return Err(Error::Backend(format!(
+                "retained final part {part_number} has size {len}, expected {expected_len}"
+            )));
+        }
+        Ok(retained.body)
+    }
+
     /// **UploadPartCopy** (§7): the copy-source is an alternate byte source for a part. Fast path —
     /// a whole, unranged, single-part, remote-resident source is one age file, so its body copies
     /// **server-side** with `pmd5` = the source cetag and no bytes through hypha; everything else
@@ -435,12 +458,7 @@ impl Hypha {
         let _gate = self.check_bucket(&bucket)?;
 
         let part_number = input.part_number;
-        if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
-            return Err(s3_error!(
-                InvalidPart,
-                "part number must be between 1 and 10000"
-            ));
-        }
+        validate_part_number(part_number)?;
 
         let (src_bucket, src_key) = parse_copy_source(&input.copy_source)?;
         meta::validate_client_key(&src_key).map_err(|e| Error::Invalid(e.to_string()))?;
@@ -449,24 +467,16 @@ impl Hypha {
         let lock_key = mpu_part_lock_key(&bucket, &input.upload_id, part_number);
         let _part_guard = self.tier.mpu_part_locks.lock(&lock_key).await;
 
-        // Resolve the source's facts + residency through the restore overlay, exactly as a read
-        // would (§7): a live cache body reports natively, anything else resolves remote-side —
-        // including a source bucket that is itself mid-restore.
-        let (facts, live) = match self.resolve_key(&src_bucket, &src_key).await? {
-            KeyState::Absent => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
-            KeyState::Remote { facts, .. } => (facts, false),
-            KeyState::CacheBody { head, .. } => (RemoteFacts::from_cache_head(&head), true),
-        };
-        evaluate_precondition(
-            input.copy_source_if_match.as_ref(),
-            input.copy_source_if_none_match.as_ref(),
-            Some(&facts.cetag),
-        )?;
-        evaluate_copy_source_time(
-            input.copy_source_if_modified_since.as_ref(),
-            input.copy_source_if_unmodified_since.as_ref(),
-            facts.mtime_ms,
-        )?;
+        let (facts, _md, live) = self
+            .resolve_copy_source(
+                &src_bucket,
+                &src_key,
+                input.copy_source_if_match.as_ref(),
+                input.copy_source_if_none_match.as_ref(),
+                input.copy_source_if_modified_since.as_ref(),
+                input.copy_source_if_unmodified_since.as_ref(),
+            )
+            .await?;
 
         // The copy range over the source's PLAINTEXT: the whole object, or `copy-source-range`.
         let pt = match input.copy_source_range.as_deref() {
@@ -598,7 +608,7 @@ impl Hypha {
             .head(&bucket, &meta::mpu_upload_key(&upload_id))
             .await
         {
-            Ok(h) => h.metadata.clone().unwrap_or_default(),
+            Ok(h) => h.metadata.unwrap_or_default(),
             Err(Error::NotFound) => return Err(s3_error!(NoSuchUpload, "unknown upload id")),
             Err(e) => return Err(e.into()),
         };
@@ -648,27 +658,16 @@ impl Hypha {
                             && live.contains_key(&(*part_number, retag.clone()))
                     });
             if !pure_is_live {
-                let stash_key =
-                    meta::mpu_stash_key(&upload_id, intent.part_number, &intent.stash_nonce);
-                let original = match self.meta().get(&bucket, &stash_key, None).await {
-                    Ok(o) => o,
-                    Err(Error::NotFound) => {
-                        return Err(Error::Backend(format!(
-                            "final part {} ciphertext not retained; cannot unfold",
-                            intent.part_number
-                        ))
-                        .into())
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                let original_len = original.content_length().unwrap_or(0).max(0) as u64;
-                if original_len != intent.ciphertext_len {
-                    return Err(Error::Backend(format!(
-                        "retained final part {} has size {original_len}, expected {}",
-                        intent.part_number, intent.ciphertext_len
-                    ))
-                    .into());
-                }
+                let original = self
+                    .retained_part_body(
+                        &bucket,
+                        &upload_id,
+                        intent.part_number,
+                        &intent.stash_nonce,
+                        intent.ciphertext_len,
+                        "cannot unfold",
+                    )
+                    .await?;
                 let out = self
                     .remote()
                     .upload_part(
@@ -676,8 +675,8 @@ impl Hypha {
                         &key,
                         &upload_id,
                         intent.part_number,
-                        original.body,
-                        Some(original_len as i64),
+                        original,
+                        Some(intent.ciphertext_len as i64),
                     )
                     .await?;
                 let retag = out
@@ -700,7 +699,7 @@ impl Hypha {
                     (intent.part_number, retag.clone()),
                     (intent.pmd5, intent.stash_nonce),
                 );
-                live.insert((intent.part_number, retag), original_len);
+                live.insert((intent.part_number, retag), intent.ciphertext_len);
             }
             self.clear_fold_intent(&bucket, &upload_id).await?;
         }
@@ -812,29 +811,19 @@ impl Hypha {
             };
             self.persist_fold_intent(&bucket, &upload_id, &desired_intent)
                 .await?;
-            let stash_key = meta::mpu_stash_key(&upload_id, last.number, &last.stash_nonce);
-            let stashed = match self.meta().get(&bucket, &stash_key, None).await {
-                Ok(o) => o,
-                Err(Error::NotFound) => {
-                    return Err(Error::Backend(format!(
-                        "final part {} ciphertext not retained; cannot fold trailer",
-                        last.number
-                    ))
-                    .into())
-                }
-                Err(e) => return Err(e.into()),
-            };
+            let stashed = self
+                .retained_part_body(
+                    &bucket,
+                    &upload_id,
+                    last.number,
+                    &last.stash_nonce,
+                    last.size,
+                    "cannot fold the trailer",
+                )
+                .await?;
+            let folded_len = last.size + trailer.len() as u64;
             // Streamed, not buffered: part 10000 may be gigabytes.
-            let stash_len = stashed.content_length().unwrap_or(0).max(0) as u64;
-            if stash_len != last.size {
-                return Err(Error::Backend(format!(
-                    "retained final part {} has size {stash_len}, expected {}",
-                    last.number, last.size
-                ))
-                .into());
-            }
-            let folded_len = stash_len + trailer.len() as u64;
-            let folded = codec::append_bytes(stashed.body, trailer.clone());
+            let folded = codec::append_bytes(stashed, trailer.clone());
             let fout = self
                 .remote()
                 .upload_part(
@@ -1152,4 +1141,14 @@ fn parse_copy_source_range(raw: &str, plen: u64) -> S3Result<std::ops::Range<u64
         ));
     }
     Ok(first..last + 1)
+}
+
+fn validate_part_number(part_number: i32) -> S3Result<()> {
+    if !(1..=meta::MAX_CLIENT_PART).contains(&part_number) {
+        return Err(s3_error!(
+            InvalidPart,
+            "part number must be between 1 and 10000"
+        ));
+    }
+    Ok(())
 }

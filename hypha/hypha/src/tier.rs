@@ -359,7 +359,7 @@ impl Tiering {
             Err(e) => return Err(e),
         };
         let plen = out.content_length().unwrap_or(0).max(0) as u64;
-        let content_type = meta::content_type(&out.metadata.clone().unwrap_or_default());
+        let content_type = out.metadata.as_ref().and_then(meta::content_type);
         let cetag = out
             .e_tag()
             .unwrap_or_default()
@@ -441,8 +441,8 @@ impl Tiering {
             Err(Error::NotFound) => {}
             Err(e) => return Err(e),
             Ok(head) => {
-                let md = head.metadata.clone().unwrap_or_default();
-                return match meta::tomb_kind(&md) {
+                let md = head.metadata.as_ref();
+                return match md.and_then(meta::tomb_kind) {
                     // A bracket owns K and will settle it; whatever it commits decides the remote's
                     // contents, so this obligation is neither dischargeable nor stranded yet. Same
                     // reasoning as the upload branch's transit arm.

@@ -408,10 +408,13 @@ impl Hypha {
     async fn head_facts(&self, bucket: &str, key: &str) -> S3Result<Option<Object>> {
         match self.data().head(bucket, key).await {
             Ok(head) => {
-                let md = head.metadata.clone().unwrap_or_default();
-                match meta::tomb_kind(&md) {
+                // No metadata ⇒ no tombstone; the empty-map classifier would say the same.
+                let Some(md) = head.metadata.as_ref() else {
+                    return Ok(None);
+                };
+                match meta::tomb_kind(md) {
                     Some(meta::TombKind::Evict) => {
-                        let f = facts_from_tombstone(key, &md)?;
+                        let f = facts_from_tombstone(key, md)?;
                         Ok(Some(Object {
                             key: Some(key.to_string()),
                             size: Some(f.plen as i64),

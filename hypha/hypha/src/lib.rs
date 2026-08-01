@@ -15,6 +15,7 @@ mod markers;
 pub mod metrics;
 mod replication;
 mod s3;
+mod sealq;
 mod tier;
 mod volume_watch;
 

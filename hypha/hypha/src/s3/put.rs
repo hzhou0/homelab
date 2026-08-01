@@ -52,20 +52,7 @@ impl Hypha {
             .map(parse_content_md5)
             .transpose()?;
 
-        let plen = input
-            .content_length
-            .filter(|&n| n >= 0)
-            .ok_or_else(|| Error::Invalid("PutObject requires Content-Length".into()))?
-            as u64;
-        if plen > MAX_INLINE_PLAINTEXT {
-            return Err(s3_error!(
-                EntityTooLarge,
-                "PutObject bodies over 4 GiB must use multipart upload"
-            ));
-        }
-        let body = input
-            .body
-            .ok_or_else(|| Error::Invalid("PutObject requires a body".into()))?;
+        let (plen, body) = require_inline_body(&mut input)?;
 
         // One lock for the whole bracket: precondition → mark → commit → settle (§4).
         let _guard = self.write_lock(&bucket, &key).await;
@@ -187,12 +174,12 @@ impl Hypha {
     ) -> Result<Option<String>, Error> {
         match self.data().head(bucket, key).await {
             Ok(head) => {
-                let md = head.metadata.clone().unwrap_or_default();
-                Ok(match meta::tomb_kind(&md) {
+                let md = head.metadata.as_ref();
+                Ok(match md.and_then(meta::tomb_kind) {
                     Some(meta::TombKind::Transit) => {
                         self.tier.repair_locked(bucket, key).await?.map(|f| f.cetag)
                     }
-                    Some(meta::TombKind::Evict) => md.get(meta::CETAG).cloned(),
+                    Some(meta::TombKind::Evict) => md.and_then(|m| m.get(meta::CETAG)).cloned(),
                     None => head
                         .e_tag
                         .as_deref()
@@ -213,7 +200,7 @@ impl Hypha {
     /// as the ETag, and validates a forwarded `Content-MD5` (⇒ `BadDigest`) before storing.
     async fn op_put_object_cached(
         &self,
-        input: PutObjectInput,
+        mut input: PutObjectInput,
         bucket: String,
         key: String,
     ) -> S3Result<S3Response<PutObjectOutput>> {
@@ -224,21 +211,7 @@ impl Hypha {
             parse_content_md5(h)?;
         }
         let content_md5 = input.content_md5.clone();
-
-        let plen = input
-            .content_length
-            .filter(|&n| n >= 0)
-            .ok_or_else(|| Error::Invalid("PutObject requires Content-Length".into()))?
-            as u64;
-        if plen > MAX_INLINE_PLAINTEXT {
-            return Err(s3_error!(
-                EntityTooLarge,
-                "PutObject bodies over 4 GiB must use multipart upload"
-            ));
-        }
-        let body = input
-            .body
-            .ok_or_else(|| Error::Invalid("PutObject requires a body".into()))?;
+        let (plen, body) = require_inline_body(&mut input)?;
         let md = write_metadata(
             input.metadata.as_ref(),
             &storage_class,
@@ -328,6 +301,28 @@ impl Hypha {
         self.markers.owe(bucket, key, etag.clone());
         Ok(etag)
     }
+}
+
+/// The single-part body both PUT branches commit, taken out of `input`. Durable and cached mode
+/// validate it identically: a `Content-Length` is mandatory and bounds the request to what an inline
+/// commit can carry.
+fn require_inline_body(input: &mut PutObjectInput) -> S3Result<(u64, StreamingBlob)> {
+    let plen = input
+        .content_length
+        .filter(|&n| n >= 0)
+        .ok_or_else(|| Error::Invalid("PutObject requires Content-Length".into()))?
+        as u64;
+    if plen > MAX_INLINE_PLAINTEXT {
+        return Err(s3_error!(
+            EntityTooLarge,
+            "PutObject bodies over 4 GiB must use multipart upload"
+        ));
+    }
+    let body = input
+        .body
+        .take()
+        .ok_or_else(|| Error::Invalid("PutObject requires a body".into()))?;
+    Ok((plen, body))
 }
 
 /// Reject a body equal to one of hypha's reserved 16-byte tombstone sentinels (§6), handing the

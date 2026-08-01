@@ -15,9 +15,8 @@ use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
 use crate::bucket::{BucketCtl, BucketStatus};
+use crate::sealq::{self, Dedup};
 use crate::tier::{quote, Tiering};
-
-const DRAIN_BATCH: usize = 256;
 
 /// Pages of a bucket's shadow range read at once. The range holds one entry per rehydrated composite,
 /// so this is a ceiling rather than a budget — a bucket past it keeps its later shadows for the next
@@ -25,26 +24,18 @@ const DRAIN_BATCH: usize = 256;
 const RANGE_PAGES: usize = 16;
 const PAGE_KEYS: i32 = 1000;
 
-/// What the queue carries. As in [`crate::markers`], the seal is a **message, not the channel
-/// closing**: the serving future owns the [`OrphanSeal`], so an aborted process closes the channel
-/// exactly as a drain would, and closure alone must not authorize a marker.
-enum OrphanMsg {
-    Owed(Superseded),
-    Seal,
-}
-
 /// A key whose shadow a client write may have just orphaned.
 ///
 /// Deliberately *not* carrying the generation the write replaced, even where the path knew it: asking K
 /// what it currently holds is correct in every case, including the ones a remembered generation would
 /// also get right, and it costs a HEAD only for a key that actually has a shadow. One path to reason
 /// about beats a fast path for a rare case.
-struct Superseded {
+pub(crate) struct Superseded {
     bucket: String,
     key: String,
 }
 
-impl Superseded {
+impl sealq::Dedup for Superseded {
     fn dedup_key(&self) -> (String, String) {
         (self.bucket.clone(), self.key.clone())
     }
@@ -57,7 +48,7 @@ struct OrphanQueue {
     cached: bool,
     /// Weak for the same reason [`crate::markers`]'s is: the service must not hold the channel open, or
     /// its closing would prove nothing about the run having drained.
-    tx: mpsc::WeakUnboundedSender<OrphanMsg>,
+    tx: mpsc::WeakUnboundedSender<sealq::Msg<Superseded>>,
     buckets: BucketCtl,
 }
 
@@ -72,7 +63,6 @@ pub(crate) fn spawn(
     buckets: BucketCtl,
     retry: Duration,
 ) -> (Orphans, OrphanSeal, OrphanActor) {
-    let cached = tier.cached;
     let (tx, rx) = mpsc::unbounded_channel();
     let queue = Arc::new(OrphanQueue {
         cached: tier.cached,
@@ -84,25 +74,17 @@ pub(crate) fn spawn(
         Orphans {
             queue: queue.clone(),
         },
-        OrphanSeal(tx),
+        OrphanSeal::new(tx),
         OrphanActor {
             queue,
             rx,
             retry: retry.max(Duration::from_millis(1)),
-            cached,
         },
     )
 }
 
-/// Holds the queue open for the life of the run; sending is what authorizes the markers. See
-/// [`crate::markers::RunSeal`] for why dropping it must not.
-pub(crate) struct OrphanSeal(mpsc::UnboundedSender<OrphanMsg>);
-
-impl OrphanSeal {
-    pub(crate) fn seal(self) {
-        let _ = self.0.send(OrphanMsg::Seal);
-    }
-}
+/// See [`sealq::Seal`] for the mechanism and why dropping it must not seal.
+pub(crate) type OrphanSeal = sealq::Seal<Superseded>;
 
 impl Orphans {
     /// Hand over a key whose shadow this write may have orphaned. Called after the commit, so it
@@ -120,7 +102,7 @@ impl Orphans {
             self.queue.buckets.unaccount_shadows(bucket);
             return;
         };
-        let _ = tx.send(OrphanMsg::Owed(Superseded {
+        let _ = tx.send(sealq::Msg::Owed(Superseded {
             bucket: bucket.to_string(),
             key: key.to_string(),
         }));
@@ -129,44 +111,19 @@ impl Orphans {
 
 pub(crate) struct OrphanActor {
     queue: Arc<OrphanQueue>,
-    rx: mpsc::UnboundedReceiver<OrphanMsg>,
+    rx: mpsc::UnboundedReceiver<sealq::Msg<Superseded>>,
     retry: Duration,
-    /// Durable mode has nothing for a marker to vouch for.
-    cached: bool,
 }
 
 impl OrphanActor {
     pub(crate) async fn run(mut self) {
         let mut owed: HashMap<(String, String), Superseded> = HashMap::new();
-        let mut batch = Vec::with_capacity(DRAIN_BATCH);
-        let mut sealed = false;
-        loop {
-            tokio::select! {
-                n = self.rx.recv_many(&mut batch, DRAIN_BATCH) => {
-                    if n == 0 {
-                        break; // dropped rather than sealed — the run did not end gracefully
-                    }
-                    for msg in batch.drain(..) {
-                        match msg {
-                            OrphanMsg::Owed(s) => { owed.insert(s.dedup_key(), s); }
-                            OrphanMsg::Seal => sealed = true,
-                        }
-                    }
-                    self.resolve_all(&mut owed).await;
-                    if sealed {
-                        break;
-                    }
-                }
-                () = tokio::time::sleep(self.retry), if !owed.is_empty() => {
-                    self.resolve_all(&mut owed).await;
-                }
-            }
-        }
-        self.resolve_all(&mut owed).await;
-        match (sealed, owed.is_empty()) {
-            (true, true) => self.mark_clean().await,
+        let (sealed, left) =
+            sealq::drain(&mut self.rx, self.retry, &mut owed, self.queue.as_ref()).await;
+        match (sealed, left == 0) {
+            (true, true) => self.queue.mark_clean().await,
             (true, false) => tracing::warn!(
-                owed = owed.len(),
+                owed = left,
                 "shadow obligations still owed at drain; no shadow-clean markers written"
             ),
             (false, _) => {
@@ -174,7 +131,17 @@ impl OrphanActor {
             }
         }
     }
+}
 
+impl sealq::Drain for OrphanQueue {
+    type Payload = Superseded;
+
+    async fn process(&self, owed: &mut HashMap<(String, String), Superseded>) {
+        self.resolve_all(owed).await;
+    }
+}
+
+impl OrphanQueue {
     /// Resolve every obligation, retaining the ones that could not be settled. Grouped by bucket
     /// because the shadow range is per bucket and one listing of it serves every obligation there.
     async fn resolve_all(&self, owed: &mut HashMap<(String, String), Superseded>) {
@@ -188,11 +155,11 @@ impl OrphanActor {
         for (bucket, batch) in by_bucket {
             // The state map, not the backend, decides a bucket is gone — the same rule
             // [`crate::markers`] follows, and here it also spares a listing that can only 404.
-            if self.queue.buckets.status(&bucket) == BucketStatus::Absent {
+            if self.buckets.status(&bucket) == BucketStatus::Absent {
                 tracing::info!(bucket, "shadow obligations dropped; the bucket was deleted");
                 continue;
             }
-            let shadows = match list_shadows(&self.queue.tier, &bucket, RANGE_PAGES).await {
+            let shadows = match list_shadows(&self.tier, &bucket, RANGE_PAGES).await {
                 Ok(shadows) => shadows,
                 // The bucket is gone, so its whole `<meta>` projection went with it (§7) and there is
                 // nothing left to reclaim. Dropped rather than retried for the reason
@@ -237,7 +204,7 @@ impl OrphanActor {
     /// shadow is kept. Deleting it would have been safe — a shadow is only ever a copy of what the
     /// remote holds — but it would discard a transfer a client just waited for.
     async fn reclaim(&self, superseded: &Superseded, shadow: &str) -> Result<()> {
-        let tier = &self.queue.tier;
+        let tier = &self.tier;
         let (bucket, key) = (&superseded.bucket, &superseded.key);
 
         let head = match tier.meta.head(bucket, shadow).await {
@@ -246,9 +213,8 @@ impl OrphanActor {
             Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(()),
             Err(e) => return Err(e),
         };
-        let md = head.metadata.clone().unwrap_or_default();
         // No generation recorded ⇒ not a shadow this hypha wrote; judging it is not this pass's place.
-        let Some(shadow_cetag) = md.get(meta::CETAG) else {
+        let Some(shadow_cetag) = head.metadata.as_ref().and_then(|m| m.get(meta::CETAG)) else {
             return Ok(());
         };
         if still_reachable(tier, bucket, key, shadow_cetag).await? {
@@ -262,9 +228,8 @@ impl OrphanActor {
             return;
         }
         let marker = meta::shadow_clean_marker_key();
-        for bucket in self.queue.buckets.shadows_accounted() {
+        for bucket in self.buckets.shadows_accounted() {
             if let Err(e) = self
-                .queue
                 .tier
                 .meta
                 .put_small(&bucket, &marker, Vec::new(), HashMap::new(), None, None)
@@ -295,11 +260,13 @@ pub(crate) async fn sweep(tier: &Tiering, bucket: &str) -> Result<usize> {
             Err(Error::NotFound) => continue,
             Err(e) => return Err(e),
         };
-        let md = head.metadata.clone().unwrap_or_default();
+        let md = head.metadata.as_ref();
         // Written before the back-pointer existed, or not a shadow this hypha wrote: either way there
         // is no key to judge it against.
-        let (Some(cetag), Some(encoded)) = (md.get(meta::CETAG), md.get(meta::SHADOW_CLIENT_KEY))
-        else {
+        let (Some(cetag), Some(encoded)) = (
+            md.and_then(|m| m.get(meta::CETAG)),
+            md.and_then(|m| m.get(meta::SHADOW_CLIENT_KEY)),
+        ) else {
             continue;
         };
         // An unreadable back-pointer is "cannot judge", never "orphan" — the alternative is deleting a
@@ -330,9 +297,11 @@ async fn still_reachable(tier: &Tiering, bucket: &str, key: &str, cetag: &str) -
         Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
         Err(e) => return Err(e),
     };
-    let md = head.metadata.clone().unwrap_or_default();
-    Ok(match meta::tomb_kind(&md) {
-        Some(meta::TombKind::Evict) => md.get(meta::CETAG).map(String::as_str) == Some(cetag),
+    let md = head.metadata.as_ref();
+    Ok(match md.and_then(meta::tomb_kind) {
+        Some(meta::TombKind::Evict) => {
+            md.and_then(|m| m.get(meta::CETAG)).map(String::as_str) == Some(cetag)
+        }
         Some(meta::TombKind::Transit) => true,
         None => false,
     })

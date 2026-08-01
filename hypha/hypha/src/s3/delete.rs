@@ -90,13 +90,7 @@ impl Hypha {
         // Per-key failures land here; a key absent from the map at the end succeeded.
         let mut failed: HashMap<String, BatchDeleteError> = HashMap::new();
 
-        let keys = valid_sorted_keys(&requested, &mut failed);
-
-        // Each key materialized before any is marked, so the batch runs against correct entries.
-        // The per-key gate is dropped at once — the batch's own, taken above, covers the whole op.
-        for key in &keys {
-            let (_, _) = self.prepare_write(&bucket, key).await?;
-        }
+        let keys = self.admitted_keys(&bucket, &requested, &mut failed).await?;
 
         // Sequentially, in sorted order — the deadlock-freedom argument is the acquisition order.
         let mut guards = Vec::with_capacity(keys.len());
@@ -158,12 +152,7 @@ impl Hypha {
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let mut failed: HashMap<String, BatchDeleteError> = HashMap::new();
 
-        let keys = valid_sorted_keys(&requested, &mut failed);
-
-        // Its caller's gate is held across this whole call, so the per-key ones add nothing.
-        for key in &keys {
-            let (_, _) = self.prepare_write(&bucket, key).await?;
-        }
+        let keys = self.admitted_keys(&bucket, &requested, &mut failed).await?;
 
         let bucket = bucket.as_str();
         let outcomes = futures::stream::iter(keys)
@@ -252,8 +241,8 @@ impl Hypha {
     async fn repair_leftover_mark_locked(&self, bucket: &str, key: &str) -> Result<(), Error> {
         match self.data().head(bucket, key).await {
             Ok(head) => {
-                let md = head.metadata.clone().unwrap_or_default();
-                if meta::tomb_kind(&md) == Some(meta::TombKind::Transit) {
+                if head.metadata.as_ref().and_then(meta::tomb_kind) == Some(meta::TombKind::Transit)
+                {
                     self.tier.repair_locked(bucket, key).await?;
                 }
                 Ok(())
@@ -261,6 +250,22 @@ impl Hypha {
             Err(Error::NotFound) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// The batch's admission: validate every key and materialize each one's remote state before any
+    /// is marked, so the batch runs against correct entries. The per-key gate is dropped at once —
+    /// the batch's own, taken by the caller, covers the whole op (§7).
+    async fn admitted_keys(
+        &self,
+        bucket: &str,
+        requested: &[String],
+        failed: &mut HashMap<String, BatchDeleteError>,
+    ) -> S3Result<Vec<String>> {
+        let keys = valid_sorted_keys(requested, failed);
+        for key in &keys {
+            let (_, _) = self.prepare_write(bucket, key).await?;
+        }
+        Ok(keys)
     }
 }
 

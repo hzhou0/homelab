@@ -50,27 +50,17 @@ impl Hypha {
         // from the remote first, so this copy's bracket then overwrites a correct tombstone.
         let (_gate, write_mode) = self.prepare_write(&bucket, &key).await?;
 
-        // Resolve the source's facts + cache-side user metadata through the restore overlay, exactly
-        // as a read would: a live cache body reports natively, anything else resolves remote-side.
-        let (facts, src_md, source_live) = match self.resolve_key(&src_bucket, &src_key).await? {
-            KeyState::Absent => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
-            KeyState::Remote { facts, md } => (facts, md, false),
-            KeyState::CacheBody { head, md } => (RemoteFacts::from_cache_head(&head), md, true),
-        };
-
-        // Copy-source preconditions against the source's current state (§7). ETag conditions reuse
-        // the PUT evaluator (the source exists, so its ETag is the `current`); the two time
-        // conditions compare at the second granularity a client sees LastModified.
-        evaluate_precondition(
-            input.copy_source_if_match.as_ref(),
-            input.copy_source_if_none_match.as_ref(),
-            Some(&facts.cetag),
-        )?;
-        evaluate_copy_source_time(
-            input.copy_source_if_modified_since.as_ref(),
-            input.copy_source_if_unmodified_since.as_ref(),
-            facts.mtime_ms,
-        )?;
+        // Shared with UploadPartCopy (§7).
+        let (facts, src_md, source_live) = self
+            .resolve_copy_source(
+                &src_bucket,
+                &src_key,
+                input.copy_source_if_match.as_ref(),
+                input.copy_source_if_none_match.as_ref(),
+                input.copy_source_if_modified_since.as_ref(),
+                input.copy_source_if_unmodified_since.as_ref(),
+            )
+            .await?;
 
         let replace = input
             .metadata_directive
@@ -564,6 +554,29 @@ impl Hypha {
             )
             .await?;
         Ok(())
+    }
+
+    /// Resolve a copy source's facts, cache-side user metadata, and residency through the restore
+    /// overlay — exactly as a read would — then evaluate its preconditions against that state. The
+    /// shared head of CopyObject and UploadPartCopy (§7): a live cache body reports natively,
+    /// anything else resolves remote-side, and an absent source (including one mid-restore) is 404.
+    pub(super) async fn resolve_copy_source(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        if_match: Option<&ETagCondition>,
+        if_none_match: Option<&ETagCondition>,
+        if_modified_since: Option<&Timestamp>,
+        if_unmodified_since: Option<&Timestamp>,
+    ) -> S3Result<(RemoteFacts, HashMap<String, String>, bool)> {
+        let (facts, md, live) = match self.resolve_key(src_bucket, src_key).await? {
+            KeyState::Absent => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
+            KeyState::Remote { facts, md } => (facts, md, false),
+            KeyState::CacheBody { head, md } => (RemoteFacts::from_cache_head(&head), md, true),
+        };
+        evaluate_precondition(if_match, if_none_match, Some(&facts.cetag))?;
+        evaluate_copy_source_time(if_modified_since, if_unmodified_since, facts.mtime_ms)?;
+        Ok((facts, md, live))
     }
 }
 

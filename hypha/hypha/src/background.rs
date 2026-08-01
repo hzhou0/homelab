@@ -249,8 +249,11 @@ async fn rehydrate(
         Err(Error::NotFound) => return Ok(()),
         Err(e) => return Err(e),
     };
-    let tomb = head.metadata.clone().unwrap_or_default();
-    if meta::tomb_kind(&tomb) != Some(meta::TombKind::Evict) {
+    // No metadata ⇒ no tombstone; the classifier says the same of an empty map.
+    let Some(tomb) = head.metadata.as_ref() else {
+        return Ok(());
+    };
+    if meta::tomb_kind(tomb) != Some(meta::TombKind::Evict) {
         return Ok(());
     }
     if tomb.get(meta::CETAG).map(String::as_str) != Some(cetag) {
@@ -277,7 +280,7 @@ async fn rehydrate(
             r = land => r,
         }
     } else {
-        let md = meta::passthrough_metadata(&tomb);
+        let md = meta::passthrough_metadata(tomb);
         let land = async move {
             let body = codec::blob_to_bytestream(
                 tier.decrypt_remote_body(bucket, key, cetag, None).await?,

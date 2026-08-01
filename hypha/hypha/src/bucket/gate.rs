@@ -71,10 +71,10 @@ fn wcount(word: u64) -> u64 {
     word & WCOUNT_MASK
 }
 
-/// ── the transition table ────
-///
-/// One row per transition; [`Gate::advance`] re-runs a row on a lost race, so the CAS *is* the
-/// classification. A row that returns `None` refuses, and the word it refused on is the answer.
+// ── the transition table ────
+//
+// One row per transition; [`Gate::advance`] re-runs a row on a lost race, so the CAS *is* the
+// classification. A row that returns `None` refuses, and the word it refused on is the answer.
 
 /// `wcount + 1`, with the epoch moved so a write that finishes before the close CAS still defeats it
 /// (ABA). Saturation refuses rather than carry into the epoch.
