@@ -18,6 +18,7 @@ use crate::tier::{Tiering, UploadOutcome};
 
 const MARKER_PAGE: i32 = 1000;
 
+#[derive(Clone)]
 pub struct ReplicationTask {
     tier: Tiering,
     buckets: BucketCtl,
@@ -105,10 +106,24 @@ impl ReplicationTask {
                 .collect();
 
             seen += markers.len();
+            // A *task* per upload, not merely a future: the codecs encrypt on whichever task drives
+            // them (§6), so uploads multiplexed onto this one would run the whole pass's crypto on
+            // a single core no matter how wide `concurrency` was set. `buffer_unordered` still
+            // bounds how many are in flight, since the spawn happens as the stream is polled.
             futures::stream::iter(markers)
-                .for_each_concurrent(self.concurrency, |(key, m_etag)| async move {
-                    if let Err(e) = self.reconcile_key(bucket, &key, &m_etag).await {
-                        tracing::warn!(bucket, key = %key, error = %e, "reconcile of key failed; retrying next pass");
+                .map(|(key, m_etag)| {
+                    let task = self.clone();
+                    let bucket = bucket.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = task.reconcile_key(&bucket, &key, &m_etag).await {
+                            tracing::warn!(bucket, key = %key, error = %e, "reconcile of key failed; retrying next pass");
+                        }
+                    })
+                })
+                .buffer_unordered(self.concurrency)
+                .for_each(|joined| async {
+                    if let Err(e) = joined {
+                        tracing::error!(bucket, error = %e, "reconcile of key did not finish");
                     }
                 })
                 .await;

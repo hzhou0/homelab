@@ -271,7 +271,9 @@ Current surface limits:
 
 Cached-mode reconciliation periodically enumerates pending markers in `O(pending)` and uploads or
 deletes the corresponding remote generation. Failed work remains represented by its marker and is
-retried.
+retried. `reconcile.concurrency` bounds uploads in flight, and each runs on its own task: the
+codecs encrypt on whichever task drives them, so a pass that multiplexed its uploads onto one task
+would run the whole sweep's encryption on a single core.
 
 Cached tombstone reads are served immediately from the remote. Rehydrate submission is non-blocking
 and deduplicated; a bounded worker pool warms the cache for later reads. A client write cancels a

@@ -1734,6 +1734,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "base64-simd",
+ "bytes",
  "dashmap",
  "fastbloom",
  "futures",

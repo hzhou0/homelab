@@ -590,7 +590,7 @@ impl Tiering {
                 None => {
                     let out = self.remote.get(bucket, key, None).await?;
                     let ct_len = envelope_len(key, out.content_length)?;
-                    codec::decrypt_full(self.env.clone(), out.body, ct_len)
+                    codec::decrypt_full(self.env.clone(), out.body, ct_len).await?
                 }
                 Some(pt) => {
                     let rhead = self.remote.head(bucket, key).await?;
