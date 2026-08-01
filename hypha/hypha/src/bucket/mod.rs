@@ -12,4 +12,4 @@ mod restore;
 
 pub(crate) use ctl::resolve_all;
 pub use ctl::{spawn, BucketCtl, Readiness};
-pub use gate::WriteGuard;
+pub use gate::{Refusal, WriteGuard};

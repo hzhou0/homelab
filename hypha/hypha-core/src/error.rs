@@ -16,12 +16,14 @@ pub enum Error {
     /// contents outright (`allowDeleteBucketNotEmpty` defaults on), so a delegated gate is no gate.
     #[error("bucket not empty")]
     BucketNotEmpty,
-    /// A `DeleteBucket` that raced a write into the same bucket. Retryable, and deliberately not
-    /// resolved by waiting: blocking the delete would make its client pay for the write, and
-    /// refusing the *write* instead would answer `NoSuchBucket` for a bucket that is about to keep
-    /// existing (§7).
+    /// A `DeleteBucket` that raced a write into the same bucket, or the write that lost that race
+    /// once the delete committed to closing its gate. Both sides retry: a refused delete leaves the
+    /// bucket serving, and a refused write learns the settled truth on retry — `NoSuchBucket` if the
+    /// delete went through, success if it did not (§7).
     #[error("a conflicting write is in progress")]
     OperationAborted,
+    #[error("reduce your request rate")]
+    SlowDown,
     #[error("precondition failed")]
     PreconditionFailed,
     #[error("content-md5 mismatch")]
@@ -62,6 +64,7 @@ impl From<Error> for S3Error {
             Error::NoSuchBucket => S3ErrorCode::NoSuchBucket,
             Error::BucketNotEmpty => S3ErrorCode::BucketNotEmpty,
             Error::OperationAborted => S3ErrorCode::OperationAborted,
+            Error::SlowDown => S3ErrorCode::SlowDown,
             Error::PreconditionFailed => S3ErrorCode::PreconditionFailed,
             Error::BadDigest => S3ErrorCode::BadDigest,
             Error::Invalid(_) => S3ErrorCode::InvalidRequest,

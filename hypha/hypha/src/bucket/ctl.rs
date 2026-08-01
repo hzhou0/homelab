@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
-use super::gate::{WriteGates, WriteGuard};
+use super::gate::{Refusal, WriteGates, WriteGuard};
 use super::{rebuild, restore};
 use crate::gc::orphans;
 use crate::halt::{Invariant, Violation};
@@ -25,6 +25,8 @@ use crate::tier::Tiering;
 /// slot for its duration, so this also bounds the head-of-line a lost-volume restore storm drains
 /// against.
 const MAX_CONCURRENT: usize = 16;
+
+const MAX_QUEUED_BUCKET_REQUESTS: usize = 4;
 
 /// How long a bucket whose recovery could not run waits before the pass is re-queued. Nothing else
 /// re-triggers one: the state map is resolved once at startup and never re-probed, so a pass that
@@ -212,16 +214,17 @@ impl BucketCtl {
         self.state(bucket).readiness
     }
 
-    /// Admit a write into `bucket`, or refuse because a `DeleteBucket` has closed its gate
-    /// ([`WriteGates`]). Every producer into a bucket's namespaces goes through here — not just
-    /// client ops: a reconcile upload that landed after the drain would resurrect the bucket exactly
-    /// as a late `PutObject` would.
+    /// Admit a write into `bucket`, or refuse. Every producer into a bucket's namespaces goes
+    /// through here — not just client ops: a reconcile upload that landed after the drain would
+    /// resurrect the bucket exactly as a late `PutObject` would.
     ///
     /// The guard is the write's whole claim on the bucket's existence, so it must be held until the
-    /// write has committed and raised whatever it owes. `readiness` is still checked afterwards and
-    /// still decides `NoSuchBucket` for a bucket that was never there — the gate only answers for
-    /// one that is going away underneath.
-    pub fn enter_write(&self, bucket: &str) -> Option<WriteGuard> {
+    /// write has committed and raised whatever it owes. [`Refusal::Absent`] — no gate, so the bucket
+    /// was never here or its delete committed — is a definitive `NoSuchBucket`; [`Refusal::Closed`]
+    /// is a delete still deciding, so the write answers `OperationAborted` and may retry. `readiness`
+    /// is still checked afterwards for a bucket whose gate is installed but whose phase has not been
+    /// published yet.
+    pub fn enter_write(&self, bucket: &str) -> std::result::Result<WriteGuard, Refusal> {
         self.gates.enter(bucket)
     }
 
@@ -512,23 +515,32 @@ impl BucketActor {
 
     fn enqueue(&mut self, msg: BucketMsg) {
         match msg {
-            BucketMsg::Create { bucket, reply } => self
-                .queued
-                .entry(bucket)
-                .or_default()
-                .requests
-                .push_back(LifecycleRequest::Create(reply)),
-            BucketMsg::Delete { bucket, reply } => self
-                .queued
-                .entry(bucket)
-                .or_default()
-                .requests
-                .push_back(LifecycleRequest::Delete(reply)),
+            BucketMsg::Create { bucket, reply } => {
+                self.enqueue_request(bucket, LifecycleRequest::Create(reply))
+            }
+            BucketMsg::Delete { bucket, reply } => {
+                self.enqueue_request(bucket, LifecycleRequest::Delete(reply))
+            }
             BucketMsg::Provision { bucket, reply } => self.provision(bucket, reply),
             BucketMsg::Recover { bucket, pass } => {
                 self.queued.entry(bucket).or_default().recovery = Some(pass)
             }
         }
+    }
+
+    /// Queue one lifecycle request, or refuse it once the bucket's backlog is at the cap. Refusal
+    /// beats growing without bound: the reply is sent here, so the caller gets its error immediately
+    /// instead of pending on a oneshot that may never fire.
+    fn enqueue_request(&mut self, bucket: String, request: LifecycleRequest) {
+        let work = self.queued.entry(bucket).or_default();
+        if work.requests.len() >= MAX_QUEUED_BUCKET_REQUESTS {
+            let reply = match request {
+                LifecycleRequest::Create(reply) | LifecycleRequest::Delete(reply) => reply,
+            };
+            let _ = reply.send(Err(Error::SlowDown));
+            return;
+        }
+        work.requests.push_back(request);
     }
 
     /// Attach a waiter to the bucket's in-flight provisioning, starting it if this is the first.

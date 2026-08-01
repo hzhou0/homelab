@@ -155,7 +155,8 @@ async fn delete_bucket_refuses_a_non_empty_bucket() {
 /// delete, a write must not be able to put something back. A write *arriving* now meets the closed
 /// gate (§7) — which on a backend that creates the bucket a PUT addresses (SeaweedFS, again
 /// backend.rs) is the difference between a resurrected bucket and a refused request. The refusal is
-/// also immediate: the write is told `NoSuchBucket` rather than queued behind the whole drain.
+/// also immediate: the write is told `OperationAborted` rather than queued behind the whole drain —
+/// retryable, because the delete may still fail and leave the bucket writable again.
 #[tokio::test]
 async fn a_write_cannot_slip_into_a_bucket_whose_delete_is_committing() {
     let h = Harness::durable_with_faults().await;
@@ -180,7 +181,7 @@ async fn a_write_cannot_slip_into_a_bucket_whose_delete_is_committing() {
         .send()
         .await
         .expect_err("a write into a committing delete must be refused");
-    assert_eq!(sdk_err_code(&err).as_deref(), Some("NoSuchBucket"));
+    assert_eq!(sdk_err_code(&err).as_deref(), Some("OperationAborted"));
 
     committing.release();
     deleting
@@ -1358,7 +1359,7 @@ async fn list_pagination_short_pages() {
             assert_eq!(
                 page.next_continuation_token().is_some(),
                 more,
-                "NextContinuationToken present iff truncated (size {page_size})"
+                "NextContinuationToken present if truncated (size {page_size})"
             );
 
             collected.extend(keys);

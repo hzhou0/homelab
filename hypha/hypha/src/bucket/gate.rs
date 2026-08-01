@@ -8,7 +8,9 @@
 //!
 //! `count` detects writes already in flight. `epoch` makes the final close CAS detect a write that
 //! starts and finishes during the emptiness listing, avoiding the zero-count ABA. Refused deletes
-//! leave the gate untouched, so writes are never rejected speculatively for a bucket that survives.
+//! leave the gate untouched, so writes are never rejected speculatively for a bucket that survives;
+//! a delete that is going ahead closes the gate, and the write refused there gets a retryable
+//! `OperationAborted` rather than a permanent `NoSuchBucket` — the delete may still fail.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,10 +44,10 @@ impl Gate {
     fn enter(self: &Arc<Self>) -> Option<WriteGuard> {
         let mut current = self.state.load(Ordering::Relaxed);
         loop {
-            // Refusing on a saturated count would answer `NoSuchBucket` for a bucket that is merely
-            // busy, which is wrong — but letting the increment carry into the epoch would corrupt the
-            // delete's evidence, which is worse, and 2³² concurrent in-flight writes is not a state
-            // this process can reach.
+            // Refusing on a saturated count would reject a bucket that is merely busy, which is
+            // wrong — but letting the increment carry into the epoch would corrupt the delete's
+            // evidence, which is worse, and 2³² concurrent in-flight writes is not a state this
+            // process can reach.
             if current & CLOSED != 0 || count(current) == COUNT_MASK {
                 return None;
             }
@@ -82,18 +84,29 @@ impl Gate {
 /// lifecycle event; a sharded concurrent map would be paying for churn this table does not have.
 type Gates = Arc<ArcSwap<HashMap<String, Arc<Gate>>>>;
 
+/// Why [`WriteGates::enter`] refused a write.
+#[derive(Debug)]
+pub enum Refusal {
+    /// No gate: the bucket is absent — deleted, or never known. Definitive.
+    Absent,
+    /// The gate is closed: a `DeleteBucket` is between its emptiness check and its commit, and the
+    /// bucket's fate is not yet decided.
+    Closed,
+}
+
 #[derive(Clone, Default)]
 pub struct WriteGates {
     table: Gates,
 }
 
 impl WriteGates {
-    /// Admit a write, or report that the bucket is gone — deleted, or never known. The guard must be
-    /// held until the write has committed **and** raised whatever it owes: it is the write's whole
-    /// claim on the bucket existing, and a delete that observes it gone treats the namespace as
-    /// settled.
-    pub fn enter(&self, bucket: &str) -> Option<WriteGuard> {
-        self.gate(bucket)?.enter()
+    /// Admit a write. The guard must be held until the write has committed **and** raised whatever it
+    /// owes: it is the write's whole claim on the bucket existing, and a delete that observes it gone
+    /// treats the namespace as settled. Refusal distinguishes a bucket that is simply not there
+    /// ([`Refusal::Absent`]) from one a `DeleteBucket` is mid-flight on ([`Refusal::Closed`]).
+    pub fn enter(&self, bucket: &str) -> Result<WriteGuard, Refusal> {
+        let gate = self.gate(bucket).ok_or(Refusal::Absent)?;
+        gate.enter().ok_or(Refusal::Closed)
     }
 
     /// Step 1 of a delete: `Some` if no write is in flight. Records the exact word it saw, which
@@ -143,7 +156,7 @@ pub(super) struct Quiescent {
 }
 
 impl Quiescent {
-    /// Step 3: close the gate iff nothing has been admitted since the observation. `None` means a
+    /// Step 3: close the gate if nothing has been admitted since the observation. `None` means a
     /// write arrived while the caller was listing, so the listing is stale and the delete must
     /// refuse — again without having touched anything.
     pub(super) fn close(self) -> Option<ClosedGate> {
@@ -220,7 +233,7 @@ mod tests {
         drop(held);
 
         // The refused observation cost the bucket nothing: writes never stopped being admitted.
-        assert!(gates.enter("b").is_some(), "the gate was never closed");
+        assert!(gates.enter("b").is_ok(), "the gate was never closed");
         assert!(gates.quiescent("b").is_some(), "and it is quiescent again");
     }
 
@@ -235,7 +248,7 @@ mod tests {
         );
         drop(racer);
         assert!(
-            gates.enter("b").is_some(),
+            gates.enter("b").is_ok(),
             "a defeated close must leave the gate open"
         );
     }
@@ -260,7 +273,10 @@ mod tests {
         let seen = gates.quiescent("b").expect("an idle bucket is quiescent");
         seen.close().expect("an idle gate closes").commit();
 
-        assert!(gates.enter("b").is_none(), "a closed gate admits nothing");
+        assert!(
+            matches!(gates.enter("b"), Err(Refusal::Closed)),
+            "a closed gate admits nothing"
+        );
         assert!(gates.quiescent("b").is_none(), "and is not quiescent");
     }
 
@@ -270,7 +286,7 @@ mod tests {
         let seen = gates.quiescent("b").expect("an idle bucket is quiescent");
         drop(seen.close().expect("an idle gate closes"));
         assert!(
-            gates.enter("b").is_some(),
+            gates.enter("b").is_ok(),
             "a delete that failed to commit must return the bucket to service"
         );
     }
@@ -285,14 +301,14 @@ mod tests {
         gates.retire("b");
 
         assert!(
-            gates.enter("b").is_none(),
+            matches!(gates.enter("b"), Err(Refusal::Absent)),
             "an unknown bucket admits nothing"
         );
         assert!(gates.quiescent("b").is_none(), "and cannot be deleted");
 
         gates.install("b");
         assert!(
-            gates.enter("b").is_some(),
+            gates.enter("b").is_ok(),
             "a recreated bucket starts with an open gate"
         );
     }
@@ -331,7 +347,7 @@ mod tests {
             let retired = retired.clone();
             tasks.push(tokio::spawn(async move {
                 for _ in 0..2_000 {
-                    if let Some(guard) = gates.enter("b") {
+                    if let Ok(guard) = gates.enter("b") {
                         inside.fetch_add(1, Ordering::AcqRel);
                         tokio::task::yield_now().await;
                         inside.fetch_sub(1, Ordering::AcqRel);

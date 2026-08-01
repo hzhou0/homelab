@@ -15,7 +15,7 @@ use hypha_core::meta;
 
 use super::get::facts_from_tombstone;
 use super::{ts_ms, Hypha};
-use crate::bucket::{Readiness, WriteGuard};
+use crate::bucket::{Readiness, Refusal, WriteGuard};
 use crate::gc::Plaintext;
 use crate::tier::RemoteFacts;
 
@@ -161,11 +161,17 @@ impl Hypha {
 
     /// The write's claim on the bucket existing, held for the whole op (§7). Taken *before* the
     /// readiness read, which is what makes the pair meaningful: readiness is a load, so on its own
-    /// it says nothing about the bucket still being there by the time the write commits.
+    /// it says nothing about the bucket still being there by the time the write commits. A bucket
+    /// whose gate is closed — a `DeleteBucket` between its emptiness check and its commit — answers
+    /// `OperationAborted`, not `NoSuchBucket`: its fate is undecided, and a permanent `NoSuchBucket`
+    /// would be wrong if the delete then fails.
     fn enter_write(&self, bucket: &str) -> S3Result<WriteGuard> {
         self.buckets
             .enter_write(bucket)
-            .ok_or_else(|| Error::NoSuchBucket.into())
+            .map_err(|refusal| match refusal {
+                Refusal::Absent => Error::NoSuchBucket.into(),
+                Refusal::Closed => Error::OperationAborted.into(),
+            })
     }
 
     /// Project a remote LIST page into client-visible entries while the cache restores (§7): each

@@ -945,7 +945,7 @@ async fn plant_eviction_tombstone(h: &Harness, key: &str, body: &[u8]) {
         .expect("plant twin");
 }
 
-/// The per-bucket clean marker (§6): present iff a graceful drain vouched for that bucket.
+/// The per-bucket clean marker (§6): present if a graceful drain vouched for that bucket.
 async fn clean_marker_present(h: &Harness, client_bucket: &str) -> bool {
     raw_exists(h, &h.meta_bucket(client_bucket), &meta::clean_marker_key()).await
 }
