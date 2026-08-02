@@ -35,12 +35,15 @@ use hypha_core::config::{Mode, DATA_ROLE, META_ROLE, REMOTE_ROLE};
 use hypha_core::{Backend, Config};
 
 pub use admin::{serve as serve_admin, Health};
+pub use bucket::{BucketCtl, BucketStatus};
 pub use halt::EXIT_INVARIANT_VIOLATION;
 pub use s3::Hypha;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
-pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), BoxError> {
+pub async fn build_service(
+    config: &Config,
+) -> Result<(S3Service, Lifecycle, BucketCtl), BoxError> {
     let env = hypha_format::Envelope::new(&config.master_passphrase)
         .map_err(|e| format!("parsing master passphrase: {e}"))?;
     // Trailer authentication key: same master passphrase, distinct KDF domain (§6).
@@ -130,6 +133,11 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), Bo
         config.mode,
         config.max_bucket_prefix_len(),
     );
+    // The service consumes the original; the clone is for observation — the authoritative bucket
+    // state lives behind the same Arc the data plane reads. `BucketCtl` is inert here: the bucket
+    // actor exits on the shutdown token, not on its queue closing, so a handle kept for observation
+    // cannot hold up the drain.
+    let bucket_ctl = app.buckets.clone();
 
     // The one failure a running process still has to watch for (§7): its cache volume vanishing
     // underneath it, which would have a ready bucket answering 404 for objects that exist.
@@ -180,7 +188,7 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), Bo
         sweeps: JoinSet::new(),
         actors,
     };
-    Ok((b.build(), lifecycle))
+    Ok((b.build(), lifecycle, bucket_ctl))
 }
 
 /// The two ends of a run that the object path itself cannot own (§7): the startup clear that makes

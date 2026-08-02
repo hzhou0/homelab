@@ -709,3 +709,79 @@ async fn reserved_remote_keys_are_invisible_and_harmless() {
     let keys: Vec<&str> = listed.contents().iter().filter_map(|o| o.key()).collect();
     assert_eq!(keys, ["visible"], "reserved keys must never reach a client");
 }
+
+/// **The phase-5 LIST token boundary (§7):** a page read while the bucket is `Restoring` is served
+/// from the remote and carries hypha's own cursor — a plain key position, never the remote's opaque
+/// continuation token — so the very next page, served from the cache after the flip to `Ready`,
+/// resumes without gaps or duplicates and sees the writes that landed after the flip.
+#[tokio::test]
+async fn list_pagination_spans_the_restore_flip() {
+    let mut h = Harness::cached().await;
+    h.create_bucket(B).await;
+
+    open_restore_window(&mut h).await;
+    let c = h.client();
+
+    // The in-process harness returns before startup's `resolve_all` publishes the gate, so wait for
+    // it — via the authoritative state, not a backend artifact — and assert the restore window is
+    // still open when the first page is read, or the test proves nothing about the boundary.
+    wait_until(30_000, "the restore window to open", || async {
+        h.bucket_status(B) == hypha::BucketStatus::Restoring
+    })
+    .await;
+    assert_eq!(
+        h.bucket_status(B),
+        hypha::BucketStatus::Restoring,
+        "the first page must be read inside the restore window"
+    );
+
+    // Page 1, served from the remote.
+    let page1 = c
+        .list_objects_v2()
+        .bucket(B)
+        .max_keys(50)
+        .send()
+        .await
+        .expect("first list page");
+    assert_eq!(page1.is_truncated(), Some(true), "a 400-key namespace cannot fit one page of 50");
+    let mut all: Vec<String> = page1
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    let mut token = page1.next_continuation_token().map(str::to_string);
+
+    // The flip: the restore completes and the cache becomes authoritative. Waited on via the gate.
+    wait_until(60_000, "the restore to flip the bucket Ready", || async {
+        h.bucket_status(B) == hypha::BucketStatus::Ready
+    })
+    .await;
+
+    // A cached-mode write after the flip; it sorts last, so the remaining pages must surface it.
+    put(&c, B, "zz-append", &pattern(32)).await;
+
+    // The continuation, now served from the cache.
+    for _ in 0..(WINDOW_KEYS + 8) {
+        let mut req = c.list_objects_v2().bucket(B).max_keys(50);
+        if let Some(t) = &token {
+            req = req.continuation_token(t.clone());
+        }
+        let page = req.send().await.expect("continuation list page");
+        all.extend(page.contents().iter().filter_map(|o| o.key().map(str::to_string)));
+        match page.next_continuation_token() {
+            Some(t) if page.is_truncated() == Some(true) => token = Some(t.to_string()),
+            _ => {
+                token = None;
+                break;
+            }
+        }
+    }
+    assert!(token.is_none(), "pagination must terminate");
+
+    let mut expected: Vec<String> = (0..WINDOW_KEYS).map(|i| format!("seed-{i:04}")).collect();
+    expected.push("zz-append".to_string());
+    assert_eq!(
+        all, expected,
+        "a remote page then cache pages must cover every key exactly once, in order"
+    );
+}

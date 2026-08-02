@@ -31,7 +31,7 @@ async fn main() -> Result<(), BoxError> {
     // harness runs many hyphas in one process (§10).
     let metrics = hypha::metrics::install().map_err(ctx("installing the metrics recorder"))?;
 
-    let (service, lifecycle) = build_service(&config).await?;
+    let (service, lifecycle, _) = build_service(&config).await?;
 
     let listener = TcpListener::bind(&config.serving.listen)
         .await

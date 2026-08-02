@@ -877,13 +877,14 @@ async fn serve_usage(
 /// hypha served on an ephemeral loopback port. Shuts the server down and drains on `Drop`.
 pub struct Hypha {
     pub endpoint: String,
+    buckets: hypha::BucketCtl,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
 
 impl Hypha {
     async fn start(config: &Config) -> Self {
-        let (service, lifecycle) = hypha::build_service(config)
+        let (service, lifecycle, buckets) = hypha::build_service(config)
             .await
             .expect("build hypha service");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind hypha");
@@ -897,6 +898,7 @@ impl Hypha {
         });
         Self {
             endpoint: format!("http://{addr}"),
+            buckets,
             shutdown: Some(tx),
             task: Some(task),
         }
@@ -1141,7 +1143,7 @@ fn config_env(config: &Config) -> HashMap<String, String> {
 /// How the hypha under test is running. In-process is the default — cheaper and directly
 /// debuggable; a child process is only for assertions about the process itself.
 pub enum Server {
-    InProcess(Hypha),
+    InProcess(Box<Hypha>),
     Child(ChildHypha),
 }
 
@@ -1263,7 +1265,7 @@ impl HarnessBuilder {
         let hypha = if self.subprocess {
             Server::Child(ChildHypha::start(&config).await)
         } else {
-            Server::InProcess(Hypha::start(&config).await)
+            Server::InProcess(Box::new(Hypha::start(&config).await))
         };
         Harness {
             storage,
@@ -1358,6 +1360,15 @@ impl Harness {
         s3_client(self.hypha.endpoint(), HYPHA_ACCESS, HYPHA_SECRET)
     }
 
+    pub fn bucket_status(&self, bucket: &str) -> hypha::BucketStatus {
+        match &self.hypha {
+            Server::InProcess(h) => h.buckets.status(bucket),
+            Server::Child(_) => {
+                panic!("in-process bucket state is unavailable to a subprocess harness")
+            }
+        }
+    }
+
     /// A client pointed straight at the cache backend — bypasses hypha.
     pub fn raw(&self) -> Client {
         self.storage.raw_client()
@@ -1438,7 +1449,7 @@ impl Harness {
 
     pub async fn start_hypha(&mut self) {
         self.hypha = match &self.hypha {
-            Server::InProcess(_) => Server::InProcess(Hypha::start(&self.config).await),
+            Server::InProcess(_) => Server::InProcess(Box::new(Hypha::start(&self.config).await)),
             Server::Child(_) => Server::Child(ChildHypha::start(&self.config).await),
         };
     }

@@ -371,8 +371,9 @@ impl Backend {
 
     /// The v1 listing, kept native rather than emulated on top of [`Self::list`]: `NextMarker` is a
     /// *key position* under the backend's own delimiter/rollup rules, and reconstructing one from a
-    /// v2 page would mean guessing where a common-prefix group ends. Forwarding the backend's
-    /// marker verbatim is the same discipline the v2 path applies to its continuation token.
+    /// v2 page would mean guessing where a common-prefix group ends. A v1 `marker` is a plain key, so
+    /// it forwards to either backend safely — the same property the v2 path buys with its own
+    /// key-anchored cursor instead of the backend's opaque continuation token.
     pub async fn list_v1(
         &self,
         bucket: &str,

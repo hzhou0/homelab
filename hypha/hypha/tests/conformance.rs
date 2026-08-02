@@ -1375,6 +1375,30 @@ async fn list_pagination_short_pages() {
     }
 }
 
+/// The v2 continuation token is hypha's own, so a token that is not one of hypha's — corruption, a
+/// foreign backend's, a hand-rolled one — is refused cleanly rather than forwarded to a backend
+/// that would misread it (§7).
+#[tokio::test]
+async fn a_foreign_continuation_token_is_rejected() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+    put(&client, B, "a/1", &pattern(8)).await;
+
+    let err = client
+        .list_objects_v2()
+        .bucket(B)
+        .continuation_token("bm90IGEgaHlwaGEgdG9rZW4=".to_string())
+        .send()
+        .await
+        .expect_err("a token hypha did not mint must be refused");
+    assert_eq!(
+        sdk_err_code(&err).as_deref(),
+        Some("InvalidRequest"),
+        "a foreign continuation token is a client error, not a probe of either backend"
+    );
+}
+
 /// LIST v1: the same classifier and plaintext facts as v2, over v1's `marker`/`NextMarker` shell.
 /// Paginating under twin dilution must still cover every key exactly once, in order.
 #[tokio::test]

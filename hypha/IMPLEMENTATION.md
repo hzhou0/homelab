@@ -464,10 +464,6 @@ is therefore unsupported.
 - **Decide whether to replace restart recovery for mid-life cache loss.** The current volume watcher
   halts the process because a ready bucket may already have served false 404s. Restart then selects
   namespace restore. In-place recovery remains deliberately deferred.
-- **Resolve the v2 LIST restore-flip token boundary if required.** A page read while `Restoring`
-  carries the remote's opaque continuation token; after the bucket becomes `Ready`, the next page
-  may send it to the cache. Target backends encode key positions compatibly, and a failure is
-  retryable. Hypha-owned continuation tokens would remove that assumption.
 
 ### Additional verification
 

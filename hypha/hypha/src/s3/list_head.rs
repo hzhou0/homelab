@@ -23,6 +23,119 @@ struct PageView {
     common_prefixes: Vec<CommonPrefix>,
 }
 
+/// Version byte for the hypha-owned v2 LIST cursor.
+const LIST_TOKEN_VERSION: u8 = 1;
+
+/// One hop of a v2 LIST cursor. The resume position is a plain key, not the backend's opaque token,
+/// so the page can resume on whichever backend serves the next one — the `Restoring` → `Ready` flip
+/// is a non-event. The stream's prefix and delimiter ride along so a continued request that omits
+/// them still paginates the stream it started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListToken {
+    prefix: Option<String>,
+    delimiter: Option<String>,
+    anchor: String,
+}
+
+impl ListToken {
+    fn new(prefix: Option<String>, delimiter: Option<String>, anchor: String) -> Self {
+        Self {
+            prefix,
+            delimiter,
+            anchor,
+        }
+    }
+
+    fn encode(&self) -> String {
+        let mut buf = vec![LIST_TOKEN_VERSION];
+        push_token_field(&mut buf, self.prefix.as_deref().map(str::as_bytes));
+        push_token_field(&mut buf, self.delimiter.as_deref().map(str::as_bytes));
+        push_token_field(&mut buf, Some(self.anchor.as_bytes()));
+        base64_simd::URL_SAFE_NO_PAD.encode_to_string(&buf)
+    }
+
+    /// `None` for anything hypha could not have minted — a foreign backend's token, corruption, a
+    /// non-UTF-8 field — which the caller turns into a retryable client error.
+    fn decode(token: &str) -> Option<Self> {
+        let raw = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(token).ok()?;
+        if raw.first() != Some(&LIST_TOKEN_VERSION) {
+            return None;
+        }
+        let mut rest = &raw[1..];
+        let prefix = match take_token_field(&mut rest)? {
+            None => None,
+            Some(bytes) => Some(String::from_utf8(bytes.to_vec()).ok()?),
+        };
+        let delimiter = match take_token_field(&mut rest)? {
+            None => None,
+            Some(bytes) => Some(String::from_utf8(bytes.to_vec()).ok()?),
+        };
+        let anchor = String::from_utf8(take_token_field(&mut rest)??.to_vec()).ok()?;
+        if !rest.is_empty() {
+            return None;
+        }
+        Some(Self {
+            prefix,
+            delimiter,
+            anchor,
+        })
+    }
+
+    /// Fold a continuation request's own stream parameters over the token's: the request's win when
+    /// it sends them, the token's carry the stream forward when it omits them. A contradiction is an
+    /// error — the token would silently resume a different LIST.
+    fn resolve(
+        self,
+        prefix: &Option<String>,
+        delimiter: &Option<String>,
+    ) -> Result<(Option<String>, Option<String>, String), Error> {
+        if let (Some(p), Some(tp)) = (prefix.as_ref(), self.prefix.as_ref()) {
+            if p != tp {
+                return Err(Error::Invalid(
+                    "continuation token was minted for a different prefix".into(),
+                ));
+            }
+        }
+        if let (Some(d), Some(td)) = (delimiter.as_ref(), self.delimiter.as_ref()) {
+            if d != td {
+                return Err(Error::Invalid(
+                    "continuation token was minted for a different delimiter".into(),
+                ));
+            }
+        }
+        Ok((
+            prefix.clone().or(self.prefix),
+            delimiter.clone().or(self.delimiter),
+            self.anchor,
+        ))
+    }
+}
+
+fn push_token_field(buf: &mut Vec<u8>, field: Option<&[u8]>) {
+    match field {
+        Some(bytes) => {
+            buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        // `u16::MAX` cannot collide with a real length: keys and prefixes cap at 1024 bytes.
+        None => buf.extend_from_slice(&u16::MAX.to_le_bytes()),
+    }
+}
+
+fn take_token_field<'a>(rest: &mut &'a [u8]) -> Option<Option<&'a [u8]>> {
+    if rest.len() < 2 {
+        return None;
+    }
+    let len = u16::from_le_bytes([rest[0], rest[1]]);
+    *rest = &rest[2..];
+    if len == u16::MAX {
+        return Some(None);
+    }
+    let field = rest.get(..len as usize)?;
+    *rest = &rest[len as usize..];
+    Some(Some(field))
+}
+
 impl Hypha {
     pub(super) async fn op_head_object(
         &self,
@@ -85,21 +198,66 @@ impl Hypha {
         } else {
             self.data()
         };
+
+        // The resume position is hypha's own key-anchored cursor, never the backend's opaque token:
+        // a page minted while the bucket was `Restoring` (served from the remote) must be able to
+        // resume on the cache once it is `Ready`, and only a key means the same thing to both. The
+        // token carries the stream's prefix and delimiter, so a continued request that omits them
+        // still paginates the stream it started; a request that contradicts them is a fresh LIST,
+        // not a continuation.
+        let (eff_prefix, eff_delim, start_after) = match &input.continuation_token {
+            Some(token) => {
+                let tok = ListToken::decode(token).ok_or_else(|| {
+                    Error::Invalid("continuation token is not one of hypha's own".into())
+                })?;
+                let (prefix, delimiter, anchor) = tok.resolve(&input.prefix, &input.delimiter)?;
+                (prefix, delimiter, Some(anchor))
+            }
+            None => (
+                input.prefix.clone(),
+                input.delimiter.clone(),
+                input.start_after.clone(),
+            ),
+        };
+
         let raw = source
             .list(
                 &bucket,
-                input.prefix.clone(),
-                input.delimiter.clone(),
-                input.continuation_token.clone(),
-                input.start_after.clone(),
+                eff_prefix.clone(),
+                eff_delim.clone(),
+                None,
+                start_after,
                 input.max_keys,
             )
             .await?;
         let max_keys = raw.max_keys;
         let is_truncated = raw.is_truncated;
-        let next_continuation_token = raw.next_continuation_token.clone();
         let objs = raw.contents.unwrap_or_default();
         let prefixes = raw.common_prefixes.unwrap_or_default();
+
+        // The next resume position, present only while truncated: the greater of the page's last raw
+        // key and its last common prefix — with a delimiter the two interleave, and resuming from the
+        // last *content* key would re-roll a group already emitted (the rule v1 applies to
+        // `NextMarker`). Raw, not projected: the anchor must advance past entries the projection
+        // drops, or a page with no client-visible entry could re-read itself forever.
+        let next_continuation_token = if is_truncated == Some(true) {
+            objs.iter()
+                .next_back()
+                .and_then(|o| o.key())
+                .map(str::to_string)
+                .into_iter()
+                .chain(
+                    prefixes
+                        .iter()
+                        .next_back()
+                        .and_then(|cp| cp.prefix())
+                        .map(str::to_string),
+                )
+                .max()
+                .map(|a| ListToken::new(eff_prefix.clone(), eff_delim.clone(), a).encode())
+        } else {
+            None
+        };
 
         let PageView {
             entries,
@@ -108,8 +266,8 @@ impl Hypha {
             .page_view(
                 &bucket,
                 restoring,
-                input.prefix.as_deref(),
-                input.delimiter.as_deref(),
+                eff_prefix.as_deref(),
+                eff_delim.as_deref(),
                 objs,
                 prefixes,
             )
@@ -120,12 +278,12 @@ impl Hypha {
         let key_count = (entries.len() + common_prefixes.len()) as i32;
         let resp = ListObjectsV2Output {
             name: Some(bucket),
-            prefix: input.prefix,
-            delimiter: input.delimiter,
+            prefix: eff_prefix,
+            delimiter: eff_delim,
             key_count: Some(key_count),
             max_keys,
-            // The backend's key-position token and flag, forwarded verbatim: a short page still
-            // paginates correctly, and a client follows the token until IsTruncated is false.
+            // The backend's truncation flag, forwarded verbatim: a short page still paginates
+            // correctly, and a client follows the cursor until IsTruncated is false.
             is_truncated,
             continuation_token: input.continuation_token,
             next_continuation_token,
@@ -136,9 +294,9 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// LIST v1. The classifier and the forwarded-pagination discipline are v2's verbatim (s3s does
-    /// not translate v1→v2, so it is its own method); only the pagination shell differs —
-    /// `marker` in, `NextMarker` out. Short pages are as valid under v1 as under v2.
+    /// LIST v1. The classifier and the key-anchored pagination discipline are v2's verbatim (s3s does
+    /// not translate v1→v2, so it is its own method); only the pagination shell differs — `marker`
+    /// in, `NextMarker` out. Short pages are as valid under v1 as under v2.
     pub(super) async fn op_list_objects(
         &self,
         req: S3Request<ListObjectsInput>,
