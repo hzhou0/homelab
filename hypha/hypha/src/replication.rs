@@ -38,15 +38,19 @@ impl ReplicationTask {
 
     /// Shutdown interrupts only the wait between idempotent passes; an active pass finishes.
     pub async fn run(self, shutdown: CancellationToken) {
+        // The backpressure counter was seeded once by `Lifecycle::startup`, ahead of the listener;
+        // from here every raise/clear/drain keeps it exact (§7). Each pass only re-publishes the
+        // oldest marker age — it has no atomic source, so it is sampled where the sweep already
+        // enumerates the whole set.
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 () = tokio::time::sleep(self.interval) => {}
             }
             let started = std::time::Instant::now();
-            // The pending count is the pass's own census — the markers it enumerated — so it is the
-            // size of the set *before* this pass drained it (§10).
-            crate::metrics::reconcile_pass(self.pass().await, started.elapsed());
+            let (pending, oldest_age_ms) = self.pass().await;
+            crate::metrics::reconcile_pass(pending, started.elapsed());
+            self.tier.pressure.publish_age(oldest_age_ms);
         }
     }
 
@@ -54,29 +58,37 @@ impl ReplicationTask {
     /// state map, not from listing `<meta>` buckets: a projection can outlive the bucket it belonged
     /// to — a marker write already in flight when a `DeleteBucket` drains it re-creates it on a
     /// backend that creates the bucket a PUT addresses — and reconciling that debris would push its
-    /// markers at a remote bucket that no longer exists. A bucket the map does not call `Ready` has
-    /// no pending set to drain: markers are raised only by cached writes into a ready bucket, and a
-    /// restore rebuilds its namespace with the set empty (§7).
-    async fn pass(&self) -> usize {
+    /// markers at a remote bucket that no longer exists. A bucket the map does not call `Ready` is
+    /// therefore not drained: its markers are either that debris or leftovers a volume-loss restore
+    /// has not yet repriced, and the census counts them only so the counter starts from the truth —
+    /// they are removed by `drained` or by the sweep once the bucket is `Ready` again (§7).
+    async fn pass(&self) -> (usize, u64) {
+        let now = crate::tier::now_ms();
         let mut pending = 0;
+        let mut oldest_age_ms = 0;
         for bucket in self.buckets.ready() {
-            match self.reconcile_bucket(&bucket).await {
-                Ok(seen) => pending += seen,
+            match self.reconcile_bucket(&bucket, now).await {
+                Ok((seen, oldest)) => {
+                    pending += seen;
+                    oldest_age_ms = oldest_age_ms.max(oldest);
+                }
                 Err(e) => {
                     tracing::warn!(bucket, error = %e, "reconcile pass for bucket failed; retrying next pass")
                 }
             }
         }
-        pending
+        (pending, oldest_age_ms)
     }
 
     /// Drain one bucket's pending markers. The flat LIST past the `0x01` block yields only range-C
     /// bare markers; a residual `0x01`-lead key (a boundary miscompare) is filtered defensively so a
-    /// twin can never be mistaken for a marker.
-    async fn reconcile_bucket(&self, bucket: &str) -> Result<usize> {
+    /// twin can never be mistaken for a marker. Also reports the oldest marker's age, sampled at
+    /// enumeration — the pre-drain set, which is the conservative reading for the age gate (§7).
+    async fn reconcile_bucket(&self, bucket: &str, now: i64) -> Result<(usize, u64)> {
         let mut token: Option<String> = None;
         let mut first = true;
         let mut seen = 0;
+        let mut oldest = 0u64;
         loop {
             let page = self
                 .tier
@@ -99,6 +111,9 @@ impl ReplicationTask {
                     let key = o.key?;
                     if key.starts_with(meta::CTRL as char) {
                         return None; // range A/B leaked past the boundary — not a marker
+                    }
+                    if let Some(lm) = o.last_modified.and_then(|t| t.to_millis().ok()) {
+                        oldest = oldest.max((now - lm).max(0) as u64);
                     }
                     let m_etag = o.e_tag.unwrap_or_default().trim_matches('"').to_string();
                     Some((key, m_etag))
@@ -133,7 +148,7 @@ impl ReplicationTask {
                 None => break,
             }
         }
-        Ok(seen)
+        Ok((seen, oldest))
     }
 
     /// Reconcile one pending key under its upload lock (§7). The marker ETag selects the operation
@@ -198,4 +213,75 @@ impl ReplicationTask {
             }
         }
     }
+}
+
+/// Count the pending set and its oldest marker across every client bucket, without draining. The
+/// count seeds the backpressure counter once, at startup, before the listener opens; it is exact
+/// thereafter by raise/clear accounting, so the sweep never re-seeds it (§7).
+///
+/// Buckets come from the remote list — the same authority `resolve_all` classifies from — not from
+/// the state map's ready set, because "markers live only in ready buckets" is not an invariant the
+/// sweep can rely on: the marker actor raises into any non-Absent bucket, so a write admitted before
+/// a volume-loss restore can leave its marker in a bucket the map no longer calls `Ready`.
+pub(crate) async fn census(tier: &Tiering) -> (usize, u64) {
+    let now = crate::tier::now_ms();
+    let mut pending = 0;
+    let mut oldest_age_ms = 0;
+    let buckets = match tier.remote.list_buckets().await {
+        Ok(buckets) => buckets,
+        Err(e) => {
+            tracing::warn!(error = %e, "backpressure census could not list buckets; seeding zero");
+            return (0, 0);
+        }
+    };
+    for (bucket, _) in buckets {
+        match census_bucket(tier, &bucket, now).await {
+            Ok((count, oldest)) => {
+                pending += count;
+                oldest_age_ms = oldest_age_ms.max(oldest);
+            }
+            Err(e) => {
+                tracing::warn!(bucket, error = %e, "backpressure census for bucket failed")
+            }
+        }
+    }
+    (pending, oldest_age_ms)
+}
+
+async fn census_bucket(tier: &Tiering, bucket: &str, now: i64) -> Result<(usize, u64)> {
+    let mut token: Option<String> = None;
+    let mut first = true;
+    let mut seen = 0usize;
+    let mut oldest = 0u64;
+    loop {
+        let page = tier
+            .meta
+            .list(
+                bucket,
+                None,
+                None,
+                token.take(),
+                first.then(meta::marker_scan_start_after),
+                Some(MARKER_PAGE),
+            )
+            .await?;
+        first = false;
+        for o in page.contents.unwrap_or_default() {
+            let Some(key) = o.key else {
+                continue;
+            };
+            if key.starts_with(meta::CTRL as char) {
+                continue; // range A/B leaked past the boundary — not a marker
+            }
+            seen += 1;
+            if let Some(lm) = o.last_modified.and_then(|t| t.to_millis().ok()) {
+                oldest = oldest.max((now - lm).max(0) as u64);
+            }
+        }
+        match page.next_continuation_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+    Ok((seen, oldest))
 }

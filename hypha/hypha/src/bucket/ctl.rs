@@ -776,14 +776,15 @@ impl BucketTask {
         // The commit landed, so the bucket is gone whatever the cache drain fares; the gate rides
         // the entry out with it.
         retire(&self.states, bucket);
-        for (role, backend) in [("data", &self.tier.data), ("meta", &self.tier.meta)] {
-            if let Err(error) = drain_and_delete_if_exists(backend, bucket).await {
-                tracing::warn!(
-                    bucket,
-                    role,
-                    %error,
-                    "deleted bucket projection cleanup failed"
-                );
+        if let Err(error) = drain_and_delete_if_exists(&self.tier.data, bucket).await {
+            tracing::warn!(bucket, role = "data", %error, "deleted bucket projection cleanup failed");
+        }
+        // The meta drain deletes the bucket's pending markers outright; count them back off the
+        // backpressure counter, which their removal never ran through `clear_marker_cas` (§7).
+        match drain_and_delete_if_exists(&self.tier.meta, bucket).await {
+            Ok(drained) => self.tier.pressure.drained(drained),
+            Err(error) => {
+                tracing::warn!(bucket, role = "meta", %error, "deleted bucket projection cleanup failed")
             }
         }
         Ok(())
@@ -898,7 +899,8 @@ impl BucketTask {
     async fn reset_cache(&self, bucket: &str) -> Result<()> {
         update(&self.states, bucket, |s| s.provisioned = false);
         drain_and_delete_if_exists(&self.tier.data, bucket).await?;
-        drain_and_delete_if_exists(&self.tier.meta, bucket).await?;
+        let drained = drain_and_delete_if_exists(&self.tier.meta, bucket).await?;
+        self.tier.pressure.drained(drained);
         self.provision(bucket).await
     }
 
@@ -946,12 +948,13 @@ async fn ensure_cache_bucket(backend: &hypha_core::Backend, bucket: &str) -> Res
     }
 }
 
-async fn drain_and_delete_if_exists(backend: &hypha_core::Backend, bucket: &str) -> Result<()> {
+async fn drain_and_delete_if_exists(backend: &hypha_core::Backend, bucket: &str) -> Result<usize> {
     match backend.head_bucket(bucket).await {
         Ok(()) => {}
-        Err(Error::NoSuchBucket) => return Ok(()),
+        Err(Error::NoSuchBucket) => return Ok(0),
         Err(e) => return Err(e),
     }
+    let mut markers = 0usize;
     loop {
         let page = backend.list(bucket, None, None, None, None, None).await?;
         let keys: Vec<String> = page
@@ -963,6 +966,12 @@ async fn drain_and_delete_if_exists(backend: &hypha_core::Backend, bucket: &str)
         if keys.is_empty() {
             break;
         }
+        // Pending markers are `<meta>`'s bare-K range; a control-byte lead is a twin or MPU record.
+        // Only the `<meta>` caller reads the count back, for the backpressure counter (§7).
+        markers += keys
+            .iter()
+            .filter(|k| !k.starts_with(meta::CTRL as char))
+            .count();
         // Keys go one at a time: `<meta>`'s twin/mpu keys carry the 0x01 control byte the batch
         // DeleteObjects XML body can't represent (§6). Buckets are rare, so the per-key cost is fine.
         let deletes = keys.iter().map(|k| backend.delete(bucket, k));
@@ -972,7 +981,7 @@ async fn drain_and_delete_if_exists(backend: &hypha_core::Backend, bucket: &str)
         }
     }
     match backend.delete_bucket(bucket).await {
-        Ok(()) | Err(Error::NoSuchBucket) => Ok(()),
+        Ok(()) | Err(Error::NoSuchBucket) => Ok(markers),
         Err(e) => Err(e),
     }
 }

@@ -59,6 +59,11 @@ fn describe() {
         "Reconcile transitions to the remote by outcome; a failure is retried on the next pass"
     );
     describe_counter!(
+        "hypha_backpressure_throttled",
+        "Cached writes refused with 503 SlowDown after waiting out the reconcile backpressure \
+         timeout (§7)"
+    );
+    describe_counter!(
         "hypha_gc_reclaimed_bytes_total",
         "Bytes GC reclaimed, by whether they cost a client anything (§8: debris is free, eviction \
          is paid back as rehydration latency)"
@@ -104,6 +109,10 @@ pub(crate) fn remote_upload(failed: bool, elapsed: Duration) {
     let outcome = if failed { "error" } else { "ok" };
     counter!("hypha_remote_uploads_total", "outcome" => outcome).increment(1);
     histogram!("hypha_remote_upload_seconds").record(elapsed.as_secs_f64());
+}
+
+pub(crate) fn backpressure_throttled() {
+    counter!("hypha_backpressure_throttled").increment(1);
 }
 
 pub(crate) fn markers_owed(owed: usize) {

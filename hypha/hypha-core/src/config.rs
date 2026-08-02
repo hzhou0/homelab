@@ -76,6 +76,10 @@ pub struct Reconcile {
     pub interval_ms: u64,
     #[serde(default = "default_reconcile_concurrency")]
     pub concurrency: usize,
+    /// Cached-write admission gate driven by the pending-marker set (§7). `0` disables a dimension;
+    /// with both at `0` the gate is off entirely.
+    #[serde(default)]
+    pub backpressure: Backpressure,
 }
 
 fn default_reconcile_interval_ms() -> u64 {
@@ -90,8 +94,26 @@ impl Default for Reconcile {
         Reconcile {
             interval_ms: default_reconcile_interval_ms(),
             concurrency: default_reconcile_concurrency(),
+            backpressure: Backpressure::default(),
         }
     }
+}
+
+/// Backpressure on cached writes (§7). Once the pending set crosses a configured size or the oldest
+/// pending marker crosses a configured age, cached-mode PUT/DELETE/copy are refused outright with
+/// `503 SlowDown` (S3-idiomatic; SDKs retry with backoff) instead of acking writes the remote will
+/// keep falling behind.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Backpressure {
+    /// Cached writes are refused while the pending set holds more than this many markers. `0`
+    /// (default) disables the count gate.
+    #[serde(default)]
+    pub max_pending: usize,
+    /// Cached writes are refused while the oldest pending marker is older than this many
+    /// milliseconds. `0` (default) disables the age gate.
+    #[serde(default)]
+    pub max_age_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

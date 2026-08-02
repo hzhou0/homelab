@@ -177,6 +177,27 @@ async fn overwrite_during_reconcile_preserves_the_newer_marker() {
         .to_string();
 
     put(&h.client(), B, key, &v2).await;
+    // The replacement marker is handed to the marker actor after the commit's ack (§7), so its
+    // presence is never synchronous with the put — and an overwrite's create-only raise now costs an
+    // extra round-trip, widening the window. Wait for the replacement rather than head immediately.
+    wait_until(5_000, "the replacement marker to land", || {
+        let h = &h;
+        let old = &old_marker_etag;
+        async move {
+            match h
+                .raw()
+                .head_object()
+                .bucket(h.meta_bucket(B))
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(o) => o.e_tag().is_some_and(|t| t != old.as_str()),
+                Err(_) => false,
+            }
+        }
+    })
+    .await;
     let new_marker_etag = h
         .raw()
         .head_object()
@@ -304,6 +325,77 @@ async fn a_cached_bucket_deletes_before_its_deletes_have_propagated() {
         );
     }
     h.stop_hypha().await;
+}
+
+/// The reconcile backpressure gate (§7) refuses cached writes once the pending set is past
+/// `max_pending`. A write admitted at the threshold is what pushes the queue over it; the next one
+/// is refused immediately with `503 SlowDown` and nothing committed — and once the sweep drains, the
+/// gate reopens and the same write lands.
+#[tokio::test]
+async fn backpressure_refuses_cached_writes_past_max_pending() {
+    let mut h = Harness::builder(Mode::Cached)
+        .tune(|c| {
+            // Hold the sweep off so the queue stays over the limit and the gate has something to
+            // actually refuse — a drain mid-refusal would reopen the gate and the test would pass by
+            // outrunning the pressure.
+            c.reconcile.interval_ms = 600_000;
+            c.reconcile.backpressure.max_pending = 1;
+        })
+        .start()
+        .await;
+    h.create_bucket(B).await;
+    let c = h.client();
+
+    put(&c, B, "one", b"one").await;
+    wait_until(5_000, "the first marker to land", || async {
+        marker_present(&h, B, "one").await
+    })
+    .await;
+    put(&c, B, "two", b"two").await;
+    wait_until(5_000, "the second marker to land", || async {
+        marker_present(&h, B, "two").await
+    })
+    .await;
+
+    // Pending is now 2, over the limit of 1: the gate refuses the request outright, and the SDK
+    // surfaces SlowDown. The admission happens before the cache write (§7), so nothing commits.
+    let refused = c
+        .put_object()
+        .bucket(B)
+        .key("three")
+        .body(bytes_body(b"three"))
+        .content_length(5)
+        .send()
+        .await;
+    assert_eq!(
+        sdk_err_code(&refused.unwrap_err()).as_deref(),
+        Some("SlowDown"),
+        "a pending set over the limit must refuse cached writes"
+    );
+    assert!(
+        !raw_exists(&h, &h.cache_bucket(B), "three").await,
+        "the refused write must not be committed"
+    );
+    assert!(
+        !marker_present(&h, B, "three").await,
+        "the refused write must not raise a marker"
+    );
+
+    // Un-pause the sweep: it drains the queue, the gate reopens, and the refused write lands.
+    h.config.reconcile.interval_ms = 100;
+    h.stop_hypha().await;
+    h.start_hypha().await;
+    h.await_ready().await;
+    let c = h.client();
+    wait_until(8_000, "the sweep to drain the pending queue", || async {
+        remote_present(&h, B, "one").await && !marker_present(&h, B, "one").await
+    })
+    .await;
+    put(&c, B, "three", b"three").await;
+    wait_until(8_000, "the unblocked write to reach the remote", || async {
+        remote_present(&h, B, "three").await && !marker_present(&h, B, "three").await
+    })
+    .await;
 }
 
 /// A cached delete removes K immediately, including from delimiter grouping, and the reconcile

@@ -292,6 +292,17 @@ retried. `reconcile.concurrency` bounds uploads in flight, and each runs on its 
 codecs encrypt on whichever task drives them, so a pass that multiplexed its uploads onto one task
 would run the whole sweep's encryption on a single core.
 
+`reconcile.backpressure` bounds the async lag window: once the pending set crosses
+`max_pending` markers, or the oldest pending marker crosses `max_age_ms`, cached PUT/DELETE/copy
+are refused immediately with `503 SlowDown` (SDKs retry with backoff) instead of acking writes the
+remote will keep falling behind. The counter is seeded once at startup, before the listener opens,
+by a full census of every bucket's pending markers, and is exact thereafter: a marker counts once
+when raised (create-only, so an overwrite never double-counts), once when the sweep's CAS actually
+removes it, and wholesale when `DeleteBucket` drains a `<meta>` projection. Both thresholds at `0`
+disable the gate. The age is sampled where the sweep already enumerates the pending set; the census
+lives in the reconcile domain but runs from `Lifecycle::startup` because a one-time seed races
+bucket classification — and an under-counted seed would turn the sweep's clears negative.
+
 Cached tombstone reads are served immediately from the remote. Rehydrate submission is non-blocking
 and deduplicated; a bounded worker pool warms the cache for later reads. A client write cancels a
 same-key rehydrate before waiting for the write lock.
@@ -348,6 +359,8 @@ Optional settings and defaults:
 | `serving.admin_listen` | `0.0.0.0:9014` |
 | `reconcile.interval_ms` | 5,000 |
 | `reconcile.concurrency` | 16 |
+| `reconcile.backpressure.max_pending` | 0 (off) |
+| `reconcile.backpressure.max_age_ms` | 0 (off) |
 | `background.concurrency` | 4 |
 | `background.queue_depth` | 256 |
 | `volume_watch_interval_ms` | 30,000 |
@@ -396,7 +409,7 @@ The separate unauthenticated admin listener serves:
 - `/healthz`: process liveness;
 - `/readyz`: startup/drain state plus a live remote reachability check;
 - `/metrics`: Prometheus metrics for S3 traffic, cache hits, markers, reconciliation, uploads, GC,
-  cache usage, water marks, and shutdown accounting.
+  cache usage, water marks, backpressure throttling, and shutdown accounting.
 
 ## Verification
 

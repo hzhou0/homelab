@@ -13,6 +13,7 @@ mod halt;
 mod keylocks;
 mod markers;
 pub mod metrics;
+mod pressure;
 mod replication;
 mod s3;
 mod sealq;
@@ -65,6 +66,9 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle), Bo
         mpu_part_locks: keylocks::KeyLocks::default(),
         cached: config.mode == Mode::Cached,
         halt,
+        pressure: std::sync::Arc::new(crate::pressure::Pressure::new(
+            &config.reconcile.backpressure,
+        )),
     };
 
     // Cancelled at the start of the actor-quiescence phase. It exists because two of the actors
@@ -214,6 +218,13 @@ impl Lifecycle {
 
     pub async fn startup(&mut self) -> Result<(), BoxError> {
         self.sweeps = bucket::resolve_all(&self.tier, &self.buckets).await?;
+        // Seed the backpressure counter from a full pending-set census before the listener opens,
+        // while no marker can move underneath it (§7). The sweep seeds nothing itself: from here the
+        // count is exact by raise/clear accounting.
+        if self.tier.pressure.enabled() {
+            let (pending, oldest_age_ms) = replication::census(&self.tier).await;
+            self.tier.pressure.publish(pending, oldest_age_ms);
+        }
         self.health.started();
         Ok(())
     }

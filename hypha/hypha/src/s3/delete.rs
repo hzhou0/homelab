@@ -32,6 +32,10 @@ impl Hypha {
 
         let (_gate, mode) = self.prepare_write(&bucket, &key).await?;
         if let WriteMode::Cached = mode {
+            // Admission gate (§7) — see `op_put_object_cached`.
+            if !self.tier.pressure.admit() {
+                return Err(Error::SlowDown.into());
+            }
             self.commit_cached_delete(&bucket, &key).await?;
             return Ok(S3Response::new(DeleteObjectOutput::default()));
         }
@@ -150,6 +154,10 @@ impl Hypha {
         quiet: bool,
         requested: Vec<String>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        // Admission gate (§7), once per request rather than per key — see `op_put_object_cached`.
+        if !self.tier.pressure.admit() {
+            return Err(Error::SlowDown.into());
+        }
         let mut failed: HashMap<String, BatchDeleteError> = HashMap::new();
 
         let keys = self.admitted_keys(&bucket, &requested, &mut failed).await?;

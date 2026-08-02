@@ -288,6 +288,13 @@ Every write is mirrored to the remote as it happens, so the encrypted remote is 
 a periodic snapshot — always current to within the async upload lag, which is what lets the cache run
 with no local redundancy and supersedes the old nightly `rclone crypt` sync.
 
+Backpressure bounds that lag window. Once the pending set crosses a configured size (`max_pending`), or
+the oldest pending marker crosses a configured age (`max_age_ms`), cached-mode writes are refused
+immediately with `503 SlowDown` — which SDKs retry with backoff — instead of acking writes the mirror
+will keep falling behind. The pending count is seeded once at startup by a full census and maintained
+exactly since: create-only marker raises count a key once (an overwrite replaces, never adds), the
+sweep's CAS clear removes it, and a bucket delete drains its whole projection wholesale.
+
 Clients that cannot tolerate the async-lag window use a **durable deployment** (see *Two modes*),
 whose writes ack only after the remote confirms.
 

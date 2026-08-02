@@ -91,6 +91,10 @@ impl Hypha {
         if source_live {
             return match write_mode {
                 WriteMode::Cached => {
+                    // Admission gate (§7) — see `op_put_object_cached`.
+                    if !self.tier.pressure.admit() {
+                        return Err(Error::SlowDown.into());
+                    }
                     self.commit_cached_copy(
                         &bucket,
                         &key,

@@ -204,6 +204,11 @@ impl Hypha {
         bucket: String,
         key: String,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        // Admission gate (§7): acking a write the sweep cannot keep up with only widens the async
+        // lag window, so refuse outright rather than contribute to it. The SDK retries the 503.
+        if !self.tier.pressure.admit() {
+            return Err(Error::SlowDown.into());
+        }
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
         // Validate the digest shape up front (bad base64/length ⇒ InvalidDigest), then forward the
         // raw header to the cache, which validates it against the body atomically.

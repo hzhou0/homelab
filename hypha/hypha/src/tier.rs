@@ -50,6 +50,8 @@ pub struct Tiering {
     /// has no pending set at all.
     pub cached: bool,
     pub(crate) halt: Halt,
+    /// The cached-write backpressure gate (§7). Inert in durable mode, which has no pending set.
+    pub(crate) pressure: std::sync::Arc<crate::pressure::Pressure>,
 }
 
 /// What one reconcile upload attempt found at K (§7). Only a real upload completes a PUT marker.
@@ -228,12 +230,18 @@ impl Tiering {
     ///
     /// The body encodes an upload or DELETE operation; the marker object's own ETag is its branch
     /// discriminator and completion CAS.
+    ///
+    /// Create-only first, so the key is counted once toward backpressure (§7): an overwrite is a
+    /// replacement, not a new pending obligation.
     pub(crate) async fn raise_marker(
         &self,
         bucket: &str,
         key: &str,
         marker_body: &str,
     ) -> Result<()> {
+        if self.raise_marker_if_absent(bucket, key, marker_body).await? {
+            return Ok(());
+        }
         self.meta
             .put_small(
                 bucket,
@@ -257,6 +265,9 @@ impl Tiering {
     /// — a delete that never propagates and resurrects on the next restore. Whatever marker is
     /// already there was written by the operation that owns it, which is by definition the newer
     /// judgement.
+    ///
+    /// Counts the created marker toward backpressure; a `false` is an existing marker the key is
+    /// already counted for (§7).
     pub(crate) async fn raise_marker_if_absent(
         &self,
         bucket: &str,
@@ -275,7 +286,10 @@ impl Tiering {
             )
             .await
         {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                self.pressure.raised();
+                Ok(true)
+            }
             Err(Error::PreconditionFailed) => Ok(false),
             Err(e) => Err(e),
         }
@@ -477,6 +491,7 @@ impl Tiering {
 
     /// Clear the pending marker at bare `K`, conditional on its `M_etag` (§7). A newer operation
     /// rewrites the marker, so a 412 leaves that obligation for the next pass. A 404 is equally fine.
+    /// Counts the removed marker against backpressure only when the CAS actually removed it (§7).
     pub(crate) async fn clear_marker_cas(
         &self,
         bucket: &str,
@@ -488,7 +503,11 @@ impl Tiering {
             .delete_if_match(bucket, meta::pending_marker_key(key), quote(m_etag))
             .await
         {
-            Ok(()) | Err(Error::PreconditionFailed) | Err(Error::NotFound) => Ok(()),
+            Ok(()) => {
+                self.pressure.cleared();
+                Ok(())
+            }
+            Err(Error::PreconditionFailed) | Err(Error::NotFound) => Ok(()),
             Err(e) => Err(e),
         }
     }

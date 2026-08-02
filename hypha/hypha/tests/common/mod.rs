@@ -27,7 +27,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use hypha_core::config::{
-    Background, ClientAuth, Config, Gc, Mode, Recency, Reconcile, S3Endpoint, Serving, Usage,
+    Backpressure, Background, ClientAuth, Config, Gc, Mode, Recency, Reconcile, S3Endpoint, Serving,
+    Usage,
     DATA_ROLE, META_ROLE, REMOTE_ROLE,
 };
 
@@ -1481,6 +1482,7 @@ fn base_config(cache: &TestS3, remote: &TestS3, mode: Mode) -> Config {
         reconcile: Reconcile {
             interval_ms: 150,
             concurrency: 8,
+            backpressure: Backpressure::default(),
         },
         background: Background::default(),
         // Tight for the same reason as the reconcile cadence: a test asserting a reclaim shouldn't
