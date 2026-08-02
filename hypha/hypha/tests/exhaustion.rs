@@ -52,7 +52,7 @@ fn point_at(role: &mut hypha_core::config::S3Endpoint, endpoint: String) {
 /// Consume the store's spare capacity through a bucket hypha cannot see.
 ///
 /// Ballast rather than client traffic: the name carries no `bucket_prefix`, and `list_buckets`
-/// filters by that (§9), so hypha neither resolves it at startup nor trips **I5** on it.
+/// filters by that , so hypha neither resolves it at startup nor trips **I5** on it.
 ///
 /// This alone does **not** make hypha's next write fail. SeaweedFS allocates volumes per collection,
 /// so what runs out here is the store's ability to allocate a *new* one — a bucket that already has
@@ -125,7 +125,7 @@ async fn fill_through(c: &aws_sdk_s3::Client, bucket: &str) -> (Vec<(String, Vec
 }
 
 /// Which of `written`'s keys still carry a pending marker — the obligations the sweep has not
-/// discharged (§6).
+/// discharged .
 async fn owed(h: &Harness, written: &[(String, Vec<u8>)]) -> Vec<String> {
     let mut owed = Vec::new();
     for (key, _) in written {
@@ -146,7 +146,7 @@ async fn reached_remote_key(remote: &aws_sdk_s3::Client, bucket: &str, key: &str
         .is_ok()
 }
 
-/// An invariant violation is recorded on the remote before the process exits (§7), so its absence is
+/// An invariant violation is recorded on the remote before the process exits , so its absence is
 /// the check that a full store was handled as an error rather than mistaken for corruption.
 async fn halted(h: &Harness, remote: &aws_sdk_s3::Client) -> bool {
     remote
@@ -174,7 +174,7 @@ where
 
 /// **Durable mode, full remote.** The remote is the commit point, so nothing can be written at all —
 /// and the object already committed there must come through untouched, including across a failed
-/// overwrite of its own key. That last part is the §7 bracket's whole contract stated against a real
+/// overwrite of its own key. That last part is the bracket's whole contract stated against a real
 /// failure: mark → commit → settle, where a commit that never happens leaves the old object whole.
 ///
 /// Runs as the shipped binary so "did not panic" is a real check: the process has to still be there,
@@ -317,7 +317,7 @@ async fn a_full_remote_refuses_durable_writes_and_keeps_what_it_committed() {
 /// the bytes stay readable from the cache across a restart the remote is no better after.
 ///
 /// It also pins the distinction a full store makes easy to get wrong. The run still ends **clean**:
-/// the clean marker says the pending-marker range is a *complete account* of the pending set (§6),
+/// the clean marker says the pending-marker range is a *complete account* of the pending set ,
 /// not that the set is empty. Every marker here was written — to the healthy cache — so the account
 /// is complete, and what is outstanding is the upload, which is what a pending set is for.
 #[tokio::test]
@@ -402,7 +402,7 @@ async fn a_full_remote_still_acks_cached_writes_and_carries_the_obligation() {
     );
 
     // A graceful drain still ends **clean**, and that is the distinction worth pinning: the clean
-    // marker says the pending-marker range is a *complete* account of the pending set (§6), not that
+    // marker says the pending-marker range is a *complete* account of the pending set , not that
     // the set is empty. Every marker here was written — to the healthy cache — so the account is
     // complete; what is outstanding is the upload, which is the pending set's whole purpose.
     h.stop_hypha().await;

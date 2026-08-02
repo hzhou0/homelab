@@ -89,7 +89,7 @@ async fn pressure_evicts_a_cold_body_and_the_next_read_rehydrates_it() {
     .await;
 
     // The key is unchanged as far as a client can tell: same length, same ETag, and the tombstone's
-    // facts are what answer for it (§6).
+    // facts are what answer for it .
     let head = c
         .head_object()
         .bucket(B)
@@ -356,7 +356,7 @@ async fn sustained_writes_under_eviction_never_serve_bytes_that_disagree_with_th
 /// pass that takes the one displaced out of the ring.
 ///
 /// The filler writes are how a key is made cold without waiting: recency is denominated in competing
-/// traffic (§8), so 80 distinct keys past a 16-key fill target displace anything older by more than
+/// traffic , so 80 distinct keys past a 16-key fill target displace anything older by more than
 /// the ring's depth. Keys are named to sort *after* every filler so a probe from any position covers
 /// them — a random position that lands past the whole keyspace is the only one that wraps.
 #[tokio::test]
@@ -434,7 +434,7 @@ async fn durable_mode_evicts_nothing_under_pressure() {
     );
 }
 
-/// The accounting gate (§8), which is the second lock on the same door as gate 2: until this run has
+/// The accounting gate , which is the second lock on the same door as gate 2: until this run has
 /// rebuilt a bucket's pending set, the marker range on disk is known incomplete, and a scavenger
 /// reading it as exhaustive is the one way an acked write is lost. So a bucket whose rebuild has not
 /// finished is not evictable however cold its bodies are.
@@ -497,7 +497,7 @@ async fn a_bucket_whose_pending_set_is_unaccounted_is_not_evicted_from() {
 
 /// Phase 5's second exit criterion, end to end: the cache volume goes, the namespace is restored from
 /// the remote as tombstones, and reads rehydrate off them — then pressure evicts the rehydrated body
-/// again and the cycle closes. The restore leaves the pending set empty by construction (§7), which is
+/// again and the cycle closes. The restore leaves the pending set empty by construction , which is
 /// asserted here because it is also what makes those bodies immediately evictable.
 #[tokio::test]
 async fn a_cache_wipe_restores_the_namespace_and_reads_rehydrate_off_it() {
@@ -520,7 +520,7 @@ async fn a_cache_wipe_restores_the_namespace_and_reads_rehydrate_off_it() {
     h.start_hypha().await;
     let c = h.client();
 
-    // The bucket serves from the remote for the whole window (§7's restore overlay); `w/1` takes that
+    // The bucket serves from the remote for the whole window (restore overlay); `w/1` takes that
     // read, and the assertions about what the restore *rebuilt* are taken on the two keys nothing has
     // read — a read landing after the flip rehydrates, so reading a key is not compatible with
     // asserting it is still a tombstone.
@@ -586,7 +586,7 @@ async fn gauge(h: &Harness, name: &str) -> Option<f64> {
         .find_map(|line| line.strip_prefix(name)?.trim().parse::<f64>().ok())
 }
 
-/// §8's escalation order, against a target the deployment cannot meet: every completed pass moves one
+/// The escalation order, against a target the deployment cannot meet: every completed pass moves one
 /// rung, and the cheap rungs — interval, then concurrency — are spent before the age threshold, which
 /// is the only one whose cost is paid by a client. Then usage drops below the low-water mark and the
 /// ladder returns to base in a single step, because a ratchet here would leave a deployment evicting

@@ -18,7 +18,7 @@ impl GcStore {
     }
 
     /// Created here rather than by the bucket-control actor: that actor owns *client* bucket
-    /// lifecycle (§7), and this bucket has none — it exists for the life of the deployment.
+    /// lifecycle , and this bucket has none — it exists for the life of the deployment.
     pub(super) async fn ensure(&self) -> Result<()> {
         match self.backend.head_bucket(&self.bucket).await {
             Ok(()) => Ok(()),

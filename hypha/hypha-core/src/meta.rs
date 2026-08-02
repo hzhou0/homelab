@@ -6,16 +6,16 @@
 /// User-metadata key names on cache objects. The SDK adds the `x-amz-meta-` prefix on the wire.
 pub const PLEN: &str = "plen";
 pub const CETAG: &str = "cetag";
-/// Marks a cache object as a tombstone — body is remote-only (§8). Value is the tombstone kind.
+/// Marks a cache object as a tombstone — body is remote-only . Value is the tombstone kind.
 pub const TOMB: &str = "tomb";
 /// Original client-write mtime (unix ms) on a tombstone — eviction must not move a key's
-/// client-visible LastModified (§6).
+/// client-visible LastModified .
 pub const MTIME: &str = "mtime";
-/// Echoed storage class (§7). hypha has one physical tier, so the class is a label the write path
+/// Echoed storage class . hypha has one physical tier, so the class is a label the write path
 /// records and the read path replays; absent ⇒ [`STANDARD`].
 pub const SCLASS: &str = "sc";
 /// Client `Content-Type`. Unlike the rest of the pass-through it is *also* written to the remote
-/// object natively (§6, *Remote objects*), so it is the one client value a restore recovers.
+/// object natively (*Remote objects*), so it is the one client value a restore recovers.
 pub const CTYPE: &str = "ct";
 
 pub const STANDARD: &str = "STANDARD";
@@ -24,7 +24,7 @@ pub const TOMB_EVICT: &str = "evict";
 pub const TOMB_TRANSIT: &str = "transit";
 
 /// Fixed 16-byte tombstone bodies, compiled in, so a LIST classifies every internal data entry from
-/// its (size, ETag) pair without a metadata read (§6).
+/// its (size, ETag) pair without a metadata read .
 pub const EVICT_SENTINEL: [u8; 16] = [
     0xe4, 0x80, 0xae, 0x85, 0xd6, 0xe7, 0x58, 0x9c, 0x7e, 0x07, 0xb5, 0xa5, 0xac, 0x39, 0x37, 0xaa,
 ];
@@ -60,14 +60,14 @@ impl TombKind {
     }
 
     /// The sentinel's constant cache ETag — LIST's classification token and the `If-Match` CAS
-    /// token eviction/rehydrate use (§6, §8).
+    /// token eviction/rehydrate use .
     pub fn sentinel_etag(self) -> String {
         use md5::{Digest, Md5};
         hex::encode(Md5::digest(self.sentinel()))
     }
 }
 
-/// Whether `body` equals a reserved internal sentinel (§6). Evict/transition values would spoof the
+/// Whether `body` equals a reserved internal sentinel . Evict/transition values would spoof the
 /// data classifier; the DELETE value would spoof the marker operation discriminator.
 pub fn is_reserved_sentinel(body: &[u8]) -> bool {
     body.len() == 16
@@ -76,7 +76,7 @@ pub fn is_reserved_sentinel(body: &[u8]) -> bool {
             .any(|s| s.as_slice() == body)
 }
 
-/// Classify a cache LIST entry from its (size, ETag) pair alone (§6). `None` ⇒ a live body.
+/// Classify a cache LIST entry from its (size, ETag) pair alone . `None` ⇒ a live body.
 pub fn classify_entry(size: i64, etag: &str) -> Option<TombKind> {
     if size != 16 {
         return None;
@@ -197,7 +197,7 @@ pub fn storage_class(metadata: &std::collections::HashMap<String, String>) -> St
 //   0x01 <K> 0x01 <facts>   range B: facts twins. K's first byte is >= 0x02 (admission), so the
 //                                    single 0x01 lead can never collide with range A's doubled one.
 //   <K>                     range C: pending markers, **bare** — zero overhead, so every
-//                                    admissible key has one (a marker is a durability signal, §6).
+//                                    admissible key has one (a marker is a durability signal).
 //
 // This ordering lets reconcile enumerate only pending markers with one start-after boundary.
 
@@ -243,7 +243,7 @@ pub fn clean_marker_key() -> String {
 }
 
 /// The `0x01 0x01 m <upload-id> 0x01` prefix every record of one upload shares — a range-A prefix
-/// scan yields the whole set, and a range delete sweeps it (§7).
+/// scan yields the whole set, and a range delete sweeps it .
 fn mpu_range(upload_id: &str) -> String {
     format!("{c}{c}{TAG_MPU}{upload_id}{c}", c = CTRL as char)
 }
@@ -263,13 +263,13 @@ pub fn mpu_scan_prefix() -> String {
     format!("{c}{c}{TAG_MPU}", c = CTRL as char)
 }
 
-/// A retired recency slice in **GC's own bucket** (§8) — not `<meta><b>`, since the ring is global.
+/// A retired recency slice in **GC's own bucket**  — not `<meta><b>`, since the ring is global.
 /// Nothing client-facing shares that bucket, so these keys need none of the control-byte machinery
 /// the `<meta>` ranges are built from.
 ///
 /// Zero-padded hex so the listing's lexicographic order **is** seal order — the whole of what a
 /// reload needs to rebuild the ring newest-first, and the reason the sequence is a counter rather
-/// than a timestamp (§8 keeps wall clock out of the mechanism; naming it would invite reading age
+/// than a timestamp (keeps wall clock out of the mechanism; naming it would invite reading age
 /// off the key).
 pub fn recency_slice_key(seq: u64) -> String {
     format!("{RECENCY_PREFIX}{seq:016x}")
@@ -304,7 +304,7 @@ pub struct MpuPart<'a> {
 }
 
 /// Cache (`<meta>`): per-part record for a multipart upload, its facts encoded **in the key** so
-/// complete recovers them with one LIST and no per-part HEAD (§7). A re-uploaded part writes a
+/// complete recovers them with one LIST and no per-part HEAD . A re-uploaded part writes a
 /// *new* key, and the stale one is resolved away at complete by the remote's `ListParts`. `retag`
 /// and `pmd5` are hex and `stash_nonce` is base64url, so none contain `;` or a control byte and the
 /// `;`-delimited form is unambiguous; the zero-padded number keeps LIST order and lets
@@ -345,7 +345,7 @@ pub fn parse_mpu_part(key: &str) -> Option<MpuPart<'_>> {
 /// 5 MiB part minimum (which any S3 backend permits only as the upload's *final* part), or part
 /// [`MAX_CLIENT_PART`] (which no number can follow). Either way such a part, if committed, is the
 /// object's tail, so it is the one that must carry the terminating trailer; complete re-uploads it
-/// as `part ‖ trailer` (§7) and needs the ciphertext back to do so, because an in-progress part
+/// as `part ‖ trailer`  and needs the ciphertext back to do so, because an in-progress part
 /// isn't readable.
 ///
 /// Keyed by a **nonce** rather than the part's `retag`: this write is fed by a split of the very
@@ -366,7 +366,7 @@ pub const MAX_CLIENT_PART: i32 = 10_000;
 /// Two conditions, one meaning: S3 exempts only the last part from the 5 MiB minimum, and nothing
 /// follows part [`MAX_CLIENT_PART`]. This single predicate drives both decisions that must agree —
 /// UploadPart retains such a part's ciphertext ([`mpu_stash_key`]), and complete folds the trailer
-/// into it instead of appending a trailer part of its own (§7).
+/// into it instead of appending a trailer part of its own .
 pub fn admits_no_successor(part_number: i32, ct_len: u64, min_remote_part: u64) -> bool {
     ct_len < min_remote_part || part_number >= MAX_CLIENT_PART
 }
@@ -375,7 +375,7 @@ pub fn mpu_prefix(upload_id: &str) -> String {
     mpu_range(upload_id)
 }
 
-/// Cache (`<meta>`): a rehydrated composite's plaintext (cached mode, §6). Range-A tag `b`, keyed by
+/// Cache (`<meta>`): a rehydrated composite's plaintext (cached mode). Range-A tag `b`, keyed by
 /// the **whole** SHA-256 of K rather than by K — the access pattern is a point lookup, so the key can
 /// be a digest, which lifts every length condition K would otherwise impose.
 ///
@@ -401,7 +401,7 @@ pub fn shadow_scan_prefix() -> String {
 }
 
 /// Metadata key on a shadow body carrying **K itself** — the back-pointer the digest key cannot
-/// provide (§8). Only the orphan backstop reads it: a shadow whose K no longer names this generation
+/// provide . Only the orphan backstop reads it: a shadow whose K no longer names this generation
 /// is unreachable and unrankable, and there is no other way to ask K about it.
 ///
 /// base64url of K's raw bytes rather than the percent-encoding the client passthrough uses. The
@@ -425,7 +425,7 @@ pub fn decode_shadow_client_key(encoded: &str) -> Option<String> {
     validate_client_key(&key).ok().map(|()| key)
 }
 
-/// Cache (`<meta><b>`): the shadow-clean marker (§8). Present iff no shadow body in this bucket has
+/// Cache (`<meta><b>`): the shadow-clean marker . Present iff no shadow body in this bucket has
 /// been orphaned without being reclaimed — the same positive-evidence discipline as the pending set's
 /// clean marker ([`clean_marker_key`]), and deliberately a *separate* marker rather than a second
 /// meaning bolted onto that one: a failed shadow reclaim is a handful of leaked bytes, and folding it
@@ -444,7 +444,7 @@ pub fn pending_marker_key(key: &str) -> &str {
     key
 }
 
-/// `start_after` for the reconcile sweep's flat marker LIST (§7): a value above every range-A/B key
+/// `start_after` for the reconcile sweep's flat marker LIST : a value above every range-A/B key
 /// (all lead with `0x01`) yet below every range-C bare marker (client keys, whose first byte is
 /// ≥ `0x02` by admission), so one LIST past it enumerates only markers — `O(pending)`, never
 /// `O(evicted)`. It leads with `0x01` (hence below all client keys) then the maximum code point
@@ -466,7 +466,7 @@ pub fn marker_scan_start_after() -> String {
 // **order-isomorphic to the client keyspace**: for `A < B`, if `A` is a proper prefix of `B` the
 // twins diverge where `twin(A)` holds `0x01` and `twin(B)` a byte >= 0x02, so `twin(A) < twin(B)`;
 // otherwise they diverge on a shared byte. LIST therefore pairs twins to keys by a **merge join**
-// over the client (`<data>`) cursor and this twin cursor, matched by base-key equality (§7) — not
+// over the client (`<data>`) cursor and this twin cursor, matched by base-key equality  — not
 // by adjacency, since the twins no longer sit beside their keys.
 //
 // A twin applies **iff K's own entry classifies as an eviction tombstone** — against anything else
@@ -477,7 +477,7 @@ pub fn marker_scan_start_after() -> String {
 // a fixed 39-char field (below), so a twin is `2 + 39 = 41` bytes longer than its base key. A key
 // longer than [`TWIN_MAX_KEY_LEN`] therefore gets **no** twin ([`Facts::twin_key`] returns `None`),
 // and its eviction tombstone resolves through the per-key HEAD fallback LIST already runs for a
-// genuinely-missing twin (§6): the tombstone metadata is the authoritative copy, the twin only its
+// genuinely-missing twin : the tombstone metadata is the authoritative copy, the twin only its
 // LIST projection, so a missing one costs a round trip and never correctness.
 
 /// Longest base key that still gets a twin: `1024 − 2·|CTRL| − |facts|`. Above it, twins degrade to
@@ -489,7 +489,7 @@ pub const TWIN_MAX_KEY_LEN: usize = 1024 - 2 - FACTS_CHARS;
 /// bits fits 29 bytes, base64url-unpadded → 39 chars, fixed width. base64url because every char is
 /// RFC 3986-unreserved — a twin key never needs percent-encoding or XML escaping, and the historic
 /// hazards are absent by construction: `/` (a twin would roll up under a delimiter listing and
-/// vanish from the twin cursor, §7), the `+`/space pair (form-style decoders turn `+` into a
+/// vanish from the twin cursor), the `+`/space pair (form-style decoders turn `+` into a
 /// space, and a literal space round-trips through the `encoding-type=url` LIST as `+` on some
 /// backends), and `\`/`.` — MinIO splits path components on `\` as well as `/` and rejects any
 /// `.`/`..` segment (`XMinioInvalidResourceName`), so either char in the pseudo-random facts made
@@ -600,7 +600,7 @@ pub fn parse_twin(full_key: &str) -> Option<(&str, Facts)> {
 }
 
 /// The raw digest half of the composite ETag: `md5(md5₀‖…‖md5ₙ)` over the ordered per-part
-/// plaintext MD5s (§6) — what the object footer stores; the `-N` rides its `count` field.
+/// plaintext MD5s  — what the object footer stores; the `-N` rides its `count` field.
 pub fn composite_md5(part_md5s_hex: &[String]) -> Option<[u8; 16]> {
     use md5::{Digest, Md5};
     if part_md5s_hex.is_empty() {
@@ -613,7 +613,7 @@ pub fn composite_md5(part_md5s_hex: &[String]) -> Option<[u8; 16]> {
     Some(hasher.finalize().into())
 }
 
-/// The S3-correct composite ETag `md5(md5₀‖…‖md5ₙ)-N` (§6). hypha composes this at
+/// The S3-correct composite ETag `md5(md5₀‖…‖md5ₙ)-N` . hypha composes this at
 /// `CompleteMultipartUpload` — parts route around the cache, so nothing else can produce it.
 pub fn composite_etag(part_md5s_hex: &[String]) -> Option<String> {
     Some(format!(
@@ -627,7 +627,7 @@ pub const MAX_KEY_LEN: usize = 1024;
 
 pub const S3_MAX_BUCKET_NAME: usize = 63;
 
-/// Key admission (§6): S3's own 1024-byte cap plus the one structural rule the `<meta>` ranges rest
+/// Key admission : S3's own 1024-byte cap plus the one structural rule the `<meta>` ranges rest
 /// on — no `0x00` or `0x01`. Those two bytes build every `<meta>` range, and both sort at or below
 /// the twin separator, so either in a client key could fall inside the twin range. Every other byte,
 /// control chars included, is permitted: LIST rides `encoding-type=url` (`Backend::list`), so any
@@ -656,7 +656,7 @@ pub fn validate_bucket_name(name: &str, max_prefix_len: usize) -> Result<(), Str
 mod tests {
     use super::*;
 
-    /// The remote bucket is client keyspace *plus* the halt marker (§6), and every key that gets
+    /// The remote bucket is client keyspace *plus* the halt marker , and every key that gets
     /// past this filter goes to a trailer read — so the test that matters is that the filter is
     /// exactly the control byte no client key may carry, not a name match on the marker.
     #[test]
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn twin_range_is_order_isomorphic() {
-        // The merge join (§7) relies on `A < B  ⇒  twin(A) < twin(B)`, including the prefix case.
+        // The merge join  relies on `A < B  ⇒  twin(A) < twin(B)`, including the prefix case.
         let f = Facts {
             client_etag: "ab".repeat(16),
             plen: 1,
@@ -812,7 +812,7 @@ mod tests {
             mtime_ms: 1,
         };
         assert!(f.twin_key(&"k".repeat(TWIN_MAX_KEY_LEN)).is_some());
-        // One byte over: no twin — the eviction tombstone resolves via the HEAD fallback (§6).
+        // One byte over: no twin — the eviction tombstone resolves via the HEAD fallback .
         assert!(f.twin_key(&"k".repeat(TWIN_MAX_KEY_LEN + 1)).is_none());
     }
 

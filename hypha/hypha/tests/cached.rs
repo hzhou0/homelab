@@ -40,7 +40,7 @@ async fn raw_exists(h: &Harness, bucket: &str, key: &str) -> bool {
         .is_ok()
 }
 
-/// The pending marker for `key` lives at bare `K` in `<meta>` (§6).
+/// The pending marker for `key` lives at bare `K` in `<meta>` .
 async fn marker_present(h: &Harness, client_bucket: &str, key: &str) -> bool {
     raw_exists(h, &h.meta_bucket(client_bucket), key).await
 }
@@ -49,7 +49,7 @@ async fn remote_present(h: &Harness, client_bucket: &str, key: &str) -> bool {
     raw_exists(h, &h.remote_bucket(client_bucket), key).await
 }
 
-/// Classify the `<data>` object at `key`: `None` ⇒ live body, `Some(kind)` ⇒ a tombstone (§6).
+/// Classify the `<data>` object at `key`: `None` ⇒ live body, `Some(kind)` ⇒ a tombstone .
 async fn data_class(h: &Harness, client_bucket: &str, key: &str) -> Option<meta::TombKind> {
     let head = h
         .raw()
@@ -85,7 +85,7 @@ async fn cached_put_serves_from_cache_and_reconciles() {
     // Served from the live cache body before any reconcile could run.
     assert_eq!(get_all(&c, B, "obj").await, body);
     // Waited for rather than asserted outright: the marker is handed to the queue *after* the commit
-    // (§7), precisely so a marker failure cannot turn an acked write into an error, so its presence
+    // , precisely so a marker failure cannot turn an acked write into an error, so its presence
     // is never synchronous with the ack. On a fast backend it lands within the same millisecond,
     // which is what made an immediate assertion look sound.
     wait_until(5_000, "the queue to land the write's marker", || async {
@@ -177,7 +177,7 @@ async fn overwrite_during_reconcile_preserves_the_newer_marker() {
         .to_string();
 
     put(&h.client(), B, key, &v2).await;
-    // The replacement marker is handed to the marker actor after the commit's ack (§7), so its
+    // The replacement marker is handed to the marker actor after the commit's ack , so its
     // presence is never synchronous with the put — and an overwrite's create-only raise now costs an
     // extra round-trip, widening the window. Wait for the replacement rather than head immediately.
     wait_until(5_000, "the replacement marker to land", || {
@@ -275,7 +275,7 @@ async fn overwrite_during_reconcile_preserves_the_newer_marker() {
 /// Emptiness is a claim about the **client** namespace, so a cached bucket whose deletes have not
 /// reached the remote yet still deletes: the cache is what the client can see, and the remote bodies
 /// standing behind it are exactly as stale as the bucket now is. hypha drains them itself rather
-/// than leaving the remote to refuse the delete (§7) — which is also what makes the gate independent
+/// than leaving the remote to refuse the delete  — which is also what makes the gate independent
 /// of whether the backend refuses one at all.
 #[tokio::test]
 async fn a_cached_bucket_deletes_before_its_deletes_have_propagated() {
@@ -327,7 +327,7 @@ async fn a_cached_bucket_deletes_before_its_deletes_have_propagated() {
     h.stop_hypha().await;
 }
 
-/// The reconcile backpressure gate (§7) refuses cached writes once the pending set is past
+/// The reconcile backpressure gate  refuses cached writes once the pending set is past
 /// `max_pending`. A write admitted at the threshold is what pushes the queue over it; the next one
 /// is refused immediately with `503 SlowDown` and nothing committed — and once the sweep drains, the
 /// gate reopens and the same write lands.
@@ -358,7 +358,7 @@ async fn backpressure_refuses_cached_writes_past_max_pending() {
     .await;
 
     // Pending is now 2, over the limit of 1: the gate refuses the request outright, and the SDK
-    // surfaces SlowDown. The admission happens before the cache write (§7), so nothing commits.
+    // surfaces SlowDown. The admission happens before the cache write , so nothing commits.
     let refused = c
         .put_object()
         .bucket(B)
@@ -596,7 +596,7 @@ async fn multipart_completion_waits_for_an_in_flight_cached_delete() {
     assert!(!marker_present(&h, B, key).await);
 }
 
-/// Conditional writes linearize on the cache in cached mode (§4): `If-None-Match: *` creates only
+/// Conditional writes linearize on the cache in cached mode : `If-None-Match: *` creates only
 /// when absent, `If-Match` requires the current ETag — hypha's own semantics, not the backend's.
 #[tokio::test]
 async fn cached_conditional_put_linearizes() {
@@ -790,7 +790,7 @@ async fn rehydrate_composite_into_shadow() {
     let e2 = upload_part(&c, B, key, &up, 2, &p2).await;
     complete_mpu(&c, B, key, &up, &[(1, e1), (2, e2)]).await;
 
-    // Complete tombstones K (both modes, §7); the composite lives on the remote.
+    // Complete tombstones K (both modes); the composite lives on the remote.
     assert_eq!(data_class(&h, B, key).await, Some(meta::TombKind::Evict));
     let shadow = meta::shadow_key(key);
 
@@ -810,7 +810,7 @@ async fn rehydrate_composite_into_shadow() {
     );
 }
 
-/// Linearizability on the cached write path (§4): many racing `If-None-Match:*` creates on one key
+/// Linearizability on the cached write path : many racing `If-None-Match:*` creates on one key
 /// resolve to exactly one winner, the losers 412 — the conditional PUTs serialize on the write lock
 /// even though unconditional cached PUTs take none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -954,7 +954,7 @@ async fn composite_concurrent_reads_are_correct() {
 }
 
 /// A client write to a key with a rehydrate in flight supersedes it: the write's bytes stand and the
-/// evicted generation never resurfaces. The write cancels K's background transition (§8) instead of
+/// evicted generation never resurfaces. The write cancels K's background transition  instead of
 /// queuing behind its fetch, and a cancelled — or merely late — rehydrate cannot land over the new
 /// body anyway: its land CAS is conditional on the evict sentinel the write already replaced.
 #[tokio::test]
@@ -1000,7 +1000,7 @@ async fn two_part_composite(c: &aws_sdk_s3::Client, key: &str, seed1: u8, seed2:
     p1.iter().chain(&p2).copied().collect()
 }
 
-/// Plant an eviction tombstone over `key` (as GC would, §8): the remote must already hold the
+/// Plant an eviction tombstone over `key` (as GC would): the remote must already hold the
 /// ciphertext. Overwrites the `<data>` body with the evict sentinel + facts metadata, and writes the
 /// facts twin — leaving the key resolvable from the remote and rehydratable on read.
 async fn plant_eviction_tombstone(h: &Harness, key: &str, body: &[u8]) {
@@ -1037,7 +1037,7 @@ async fn plant_eviction_tombstone(h: &Harness, key: &str, body: &[u8]) {
         .expect("plant twin");
 }
 
-/// The per-bucket clean marker (§6): present if a graceful drain vouched for that bucket.
+/// The per-bucket clean marker : present if a graceful drain vouched for that bucket.
 async fn clean_marker_present(h: &Harness, client_bucket: &str) -> bool {
     raw_exists(h, &h.meta_bucket(client_bucket), &meta::clean_marker_key()).await
 }
@@ -1232,7 +1232,7 @@ async fn marker_still_owed_at_drain_withholds_the_clean_marker() {
     );
 }
 
-/// **A multipart complete must survive the delete it superseded.** Multipart is always durable (§7),
+/// **A multipart complete must survive the delete it superseded.** Multipart is always durable ,
 /// so a complete commits to the remote and settles K without raising a pending marker — which makes
 /// it the one write path that does not supersede a marker already standing at K. If a cached DELETE's
 /// marker has not been swept yet when the complete lands, the sweep is left holding an obligation for
@@ -1313,7 +1313,7 @@ async fn a_multipart_complete_survives_the_delete_marker_it_superseded() {
 }
 
 /// **A cached commit whose response was lost may have landed**, and the obligation that would have
-/// followed it did not. A cached DELETE removes K and *then* queues its marker (§7 — the queue sits
+/// followed it did not. A cached DELETE removes K and *then* queues its marker (the queue sits
 /// after the commit so a marker failure cannot turn an acked write into an error); a cache that takes
 /// the delete and loses the response returns an error from between those two steps, leaving the key
 /// client-absent with nothing to propagate the delete to the remote.
@@ -1397,7 +1397,7 @@ async fn a_cached_delete_that_lost_its_response_leaves_the_bucket_unaccounted() 
 }
 
 /// A marker owed to a deleted bucket must be discarded, not retried: one permanently owed marker
-/// withholds the clean marker of *every* bucket at drain (§6). The obligation is dropped on the
+/// withholds the clean marker of *every* bucket at drain . The obligation is dropped on the
 /// state map's verdict rather than on the backend's error, so it does not matter what the backend
 /// makes of a write into a bucket that is gone.
 ///
@@ -1426,7 +1426,7 @@ async fn marker_for_a_deleted_bucket_does_not_withhold_surviving_clean_markers()
     tokio::time::timeout(Duration::from_secs(5), marker_write.reached())
         .await
         .expect("the deleted bucket's marker was never attempted");
-    // The bucket has to be emptied to be deletable (§7's emptiness gate), which does not settle the
+    // The bucket has to be emptied to be deletable (emptiness gate), which does not settle the
     // marker: the actor is still blocked on the held write, so the obligation stays owed across the
     // delete — which is the state under test.
     h.client()
@@ -1476,7 +1476,7 @@ async fn marker_for_a_deleted_bucket_does_not_withhold_surviving_clean_markers()
 }
 
 /// A graceful drain writes each accounted-for bucket's clean marker, and the next startup deletes
-/// every one of them **before serving** — so the on-disk default is always "dirty" (§6/§7). Absence
+/// every one of them **before serving** — so the on-disk default is always "dirty" . Absence
 /// is what buys a recovery scan, so a marker that outlived a startup would silently skip one.
 #[tokio::test]
 async fn clean_marker_is_written_on_drain_and_cleared_on_startup() {
@@ -1528,7 +1528,7 @@ async fn a_graceful_drain_joins_every_actor_well_inside_its_budget() {
 }
 
 /// A kill leaves no clean marker, so the next run rebuilds the pending set from cache-vs-remote
-/// state (§7). The orphan here is a live cache body with no marker whose generation the remote does
+/// state . The orphan here is a live cache body with no marker whose generation the remote does
 /// not hold — exactly what a crash between an acked write and its marker leaves behind, and what
 /// nothing else would ever revisit: the reconcile sweep enumerates markers, so a markerless body is
 /// invisible to it.
@@ -1618,7 +1618,7 @@ async fn killing_the_active_mid_sweep_loses_no_pending_key() {
     }
 }
 
-/// The bounded loss window (§7): a cache volume that goes takes exactly the keys the pending set names
+/// The bounded loss window : a cache volume that goes takes exactly the keys the pending set names
 /// and nothing else. That is the whole durability claim of cached mode, and the pending set is what
 /// makes it a *bound* rather than a hope — so both sides are asserted from one wipe, a key the sweep
 /// had already uploaded and a key it could not.
@@ -1741,11 +1741,11 @@ async fn a_bucket_whose_rebuild_never_completed_ends_the_run_dirty() {
 /// empty pending set, which no later pass would ever revisit.
 ///
 /// Which generation the remote holds is read off its framed length: every body here has a distinct
-/// plaintext length, and the framed size is a closed form of it (§6), so the byte count names the
+/// plaintext length, and the framed size is a closed form of it , so the byte count names the
 /// generation without decrypting anything.
 ///
 /// The claim is **convergence**, so it is asserted as one: an empty pending set is not by itself the
-/// end state to wait for. A marker is written after its write acks (§7), so between an ack and the
+/// end state to wait for. A marker is written after its write acks , so between an ack and the
 /// queue landing its marker there is a moment when the key is genuinely owed and genuinely unmarked,
 /// and sampling a single instant can catch exactly that moment.
 ///
@@ -1769,7 +1769,7 @@ async fn bursty_same_key_overwrites_converge_on_the_last_acked_generation() {
         put(&c, B, key, &body).await;
         last = body;
     }
-    // Every body has a distinct plaintext length and the framed size is a closed form of it (§6), so
+    // Every body has a distinct plaintext length and the framed size is a closed form of it , so
     // the remote object's byte count names the generation without decrypting anything.
     let framed =
         hypha_format::offset::ciphertext_len(last.len() as u64, hypha_format::offset::HLEN)

@@ -46,11 +46,11 @@ impl Hypha {
 
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
 
-        // Overlay (§7): the destination bucket must exist; a restoring one has K_dst materialized
+        // Overlay : the destination bucket must exist; a restoring one has K_dst materialized
         // from the remote first, so this copy's bracket then overwrites a correct tombstone.
         let (_gate, write_mode) = self.prepare_write(&bucket, &key).await?;
 
-        // Shared with UploadPartCopy (§7).
+        // Shared with UploadPartCopy .
         let (facts, src_md, source_live) = self
             .resolve_copy_source(
                 &src_bucket,
@@ -91,7 +91,7 @@ impl Hypha {
         if source_live {
             return match write_mode {
                 WriteMode::Cached => {
-                    // Admission gate (§7) — see `op_put_object_cached`.
+                    // Admission gate  — see `op_put_object_cached`.
                     if !self.tier.pressure.admit() {
                         return Err(Error::SlowDown.into());
                     }
@@ -122,13 +122,13 @@ impl Hypha {
         // One bounded tail GET of the source's remote trailer (MAC-verified at K_src) fixes the
         // body/trailer boundary and, for a composite, the offset table — both body-relative, so they
         // carry over to K_dst unchanged. Foreign/unverifiable halts the deployment, as on any read
-        // (§6, `crate::halt`).
+        // (`crate::halt`).
         let Some(tail) = self.tier.read_tail(&src_bucket, &src_key).await? else {
             self.tier.halt.foreign_object(&src_bucket, &src_key).await
         };
         let body_ct_len = tail.body_ct_len;
 
-        // Whole bracket under K_dst's write lock (§7). No destination precondition to resolve, and
+        // Whole bracket under K_dst's write lock . No destination precondition to resolve, and
         // this copy's mark → commit → settle overwrites K_dst wholesale, so any leftover mark on it
         // is simply superseded — no separate repair needed.
         let _guard = self.write_lock(&bucket, &key).await;
@@ -187,7 +187,7 @@ impl Hypha {
             )
             .await?;
 
-        // The destination only; the source fed the ring when it resolved (§8). A large copy commits
+        // The destination only; the source fed the ring when it resolved . A large copy commits
         // through native multipart, so the destination can be either shape.
         self.gc.touch(&bucket, &key, Plaintext::of(&facts.cetag));
         self.orphans.owe(&bucket, &key);
@@ -410,7 +410,7 @@ impl Hypha {
         }))
     }
 
-    /// Large-body commit (§7). Owns the native upload, so a failure aborts it best-effort — a
+    /// Large-body commit . Owns the native upload, so a failure aborts it best-effort — a
     /// leftover is a sweepable orphan regardless.
     #[allow(clippy::too_many_arguments)]
     async fn commit_copy_multipart(
@@ -488,7 +488,7 @@ impl Hypha {
         }
 
         // The fresh trailer as the sole final part, always above every copied body part — so the
-        // small-final-part fold multipart needs never arises here (§7).
+        // small-final-part fold multipart needs never arises here .
         let trailer_pn = ranges.len() as i32 + 1;
         let tout = self
             .remote()
@@ -520,7 +520,7 @@ impl Hypha {
         Ok(())
     }
 
-    /// Small-body commit (§7): the source is one age file, so decrypt it whole and re-encrypt as one
+    /// Small-body commit : the source is one age file, so decrypt it whole and re-encrypt as one
     /// age file (age's framed length is fixed by the plaintext length, so body_ct_len — and thus the
     /// prebuilt trailer's table — is unchanged), with the fresh trailer appended inline in one PUT.
     #[allow(clippy::too_many_arguments)]
@@ -562,7 +562,7 @@ impl Hypha {
 
     /// Resolve a copy source's facts, cache-side user metadata, and residency through the restore
     /// overlay — exactly as a read would — then evaluate its preconditions against that state. The
-    /// shared head of CopyObject and UploadPartCopy (§7): a live cache body reports natively,
+    /// shared head of CopyObject and UploadPartCopy : a live cache body reports natively,
     /// anything else resolves remote-side, and an absent source (including one mid-restore) is 404.
     pub(super) async fn resolve_copy_source(
         &self,
@@ -609,7 +609,7 @@ fn copy_part_ranges(total: u64) -> Vec<Range<u64>> {
     ranges
 }
 
-/// The two time-based copy-source conditions (§7), compared at the second granularity a client sees
+/// The two time-based copy-source conditions , compared at the second granularity a client sees
 /// `LastModified` at. `if_modified_since` fails when the source has *not* changed since; `if_unmodified_since`
 /// fails when it *has* — both surface as `412 PreconditionFailed`.
 pub(super) fn evaluate_copy_source_time(

@@ -168,7 +168,7 @@ impl Backend {
             .set_content_length(content_length)
             .set_metadata(Some(metadata))
             .set_content_type(content_type)
-            // Client `Content-MD5` forwarded to the cache (cached-mode PUT, §7) so the backend
+            // Client `Content-MD5` forwarded to the cache (cached-mode PUT) so the backend
             // validates the plaintext and returns `BadDigest` atomically — nothing lands on a bad
             // digest, and any prior body stays intact. `None` for hypha's own writes (ciphertext,
             // whose integrity is the trailer's job).
@@ -259,7 +259,7 @@ impl Backend {
     }
 
     /// Cache-side conditional DELETE — remove `key` only if its current ETag matches `if_match`
-    /// (quoted, §7/§8). Marker completion and shadow reclamation depend on this CAS.
+    /// (quoted). Marker completion and shadow reclamation depend on this CAS.
     pub async fn delete_if_match(&self, bucket: &str, key: &str, if_match: String) -> Result<()> {
         self.client
             .delete_object()
@@ -345,7 +345,7 @@ impl Backend {
         max_keys: Option<i32>,
     ) -> Result<ListObjectsV2Output> {
         // `encoding-type=url` so keys carrying bytes XML can't represent — the twin separator
-        // `0x01`, and any control byte a client used — survive the LIST response (§6). Keys come
+        // `0x01`, and any control byte a client used — survive the LIST response . Keys come
         // back percent-encoded; decode them before returning so callers see raw bytes.
         let mut out = self
             .client
@@ -464,7 +464,7 @@ impl Backend {
             .collect())
     }
 
-    // ── Multipart-to-remote primitives: each part an independent age file (§6/§7) ───────────
+    // ── Multipart-to-remote primitives: each part an independent age file  ───────────
 
     pub async fn create_multipart(
         &self,
@@ -507,7 +507,7 @@ impl Backend {
             .map_err(Error::from_sdk)
     }
 
-    /// Server-side `UploadPartCopy` (§7): copy a byte range of a source object straight into a part
+    /// Server-side `UploadPartCopy` : copy a byte range of a source object straight into a part
     /// of an in-progress native upload, remote→remote, no bytes through hypha. `src_range` is over
     /// the **source object's** bytes (`bytes=a-b`), used to exclude the source's tail trailer.
     ///
@@ -562,7 +562,7 @@ impl Backend {
 
     /// Every part currently held by an in-progress native upload, as `(part_number, etag, size)` —
     /// the remote's own last-write-wins-resolved view. Complete uses it to pick the winning parts
-    /// and their ciphertext sizes (§7), so a re-uploaded part's stale hypha record never wins.
+    /// and their ciphertext sizes , so a re-uploaded part's stale hypha record never wins.
     /// Paginated; ETags are unquoted.
     pub async fn list_parts(
         &self,
@@ -609,7 +609,7 @@ impl Backend {
     }
 
     /// One page of the remote's in-progress uploads — what the client-facing
-    /// `ListMultipartUploads` proxies (§7). hypha creates each native upload *at the client key*
+    /// `ListMultipartUploads` proxies . hypha creates each native upload *at the client key*
     /// and hands the client the remote's own upload id, so a page needs no translation; the
     /// backend's `(key, upload_id)` ordering and markers are what make the op's pagination correct.
     ///
@@ -683,7 +683,7 @@ const KEY_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-/// URL-encode a source key for the `x-amz-copy-source` header (the SDK sends it verbatim, §7).
+/// URL-encode a source key for the `x-amz-copy-source` header (the SDK sends it verbatim).
 fn encode_copy_source_key(key: &str) -> String {
     key.split('/')
         .map(|seg| utf8_percent_encode(seg, KEY_SEGMENT).to_string())

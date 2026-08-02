@@ -37,7 +37,7 @@ pub fn chunk_of(offset: u64) -> u64 {
 
 /// Plaintext length from a file's total ciphertext length and its header length — the inverse of
 /// [`ciphertext_len`], used to recover a composite part's `plen` from its ciphertext window and
-/// [`HLEN`] (§6). Each full ciphertext chunk is `CHUNK_CIPHERTEXT` bytes and a trailing partial
+/// [`HLEN`] . Each full ciphertext chunk is `CHUNK_CIPHERTEXT` bytes and a trailing partial
 /// chunk still carries a whole tag, so the chunk count falls out of the payload length alone.
 /// Returns `None` if the pair is inconsistent (truncated object, or a wrong `header_len`).
 pub fn plaintext_len_from(total_ciphertext_len: u64, header_len: u64) -> Option<u64> {

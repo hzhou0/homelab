@@ -34,7 +34,7 @@ pub struct Hypha {
     pub(crate) buckets: BucketCtl,
     pub(crate) background: Background,
     pub(crate) markers: Markers,
-    /// The GC actor (§8). Every op that resolves or lands a single key touches it — reads *and*
+    /// The GC actor . Every op that resolves or lands a single key touches it — reads *and*
     /// writes, since a write is the strongest statement of interest a key gets. LIST and DELETE
     /// deliberately do not: a full listing would mark the whole keyspace hot, and a delete leaves no
     /// body to protect.
@@ -42,7 +42,7 @@ pub struct Hypha {
     pub(crate) orphans: Orphans,
     pub mode: Mode,
     /// Longest configured bucket prefix, charged against S3's 63-byte cap so the client-visible
-    /// bucket-name limit is `63 − this` (§7 *Buckets*). Checked at CreateBucket.
+    /// bucket-name limit is `63 − this`. Checked at CreateBucket.
     pub max_bucket_prefix_len: usize,
 }
 
@@ -70,8 +70,8 @@ impl Hypha {
         }
     }
 
-    /// Take K's **write** lock for a client write (§4), first telling any background transition on K
-    /// to stop (§8). Every client write-lock acquisition goes through here rather than
+    /// Take K's **write** lock for a client write , first telling any background transition on K
+    /// to stop . Every client write-lock acquisition goes through here rather than
     /// `tier.locks.lock` directly: a rehydrate holds the lock across a whole-object fetch, so
     /// without the cancel a conditional PUT, DELETE, or CompleteMultipartUpload on a hot key would
     /// park behind a multi-minute transfer. The cancel is a map lookup and needs no reply — see
@@ -95,18 +95,18 @@ impl Hypha {
     }
 }
 
-/// Plaintext cap for any single encrypted upload leg — a PutObject body or one part (§7): the
+/// Plaintext cap for any single encrypted upload leg — a PutObject body or one part : the
 /// framed form (age envelope + footer) must never push past the remote's 5 GiB PUT/part cap.
 pub(crate) const MAX_INLINE_PLAINTEXT: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Unix-ms mtime (twin / tombstone metadata, §6) → an S3 `LastModified`.
+/// Unix-ms mtime (twin / tombstone metadata) → an S3 `LastModified`.
 pub(crate) fn ts_ms(ms: i64) -> Timestamp {
     let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms.max(0) as u64);
     Timestamp::from(t)
 }
 
 /// Storage classes implying `RestoreObject`, which hypha's single physical tier cannot honour —
-/// accepting one would promise a retrieval workflow that never arrives (§7).
+/// accepting one would promise a retrieval workflow that never arrives .
 const ARCHIVE_CLASSES: &[&str] = &[
     StorageClass::GLACIER,
     StorageClass::DEEP_ARCHIVE,
@@ -115,7 +115,7 @@ const ARCHIVE_CLASSES: &[&str] = &[
     StorageClass::OUTPOSTS,
 ];
 
-/// Validate a requested `x-amz-storage-class` and resolve it to the label hypha will echo (§7).
+/// Validate a requested `x-amz-storage-class` and resolve it to the label hypha will echo .
 /// One physical tier, so every non-archive class is accepted as-is and simply replayed on read.
 pub(crate) fn resolve_storage_class(requested: Option<&StorageClass>) -> S3Result<String> {
     let Some(sc) = requested else {
@@ -130,7 +130,7 @@ pub(crate) fn resolve_storage_class(requested: Option<&StorageClass>) -> S3Resul
     Ok(sc.as_str().to_string())
 }
 
-/// The cache-side user-metadata a write carries alongside its facts (§7): the client's
+/// The cache-side user-metadata a write carries alongside its facts : the client's
 /// `x-amz-meta-*` under hypha's namespace, the echoed storage class, and the content type.
 pub(crate) fn write_metadata(
     client: Option<&Metadata>,
@@ -157,7 +157,7 @@ pub(crate) fn parse_content_md5(header: &str) -> S3Result<[u8; 16]> {
 }
 
 /// The ETag a server-side `UploadPartCopy` returned, unquoted. Required — an absent one could
-/// never match this part at complete (§6).
+/// never match this part at complete .
 pub(crate) fn copied_part_retag(
     out: &aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput,
 ) -> Result<String, hypha_core::error::Error> {
@@ -170,7 +170,7 @@ pub(crate) fn copied_part_retag(
 }
 
 /// The trait surface, as one table: every method is the same shape — open the request's span,
-/// delegate to the op module, report the call (§10) — so writing them out longhand would put
+/// delegate to the op module, report the call  — so writing them out longhand would put
 /// twenty-two copies of that shape between a reader and the one line that differs.
 ///
 /// The trailing bracket names which of the span's request-side fields this op *has*, which is why
@@ -208,7 +208,7 @@ macro_rules! client_ops {
     };
 }
 
-/// The payload this request moved, once the handler knows it (§10). For a read that is what the
+/// The payload this request moved, once the handler knows it . For a read that is what the
 /// response declares rather than what the client eventually pulls, since the span closes on the
 /// response.
 pub(crate) fn record_bytes(bytes: u64) {

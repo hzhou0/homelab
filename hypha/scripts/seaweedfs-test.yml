@@ -1,4 +1,4 @@
-# A throwaway SeaweedFS for the test suite — the cache backend hypha actually deploys on (§9), and
+# A throwaway SeaweedFS for the test suite — the cache backend hypha actually deploys on, and
 # the local fixture that enforces `If-Match` on `DeleteObject`.
 #
 # Driven by `scripts/test-seaweedfs.sh`, which owns the lifetime — including `down -v`, since the
@@ -21,7 +21,7 @@ services:
     # Both are overridable because that exhaustion is itself a test subject: `test-seaweedfs-tiny.sh`
     # starts the same fixture small enough to run out under a few megabytes, which is the only way to
     # exercise hypha against a backend that fails for a reason no proxy can fake — a real store with
-    # no room left (§11).
+    # no room left.
     command: >
       server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
       -master.volumeSizeLimitMB=${SEAWEED_VOLUME_SIZE_MB:-64}

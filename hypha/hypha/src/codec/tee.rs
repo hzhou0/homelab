@@ -13,7 +13,7 @@ use s3s::dto::StreamingBlob;
 use super::{blob_to_bytestream, bytestream_to_blob};
 
 /// Split one body into two identical streams, so it can reach two sinks in a single pass — the
-/// upload path for a retained part (§7), which must land on the remote *and* in the cache without
+/// upload path for a retained part , which must land on the remote *and* in the cache without
 /// the encrypt stream running twice. Each source chunk is handed to both branches as a `Bytes`
 /// clone, so the split costs a refcount rather than a copy, and per-request memory is one chunk
 /// however large the part is.
@@ -26,7 +26,7 @@ use super::{blob_to_bytestream, bytestream_to_blob};
 /// an error and cannot be told from one: a sink whose request completed on its declared
 /// Content-Length is dropped without the body ever being driven to its terminal `None`, which is
 /// the ordinary ending for the smaller of the two writes. What keeps a part from landing on one
-/// side alone is the caller's `try_join!` over the two requests (§7) — a sink that goes away
+/// side alone is the caller's `try_join!` over the two requests  — a sink that goes away
 /// *without* its bytes fails its own request, and that fails the operation.
 pub fn tee(src: ByteStream) -> (ByteStream, ByteStream) {
     let shared = Arc::new(Mutex::new(Tee {
@@ -235,7 +235,7 @@ mod tests {
         a_lost_sink_leaves_the_body_readable(1).await;
     }
 
-    /// The shape the retained-part path actually produces (§7): the part is one frame — a small
+    /// The shape the retained-part path actually produces : the part is one frame — a small
     /// final part, encrypted — so the faster sink takes it, satisfies its Content-Length, and is
     /// dropped before the slower sink has polled once. That drop must not cost the slower sink the
     /// body it has not read yet.

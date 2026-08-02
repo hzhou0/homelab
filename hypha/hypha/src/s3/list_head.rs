@@ -172,7 +172,7 @@ impl Hypha {
             content_length,
             e_tag,
             last_modified,
-            // The pass-through carrier the facts above share (§7). A remote-resolved key (mid-bracket
+            // The pass-through carrier the facts above share . A remote-resolved key (mid-bracket
             // or mid-restore) carries neither, so both fall back to their defaults.
             metadata: Some(meta::decode_user_metadata(&md)),
             storage_class: Some(StorageClass::from(meta::storage_class(&md))),
@@ -330,7 +330,7 @@ impl Hypha {
         // v1's `NextMarker` is a *key*, not v2's opaque token, so hypha computes the resume
         // position: the greater of the page's last raw key and its last common prefix (with a
         // delimiter the two interleave, and resuming from the last *content* key would re-roll a
-        // group already emitted). Both sources hold nothing but client objects at client keys (§6),
+        // group already emitted). Both sources hold nothing but client objects at client keys ,
         // so the last raw key is always an XML-safe, strictly-increasing client key.
         let next_marker = objs
             .iter()
@@ -399,7 +399,7 @@ impl Hypha {
         }
     }
 
-    /// One `<data>` page → the client-visible entries and common prefixes it projects (§7's
+    /// One `<data>` page → the client-visible entries and common prefixes it projects (the
     /// classifier), pairing eviction tombstones with their `<meta>` twins by a merge join. Shared by
     /// both LIST versions, which differ only in their pagination shell. `<data><b>` holds only
     /// client objects, so there is nothing hypha-internal to filter out here.
@@ -412,7 +412,7 @@ impl Hypha {
         raw_prefixes: Vec<aws_sdk_s3::types::CommonPrefix>,
     ) -> S3Result<PageView> {
         // Classify each entry first, collecting the eviction tombstones that need a twin. The twin
-        // cursor is then fetched once, bounded to the span those keys occupy (§7).
+        // cursor is then fetched once, bounded to the span those keys occupy .
         enum Kind {
             Live,
             Evict,
@@ -460,7 +460,7 @@ impl Hypha {
                     ..Default::default()
                 }),
                 Kind::Evict => match twins.get(&key) {
-                    // Paired by base-key equality (§7): a twin against an eviction tombstone is
+                    // Paired by base-key equality : a twin against an eviction tombstone is
                     // valid by construction.
                     Some(f) => entries.push(Object {
                         key: Some(key),
@@ -469,15 +469,15 @@ impl Hypha {
                         last_modified: Some(ts_ms(f.mtime_ms)),
                         ..Default::default()
                     }),
-                    // No twin: a crash window, a page straddle, or a key over the §6 twin threshold.
-                    // The tombstone's own metadata is authoritative — one per-key HEAD (§6).
+                    // No twin: a crash window, a page straddle, or a key over the twin threshold.
+                    // The tombstone's own metadata is authoritative — one per-key HEAD .
                     None => {
                         if let Some(o) = self.head_facts(bucket, &key).await? {
                             entries.push(o);
                         }
                     }
                 },
-                // Mid-bracket: the one classification that leaves the cache — remote HEAD (§7).
+                // Mid-bracket: the one classification that leaves the cache — remote HEAD .
                 Kind::Transit => match self.remote().head(bucket, &key).await {
                     Ok(h) => {
                         let f = self.tier.remote_facts(bucket, &key, &h).await?;
@@ -506,10 +506,10 @@ impl Hypha {
         })
     }
 
-    /// The twin cursor (§6/§7): `<meta>` range B over `[lo, hi]`, keyed back to base keys. Prefix
+    /// The twin cursor : `<meta>` range B over `[lo, hi]`, keyed back to base keys. Prefix
     /// `0x01 ‖ <client prefix>` and the mirrored delimiter make its shape track the client cursor's
     /// — a twin whose base rolls up under the delimiter rolls up identically (the facts alphabet
-    /// excludes `/`, §6), so only individual twins (those matching individual client entries) come
+    /// excludes `/`), so only individual twins (those matching individual client entries) come
     /// back as content. `start_after` past `0x01 ‖ lo` skips range A (mpu/shadow, `0x01 0x01 …`).
     async fn fetch_twins(
         &self,
@@ -561,7 +561,7 @@ impl Hypha {
         Ok(map)
     }
 
-    /// HEAD-fallback facts for an eviction tombstone missing its twin (§6). `None` if the key
+    /// HEAD-fallback facts for an eviction tombstone missing its twin . `None` if the key
     /// moved on (deleted / absent) since the LIST page was cut.
     async fn head_facts(&self, bucket: &str, key: &str) -> S3Result<Option<Object>> {
         match self.data().head(bucket, key).await {

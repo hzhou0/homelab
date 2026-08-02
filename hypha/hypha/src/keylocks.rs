@@ -25,7 +25,7 @@ impl KeyLocks {
 
     /// Acquire the lock only if free — for callers whose work is redundant when someone else is
     /// already doing it, so a `None` is a reason to drop the attempt, not to retry. Lock-free read
-    /// paths repair a leftover transition mark this way (§7): a *held* lock means the marking writer
+    /// paths repair a leftover transition mark this way : a *held* lock means the marking writer
     /// is alive mid-bracket, so there is nothing to repair and a read must not queue behind it. The
     /// reconcile sweep coalesces same-key uploads onto the in-flight one the same way
     /// ([`crate::replication`]).

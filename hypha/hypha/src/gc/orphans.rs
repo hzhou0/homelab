@@ -161,7 +161,7 @@ impl OrphanQueue {
             }
             let shadows = match list_shadows(&self.tier, &bucket, RANGE_PAGES).await {
                 Ok(shadows) => shadows,
-                // The bucket is gone, so its whole `<meta>` projection went with it (§7) and there is
+                // The bucket is gone, so its whole `<meta>` projection went with it  and there is
                 // nothing left to reclaim. Dropped rather than retried for the reason
                 // [`crate::markers`] spells out: one permanently owed obligation withholds the marker
                 // of *every* bucket at drain, so a single deleted bucket would send the next run
@@ -242,7 +242,7 @@ impl OrphanQueue {
     }
 }
 
-/// The backstop (§8): judge **every** shadow in a bucket against the key it names. Owed by a bucket
+/// The backstop : judge **every** shadow in a bucket against the key it names. Owed by a bucket
 /// whose shadow-clean marker was absent at startup.
 ///
 /// This is the pass the marker exists to avoid, and the only one that can find an orphan no obligation
@@ -285,7 +285,7 @@ pub(crate) async fn sweep(tier: &Tiering, bucket: &str) -> Result<usize> {
 }
 
 /// Whether K still names `cetag` as its current generation — the only thing that makes a shadow
-/// reachable (§6). A K that is absent, a live body, or a tombstone of another generation leaves the
+/// reachable . A K that is absent, a live body, or a tombstone of another generation leaves the
 /// shadow unreachable forever.
 ///
 /// A **transition mark** answers `true`: K is mid-bracket and its settle may land a tombstone carrying
@@ -356,7 +356,7 @@ async fn list_shadows(tier: &Tiering, bucket: &str, pages: usize) -> Result<Hash
 /// Run [`sweep`] for a bucket whose shadow-clean marker was absent, and account for it if the sweep
 /// succeeds. Nothing on the serving path waits on it — an orphan is invisible to clients, and a sweep
 /// that fails simply leaves the bucket unaccounted, so the drain withholds its marker and the next run
-/// tries again. Positive evidence only, as everywhere else in this pair (§7).
+/// tries again. Positive evidence only, as everywhere else in this pair .
 ///
 /// It joins `sweeps` rather than running detached so the drain can wait for it: a sweep killed a moment
 /// before it would have accounted for its bucket costs the next run a listing for nothing.

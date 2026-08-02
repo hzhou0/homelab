@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 use super::{blob_to_bytestream, bytestream_to_blob, DigestMismatch, EtagReceiver, SingleTrailer};
 
 /// One ciphertext byte the gate will not hand over on its own. What keeps a mismatched body short
-/// of its declared length — and so refused by the backend rather than committed (§6) — is that
+/// of its declared length — and so refused by the backend rather than committed  — is that
 /// age's final chunk is written by the close and released only with the verdict; but that rests on
 /// when age chooses to flush, so a release forced by a full gate withholds a byte regardless.
 const HOLDBACK: usize = 1;
@@ -82,7 +82,7 @@ enum Stage {
 /// Stream-encrypt a plaintext body into hypha's framed single-part form — age ciphertext followed
 /// by its [`SingleTrailer`] — with a Content-Length known up front (the age header is a fixed
 /// [`HLEN`], so `ciphertext_len` is exact) and no spill. Returns `(framed_len, body)`. The trailer
-/// carries the plaintext MD5, computed inline as the body streams (§6) — the reconcile path knows
+/// carries the plaintext MD5, computed inline as the body streams  — the reconcile path knows
 /// `plen`/mtime from the same cache GET that streams the body, so the framed facts can't disagree.
 pub async fn encrypt_stream(
     env: Arc<Envelope>,
@@ -104,7 +104,7 @@ pub async fn encrypt_stream(
 /// Encrypt a plaintext `StreamingBlob` to age ciphertext, computing the plaintext MD5 alongside the
 /// encryption in one pass. `trailer: Some(_)` appends a kind-*single* trailer (built from the
 /// computed digest once the last plaintext byte has streamed) behind the ciphertext, so a
-/// single-part PUT lands body and facts atomically (§6); `None` emits a pure age file — a multipart
+/// single-part PUT lands body and facts atomically ; `None` emits a pure age file — a multipart
 /// part, whose facts live in the object's terminating trailer part.
 ///
 /// `expect_md5` is the client's `Content-MD5`, checked against the digest the body actually

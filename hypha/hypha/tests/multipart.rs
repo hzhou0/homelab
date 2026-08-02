@@ -236,7 +236,7 @@ async fn multipart_reupload_resolution() {
         "part 2 must be the re-uploaded bytes"
     );
 
-    // mpu records live in the <meta> bucket's range A (0x01 0x01 m …, §6).
+    // mpu records live in the <meta> bucket's range A (0x01 0x01 m …).
     let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
     assert!(
         residue.is_empty(),
@@ -328,7 +328,7 @@ async fn multipart_concurrent_small_final_part() {
 }
 
 /// Abort drops the upload: the remote stops running it, it can no longer be completed, and its
-/// records are reclaimed — by the §8 sweep, not on the abort itself. A maxed upload's range is 10 000
+/// records are reclaimed — by the sweep, not on the abort itself. A maxed upload's range is 10 000
 /// single-object deletes (its keys carry `0x01`, so no batch delete can represent them), and paying
 /// that on the client's call to say "throw this away" is the cost the deferral exists to remove.
 #[tokio::test]
@@ -351,7 +351,7 @@ async fn multipart_abort_cleanup() {
         .await
         .expect("abort");
 
-    // mpu records live in the <meta> bucket's range A (0x01 0x01 m …, §6).
+    // mpu records live in the <meta> bucket's range A (0x01 0x01 m …).
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
@@ -529,7 +529,7 @@ async fn multipart_last_part_number_folds_trailer() {
     );
 
     // And the retained ciphertext that made the fold possible is swept at complete. Its stash key
-    // is `…m<id>0x01 c10000;<nonce>` in the <meta> bucket (§6).
+    // is `…m<id>0x01 c10000;<nonce>` in the <meta> bucket .
     let leftovers = raw_list(&h.raw(), &h.meta_bucket(B), None).await;
     assert!(
         leftovers.iter().all(|k| !k.contains("c10000;")),
@@ -1030,7 +1030,7 @@ async fn multipart_cache_wipe_restores_facts_and_part_geometry() {
 }
 
 /// GetObjectAttributes `ObjectParts` for a composite comes straight off the trailer's offset table
-/// (§7): total part count and per-part *plaintext* sizes, no remote part index — and it paginates.
+/// : total part count and per-part *plaintext* sizes, no remote part index — and it paginates.
 #[tokio::test]
 async fn get_object_attributes_composite_parts() {
     use aws_sdk_s3::types::ObjectAttributes;
@@ -1093,7 +1093,7 @@ async fn get_object_attributes_composite_parts() {
     assert_eq!(pp.total_parts_count(), Some(3));
 }
 
-/// UploadPartCopy fast path (§7): a whole, single-part source copies **server-side** as a part,
+/// UploadPartCopy fast path : a whole, single-part source copies **server-side** as a part,
 /// with `pmd5` = the source's plaintext MD5 (its single-part cetag). Source is part 1 (≥ 5 MiB, so
 /// it admits a successor and stays on the fast path); a small uploaded tail follows. The completed
 /// object is `source ‖ tail`.

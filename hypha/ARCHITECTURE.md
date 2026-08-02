@@ -390,7 +390,7 @@ explicitly by the `seaweedfs` chart (a `CiliumNetworkPolicy` per surface) — hy
 and, if the `seaweedfs` usage source is enabled, the master/volume status APIs.
 
 These grants are scoped by source **namespace** — the cluster's identity boundary, since namespaces
-are single-tenant and pod labels are self-applied (see the design doc, §11.4). So "hypha may read the
+are single-tenant and pod labels are self-applied. So "hypha may read the
 cache" means "workloads in hypha's namespace may."
 
 Hypha will reach seaweedFs by its cluster ip.

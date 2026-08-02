@@ -65,7 +65,7 @@ pub(crate) fn spawn(
     // Unbounded because the enqueue sits on the write path *after* the commit: a bounded queue would
     // either block the ack behind the marker or shed it, and shedding needs a side channel to record
     // the loss — state whose only job is to be remembered on a failure path. An enqueue that cannot
-    // fail needs none. Depth is an outage symptom rather than a tunable, and `markers_owed` (§10) is
+    // fail needs none. Depth is an outage symptom rather than a tunable, and `markers_owed`  is
     // where it shows.
     let (tx, rx) = mpsc::unbounded_channel();
     let queue = Arc::new(MarkerQueue {
@@ -98,7 +98,7 @@ impl Markers {
     /// unbounded buys, and the only reason it is.
     pub(crate) fn owe(&self, bucket: &str, key: &str, marker_body: String) {
         let Some(tx) = self.queue.tx.upgrade() else {
-            // The channel closes only after every handler has returned (§7), so a live write cannot
+            // The channel closes only after every handler has returned , so a live write cannot
             // reach this — but "cannot" is exactly what a clean marker must not assume. Withdrawing
             // the bucket's evidence is the whole remedy: no evidence, no clean marker.
             tracing::error!(bucket, key, "marker queue closed under a live write");
@@ -133,7 +133,7 @@ impl MarkerActor {
         let mut owed: HashMap<(String, String), OwedMarker> = HashMap::new();
         let (sealed, left) =
             sealq::drain(&mut self.rx, self.retry, &mut owed, self.queue.as_ref()).await;
-        // Both are flat zero in health (§10): an owed marker at drain is the cache refusing small
+        // Both are flat zero in health : an owed marker at drain is the cache refusing small
         // writes, and every bucket left dirty is a rebuild the next run pays for before it serves.
         crate::metrics::buckets_dirty_at_drain(self.queue.dirty_at_drain(sealed && left == 0));
         match (sealed, left == 0) {
@@ -171,13 +171,13 @@ impl MarkerQueue {
     /// throughput ceiling.
     ///
     /// A marker whose bucket is **gone** is dropped rather than retried. It can never land — its
-    /// `<meta>` projection was drained by the DeleteBucket (§7) — and there is nothing left for it to
+    /// `<meta>` projection was drained by the DeleteBucket  — and there is nothing left for it to
     /// index. Retrying it forever would be worse than useless: one permanently owed marker withholds
     /// the clean marker of *every* bucket at drain, so a single deleted bucket would send the next
     /// run into a full rebuild of buckets it had no reason to doubt.
     ///
     /// "Gone" is read from the **state map**, before the write rather than out of its error:
-    /// `DeleteBucket` retires the bucket there before draining its projections (§7), so the map has
+    /// `DeleteBucket` retires the bucket there before draining its projections , so the map has
     /// already caught up by the time a marker for it could be written — and a backend that re-creates
     /// the bucket a PUT addresses (SeaweedFS) would otherwise have this path resurrect a `<meta>`
     /// projection the delete had just drained, and never report a thing.

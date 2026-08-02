@@ -31,8 +31,8 @@ async fn put_raw(raw: &aws_sdk_s3::Client, bucket: &str, key: &str, body: &[u8])
 }
 
 /// The conditional **writes**, which is where hypha's single-writer guarantee is actually enforced:
-/// `If-None-Match: *` is what makes a create linearizable (§4), and `If-Match` is the abort in
-/// eviction's third gate and in every rehydrate landing (§8). Both are refused on a stale view here,
+/// `If-None-Match: *` is what makes a create linearizable , and `If-Match` is the abort in
+/// eviction's third gate and in every rehydrate landing . Both are refused on a stale view here,
 /// so those mechanisms are load-bearing rather than decorative.
 #[tokio::test]
 async fn conditional_writes_are_enforced() {
@@ -153,7 +153,7 @@ async fn the_default_minio_cache_does_not_enforce_a_conditional_delete() {
 /// SeaweedFS ships `allowDeleteBucketNotEmpty` on by default and deletes the bucket together with
 /// everything in it.
 ///
-/// hypha therefore gates emptiness itself (§7 — `BucketCtl::delete` lists the client namespace before
+/// hypha therefore gates emptiness itself (`BucketCtl::delete` lists the client namespace before
 /// it commits), and this is why: a delegated gate is not a weaker gate on the deployed backend, it is
 /// a recursive delete. The client-facing requirement is asserted where it belongs, in
 /// `conformance::delete_bucket_refuses_a_non_empty_bucket`, which passes on both.
@@ -190,7 +190,7 @@ async fn a_non_empty_bucket_is_refused_by_only_one_of_the_two_backends() {
 /// the prefix. Upstream made this unconditional: the `allowEmptyFolder` flag that once controlled it
 /// is deprecated and ignored. S3 and MinIO have no directories and report nothing.
 ///
-/// Nothing in hypha reads a common prefix — LIST forwards the backend's verbatim (§7) — so this
+/// Nothing in hypha reads a common prefix — LIST forwards the backend's verbatim  — so this
 /// costs a client a phantom folder and hypha nothing. It is pinned rather than worked around because
 /// the alternative is a probe LIST per prefix on every delimited page.
 #[tokio::test]

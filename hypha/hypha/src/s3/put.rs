@@ -30,7 +30,7 @@ impl Hypha {
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        // Ahead of the mode split (§6): durable mode has no plaintext to spoof today, but a bucket
+        // Ahead of the mode split : durable mode has no plaintext to spoof today, but a bucket
         // later switched to cached would rehydrate this plaintext to bare `K`, where it becomes the
         // classification — so the check must hold store-wide, not just for the mode that needs it now.
         let mut input = input;
@@ -54,10 +54,10 @@ impl Hypha {
 
         let (plen, body) = require_inline_body(&mut input)?;
 
-        // One lock for the whole bracket: precondition → mark → commit → settle (§4).
+        // One lock for the whole bracket: precondition → mark → commit → settle .
         let _guard = self.write_lock(&bucket, &key).await;
 
-        // Resolve the key's *current* client-visible ETag for the conditional-write check (§4),
+        // Resolve the key's *current* client-visible ETag for the conditional-write check ,
         // then evaluate. Repairs a leftover transition mark first — the marking writer held this
         // lock, so a mark seen here is always a crash leftover.
         let current_etag = self.resolve_current_client_etag(&bucket, &key).await?;
@@ -68,9 +68,9 @@ impl Hypha {
         )?;
 
         // Mark → commit → settle. The commit is one streaming PutObject at K: ciphertext framed
-        // with the facts footer (client MD5 computed inline, §6) — durable mode never writes
+        // with the facts footer (client MD5 computed inline) — durable mode never writes
         // plaintext to the cache. On failure or indeterminacy, settle K to whichever way the
-        // remote actually landed — the same repair that handles a crash here (§7).
+        // remote actually landed — the same repair that handles a crash here .
         let mtime_ms = tier::now_ms();
         self.tier.mark_transit_locked(&bucket, &key).await?;
         let trailer = SingleTrailer {
@@ -114,7 +114,7 @@ impl Hypha {
                 tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
             }
             // A Content-MD5 mismatch cuts the ciphertext stream short, so it reaches us as a
-            // backend fault; the digest channel is what tells the two apart (§7).
+            // backend fault; the digest channel is what tells the two apart .
             return Err(match etag_rx.try_recv() {
                 Ok(Err(_)) => s3_error!(BadDigest, "Content-MD5 does not match the request body"),
                 _ => e.into(),
@@ -153,7 +153,7 @@ impl Hypha {
             .await?;
 
         super::record_bytes(plen);
-        // The write half of §8's recency feed. A write is the strongest statement of interest a key
+        // The write half of the recency feed. A write is the strongest statement of interest a key
         // gets, and a read-only ring would have write-hot/read-cold keys evict first — reclaiming
         // bytes the next PUT immediately takes back. Always `AtKey`: a PUT is single-part, so its
         // plaintext lives at K whether it stays cached or is rehydrated back there later.
@@ -166,7 +166,7 @@ impl Hypha {
     }
 
     /// Caller holds K's write lock, so a transition mark seen here is always a crash leftover and is
-    /// repaired from the remote before the ETag is read off it (§4).
+    /// repaired from the remote before the ETag is read off it .
     pub(super) async fn resolve_current_client_etag(
         &self,
         bucket: &str,
@@ -191,12 +191,12 @@ impl Hypha {
         }
     }
 
-    /// Cached-mode PUT (§7) — reached only for a bucket whose namespace is ready, since a restoring
+    /// Cached-mode PUT  — reached only for a bucket whose namespace is ready, since a restoring
     /// one runs the durable bracket above. Ack on the cache body write, with the bare-`K` pending marker handed to
     /// the marker queue behind it; the reconcile sweep uploads to the remote asynchronously. A
     /// conditional PUT holds K's write lock across resolve → evaluate → commit; an unconditional one
     /// takes **no** lock — it races on the cache (S3 last-writer-wins) and is fenced against eviction
-    /// by §8's remote-generation confirm, not the lock. The cache computes `MD5(plaintext)` natively
+    /// by the remote-generation confirm, not the lock. The cache computes `MD5(plaintext)` natively
     /// as the ETag, and validates a forwarded `Content-MD5` (⇒ `BadDigest`) before storing.
     async fn op_put_object_cached(
         &self,
@@ -204,7 +204,7 @@ impl Hypha {
         bucket: String,
         key: String,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        // Admission gate (§7): acking a write the sweep cannot keep up with only widens the async
+        // Admission gate : acking a write the sweep cannot keep up with only widens the async
         // lag window, so refuse outright rather than contribute to it. The SDK retries the 503.
         if !self.tier.pressure.admit() {
             return Err(Error::SlowDown.into());
@@ -225,7 +225,7 @@ impl Hypha {
 
         let conditional = input.if_match.is_some() || input.if_none_match.is_some();
         let etag = if conditional {
-            // The lock covers resolve → evaluate → commit → marker (§4), the linearization point.
+            // The lock covers resolve → evaluate → commit → marker , the linearization point.
             let _guard = self.write_lock(&bucket, &key).await;
             let current = self.resolve_current_client_etag(&bucket, &key).await?;
             evaluate_precondition(
@@ -243,7 +243,7 @@ impl Hypha {
         super::record_bytes(plen);
         self.gc.touch(&bucket, &key, Plaintext::AtKey);
         // This write replaced whatever K held; if that was a rehydrated composite, its shadow is now
-        // unreachable (§8). Unconditional here because the unconditional branch above never read K and
+        // unreachable . Unconditional here because the unconditional branch above never read K and
         // so cannot know — the actor resolves it.
         self.orphans.owe(&bucket, &key);
         Ok(S3Response::new(PutObjectOutput {
@@ -254,7 +254,7 @@ impl Hypha {
 
     /// Land a cached-mode PUT: plaintext body to `<data>` at K (native ETag), which **is** the
     /// commit — the caller acks on it. The pending marker at bare `K` is then handed to the marker
-    /// queue (§7, [`crate::markers`]) rather than written here: the ack cannot depend on it, because
+    /// queue ([`crate::markers`]) rather than written here: the ack cannot depend on it, because
     /// a marker failure has no honest error to return once the body is live and client-visible.
     /// Returns the client ETag.
     async fn commit_cached(
@@ -291,7 +291,7 @@ impl Hypha {
                 other => {
                     // Everything else may have landed and lost its response, leaving K live with no
                     // marker queued behind it. This run can no longer claim the bucket's pending set
-                    // is a complete account of itself, so it withdraws the claim (§6) — no clean
+                    // is a complete account of itself, so it withdraws the claim  — no clean
                     // marker, and the next run's R2 rebuilds the set from both namespaces.
                     self.buckets.unaccount(bucket);
                     other.into()
@@ -330,7 +330,7 @@ fn require_inline_body(input: &mut PutObjectInput) -> S3Result<(u64, StreamingBl
     Ok((plen, body))
 }
 
-/// Reject a body equal to one of hypha's reserved 16-byte tombstone sentinels (§6), handing the
+/// Reject a body equal to one of hypha's reserved 16-byte tombstone sentinels , handing the
 /// buffered bytes back as the body otherwise. Only a 16-byte body can collide, so the caller gates
 /// on that and nothing larger is ever buffered.
 async fn reject_sentinel_body(body: StreamingBlob) -> S3Result<StreamingBlob> {
@@ -349,7 +349,7 @@ async fn reject_sentinel_body(body: StreamingBlob) -> S3Result<StreamingBlob> {
 }
 
 /// `current_etag` is the client-visible ETag of whatever is at K now; `None` ⇒ K is client-visibly
-/// absent, which no condition can match (§4).
+/// absent, which no condition can match .
 pub(super) fn evaluate_precondition(
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,

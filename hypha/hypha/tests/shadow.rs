@@ -25,7 +25,7 @@ async fn shadow_clean_marker_present(h: &Harness) -> bool {
 }
 
 /// A composite at `key`, completed and therefore tombstoned at K with its plaintext on the remote
-/// (§7). Returns the whole plaintext.
+/// . Returns the whole plaintext.
 async fn composite(c: &aws_sdk_s3::Client, key: &str, seed: u8) -> Vec<u8> {
     let p1 = pattern_seeded(MIN_PART, seed);
     let p2 = pattern_seeded(MIN_PART, seed.wrapping_add(1));
@@ -70,7 +70,7 @@ async fn plant_ghost_shadow(h: &Harness) {
 
 /// The queue's own path: a cached PUT over a rehydrated composite makes its shadow unreachable, and the
 /// obligation the write handed over is what reclaims it. Nothing here reads K — an unconditional cached
-/// PUT deliberately never does (§7) — so the write cannot know it superseded a composite, which is
+/// PUT deliberately never does  — so the write cannot know it superseded a composite, which is
 /// exactly why the obligation is unconditional and the actor resolves it.
 #[tokio::test]
 async fn a_write_that_supersedes_a_composite_reclaims_its_shadow() {
@@ -279,7 +279,7 @@ async fn a_shadow_reclaim_still_owed_at_drain_withholds_the_marker() {
     .await;
 }
 
-/// A shadow under pressure is the one reclaim in §8 that takes plaintext a client can ask for and
+/// A shadow under pressure is the one reclaim that takes plaintext a client can ask for and
 /// answers to *none* of the three eviction gates: the remote demonstrably holds the composite and K's
 /// tombstone points at it throughout, so one conditional delete is the whole transition. Both halves of
 /// that are asserted — the shadow goes, K's tombstone and its single twin do not — because a shadow

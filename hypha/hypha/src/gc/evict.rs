@@ -43,10 +43,10 @@ async fn evict_body(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<
     // Gate 2 — durability. A skip here **raises the key's pending marker**: this check has just
     // established the one thing a marker records, gate 1 established there is none, and no other path
     // can see a body that is cache-only because a write forgot to owe one. It costs no extra round
-    // trip and it lands on cold keys — precisely the ones no future write would have re-owed (§8).
+    // trip and it lands on cold keys — precisely the ones no future write would have re-owed .
     //
     // Create-only even so, because the lock cannot order this against a marker: markers are written
-    // asynchronously (§7), so a delete that committed before the lock may still owe its marker to the
+    // asynchronously , so a delete that committed before the lock may still owe its marker to the
     // queue. That interleaving is safe — the queue's write lands *after* this one and wins — but the
     // reverse is not, and `if_absent` is what forbids it.
     if !remote_holds_generation(tier, candidate, key).await? {
@@ -61,7 +61,7 @@ async fn evict_body(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<
     }
 
     // Gate 3 — the CAS. Twin before tombstone, so a sentinel always has its twin; a crash between
-    // leaves a twin next to a live body, which classification ignores (§6) and a later sweep reclaims.
+    // leaves a twin next to a live body, which classification ignores  and a later sweep reclaims.
     match tier.tombstone_locked(bucket, key, etag).await {
         Ok(()) => Ok(candidate.bytes),
         // A client wrote, deleted, or completed K while we were judging it. Its eviction was the one
@@ -71,7 +71,7 @@ async fn evict_body(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<
     }
 }
 
-/// Reclaim a rehydrated composite's shadow body (§6/§8) — one conditional delete, and none of the
+/// Reclaim a rehydrated composite's shadow body  — one conditional delete, and none of the
 /// three gates above.
 ///
 /// **No durability gate, because there is nothing to gate.** A shadow only ever exists because a
@@ -118,7 +118,7 @@ async fn cache_still_holds_generation(
 /// A single-part object's framed size is a closed-form function of its plaintext length, so a HEAD
 /// settles the common case: any other generation of a different length is refused on one round trip.
 /// Only a same-plaintext-length candidate is ambiguous, and only it pays the trailer's `cetag` — the
-/// same triage the pending-set rebuild runs (§7). A composite has no such closed form (its remote
+/// same triage the pending-set rebuild runs . A composite has no such closed form (its remote
 /// form is per-part age files), so it goes straight to the trailer.
 async fn remote_holds_generation(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<bool> {
     let (bucket, etag) = (&candidate.bucket, &candidate.etag);

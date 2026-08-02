@@ -54,7 +54,7 @@ async fn sync_marker_present(h: &Harness) -> bool {
     raw_exists(h, &h.meta_bucket(B), &meta::sync_marker_key()).await
 }
 
-/// Classify K's `<data>` entry: `None` ⇒ a live plaintext body, `Some(kind)` ⇒ a tombstone (§6).
+/// Classify K's `<data>` entry: `None` ⇒ a live plaintext body, `Some(kind)` ⇒ a tombstone .
 /// Panics if K has no entry at all — the callers here all know it does.
 async fn data_class(h: &Harness, key: &str) -> Option<meta::TombKind> {
     let head = h
@@ -170,7 +170,7 @@ const WINDOW_KEYS: usize = 400;
 
 // ── the write-mode gate ───────────────────────────────────────────────────────────────────────
 
-/// A cached deployment runs **durable** semantics for the whole of a bucket's restore (§7).
+/// A cached deployment runs **durable** semantics for the whole of a bucket's restore .
 ///
 /// This is what makes the restore's premise true rather than hoped-for. A cached write would ack off
 /// the cache and leave committed state in a namespace every reader is being told to ignore and the
@@ -340,7 +340,7 @@ async fn restore_does_not_resurrect_a_delete_taken_during_the_window() {
 }
 
 /// An entry the cache already holds is left exactly as it is — including the client pass-through the
-/// eviction tombstone's metadata is the only surviving copy of (§7: the remote's trailer carries
+/// eviction tombstone's metadata is the only surviving copy of (the remote's trailer carries
 /// facts and nothing else). Settling every key from the remote, as the old path did, silently erased
 /// `x-amz-meta-*` and the storage class on every key a restore touched.
 #[tokio::test]
@@ -447,7 +447,7 @@ async fn pending_rebuild_writes_markers_and_never_touches_data() {
 
 // ── invariants ────────────────────────────────────────────────────────────────────────────────
 
-/// Poll for the halt marker, which is recorded on the **remote** so it outlives the cache (§6).
+/// Poll for the halt marker, which is recorded on the **remote** so it outlives the cache .
 async fn halt_marker_present(h: &Harness) -> bool {
     raw_exists(h, &h.remote_bucket(B), &meta::halt_marker_key()).await
 }
@@ -609,7 +609,7 @@ async fn a_sync_marker_vanishing_mid_run_halts() {
 /// **I6 from the other side** — the marker queue, rather than the watchdog.
 ///
 /// A marker whose bucket is gone is *dropped*, deliberately: it can never land, and retrying it would
-/// withhold every other bucket's clean marker for the rest of the run (§7). That drop is gated on the
+/// withhold every other bucket's clean marker for the rest of the run . That drop is gated on the
 /// state map agreeing the bucket is gone, and this is the case where it does not: the `<meta>`
 /// projection vanished under a live bucket, so dropping the marker would silently shorten a pending set
 /// this run still vouches for. The watchdog would eventually see the same loss, so its interval is
@@ -668,7 +668,7 @@ async fn a_marker_owed_to_a_live_bucket_whose_projection_vanished_halts() {
     );
 }
 
-/// hypha's own keys live in the remote bucket alongside client objects (the halt marker, §6), and
+/// hypha's own keys live in the remote bucket alongside client objects (the halt marker), and
 /// every remote key a restore-time LIST emits goes to a trailer read. An unfiltered one would be
 /// reported as a foreign object — hypha halting on its own bookkeeping.
 #[tokio::test]
@@ -710,7 +710,7 @@ async fn reserved_remote_keys_are_invisible_and_harmless() {
     assert_eq!(keys, ["visible"], "reserved keys must never reach a client");
 }
 
-/// **The phase-5 LIST token boundary (§7):** a page read while the bucket is `Restoring` is served
+/// **The phase-5 LIST token boundary :** a page read while the bucket is `Restoring` is served
 /// from the remote and carries hypha's own cursor — a plain key position, never the remote's opaque
 /// continuation token — so the very next page, served from the cache after the flip to `Ready`,
 /// resumes without gaps or duplicates and sees the writes that landed after the flip.

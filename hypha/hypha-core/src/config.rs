@@ -34,7 +34,7 @@ pub struct S3Endpoint {
 pub const DATA_ROLE: &str = "d";
 pub const META_ROLE: &str = "m";
 pub const REMOTE_ROLE: &str = "r";
-/// GC's own bucket (§8). Not per client bucket — one bucket for the whole deployment, since the
+/// GC's own bucket . Not per client bucket — one bucket for the whole deployment, since the
 /// recency ring is global and its slices are keyed by fully qualified `<bucket>/<key>`.
 pub const GC_ROLE: &str = "g";
 
@@ -54,7 +54,7 @@ pub struct ClientAuth {
 pub struct Serving {
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Where §10's metrics and health probes are served. A second listener rather than paths on the
+    /// Where the metrics and health probes are served. A second listener rather than paths on the
     /// S3 port: those are unauthenticated and in-cluster, and the S3 port is neither.
     #[serde(default = "default_admin_listen")]
     pub admin_listen: String,
@@ -76,7 +76,7 @@ pub struct Reconcile {
     pub interval_ms: u64,
     #[serde(default = "default_reconcile_concurrency")]
     pub concurrency: usize,
-    /// Cached-write admission gate driven by the pending-marker set (§7). `0` disables a dimension;
+    /// Cached-write admission gate driven by the pending-marker set . `0` disables a dimension;
     /// with both at `0` the gate is off entirely.
     #[serde(default)]
     pub backpressure: Backpressure,
@@ -99,7 +99,7 @@ impl Default for Reconcile {
     }
 }
 
-/// Backpressure on cached writes (§7). Once the pending set crosses a configured size or the oldest
+/// Backpressure on cached writes . Once the pending set crosses a configured size or the oldest
 /// pending marker crosses a configured age, cached-mode PUT/DELETE/copy are refused outright with
 /// `503 SlowDown` (S3-idiomatic; SDKs retry with backoff) instead of acking writes the remote will
 /// keep falling behind.
@@ -169,7 +169,7 @@ pub struct Gc {
     /// byte target, so a gap this wide is what stops the scavenger from re-triggering on every pass.
     #[serde(default = "default_gc_low_water")]
     pub low_water: f64,
-    /// Pages one probe reads from its random position before moving on (§8). Small on purpose: the
+    /// Pages one probe reads from its random position before moving on . Small on purpose: the
     /// point of sampling is that scan cost tracks pressure rather than keyspace size.
     #[serde(default = "default_gc_probe_pages")]
     pub probe_pages: usize,
@@ -178,12 +178,12 @@ pub struct Gc {
     /// once and then stops learning.
     #[serde(default = "default_gc_yield_floor")]
     pub yield_floor: f64,
-    /// Evictions a pass may keep making after its target is met, taking only ring *misses* (§8).
+    /// Evictions a pass may keep making after its target is met, taking only ring *misses* .
     /// Over-evicting an affirmatively cold key is nearly free in rehydration risk, but each one still
     /// costs a remote HEAD, a twin write, and a CAS — hence a bound rather than no limit.
     #[serde(default = "default_gc_opportunistic_evictions")]
     pub opportunistic_evictions: usize,
-    /// Where usage is measured. Absent, GC never evicts (§8): with no measure of pressure there is no
+    /// Where usage is measured. Absent, GC never evicts : with no measure of pressure there is no
     /// target to evict against, and cached mode warns at boot because its cache will only fill.
     #[serde(default)]
     pub usage: Option<Usage>,
@@ -207,7 +207,7 @@ pub enum Usage {
     },
 }
 
-/// The shape of §8's recency ring: how much traffic a slice covers, and how far back the ring
+/// The shape of the recency ring: how much traffic a slice covers, and how far back the ring
 /// remembers.
 ///
 /// The slice's **bit count is derived**, not configured — it follows from `fill_target` and
@@ -219,7 +219,7 @@ pub enum Usage {
 #[serde(deny_unknown_fields)]
 pub struct Recency {
     /// Distinct keys a slice absorbs before it rotates. This — not a duration — is what recency is
-    /// denominated in (§8), so it is really the question "how much competing traffic should it take
+    /// denominated in , so it is really the question "how much competing traffic should it take
     /// to make a key look old".
     #[serde(default = "default_recency_fill_target")]
     pub fill_target: usize,
@@ -323,7 +323,7 @@ pub struct Config {
     pub background: Background,
     #[serde(default)]
     pub gc: Gc,
-    /// How often to re-check that each `Ready` bucket still has its sync marker (§7). One HEAD per
+    /// How often to re-check that each `Ready` bucket still has its sync marker . One HEAD per
     /// ready bucket per tick, so it is cheap at homelab bucket counts; the cost of a slow tick is
     /// only how long a live volume loss goes unnoticed.
     #[serde(default = "default_volume_watch_interval_ms")]
@@ -368,8 +368,8 @@ impl Config {
         format!("{}-{GC_ROLE}", self.bucket_prefix)
     }
 
-    /// Charged against S3's 63-byte bucket-name cap, so the client-visible cap is `63 − this`
-    /// (§7 *Buckets*). Every role prefix is the same length, so one answer covers them all.
+    /// Charged against S3's 63-byte bucket-name cap, so the client-visible cap is `63 − this`.
+    /// Every role prefix is the same length, so one answer covers them all.
     pub fn max_bucket_prefix_len(&self) -> usize {
         self.role_prefix(DATA_ROLE).len()
     }
@@ -397,7 +397,7 @@ impl Config {
                 self.bucket_prefix
             ));
         }
-        // An inverted bound doesn't degrade the §8 ladder, it reverses it: escalating would slow the
+        // An inverted bound doesn't degrade the ladder, it reverses it: escalating would slow the
         // scavenger down and reach the age threshold having spent nothing cheap first.
         if self.gc.min_interval_ms > self.gc.interval_ms {
             return Err(format!(

@@ -123,7 +123,7 @@ impl RecencyRing {
             match decode(&body, &self.geometry) {
                 Some(slice) => self.retired.push_back(slice),
                 // A slice written under a different geometry cannot be read under this one, and
-                // guessing would be worse than starting cold (§8: advisory, never incorrect).
+                // guessing would be worse than starting cold (advisory, never incorrect).
                 None => tracing::info!(seq, "recency slice ignored; geometry changed"),
             }
         }

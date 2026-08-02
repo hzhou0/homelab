@@ -32,7 +32,7 @@ impl Hypha {
 
         let (_gate, mode) = self.prepare_write(&bucket, &key).await?;
         if let WriteMode::Cached = mode {
-            // Admission gate (§7) — see `op_put_object_cached`.
+            // Admission gate  — see `op_put_object_cached`.
             if !self.tier.pressure.admit() {
                 return Err(Error::SlowDown.into());
             }
@@ -144,7 +144,7 @@ impl Hypha {
         Ok(delete_objects_reply(quiet, requested, &failed))
     }
 
-    /// Cached-mode DeleteObjects (§7): the remote isn't touched here, so there is nothing to batch —
+    /// Cached-mode DeleteObjects : the remote isn't touched here, so there is nothing to batch —
     /// it is a per-key fan-out of the cached single delete (its own write lock, removal + marker),
     /// with reconcile propagating the remote deletes. Same S3 contract as durable: deleting an
     /// absent key succeeds, `VersionId` is ignored.
@@ -154,7 +154,7 @@ impl Hypha {
         quiet: bool,
         requested: Vec<String>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        // Admission gate (§7), once per request rather than per key — see `op_put_object_cached`.
+        // Admission gate , once per request rather than per key — see `op_put_object_cached`.
         if !self.tier.pressure.admit() {
             return Err(Error::SlowDown.into());
         }
@@ -183,7 +183,7 @@ impl Hypha {
         Ok(delete_objects_reply(quiet, requested, &failed))
     }
 
-    /// Cached-mode delete of one key (§7), under its write lock: remove K — the commit, which makes
+    /// Cached-mode delete of one key , under its write lock: remove K — the commit, which makes
     /// GET/HEAD/LIST agree immediately — then hand the DELETE marker to the same queue as PUT. A
     /// crash before the marker lands leaves the clean marker absent; R2 recovers the remote-only key
     /// as an interrupted delete.
@@ -193,14 +193,14 @@ impl Hypha {
         if let Err(e) = self.data().delete(bucket, key).await {
             // Indeterminate, not a rollback: the cache may have removed K and lost the response,
             // leaving the key client-absent with no DELETE marker behind it — and so a remote object
-            // nothing would ever propagate the delete to. Withdrawing the bucket's accounting (§6) is
+            // nothing would ever propagate the delete to. Withdrawing the bucket's accounting  is
             // what puts R2 on the remote-only sighting next run, instead of a clean marker telling it
             // there is nothing to look for.
             self.buckets.unaccount(bucket);
             return Err(e);
         }
         self.markers.owe(bucket, key, meta::delete_marker_body());
-        // A deleted K can never name a shadow's generation again, so any shadow it had is orphaned (§8).
+        // A deleted K can never name a shadow's generation again, so any shadow it had is orphaned .
         self.orphans.owe(bucket, key);
         Ok(())
     }
@@ -243,7 +243,7 @@ impl Hypha {
         marked
     }
 
-    /// A leftover mark is repaired before an op takes its own (§7) — the bracket must start from a
+    /// A leftover mark is repaired before an op takes its own  — the bracket must start from a
     /// settled projection, or a stale mark could hide an object this delete should 404. Caller
     /// holds K's write lock.
     async fn repair_leftover_mark_locked(&self, bucket: &str, key: &str) -> Result<(), Error> {
@@ -262,7 +262,7 @@ impl Hypha {
 
     /// The batch's admission: validate every key and materialize each one's remote state before any
     /// is marked, so the batch runs against correct entries. The per-key gate is dropped at once —
-    /// the batch's own, taken by the caller, covers the whole op (§7).
+    /// the batch's own, taken by the caller, covers the whole op .
     async fn admitted_keys(
         &self,
         bucket: &str,

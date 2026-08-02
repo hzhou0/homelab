@@ -25,9 +25,9 @@ tokio-util = { version = "0.7", features = ["io", "io-util", "codec", "compat"] 
 # S3 server surface + client
 async-trait = "0.1"
 md-5 = "0.10"
-rand = "0.8"           # mpu stash nonces (§6); already in-tree via age
+rand = "0.8"           # mpu stash nonces; already in-tree via age
 hex = "0.4"
-percent-encoding = "2"  # decode encoding-type=url LIST keys (§6)
+percent-encoding = "2"  # decode encoding-type=url LIST keys
 base64-simd = "0.8"     # Content-MD5 decode, stash nonces, twin facts; already in the tree via s3s
 bytes = "1"             # the codecs' zero-copy frames; already in-tree via hyper and the SDK
 s3s = "0.14"
@@ -36,12 +36,12 @@ aws-sdk-s3 = "1"
 hyper = "1"
 http-body-util = "0.1"   # the admin listener's fixed-body responses; already in-tree via s3s
 hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio"] }
-# The §8 usage source, which is HTTP+JSON rather than S3. No TLS feature: the endpoints it reads are
+# The usage source, which is HTTP+JSON rather than S3. No TLS feature: the endpoints it reads are
 # the cache backend's own admin surface, in-cluster and plain HTTP, so pulling a second TLS stack in
 # beside the SDK's would buy nothing.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
-# Observability (§10). The exporter renders a text body on demand; hypha serves it from its own
+# Observability. The exporter renders a text body on demand; hypha serves it from its own
 # admin listener beside the health probes, so none of the crate's own listener/push features are on.
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
@@ -61,6 +61,6 @@ tempfile = "3"
 futures = "0.3"
 arc-swap = "1.9"
 dashmap = "6"
-# `rand` off: it only picks the hasher's seed, and the §8 ring pins its own so a slice sealed by one
+# `rand` off: it only picks the hasher's seed, and the ring pins its own so a slice sealed by one
 # process still means something to the next. Drops the `rand` tree; foldhash covers what remains.
 fastbloom = { version = "0.17", default-features = false, features = ["std"] }

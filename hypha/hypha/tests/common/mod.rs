@@ -32,15 +32,15 @@ use hypha_core::config::{
     DATA_ROLE, META_ROLE, REMOTE_ROLE,
 };
 
-/// The client-facing credentials hypha authenticates its own S3 clients with (§2) — distinct from
+/// The client-facing credentials hypha authenticates its own S3 clients with  — distinct from
 /// each MinIO's backend credentials.
 const HYPHA_ACCESS: &str = "hyphatestaccess";
 const HYPHA_SECRET: &str = "hyphatestsecretkey";
 
-/// A random 256-bit-ish passphrase stand-in; any stable string works for a single run (§6).
+/// A random 256-bit-ish passphrase stand-in; any stable string works for a single run .
 const MASTER_PASSPHRASE: &str = "integration-test-master-passphrase-0123456789abcdef";
 
-/// This harness's own deployment prefix. Every backend bucket is `<prefix>-<role>-<b>` (§9), which
+/// This harness's own deployment prefix. Every backend bucket is `<prefix>-<role>-<b>` , which
 /// is what keeps the cache's tombstones/twins and the remote's ciphertext from colliding on one
 /// endpoint — and, when the endpoint is shared, what keeps one fixture's buckets invisible to
 /// another's.
@@ -731,11 +731,11 @@ fn proxy_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
 
 // ── the cache-usage source ───────────────────────────────────────────────────────────────────
 
-/// The SeaweedFS master + volume server GC reads its pressure from (§8), with the numbers under the
+/// The SeaweedFS master + volume server GC reads its pressure from , with the numbers under the
 /// test's control.
 ///
 /// MinIO reports no usage at all, so the plain harness has no pressure source and its passes sweep
-/// debris and never evict — which is why nothing before this could reach the eviction half of §8.
+/// debris and never evict — which is why nothing before this could reach the eviction half.
 /// Setting the figure rather than measuring it is also what makes an *unmeetable* target
 /// expressible: a real cache shrinks as GC evicts, so a pass could never be observed escalating
 /// past the rung its first reclaim satisfied.
@@ -1170,7 +1170,7 @@ pub struct Harness {
 /// How a harness differs from the default one, chosen before anything is started.
 ///
 /// A builder rather than a constructor per combination: the axes (mode, fault proxies, in-process vs
-/// the real binary, a usage source, and the §8 knobs a test needs to move) are independent, and
+/// the real binary, a usage source, and the GC knobs a test needs to move) are independent, and
 /// naming their product was already the reason `with_faults`/`subprocess` had begun to duplicate
 /// each other.
 pub struct HarnessBuilder {
@@ -1195,7 +1195,7 @@ impl HarnessBuilder {
     }
 
     /// Run hypha as the shipped binary. Needed only where a test asserts *process-level* behaviour —
-    /// the metrics recorder and the admin listener exist nowhere else (§10), and an invariant
+    /// the metrics recorder and the admin listener exist nowhere else , and an invariant
     /// violation's `process::exit` would take the test runner down in-process.
     pub fn subprocess(mut self) -> Self {
         self.subprocess = true;
@@ -1208,7 +1208,7 @@ impl HarnessBuilder {
         self
     }
 
-    /// Adjust the config before hypha reads it — for the §8 knobs whose defaults are deliberately
+    /// Adjust the config before hypha reads it — for the knobs whose defaults are deliberately
     /// production-shaped (the water marks, the ladder's bounds, the ring's geometry).
     pub fn tune(mut self, tune: impl FnOnce(&mut Config) + 'static) -> Self {
         self.tune = Some(Box::new(tune));
@@ -1394,17 +1394,17 @@ impl Harness {
         format!("{}{client_bucket}", self.config.role_prefix(REMOTE_ROLE))
     }
 
-    /// The `<data>` cache bucket — client bodies + tombstones (§6).
+    /// The `<data>` cache bucket — client bodies + tombstones .
     pub fn cache_bucket(&self, client_bucket: &str) -> String {
         format!("{}{client_bucket}", self.config.role_prefix(DATA_ROLE))
     }
 
-    /// The `<meta>` cache bucket — hypha's twins, markers, and mpu records (§6).
+    /// The `<meta>` cache bucket — hypha's twins, markers, and mpu records .
     pub fn meta_bucket(&self, client_bucket: &str) -> String {
         format!("{}{client_bucket}", self.config.role_prefix(META_ROLE))
     }
 
-    /// GC's own bucket — the recency ring's slices (§8). One per deployment, not per client bucket.
+    /// GC's own bucket — the recency ring's slices . One per deployment, not per client bucket.
     pub fn gc_bucket(&self) -> String {
         self.config.gc_bucket()
     }
@@ -1417,7 +1417,7 @@ impl Harness {
     }
 
     /// Stop hypha **gracefully**: signal shutdown and wait out the drain, so cached mode writes its
-    /// clean markers (§7). Leaves the harness without a running server until [`Self::start_hypha`].
+    /// clean markers . Leaves the harness without a running server until [`Self::start_hypha`].
     pub async fn stop_hypha(&mut self) {
         match &mut self.hypha {
             Server::InProcess(h) => h.stop().await,
@@ -1482,7 +1482,7 @@ fn base_config(cache: &TestS3, remote: &TestS3, mode: Mode) -> Config {
         },
         master_passphrase: MASTER_PASSPHRASE.to_string(),
         serving: Serving {
-            // Its own port per harness, since the production default is a fixed one (§10) and these
+            // Its own port per harness, since the production default is a fixed one  and these
             // run concurrently. Only the subprocess ones bind it at all — and there, binding it is
             // itself under test, because a bind failure takes the whole process down.
             admin_listen: format!("127.0.0.1:{}", free_port()),
@@ -1498,7 +1498,7 @@ fn base_config(cache: &TestS3, remote: &TestS3, mode: Mode) -> Config {
         background: Background::default(),
         // Tight for the same reason as the reconcile cadence: a test asserting a reclaim shouldn't
         // wait out a production interval that is deliberately measured in minutes. Bounds pinned to
-        // the base so the §8 ladder stays flat — a test that wants it to escalate says so itself,
+        // the base so the ladder stays flat — a test that wants it to escalate says so itself,
         // rather than every unrelated test racing an interval that moves underneath it.
         gc: Gc {
             interval_ms: 200,
@@ -1667,7 +1667,7 @@ pub async fn complete_mpu(
 }
 
 /// The S3 composite ETag for parts uploaded through hypha: `md5(pmd5₀‖…‖pmd5ₙ)-N`, where each
-/// `pmd5` is the part's *plaintext* MD5 (§6). Mirrors `hypha_core::meta::composite_etag`.
+/// `pmd5` is the part's *plaintext* MD5 . Mirrors `hypha_core::meta::composite_etag`.
 pub fn expected_composite_etag(parts: &[&[u8]]) -> String {
     use md5::{Digest, Md5};
     let mut outer = Md5::new();
@@ -1820,7 +1820,7 @@ pub async fn drop_backend_bucket(harness: &Harness, bucket: &str) {
 /// Poll `cond` every 50 ms until it holds or `ms` elapses (then panic naming `what`). Every
 /// background duty here — reconcile, rehydrate, a GC pass — lands asynchronously, so this is how a
 /// test states the outcome it is waiting for rather than a sleep long enough to usually work.
-/// One request to the binary's admin listener (§10) — `(status, body)`. In-process harnesses bind no
+/// One request to the binary's admin listener  — `(status, body)`. In-process harnesses bind no
 /// admin port, so this is only meaningful for a `subprocess()` one.
 pub async fn admin_get(h: &Harness, path: &str) -> (u16, String) {
     let url = format!("http://{}{path}", h.config.serving.admin_listen);
@@ -1871,7 +1871,7 @@ pub async fn raw_exists(h: &Harness, bucket: &str, key: &str) -> bool {
         .is_ok()
 }
 
-/// The pending marker for `key` lives at bare `K` in `<meta>` (§6).
+/// The pending marker for `key` lives at bare `K` in `<meta>` .
 pub async fn marker_present(h: &Harness, bucket: &str, key: &str) -> bool {
     raw_exists(h, &h.meta_bucket(bucket), key).await
 }
@@ -1880,7 +1880,7 @@ pub async fn remote_present(h: &Harness, bucket: &str, key: &str) -> bool {
     raw_exists(h, &h.remote_bucket(bucket), key).await
 }
 
-/// Classify the `<data>` entry at `key`: `None` ⇒ a live body, `Some(kind)` ⇒ a tombstone (§6).
+/// Classify the `<data>` entry at `key`: `None` ⇒ a live body, `Some(kind)` ⇒ a tombstone .
 /// Panics if nothing is there at all, which is a third state a caller has to distinguish itself.
 pub async fn data_class(
     h: &Harness,
@@ -1901,7 +1901,7 @@ pub async fn data_class(
     )
 }
 
-/// The `<data>` entry's user metadata, where a tombstone's authoritative facts live (§6).
+/// The `<data>` entry's user metadata, where a tombstone's authoritative facts live .
 pub async fn data_metadata(h: &Harness, bucket: &str, key: &str) -> HashMap<String, String> {
     h.raw()
         .head_object()
@@ -1915,7 +1915,7 @@ pub async fn data_metadata(h: &Harness, bucket: &str, key: &str) -> HashMap<Stri
 }
 
 /// Every twin of `key` currently in `<meta>` (range B, `0x01 ‖ key ‖ 0x01 ‖ facts`). More than one
-/// is debris from a crash between a twin refresh's delete and its write (§6).
+/// is debris from a crash between a twin refresh's delete and its write .
 pub async fn twins_of(h: &Harness, bucket: &str, key: &str) -> Vec<String> {
     let c = hypha_core::meta::CTRL as char;
     raw_list(
@@ -1968,7 +1968,7 @@ pub async fn raw_meta_put(
         .expect("raw meta put");
 }
 
-/// Plant an eviction tombstone over `key` exactly as GC's own transition would (§8) — the facts twin
+/// Plant an eviction tombstone over `key` exactly as GC's own transition would  — the facts twin
 /// first, then the evict sentinel carrying the authoritative facts — leaving the key resolvable from
 /// the remote and rehydratable on read. The caller is responsible for the remote already holding this
 /// generation; an eviction tombstone without it is invariant **I2**, not a valid state to plant.

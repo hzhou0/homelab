@@ -18,7 +18,7 @@ const PINNED_WORK_FACTOR: u8 = 1;
 pub struct Envelope {
     passphrase: SecretString,
     /// Decryption bound: reject stanzas demanding more work than we ever emit, so a corrupted or
-    /// foreign work factor can't stall a GET for seconds (§6).
+    /// foreign work factor can't stall a GET for seconds .
     max_work_factor: u8,
 }
 
@@ -154,7 +154,7 @@ mod tests {
 
     /// The decryption bound, from the side that matters: a file demanding more work than hypha ever
     /// emits is refused rather than honoured, so a corrupted or foreign work factor cannot stall a GET
-    /// for seconds (§6). Asserted against a file *this* crate can otherwise read — same passphrase,
+    /// for seconds . Asserted against a file *this* crate can otherwise read — same passphrase,
     /// same format — so the only reason it fails is the bound.
     #[test]
     fn a_file_over_the_work_factor_bound_is_refused() {

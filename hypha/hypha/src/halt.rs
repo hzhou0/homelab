@@ -21,7 +21,7 @@ pub const EXIT_INVARIANT_VIOLATION: i32 = 86;
 /// Short, because nothing is being served until the record lands.
 const RECORD_RETRY: Duration = Duration::from_secs(2);
 
-/// The enumerated properties §7's recoveries assume; a variant is added only alongside the check
+/// The enumerated properties the recoveries assume; a variant is added only alongside the check
 /// that detects its violation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Invariant {
@@ -136,7 +136,7 @@ impl Halt {
         std::future::pending().await
     }
 
-    /// One helper is what keeps every trailer-reading site (§6) on the same footing — none may
+    /// One helper is what keeps every trailer-reading site  on the same footing — none may
     /// treat a trailer that does not authenticate as a miss.
     pub(crate) async fn foreign_object(&self, bucket: &str, key: &str) -> ! {
         self.raise(Violation {

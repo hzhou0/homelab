@@ -30,7 +30,7 @@ impl Hypha {
         match self.resolve_key(&bucket, &key).await? {
             KeyState::Absent => Err(Error::NotFound.into()),
             KeyState::Remote { facts, md } => {
-                // Cached mode promotes an eviction-tombstoned read back into the cache (§8): probe the
+                // Cached mode promotes an eviction-tombstoned read back into the cache : probe the
                 // shadow for a composite, else serve from the remote and kick an async rehydrate. A
                 // transition mark or a restoring bucket resolves from the remote with no rehydrate.
                 if self.mode == Mode::Cached && meta::tomb_kind(&md) == Some(meta::TombKind::Evict)
@@ -49,7 +49,7 @@ impl Hypha {
         }
     }
 
-    /// Serve an eviction-tombstoned key in cached mode, rehydrating (§8). A composite is probed in the
+    /// Serve an eviction-tombstoned key in cached mode, rehydrating . A composite is probed in the
     /// shadow body first and served on a verified hit; on a miss — or for a single-part object — the
     /// read is served from the remote and a rehydrate is queued on the background actor
     /// ([`background`]) to land the plaintext (single-part into K, composite into the shadow)
@@ -135,7 +135,7 @@ impl Hypha {
         }))
     }
 
-    /// Resolve a transition-marked K from the remote (§7): repair it if its lock is free (crash
+    /// Resolve a transition-marked K from the remote : repair it if its lock is free (crash
     /// leftover), else read through to the remote's current state. `None` ⇒ K is absent there.
     pub(super) async fn resolve_transit(
         &self,
@@ -198,7 +198,7 @@ impl Hypha {
         })
     }
 
-    /// Serve a remote-only object (tombstoned or mid-bracket) by decrypting from the remote (§6);
+    /// Serve a remote-only object (tombstoned or mid-bracket) by decrypting from the remote ;
     /// durable mode never repopulates the cache here.
     async fn serve_remote(
         &self,
@@ -262,9 +262,9 @@ impl Hypha {
         }
     }
 
-    /// **GetObjectAttributes** (§7): a read projection over the same key-state dispatch as HEAD.
+    /// **GetObjectAttributes** : a read projection over the same key-state dispatch as HEAD.
     /// `ObjectParts` for a composite comes straight off the trailer's offset table (one bounded
-    /// MAC-verified tail GET, no remote part index, §6). `Checksum` is deferred (§11).
+    /// MAC-verified tail GET, no remote part index). `Checksum` is deferred .
     pub(super) async fn op_get_object_attributes(
         &self,
         req: S3Request<GetObjectAttributesInput>,
@@ -285,7 +285,7 @@ impl Hypha {
 
         let want = |name: &str| input.object_attributes.iter().any(|a| a.as_str() == name);
 
-        // Sizes are the per-part *plaintext* lengths from the trailer's table (§6); the parts
+        // Sizes are the per-part *plaintext* lengths from the trailer's table ; the parts
         // paginate like ListParts.
         let object_parts =
             if want(ObjectAttributes::OBJECT_PARTS) && meta::is_composite_etag(&facts.cetag) {
@@ -303,7 +303,7 @@ impl Hypha {
 
         let resp = GetObjectAttributesOutput {
             // Quoted here though AWS sends this one unquoted: s3s 0.14.1 quotes every ETag DTO value
-            // uniformly, an upstream bug (Nugine/s3s#629, fixed for 0.15.0, §2). Harmless — every S3
+            // uniformly, an upstream bug (Nugine/s3s#629, fixed for 0.15.0). Harmless — every S3
             // client trims quotes — drop this note on the s3s bump.
             e_tag: want(ObjectAttributes::ETAG).then(|| ETag::Strong(facts.cetag.clone())),
             object_size: want(ObjectAttributes::OBJECT_SIZE).then_some(facts.plen as i64),
@@ -311,7 +311,7 @@ impl Hypha {
                 .then(|| StorageClass::from(storage_class)),
             object_parts,
             last_modified: Some(ts_ms(facts.mtime_ms)),
-            // No versioning, so never a delete marker; Checksum deferred (§11).
+            // No versioning, so never a delete marker; Checksum deferred .
             ..Default::default()
         };
         Ok(S3Response::new(resp))
@@ -351,7 +351,7 @@ fn build_object_parts(
     }
 }
 
-/// Where a read resolved, and how much it will return — reported to both §10 surfaces at once,
+/// Where a read resolved, and how much it will return — reported to both surfaces at once,
 /// because the two are the same statement and a call site that made only one of them would drift.
 fn resolved(cache_hit: bool, bytes: u64) {
     crate::metrics::cache_read(cache_hit);
@@ -359,7 +359,7 @@ fn resolved(cache_hit: bool, bytes: u64) {
     super::record_bytes(bytes);
 }
 
-/// Plaintext facts off an eviction tombstone's own metadata (§6) — the authoritative copy.
+/// Plaintext facts off an eviction tombstone's own metadata  — the authoritative copy.
 pub(super) fn facts_from_tombstone(
     key: &str,
     md: &std::collections::HashMap<String, String>,
@@ -372,7 +372,7 @@ pub(super) fn facts_from_tombstone(
         .get(meta::CETAG)
         .cloned()
         .ok_or_else(|| Error::Backend(format!("tombstone for {key:?} missing cetag")))?;
-    // hypha writes MTIME on every eviction tombstone (§6), so — like plen/cetag above — a missing
+    // hypha writes MTIME on every eviction tombstone , so — like plen/cetag above — a missing
     // or unparseable value is a corrupt tombstone, not a defaultable optional.
     let mtime_ms = md
         .get(meta::MTIME)

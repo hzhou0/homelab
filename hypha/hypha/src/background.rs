@@ -20,7 +20,7 @@ use crate::codec;
 use crate::tier::Tiering;
 
 pub(crate) enum Transition {
-    /// Fetch K from the remote and land its plaintext in the cache (§8): a single-part body at K
+    /// Fetch K from the remote and land its plaintext in the cache : a single-part body at K
     /// itself, a composite into K's shadow body. `cetag` names the generation the read observed —
     /// the transition is abandoned if K has moved on by the time it runs.
     Rehydrate {
@@ -75,7 +75,7 @@ impl Background {
     }
 
     /// Tell any queued or running transition for `key` to stop, so a client write can take K's write
-    /// lock without waiting out a whole-object fetch (§8). Fire-and-forget — see the module note on
+    /// lock without waiting out a whole-object fetch . Fire-and-forget — see the module note on
     /// why no acknowledgement is needed.
     pub(crate) fn cancel(&self, bucket: &str, key: &str) {
         // A cancelled-but-not-yet-removed entry is re-cancelled harmlessly; the token is
@@ -116,8 +116,8 @@ struct TransitionActor {
     live: LiveTransitions,
     sem: Arc<Semaphore>,
     /// The transitions running now. Tracked rather than detached so the drain can wait on them: a
-    /// rehydrate killed between landing a body and deleting its twin leaves the one hybrid state §8
-    /// orders every path to avoid, and it is the *last* step of the transition that does that.
+    /// rehydrate killed between landing a body and deleting its twin leaves the one hybrid state
+    /// every path orders away, and it is the *last* step of the transition that does that.
     running: JoinSet<()>,
     shutdown: CancellationToken,
 }
@@ -213,7 +213,7 @@ async fn run_transition(
     }
 }
 
-/// Fetch + decrypt K from the remote and land it in the cache (§8), under K's write lock.
+/// Fetch + decrypt K from the remote and land it in the cache , under K's write lock.
 /// Re-confirms the eviction tombstone under the lock — a write or delete may have superseded it, in
 /// which case there is nothing to rehydrate.
 ///

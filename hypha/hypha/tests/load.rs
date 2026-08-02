@@ -258,7 +258,7 @@ async fn latency_under_load() {
     summarize(&format!("GET (hot) w/ {writers} writers"), gets);
 }
 
-/// Streaming validation across a 1000× size range. §5's design is that per-request memory (and so
+/// Streaming validation across a 1000× size range. The design is that per-request memory (and so
 /// **time-to-first-byte**) is bounded by the pipe capacity, *not* the object size: hypha decrypts
 /// the remote object chunk-by-chunk into the response as it goes. So GET TTFB must stay roughly
 /// flat while total transfer grows with size — a buffer-the-whole-object implementation would show

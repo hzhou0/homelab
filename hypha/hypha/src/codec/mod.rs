@@ -40,7 +40,7 @@ pub struct DigestMismatch;
 pub type EtagReceiver = tokio::sync::oneshot::Receiver<Result<String, DigestMismatch>>;
 
 /// The facts a single-part commit stamps into its tail trailer, alongside the body. The MD5 isn't
-/// here: it's computed inline as the plaintext streams (§6) and folded into the trailer at stream
+/// here: it's computed inline as the plaintext streams  and folded into the trailer at stream
 /// end. `None` to [`encrypt_blob_with_etag`] emits a pure age file (a multipart part), whose facts
 /// live in the object's one terminating trailer part instead.
 pub struct SingleTrailer {
@@ -58,7 +58,7 @@ pub fn bytestream_to_blob(bs: ByteStream) -> StreamingBlob {
 }
 
 /// A stream of `body` followed by `tail`, without buffering `body` — the complete-time trailer
-/// fold (§7), where the retained part may be gigabytes but the trailer is a few dozen KB.
+/// fold , where the retained part may be gigabytes but the trailer is a few dozen KB.
 pub fn append_bytes(body: ByteStream, tail: Vec<u8>) -> ByteStream {
     let chained = body.into_async_read().chain(io::Cursor::new(tail));
     blob_to_bytestream(StreamingBlob::wrap(ReaderStream::new(chained)))
@@ -94,7 +94,7 @@ pub async fn decrypt_full(
 }
 
 /// Decrypt plaintext byte range `pt` of a remote object, re-opening ranged ciphertext GETs
-/// through [`RemoteRangeSource`] as age seeks (§6). `ct_len` is the object's ciphertext
+/// through [`RemoteRangeSource`] as age seeks . `ct_len` is the object's ciphertext
 /// Content-Length (from a prior HEAD), needed for `SeekFrom::End` and range clamping.
 ///
 /// The only codec that still crosses a pipe: age's `Seek` is synchronous, so the work belongs on
@@ -146,7 +146,7 @@ fn pump_decrypt_range(
 
 /// A [`RangeSource`] over a byte window `[base, base+len)` of a remote object, re-opened by
 /// byte-range GETs. `base = 0, len = ct_len` reads a whole single-part object; a composite part
-/// (its own age file inside the concatenation, §7) is a non-zero window. Lives inside the
+/// (its own age file inside the concatenation) is a non-zero window. Lives inside the
 /// blocking decrypt task, so it drives the async SDK by blocking on the runtime handle (legal
 /// off a `spawn_blocking` thread, which is not a runtime worker).
 struct RemoteRangeSource {
@@ -189,7 +189,7 @@ impl RangeSource for RemoteRangeSource {
     }
 }
 
-// ── Composite bodies (§7) ───────────────────────────────────────────────────────────────────
+// ── Composite bodies  ───────────────────────────────────────────────────────────────────
 
 /// The one remote body a composite read walks. Shared because age's async reader takes ownership
 /// of its source and never hands it back: each part's window borrows the body in turn.
@@ -308,7 +308,7 @@ impl tokio::io::AsyncRead for CompositeReader {
     }
 }
 
-/// Decrypt a whole committed composite in **one GET** (§7): the caller fetches `[0, body_ct_len)`
+/// Decrypt a whole committed composite in **one GET** : the caller fetches `[0, body_ct_len)`
 /// — the concatenated parts, trailer excluded — and hands it here with each part's ciphertext
 /// length (from the trailer's parts table). O(1) round trips.
 pub fn decrypt_composite_full(

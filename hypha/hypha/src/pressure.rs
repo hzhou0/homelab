@@ -1,11 +1,11 @@
-//! Cached-write admission gate driven by the pending-marker set (§7).
+//! Cached-write admission gate driven by the pending-marker set .
 //!
 //! One global counter of pending markers, seeded by a full census once at startup and maintained
 //! exactly since: a marker counts once when raised (create-only, so a last-writer-wins overwrite
 //! never double-counts), once when the sweep's CAS actually removes it, and wholesale when
 //! `DeleteBucket` drains a `<meta>` projection. The gate checks the counter against the configured
 //! size and age thresholds and refuses a write the moment it is over — no waiting: the pacing that
-//! a wait would provide is the SDK's retry backoff on `503 SlowDown` (§7).
+//! a wait would provide is the SDK's retry backoff on `503 SlowDown` .
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -68,7 +68,7 @@ impl Pressure {
 
     /// `Lifecycle::startup` seeds the counter and oldest age from a full census before the listener
     /// opens; the age is then re-published every pass because it has no atomic source — it is sampled
-    /// where the sweep already enumerates the whole set (§7).
+    /// where the sweep already enumerates the whole set .
     pub(crate) fn publish(&self, pending: usize, oldest_age_ms: u64) {
         if !self.enabled {
             return;

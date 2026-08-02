@@ -29,13 +29,13 @@ pub(super) struct Candidate {
     /// thousands, and they all came from the same bucket.
     pub(super) bucket: Arc<str>,
     pub(super) artifact: Artifact,
-    /// The version token the eviction conditions on (§8): a writer — or a fresher rehydrate — landing
+    /// The version token the eviction conditions on : a writer — or a fresher rehydrate — landing
     /// anywhere between the gates and the reclaim moves it, and the conditional write fails instead of
     /// discarding what landed.
     pub(super) etag: String,
     /// Plaintext bytes, since a cache body *is* plaintext — so this is what reclaiming it returns.
     pub(super) bytes: u64,
-    /// The tie-break within one age bucket (§8). Meaningful for a body, where rehydration lands a
+    /// The tie-break within one age bucket . Meaningful for a body, where rehydration lands a
     /// fresh mtime so a just-restored one sorts young; for a shadow it records only when the shadow
     /// landed, since reads never move it — which is why the ring, not this, has to order shadows.
     pub(super) mtime_ms: i64,
@@ -44,9 +44,9 @@ pub(super) struct Candidate {
 /// The two things in the cache that hold a client's plaintext, and they are reclaimed differently.
 pub(super) enum Artifact {
     /// A live client body at bare K in `<data>`. Reclaiming it means tombstoning K, so it answers to
-    /// all three of §8's gates.
+    /// all three of the gates.
     Body(String),
-    /// A rehydrated composite's plaintext in `<meta>` (§6), keyed by the digest of K — so this carries
+    /// A rehydrated composite's plaintext in `<meta>` , keyed by the digest of K — so this carries
     /// the shadow key, and **K is not recoverable from it**. That shapes both halves: the ring must
     /// have been fed this same key ([`super::Plaintext::InShadow`]), and the durability gates are
     /// unavailable *and* unnecessary, since a shadow is a copy of a composite the remote demonstrably
@@ -112,7 +112,7 @@ impl Probed {
 ///
 /// The marks cost nothing because every entry is classified here anyway to find the candidates, and
 /// this is the only listing that ever sees them: [`super::debris`] gives them no walk of their own,
-/// since a mark is repaired by any read of its key (§7/§8).
+/// since a mark is repaired by any read of its key .
 pub(super) async fn probe_bodies(
     tier: &Tiering,
     bucket: &Arc<str>,
@@ -136,7 +136,7 @@ pub(super) async fn probe_bodies(
     Ok((yielded, candidates, marked))
 }
 
-/// Sample the two things `<meta>` holds that GC acts on: shadow bodies to evict (§6), and twins that
+/// Sample the two things `<meta>` holds that GC acts on: shadow bodies to evict , and twins that
 /// may no longer project any key. One walk, because they are one listing apart — the ranges are
 /// adjacent under the `0x01` lead — and neither earns a walk of its own.
 ///
@@ -433,7 +433,7 @@ fn random_digest_position() -> String {
         .collect()
 }
 
-/// Where to probe, learned (§8). Each bucket carries a running **cold yield** — evictable candidates
+/// Where to probe, learned . Each bucket carries a running **cold yield** — evictable candidates
 /// per page — and probes are handed out in proportion to it, so a bucket that is mostly working set
 /// stops consuming probes a mostly-cold one can use.
 pub(super) struct Yields {

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::*;
+use hypha_core::config::Mode;
 use hypha_core::meta;
 
 const B: &str = "gcsweep";
@@ -332,7 +333,17 @@ async fn in_progress_upload_records_survive_the_sweep() {
 /// GC, parts and all. An upload hypha created, whose record exists, survives the same passes.
 #[tokio::test]
 async fn orphaned_remote_uploads_are_aborted_and_live_ones_survive() {
-    let h = Harness::durable().await;
+    // The default 200ms cadence would race this test's own setup: the orphan is planted straight on
+    // the remote, record-less, so a pass can abort it between the remote create and the part upload
+    // that gives it a body. The interval below leaves that setup a full sweep to land in, while the
+    // wait below still sees the abort.
+    let h = Harness::builder(Mode::Durable)
+        .tune(|c| {
+            c.gc.interval_ms = 2_000;
+            c.gc.min_interval_ms = 2_000;
+        })
+        .start()
+        .await;
     h.create_bucket(B).await;
     let client = h.client();
 

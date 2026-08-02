@@ -6,7 +6,7 @@ use common::*;
 
 const B: &str = "objs";
 
-/// One client bucket maps to three prefixed backend buckets (§7), but `ListBuckets` must show only
+/// One client bucket maps to three prefixed backend buckets , but `ListBuckets` must show only
 /// the client name — the cache `<data>`/`<meta>` prefixes never leak. DeleteBucket then removes
 /// every backend projection, twins and markers included.
 #[tokio::test]
@@ -110,7 +110,7 @@ async fn list_buckets_hides_backend_projections() {
 }
 
 /// `DeleteBucket` refuses a bucket that still holds objects, and hypha is what refuses it: the gate
-/// is its own listing of the client namespace, not the backend's answer (§7). SeaweedFS deletes a
+/// is its own listing of the client namespace, not the backend's answer . SeaweedFS deletes a
 /// non-empty bucket **and everything in it** by default (`allowDeleteBucketNotEmpty`), so delegating
 /// this would turn a misdirected `DeleteBucket` into silent data loss on the backend hypha deploys
 /// on (tests/backend.rs pins the divergence).
@@ -153,7 +153,7 @@ async fn delete_bucket_refuses_a_non_empty_bucket() {
 
 /// The window the emptiness gate opens: between judging the namespace empty and committing the
 /// delete, a write must not be able to put something back. A write *arriving* now meets the closed
-/// gate (§7) — which on a backend that creates the bucket a PUT addresses (SeaweedFS, again
+/// gate  — which on a backend that creates the bucket a PUT addresses (SeaweedFS, again
 /// backend.rs) is the difference between a resurrected bucket and a refused request. The refusal is
 /// also immediate: the write is told `OperationAborted` rather than queued behind the whole drain —
 /// retryable, because the delete may still fail and leave the bucket writable again.
@@ -423,7 +423,7 @@ async fn a_recreated_bucket_inherits_nothing_from_the_name_it_reuses() {
 
 /// A bucket whose cache was lost is detected unreconciled on restart (its sync marker gone), served
 /// from the remote meanwhile, and rebuilt in the background — the tombstone namespace and marker
-/// return, and GET stays correct throughout (§7 restore overlay).
+/// return, and GET stays correct throughout (restore overlay).
 #[tokio::test]
 async fn bucket_cache_loss_restores_from_remote() {
     let mut h = Harness::durable().await;
@@ -483,7 +483,7 @@ async fn bucket_cache_loss_restores_from_remote() {
     }
 }
 
-/// Whole-volume loss — the cache buckets themselves are gone, not just their contents (§7's "lost
+/// Whole-volume loss — the cache buckets themselves are gone, not just their contents ("lost
 /// whole or not at all"). The overlay still serves (GET + LIST from the remote, a write
 /// materializes through `prepare_write`), and the restore re-provisions the buckets.
 #[tokio::test]
@@ -567,7 +567,7 @@ async fn bucket_cache_volume_loss_restores_from_remote() {
 }
 
 /// Deleting a bucket that was unreconciled must retire every memo the gate keeps about it — a
-/// stale `Restoring` verdict would keep answering from the remote instead of `NoSuchBucket` (§7).
+/// stale `Restoring` verdict would keep answering from the remote instead of `NoSuchBucket` .
 #[tokio::test]
 async fn delete_of_an_unreconciled_bucket_resolves_absent() {
     let mut h = Harness::durable().await;
@@ -618,7 +618,7 @@ async fn delete_of_an_unreconciled_bucket_resolves_absent() {
 /// A burst of writes arriving into a bucket whose cache volume is gone: every one must land, even
 /// though none of them can write until the `<data>`/`<meta>` projections exist. Provisioning is a
 /// control-plane action, so the writers hand it to the bucket actor, which coalesces the burst onto
-/// one round rather than letting each request race to create the same two buckets (§7). The
+/// one round rather than letting each request race to create the same two buckets . The
 /// coalescing itself isn't observable from the client side — this pins the correctness half.
 #[tokio::test]
 async fn concurrent_writes_survive_cache_volume_loss() {
@@ -654,7 +654,7 @@ async fn concurrent_writes_survive_cache_volume_loss() {
     assert_eq!(rebuilt, want, "one tombstone per key after restore");
 }
 
-/// hypha is by assumption the only writer of the remote buckets (§7), so an object whose tail
+/// hypha is by assumption the only writer of the remote buckets , so an object whose tail
 /// trailer does not authenticate means that assumption is broken — foreign writes, or the wrong
 /// trailer key. hypha refuses to guess: it logs the object and exits `EXIT_FOREIGN_OBJECT` rather
 /// than deleting data it cannot authenticate or serving around it. Runs the real binary, since the
@@ -679,7 +679,7 @@ async fn foreign_remote_object_terminates_hypha() {
         .expect("put foreign object");
 
     // Drop the cache (marker included) so B's namespace is untrusted again. Stopped first, or the
-    // volume watchdog would halt on the live loss instead (§7, I6). Startup resolves every bucket's
+    // volume watchdog would halt on the live loss instead (I6). Startup resolves every bucket's
     // state, so the restarted process owes B a restore before it serves anything — no client request
     // is needed to reach `foreign`, and none can be made, since the process is expected to exit
     // rather than become ready.
@@ -1312,7 +1312,7 @@ async fn list_pagination_short_pages() {
         put(&client, B, k, &pattern(32)).await;
     }
 
-    // The keyspace split (§6) keeps twins out of the client cursor: <data> holds one tombstone per
+    // The keyspace split  keeps twins out of the client cursor: <data> holds one tombstone per
     // key (no dilution), and the n twins live in <meta>. So the client cursor pages cleanly below.
     let data = raw_list(&h.raw(), &h.cache_bucket(B), None).await;
     assert_eq!(
@@ -1320,7 +1320,7 @@ async fn list_pagination_short_pages() {
         n,
         "one tombstone per key in <data>, no twin dilution"
     );
-    // <meta> also holds the bucket's sync marker (§6, the reserved `0x01 0x01` range); twins are
+    // <meta> also holds the bucket's sync marker (the reserved `0x01 0x01` range); twins are
     // range B (`0x01 <K> 0x01 …`), so filter the doubled-control reserved keys back out.
     let meta_objs = raw_list(&h.raw(), &h.meta_bucket(B), None).await;
     let twins: Vec<&String> = meta_objs
@@ -1377,7 +1377,7 @@ async fn list_pagination_short_pages() {
 
 /// The v2 continuation token is hypha's own, so a token that is not one of hypha's — corruption, a
 /// foreign backend's, a hand-rolled one — is refused cleanly rather than forwarded to a backend
-/// that would misread it (§7).
+/// that would misread it .
 #[tokio::test]
 async fn a_foreign_continuation_token_is_rejected() {
     let h = Harness::durable().await;
@@ -1477,9 +1477,9 @@ async fn list_objects_v1() {
 /// back to the last key received, as S3 documents) must cover every key exactly once with no gaps
 /// or repeats — and must terminate.
 ///
-/// Unblocked by the §6 keyspace split: `<data><b>` holds only client objects, so the client
+/// Unblocked by the keyspace split: `<data><b>` holds only client objects, so the client
 /// cursor's last raw key is always an XML-safe, strictly-increasing client key — a valid resume
-/// position, where the pre-split interleaved layout (twins at `K ‖ 0x01`) had none (§7).
+/// position, where the pre-split interleaved layout (twins at `K ‖ 0x01`) had none .
 #[tokio::test]
 async fn list_objects_v1_pagination() {
     let h = Harness::durable().await;
@@ -1536,7 +1536,7 @@ async fn list_objects_v1_pagination() {
     }
 }
 
-/// A key over the §6 twin threshold (986 bytes) gets **no** twin, so LIST must recover its facts
+/// A key over the twin threshold (986 bytes) gets **no** twin, so LIST must recover its facts
 /// through the per-key HEAD fallback rather than the twin cursor — and still report them correctly.
 /// This is the graceful-degradation path that lets admission accept S3's full 1024-byte keys.
 #[tokio::test]
@@ -1547,7 +1547,7 @@ async fn list_over_threshold_key_head_fallback() {
 
     // 999 > 986, so no twin is emitted; 999 ≤ 1024, so admission accepts it. Segmented at 199-byte
     // path components: MinIO's filesystem backend caps a single segment at 255 bytes (a backend
-    // limit, not hypha's — the real cache is SeaweedFS, §9), so an unsegmented key wouldn't store.
+    // limit, not hypha's — the real cache is SeaweedFS), so an unsegmented key wouldn't store.
     let key = vec!["k".repeat(199); 5].join("/");
     assert!(key.len() > 986 && key.len() <= 1024);
     let body = pattern(4096);
@@ -1765,7 +1765,7 @@ async fn user_metadata_roundtrips() {
 }
 
 /// A wrong `Content-MD5` is rejected with `BadDigest`, and — the part that matters — the commit
-/// never lands: an existing object at the key is left fully intact (§7's transition bracket, whose
+/// never lands: an existing object at the key is left fully intact (transition bracket, whose
 /// repair settles K back from the remote).
 #[tokio::test]
 async fn content_md5_is_validated() {
@@ -1816,7 +1816,7 @@ async fn content_md5_is_validated() {
     assert_eq!(get_all(&client, B, "digest/obj").await, body);
 }
 
-/// Storage class is an echoed label (§7): non-archive classes round-trip, the archive family is
+/// Storage class is an echoed label : non-archive classes round-trip, the archive family is
 /// refused, and an unset class reads back as STANDARD.
 #[tokio::test]
 async fn storage_class_passthrough() {
@@ -1922,7 +1922,7 @@ async fn delete_objects_batch() {
         );
     }
     // Settle removes the <data> entry and the <meta> twin outright — absent is the authoritative
-    // 404. (Twins are prefixed `0x01 gone/…` in <meta>, §6.)
+    // 404. (Twins are prefixed `0x01 gone/…` in <meta>.)
     let cached = raw_list(&h.raw(), &h.cache_bucket(B), Some("gone/")).await;
     assert!(
         cached.is_empty(),
@@ -1948,7 +1948,7 @@ async fn delete_objects_quiet_and_partial_failure() {
 
     put(&client, B, "ok", &pattern(64)).await;
     // A key hypha refuses at admission (over S3's 1024-byte cap) — XML-valid, so it reaches the
-    // per-key admission check rather than the request parser (§6/§7).
+    // per-key admission check rather than the request parser .
     let bad_key = "z".repeat(1025);
     let out = delete_objects(&client, B, &["ok", &bad_key], true).await;
 
@@ -1970,7 +1970,7 @@ async fn delete_objects_quiet_and_partial_failure() {
     );
 }
 
-/// GetObjectAttributes over the HEAD dispatch (§7): a durable single-part object (which settles to
+/// GetObjectAttributes over the HEAD dispatch : a durable single-part object (which settles to
 /// an eviction tombstone) reports its size, ETag, and storage class from the tombstone facts, and
 /// carries no `ObjectParts` (not multipart).
 #[tokio::test]
@@ -2054,7 +2054,7 @@ async fn get_bucket_versioning_stub() {
 /// Simulate cache-volume loss and bring hypha back onto the empty volume.
 ///
 /// Stopped before the wipe, deliberately: taking the volume out from under a *live* ready bucket is
-/// a different failure — the one the volume watchdog halts on (§7, I6) — and not what these tests
+/// a different failure — the one the volume watchdog halts on (I6) — and not what these tests
 /// are about. `drop_buckets` removes the projections themselves too, modelling a volume that came
 /// back bare rather than one that came back empty.
 async fn lose_cache_volume(h: &mut Harness, drop_buckets: bool) {
@@ -2133,7 +2133,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Durable mode rejects a reserved-sentinel body too, though it keeps no plaintext in the cache and
-/// so has no (size, ETag) classifier of its own to spoof (§6). The remote object outlives the mode
+/// so has no (size, ETag) classifier of its own to spoof . The remote object outlives the mode
 /// that wrote it: a bucket later switched to cached rehydrates that plaintext to bare `K`, where it
 /// *is* the classification. One rule at ingest, so no later path has to re-derive the hazard.
 #[tokio::test]

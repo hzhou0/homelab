@@ -39,7 +39,7 @@ pub(super) trait UsageSource: Send + Sync {
     async fn sample(&self) -> Result<Usage>;
 
     /// Reclaim dead bytes inside the backend, before anything live is evicted — the same
-    /// zero-rehydration-risk trade debris reclaim makes (§8, rung 0). Backends with no such notion
+    /// zero-rehydration-risk trade debris reclaim makes (rung 0). Backends with no such notion
     /// implement it as a no-op.
     async fn compact(&self) -> Result<()>;
 }

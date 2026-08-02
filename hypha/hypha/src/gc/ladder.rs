@@ -25,8 +25,8 @@ pub(super) struct Setting {
     pub(super) threshold: Age,
 }
 
-/// Which of §8's rungs the current setting represents, for the §10 metric an operator reads to tell
-/// whether GC is coping.
+/// Which rungs the current setting represents, for the metric an operator reads to tell whether GC
+/// is coping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Rung {
     /// Base: debris and compaction only, nothing escalated.
@@ -37,7 +37,7 @@ pub(super) enum Rung {
 }
 
 impl Rung {
-    /// §8's own numbering, which is what the metric is named for and what an alert on "GC is at the
+    /// The rung numbering, which is what the metric is named for and what an alert on "GC is at the
     /// top" compares against.
     pub(super) fn number(self) -> usize {
         match self {
@@ -154,7 +154,7 @@ impl Ladder {
 
     /// Interval at its floor, concurrency at its ceiling, threshold at its youngest bucket. The cache
     /// is undersized for its working set and the choice is thrashing or running out of space — the one
-    /// GC condition an operator must act on, hence §10's warn.
+    /// GC condition an operator must act on, hence the warn.
     pub(super) fn clamped(&self) -> bool {
         self.at == self.rungs.len() - 1
     }
@@ -178,7 +178,7 @@ mod tests {
         Ladder::new(&cfg(), 2)
     }
 
-    /// The whole ordering claim of §8 in one assertion: every cheap rung is spent before the first
+    /// The whole ordering claim in one assertion: every cheap rung is spent before the first
     /// expensive one, and the threshold only ever moves once both bounds are reached.
     #[test]
     fn escalation_spends_work_before_it_spends_the_client() {

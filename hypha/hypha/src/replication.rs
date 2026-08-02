@@ -39,7 +39,7 @@ impl ReplicationTask {
     /// Shutdown interrupts only the wait between idempotent passes; an active pass finishes.
     pub async fn run(self, shutdown: CancellationToken) {
         // The backpressure counter was seeded once by `Lifecycle::startup`, ahead of the listener;
-        // from here every raise/clear/drain keeps it exact (§7). Each pass only re-publishes the
+        // from here every raise/clear/drain keeps it exact . Each pass only re-publishes the
         // oldest marker age — it has no atomic source, so it is sampled where the sweep already
         // enumerates the whole set.
         loop {
@@ -61,7 +61,7 @@ impl ReplicationTask {
     /// markers at a remote bucket that no longer exists. A bucket the map does not call `Ready` is
     /// therefore not drained: its markers are either that debris or leftovers a volume-loss restore
     /// has not yet repriced, and the census counts them only so the counter starts from the truth —
-    /// they are removed by `drained` or by the sweep once the bucket is `Ready` again (§7).
+    /// they are removed by `drained` or by the sweep once the bucket is `Ready` again .
     async fn pass(&self) -> (usize, u64) {
         let now = crate::tier::now_ms();
         let mut pending = 0;
@@ -83,7 +83,7 @@ impl ReplicationTask {
     /// Drain one bucket's pending markers. The flat LIST past the `0x01` block yields only range-C
     /// bare markers; a residual `0x01`-lead key (a boundary miscompare) is filtered defensively so a
     /// twin can never be mistaken for a marker. Also reports the oldest marker's age, sampled at
-    /// enumeration — the pre-drain set, which is the conservative reading for the age gate (§7).
+    /// enumeration — the pre-drain set, which is the conservative reading for the age gate .
     async fn reconcile_bucket(&self, bucket: &str, now: i64) -> Result<(usize, u64)> {
         let mut token: Option<String> = None;
         let mut first = true;
@@ -122,7 +122,7 @@ impl ReplicationTask {
 
             seen += markers.len();
             // A *task* per upload, not merely a future: the codecs encrypt on whichever task drives
-            // them (§6), so uploads multiplexed onto this one would run the whole pass's crypto on
+            // them , so uploads multiplexed onto this one would run the whole pass's crypto on
             // a single core no matter how wide `concurrency` was set. `buffer_unordered` still
             // bounds how many are in flight, since the spawn happens as the stream is polled.
             futures::stream::iter(markers)
@@ -151,7 +151,7 @@ impl ReplicationTask {
         Ok((seen, oldest))
     }
 
-    /// Reconcile one pending key under its upload lock (§7). The marker ETag selects the operation
+    /// Reconcile one pending key under its upload lock . The marker ETag selects the operation
     /// and remains its completion CAS, so a marker overwritten mid-pass is never cleared.
     ///
     /// `try_lock`, so pending passes for K **coalesce onto the in-flight one** instead of queuing
@@ -188,7 +188,7 @@ impl ReplicationTask {
         match self.tier.upload_locked(bucket, key).await? {
             UploadOutcome::Uploaded => self.tier.clear_marker_cas(bucket, key, m_etag).await,
             // An eviction tombstone is only ever written after its gates confirmed the remote holds
-            // that generation (§8), and it replaced every generation before it — so whichever this
+            // that generation , and it replaced every generation before it — so whichever this
             // marker names, the obligation is discharged and nothing will ever discharge it again.
             // The CAS is what makes that safe to act on: a marker raised *since* the listing is a
             // different ETag, so it survives and this pass takes no view of it.
@@ -217,7 +217,7 @@ impl ReplicationTask {
 
 /// Count the pending set and its oldest marker across every client bucket, without draining. The
 /// count seeds the backpressure counter once, at startup, before the listener opens; it is exact
-/// thereafter by raise/clear accounting, so the sweep never re-seeds it (§7).
+/// thereafter by raise/clear accounting, so the sweep never re-seeds it .
 ///
 /// Buckets come from the remote list — the same authority `resolve_all` classifies from — not from
 /// the state map's ready set, because "markers live only in ready buckets" is not an invariant the

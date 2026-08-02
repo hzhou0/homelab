@@ -14,7 +14,7 @@ fn ctx<E: std::fmt::Display>(msg: &str) -> impl FnOnce(E) -> BoxError + '_ {
 async fn main() -> Result<(), BoxError> {
     tracing_subscriber::fmt()
         .json()
-        // One line per request, on the span's close (§10): the fields are filled in over the
+        // One line per request, on the span's close : the fields are filled in over the
         // handler's life, so the open carries almost nothing worth reading and only the close
         // carries the latency.
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
@@ -28,7 +28,7 @@ async fn main() -> Result<(), BoxError> {
     tracing::info!(mode = ?config.mode, "hypha starting");
 
     // Installed here rather than in the library: the recorder is process-wide, and the integration
-    // harness runs many hyphas in one process (§10).
+    // harness runs many hyphas in one process .
     let metrics = hypha::metrics::install().map_err(ctx("installing the metrics recorder"))?;
 
     let (service, lifecycle, _) = build_service(&config).await?;

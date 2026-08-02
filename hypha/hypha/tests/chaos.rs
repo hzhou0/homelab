@@ -59,7 +59,7 @@ impl Ops {
 ///
 /// The ETag rides along rather than being derived at the assertion, because the rule differs by how
 /// the object was written: a PUT's ETag is the plaintext MD5, a composite's is `md5(concat pmd5s)-N`
-/// (§6). Carrying it is what lets the check be "the ETag served is the one this *write* would have
+/// . Carrying it is what lets the check be "the ETag served is the one this *write* would have
 /// produced" rather than the weaker "it is some MD5".
 type State = Option<(Vec<u8>, String)>;
 type Allowed = Vec<State>;
@@ -271,7 +271,7 @@ async fn storm(c: &aws_sdk_s3::Client, seed: u64) -> BTreeMap<String, Allowed> {
                     .send()
                     .await;
                 // A composite's client ETag is `md5(concat of the parts' plaintext MD5s)-N`, not the
-                // whole object's MD5 (§6) — the same object written by PUT would carry a different
+                // whole object's MD5  — the same object written by PUT would carry a different
                 // one, which is why the model records the ETag beside the bytes.
                 let state = Some((body.clone(), expected_composite_etag(&[&body])));
                 match completed.is_ok() {
@@ -360,7 +360,7 @@ async fn random_backend_faults_leave_a_cached_deployment_convergent() {
 
     // Then a restart, because the storm can have cost an obligation outright: a cached commit that
     // landed and lost its response returns an error from *between* the commit and the marker queue
-    // (§7), so the marker was never owed and no sweep will ever fix the divergence. What the run does
+    // , so the marker was never owed and no sweep will ever fix the divergence. What the run does
     // in that case is refuse to vouch for the bucket — no clean marker — which is precisely an
     // instruction to the next run to rebuild the pending set from both namespaces (R2). Convergence
     // is therefore a property of hypha *across* the restart, not within one run of it.

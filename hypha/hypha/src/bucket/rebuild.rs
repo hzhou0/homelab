@@ -101,7 +101,7 @@ async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result
     }
 }
 
-/// §6's closed form over plaintext length answers this from the two listings for any overwrite that
+/// The closed form over plaintext length answers this from the two listings for any overwrite that
 /// changed the length; only a same-length overwrite pays a trailer read.
 async fn same_generation(
     tier: &Tiering,

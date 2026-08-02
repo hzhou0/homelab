@@ -74,7 +74,7 @@ async fn get_with_etag(c: &aws_sdk_s3::Client, key: &str) -> (Vec<u8>, String) {
 }
 
 /// Repair K through the write path, which resolves a leftover mark under K's lock before it evaluates
-/// anything (§4). `If-None-Match: *` is the request that repairs and then declines: it cannot alter K,
+/// anything . `If-None-Match: *` is the request that repairs and then declines: it cannot alter K,
 /// so what it leaves behind is the repair alone.
 async fn repair_through_the_write_path(c: &aws_sdk_s3::Client, key: &str) {
     let refused = c
@@ -240,7 +240,7 @@ async fn a_settle_cut_at_the_twin_leaves_the_key_listable_with_no_twin() {
 
 /// The same cut on the DELETE bracket, where the commit is a removal: the remote object is gone and K
 /// still holds the mark, so the key has to read as **absent** — a mark resolves from the remote, and
-/// the remote's answer is the authoritative 404 (§7).
+/// the remote's answer is the authoritative 404 .
 #[tokio::test]
 async fn a_delete_cut_at_settle_leaves_the_absence_committed() {
     let h = Harness::durable_with_faults().await;
@@ -489,7 +489,7 @@ async fn a_twin_beside_a_live_body_is_ignored_by_list_and_swept() {
 }
 
 /// The opposite gap — a tombstone whose twin is gone — which LIST answers with a per-key HEAD off the
-/// tombstone's own metadata, the authoritative copy (§6). Worth pinning because the fallback is a
+/// tombstone's own metadata, the authoritative copy . Worth pinning because the fallback is a
 /// *correctness* path that only ever shows up as a cost: a LIST that silently dropped the entry, or
 /// reported the sentinel's 16 bytes, would both look like a working deployment.
 #[tokio::test]

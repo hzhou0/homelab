@@ -19,7 +19,7 @@ use crate::bucket::{Admission, Readout, Refusal, WriteGuard};
 use crate::gc::Plaintext;
 use crate::tier::RemoteFacts;
 
-/// Bounded fan-out for the per-key trailer reads a remote-served LIST page needs (§7).
+/// Bounded fan-out for the per-key trailer reads a remote-served LIST page needs .
 const REMOTE_LIST_FANOUT: usize = 16;
 
 /// Where the gate's two refusals become status codes: `Absent` is definitive, `Closed` is a delete
@@ -60,11 +60,11 @@ impl Hypha {
             Readout::Cache => self.resolve_key_cache(bucket, key).await?,
             Readout::Remote(_ticket) => self.resolve_key_remote(bucket, key).await?,
         };
-        // The read half of §8's recency feed, here rather than at each caller because *this* is what
+        // The read half of the recency feed, here rather than at each caller because *this* is what
         // "an op that resolves a single key" means — GET, HEAD, GetObjectAttributes, and both copy
         // sources reach the ring by construction, and a future single-key read cannot forget to.
-        // LIST resolves pages elsewhere and never lands here, which is exactly the exclusion §8
-        // wants. An absent key has no body to protect.
+        // LIST resolves pages elsewhere and never lands here, which is exactly the exclusion the
+        // feed wants. An absent key has no body to protect.
         // Which artifact holds the plaintext decides what the touch protects: a composite's lives in
         // K's shadow, and K itself holds a tombstone no eviction would take.
         match &state {
@@ -77,7 +77,7 @@ impl Hypha {
         Ok(state)
     }
 
-    /// The tombstone classifier every cache-authoritative read shares (§7).
+    /// The tombstone classifier every cache-authoritative read shares .
     async fn resolve_key_cache(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
         let head = match self.data().head(bucket, key).await {
             Ok(h) => h,
@@ -119,14 +119,14 @@ impl Hypha {
         }
     }
 
-    /// The semantics `bucket`'s writes run under right now (§7). Not simply the deployment's
+    /// The semantics `bucket`'s writes run under right now . Not simply the deployment's
     /// configured mode — see [`WriteMode::Durable`].
     pub(super) fn write_mode(&self, bucket: &str) -> S3Result<(WriteGuard, WriteMode)> {
         let (gate, admission) = self.enter_write(bucket)?;
         Ok((gate, self.write_mode_for(admission)))
     }
 
-    /// Report the semantics a write must run under (§7). A durably-admitted write first has K
+    /// Report the semantics a write must run under . A durably-admitted write first has K
     /// materialized from the remote into the cache, under K's lock so it doesn't race the write's own
     /// bracket — leaving a correct entry for conditional evaluation.
     pub(super) async fn prepare_write(
@@ -148,13 +148,13 @@ impl Hypha {
         Ok((gate, self.write_mode_for(admission)))
     }
 
-    /// For ops that route around the cache entirely (the multipart part path, §7) and so have no key
+    /// For ops that route around the cache entirely (the multipart part path) and so have no key
     /// state to materialize.
     pub(super) fn check_bucket(&self, bucket: &str) -> S3Result<WriteGuard> {
         Ok(self.enter_write(bucket)?.0)
     }
 
-    /// The write's claim on the bucket existing, held for the whole op (§7). The `Admission` **is**
+    /// The write's claim on the bucket existing, held for the whole op . The `Admission` **is**
     /// the classification, taken in the admitting CAS, so nothing can move between the two. A
     /// `closed` gate answers `OperationAborted`, not `NoSuchBucket` — its fate is undecided.
     fn enter_write(&self, bucket: &str) -> S3Result<(WriteGuard, Admission)> {
@@ -177,7 +177,7 @@ impl Hypha {
         Ok(())
     }
 
-    /// Project a remote LIST page into client-visible entries while the cache restores (§7): each
+    /// Project a remote LIST page into client-visible entries while the cache restores : each
     /// object's plaintext facts come from its authenticated tail trailer, fanned out bounded. Common
     /// prefixes are pure client keyspace and pass through. The caller forwards the remote's own
     /// pagination, so a restore-time LIST paginates exactly as the steady-state one does.

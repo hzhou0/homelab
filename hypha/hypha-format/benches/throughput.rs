@@ -1,4 +1,4 @@
-//! Encrypt/decrypt throughput — sets the §5 spawn_blocking offload threshold empirically.
+//! Encrypt/decrypt throughput — sets the spawn_blocking offload threshold empirically.
 
 use std::io::{Read, Write};
 
