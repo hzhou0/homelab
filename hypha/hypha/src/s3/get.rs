@@ -10,7 +10,7 @@ use hypha_core::error::Error;
 use hypha_core::meta;
 
 use super::overlay::KeyState;
-use super::{ts_ms, Hypha};
+use super::{checksum, ts_ms, Hypha};
 use crate::background;
 use crate::codec;
 use crate::tier::{shadow_is_generation, RemoteFacts};
@@ -42,8 +42,8 @@ impl Hypha {
                 }
             }
             KeyState::CacheBody { head, md } => {
-                let plen = head.content_length.unwrap_or_default().max(0) as u64;
-                self.serve_cache_body(&bucket, &key, &input, plen, &md)
+                let facts = RemoteFacts::from_cache_head(&head);
+                self.serve_cache_body(&bucket, &key, &input, &facts, &md)
                     .await
             }
         }
@@ -112,7 +112,7 @@ impl Hypha {
         resolved(true, facts.plen);
 
         let ranged = input.range.is_some();
-        let resp = GetObjectOutput {
+        let mut resp = GetObjectOutput {
             content_length: if ranged {
                 out.content_length
             } else {
@@ -128,6 +128,7 @@ impl Hypha {
             accept_ranges: Some("bytes".to_string()),
             ..Default::default()
         };
+        apply_get_checksum(&mut resp, input, facts);
         Ok(Some(if ranged {
             S3Response::with_status(resp, hyper::StatusCode::PARTIAL_CONTENT)
         } else {
@@ -157,11 +158,11 @@ impl Hypha {
         bucket: &str,
         key: &str,
         input: &GetObjectInput,
-        plen: u64,
+        facts: &RemoteFacts,
         md: &std::collections::HashMap<String, String>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(range) = &input.range {
-            plaintext_range(range, plen)?;
+            plaintext_range(range, facts.plen)?;
         }
         let out = self
             .data()
@@ -173,7 +174,7 @@ impl Hypha {
         } else {
             None
         };
-        let resp = GetObjectOutput {
+        let mut resp = GetObjectOutput {
             content_length: out.content_length,
             content_range: out.content_range,
             e_tag: out
@@ -190,6 +191,7 @@ impl Hypha {
             accept_ranges: Some("bytes".to_string()),
             ..Default::default()
         };
+        apply_get_checksum(&mut resp, input, facts);
         Ok(S3Response {
             output: resp,
             status,
@@ -224,10 +226,10 @@ impl Hypha {
 
         let body = self
             .tier
-            .decrypt_remote_body(bucket, key, &facts.cetag, pt.clone())
+            .decrypt_remote_body(bucket, key, &facts.cetag, facts.plen, pt.clone())
             .await?;
 
-        let resp = match pt {
+        let mut resp = match pt {
             None => GetObjectOutput {
                 body: Some(body),
                 content_length: Some(plen as i64),
@@ -252,6 +254,7 @@ impl Hypha {
                 ..Default::default()
             },
         };
+        apply_get_checksum(&mut resp, input, facts);
         if resp.content_range.is_some() {
             Ok(S3Response::with_status(
                 resp,
@@ -264,7 +267,7 @@ impl Hypha {
 
     /// **GetObjectAttributes** : a read projection over the same key-state dispatch as HEAD.
     /// `ObjectParts` for a composite comes straight off the trailer's offset table (one bounded
-    /// MAC-verified tail GET, no remote part index). `Checksum` is deferred .
+    /// MAC-verified tail GET, no remote part index).
     pub(super) async fn op_get_object_attributes(
         &self,
         req: S3Request<GetObjectAttributesInput>,
@@ -309,13 +312,48 @@ impl Hypha {
             object_size: want(ObjectAttributes::OBJECT_SIZE).then_some(facts.plen as i64),
             storage_class: want(ObjectAttributes::STORAGE_CLASS)
                 .then(|| StorageClass::from(storage_class)),
+            checksum: want(ObjectAttributes::CHECKSUM)
+                .then(|| {
+                    facts
+                        .checksum
+                        .as_ref()
+                        .map(|value| checksum::dto(value, checksum_count(&facts.cetag)))
+                })
+                .flatten(),
             object_parts,
             last_modified: Some(ts_ms(facts.mtime_ms)),
-            // No versioning, so never a delete marker; Checksum deferred .
+            // No versioning, so never a delete marker.
             ..Default::default()
         };
         Ok(S3Response::new(resp))
     }
+}
+
+fn apply_get_checksum(output: &mut GetObjectOutput, input: &GetObjectInput, facts: &RemoteFacts) {
+    if input.range.is_some()
+        || input
+            .checksum_mode
+            .as_ref()
+            .is_none_or(|mode| mode.as_str() != ChecksumMode::ENABLED)
+    {
+        return;
+    }
+    let Some(value) = facts.checksum.as_ref() else {
+        return;
+    };
+    let value = checksum::dto(value, checksum_count(&facts.cetag));
+    output.checksum_crc32 = value.checksum_crc32;
+    output.checksum_crc32c = value.checksum_crc32c;
+    output.checksum_crc64nvme = value.checksum_crc64nvme;
+    output.checksum_sha1 = value.checksum_sha1;
+    output.checksum_sha256 = value.checksum_sha256;
+    output.checksum_type = value.checksum_type;
+}
+
+pub(super) fn checksum_count(etag: &str) -> u32 {
+    etag.rsplit_once('-')
+        .and_then(|(_, count)| count.parse().ok())
+        .unwrap_or(1)
 }
 
 /// Paginated like `ListParts`.
@@ -382,6 +420,7 @@ pub(super) fn facts_from_tombstone(
         plen,
         cetag,
         mtime_ms,
+        checksum: meta::decode_checksum(md),
     })
 }
 

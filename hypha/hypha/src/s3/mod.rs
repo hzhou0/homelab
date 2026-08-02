@@ -1,6 +1,7 @@
 //! S3 operation dispatch and shared request-path state.
 
 mod buckets;
+pub(crate) mod checksum;
 mod copy;
 mod delete;
 mod get;

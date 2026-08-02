@@ -29,6 +29,7 @@ rand = "0.8"           # mpu stash nonces; already in-tree via age
 hex = "0.4"
 percent-encoding = "2"  # decode encoding-type=url LIST keys
 base64-simd = "0.8"     # Content-MD5 decode, stash nonces, twin facts; already in the tree via s3s
+crc-fast = "1"          # combine multipart full-object CRCs without rereading plaintext
 bytes = "1"             # the codecs' zero-copy frames; already in-tree via hyper and the SDK
 s3s = "0.14"
 s3s-aws = "0.14"

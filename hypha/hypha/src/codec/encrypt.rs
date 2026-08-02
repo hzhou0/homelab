@@ -16,12 +16,19 @@ use bytes::{Buf as _, Bytes, BytesMut};
 use futures::io::AsyncWrite;
 use futures::Stream;
 use hypha_format::offset::{ciphertext_len, CHUNK_CIPHERTEXT, HLEN};
-use hypha_format::{encode_trailer, Envelope, Footer, FooterKind, SINGLE_TRAILER_LEN};
+use hypha_format::{
+    encode_trailer, single_trailer_len, ChecksumKind, Envelope, Footer, FooterKind, StoredChecksum,
+};
 use md5::Digest as _;
 use s3s::dto::StreamingBlob;
 use tokio::sync::oneshot;
 
-use super::{blob_to_bytestream, bytestream_to_blob, DigestMismatch, EtagReceiver, SingleTrailer};
+use crate::s3::checksum::{Hasher as ChecksumHasher, RequestedChecksum};
+
+use super::{
+    blob_to_bytestream, bytestream_to_blob, DigestMismatch, EtagReceiver, ObjectDigests,
+    SingleTrailer,
+};
 
 /// One ciphertext byte the gate will not hand over on its own. What keeps a mismatched body short
 /// of its declared length — and so refused by the backend rather than committed  — is that
@@ -79,6 +86,13 @@ enum Stage {
     Done,
 }
 
+#[derive(Default)]
+pub struct EncryptOptions {
+    pub trailer: Option<SingleTrailer>,
+    pub expected_md5: Option<[u8; 16]>,
+    pub checksum: Option<RequestedChecksum>,
+}
+
 /// Stream-encrypt a plaintext body into hypha's framed single-part form — age ciphertext followed
 /// by its [`SingleTrailer`] — with a Content-Length known up front (the age header is a fixed
 /// [`HLEN`], so `ciphertext_len` is exact) and no spill. Returns `(framed_len, body)`. The trailer
@@ -94,8 +108,10 @@ pub async fn encrypt_stream(
         env,
         bytestream_to_blob(plaintext),
         plen,
-        Some(trailer),
-        None,
+        EncryptOptions {
+            trailer: Some(trailer),
+            ..Default::default()
+        },
     )
     .await?;
     Ok((framed_len, body))
@@ -120,10 +136,9 @@ pub async fn encrypt_blob_with_etag(
     env: Arc<Envelope>,
     plaintext: StreamingBlob,
     plen: u64,
-    trailer: Option<SingleTrailer>,
-    expect_md5: Option<[u8; 16]>,
+    options: EncryptOptions,
 ) -> io::Result<(u64, ByteStream, EtagReceiver)> {
-    let (body_len, stream, etag_rx) = open(env, plaintext, plen, trailer, expect_md5).await?;
+    let (body_len, stream, etag_rx) = open(env, plaintext, plen, options).await?;
     Ok((
         body_len,
         blob_to_bytestream(StreamingBlob::wrap(stream)),
@@ -135,14 +150,24 @@ async fn open(
     env: Arc<Envelope>,
     plaintext: StreamingBlob,
     plen: u64,
-    trailer: Option<SingleTrailer>,
-    expect_md5: Option<[u8; 16]>,
+    options: EncryptOptions,
 ) -> io::Result<(u64, EncryptStream, EtagReceiver)> {
+    let EncryptOptions {
+        trailer,
+        expected_md5,
+        checksum,
+    } = options;
     let (etag_tx, etag_rx) = oneshot::channel();
     let body_ct_len = ciphertext_len(plen, HLEN);
+    let checksum_algorithm = checksum.as_ref().map(|value| value.algorithm).or_else(|| {
+        trailer
+            .as_ref()
+            .and_then(|trailer| trailer.checksum.as_ref())
+            .map(|value| value.algorithm)
+    });
     let body_len = body_ct_len
         + if trailer.is_some() {
-            SINGLE_TRAILER_LEN as u64
+            single_trailer_len(checksum_algorithm) as u64
         } else {
             0
         };
@@ -160,8 +185,12 @@ async fn open(
         writer,
         gate,
         hasher: md5::Md5::new(),
+        checksum_hasher: checksum
+            .as_ref()
+            .map(|request| ChecksumHasher::new(request.algorithm)),
+        checksum,
         inflight: Bytes::new(),
-        expect_md5,
+        expect_md5: expected_md5,
         etag_tx: Some(etag_tx),
         trailer,
         plen,
@@ -177,10 +206,12 @@ struct EncryptStream {
     writer: StreamWriter<GateSink>,
     gate: Gate,
     hasher: md5::Md5,
+    checksum_hasher: Option<ChecksumHasher>,
+    checksum: Option<RequestedChecksum>,
     /// Plaintext taken from the source but not yet accepted by age.
     inflight: Bytes,
     expect_md5: Option<[u8; 16]>,
-    etag_tx: Option<oneshot::Sender<Result<String, DigestMismatch>>>,
+    etag_tx: Option<oneshot::Sender<Result<ObjectDigests, DigestMismatch>>>,
     trailer: Option<SingleTrailer>,
     plen: u64,
     body_ct_len: u64,
@@ -235,9 +266,21 @@ impl EncryptStream {
         let etag_tx = self.etag_tx.take();
         if self.expect_md5.is_some_and(|want| want != md5) {
             if let Some(tx) = etag_tx {
-                let _ = tx.send(Err(DigestMismatch));
+                let _ = tx.send(Err(DigestMismatch::Md5));
             }
             return Ok(None);
+        }
+        let mut checksum: Option<StoredChecksum> = self
+            .checksum_hasher
+            .take()
+            .map(|hasher| hasher.finalize(ChecksumKind::FullObject));
+        if let (Some(request), Some(actual)) = (&self.checksum, &checksum) {
+            if request.verify(actual).is_err() {
+                if let Some(tx) = etag_tx {
+                    let _ = tx.send(Err(DigestMismatch::Checksum));
+                }
+                return Ok(None);
+            }
         }
 
         let mut tail = std::mem::take(&mut *self.gate.lock().unwrap());
@@ -245,12 +288,14 @@ impl EncryptStream {
             return Err(io::Error::other("age emitted no final chunk"));
         }
         if let Some(t) = self.trailer.take() {
+            checksum = checksum.or(t.checksum);
             let footer = Footer {
                 kind: FooterKind::Single,
                 count: 1,
                 plen: self.plen,
                 mtime_ms: t.mtime_ms,
                 md5,
+                checksum: checksum.clone(),
             };
             tail.extend_from_slice(&encode_trailer(
                 &t.trailer_key,
@@ -263,7 +308,10 @@ impl EncryptStream {
         // Before the last bytes go out, not after: a consumer that stops polling once it has its
         // declared Content-Length would otherwise never let this be sent.
         if let Some(tx) = etag_tx {
-            let _ = tx.send(Ok(hex::encode(md5)));
+            let _ = tx.send(Ok(ObjectDigests {
+                etag: hex::encode(md5),
+                checksum,
+            }));
         }
         Ok(Some(tail.freeze()))
     }
@@ -297,6 +345,9 @@ impl Stream for EncryptStream {
                     match Pin::new(&mut me.writer).poll_write(cx, &chunk) {
                         Poll::Ready(Ok(n)) => {
                             me.hasher.update(&chunk[..n]);
+                            if let Some(hasher) = &mut me.checksum_hasher {
+                                hasher.update(&chunk[..n]);
+                            }
                             chunk.advance(n);
                             me.inflight = chunk;
                         }
@@ -347,6 +398,7 @@ mod tests {
             trailer_key: TrailerKey::derive(PASSPHRASE),
             object_key: object_key.to_string(),
             mtime_ms: 1_700_000_000_000,
+            checksum: None,
         }
     }
 
@@ -420,8 +472,10 @@ mod tests {
                 env.clone(),
                 frames(&plaintext, 7_000, true),
                 plen as u64,
-                Some(single("k")),
-                None,
+                EncryptOptions {
+                    trailer: Some(single("k")),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -429,17 +483,12 @@ mod tests {
             let framed = body(&frames_of(stream).await);
             assert_eq!(framed.len() as u64, body_len, "plen {plen}");
 
-            let tail = decode_tail(
-                &TrailerKey::derive(PASSPHRASE),
-                "k",
-                body_len,
-                &framed[framed.len() - SINGLE_TRAILER_LEN..],
-            )
-            .expect("the framed trailer must authenticate");
+            let tail = decode_tail(&TrailerKey::derive(PASSPHRASE), "k", body_len, &framed)
+                .expect("the framed trailer must authenticate");
             let md5: [u8; 16] = md5::Md5::digest(&plaintext).into();
             assert_eq!(tail.footer.plen, plen as u64);
             assert_eq!(tail.footer.md5, md5);
-            assert_eq!(etag.await.unwrap().unwrap(), hex::encode(md5));
+            assert_eq!(etag.await.unwrap().unwrap().etag, hex::encode(md5));
             assert_eq!(
                 decrypt(&env, &framed[..tail.body_ct_len as usize]),
                 plaintext
@@ -458,8 +507,7 @@ mod tests {
             envelope(),
             frames(&plaintext, plaintext.len(), false),
             plaintext.len() as u64,
-            None,
-            None,
+            EncryptOptions::default(),
         )
         .await
         .unwrap();
@@ -489,8 +537,11 @@ mod tests {
                 env.clone(),
                 frames(&plaintext, 9_000, true),
                 plaintext.len() as u64,
-                trailer,
-                Some([0u8; 16]),
+                EncryptOptions {
+                    trailer,
+                    expected_md5: Some([0u8; 16]),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -499,7 +550,7 @@ mod tests {
             assert!(emitted < body_len, "{emitted} of {body_len} bytes emitted");
             // Not merely short: short of a decryptable age file.
             assert!(emitted < ciphertext_len(plaintext.len() as u64, HLEN));
-            assert!(matches!(etag.await, Ok(Err(DigestMismatch))));
+            assert!(matches!(etag.await, Ok(Err(DigestMismatch::Md5))));
         }
     }
 
@@ -513,8 +564,10 @@ mod tests {
             envelope(),
             frames(&plaintext, 4_096, true),
             plaintext.len() as u64,
-            Some(single("k")),
-            None,
+            EncryptOptions {
+                trailer: Some(single("k")),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -531,8 +584,10 @@ mod tests {
             envelope(),
             frames(&plaintext, 4_096, true),
             plaintext.len() as u64,
-            None,
-            Some(md5::Md5::digest(&plaintext).into()),
+            EncryptOptions {
+                expected_md5: Some(md5::Md5::digest(&plaintext).into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -549,9 +604,14 @@ mod tests {
             inner: frames(&vec![1u8; 500_000], 8_192, false),
             dropped: dropped.clone(),
         };
-        let (_, stream, etag) = open(envelope(), StreamingBlob::wrap(source), 500_000, None, None)
-            .await
-            .unwrap();
+        let (_, stream, etag) = open(
+            envelope(),
+            StreamingBlob::wrap(source),
+            500_000,
+            EncryptOptions::default(),
+        )
+        .await
+        .unwrap();
 
         let mut stream = Box::pin(stream);
         stream.next().await.unwrap().unwrap();
@@ -569,8 +629,7 @@ mod tests {
                 Err(io::Error::other("the cache hung up"))
             })),
             10,
-            None,
-            None,
+            EncryptOptions::default(),
         )
         .await
         .unwrap();

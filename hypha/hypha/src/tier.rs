@@ -7,10 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
-use hypha_format::{decode_tail, Tail, TrailerKey};
-use hypha_format::{Envelope, MAX_TAIL_LEN, SINGLE_TRAILER_LEN};
+use hypha_format::{decode_tail, single_trailer_len, ChecksumAlgorithm, Tail, TrailerKey};
+use hypha_format::{Envelope, MAX_TAIL_LEN};
 use s3s::dto::StreamingBlob;
 
+use hypha_core::backend::PutOptions;
 use hypha_core::error::{Error, Result};
 use hypha_core::{meta, Backend};
 
@@ -18,13 +19,21 @@ use crate::codec::{self, PartSegment, SingleTrailer};
 use crate::halt::Halt;
 use crate::keylocks::{CreateLocks, KeyLocks};
 
-/// The framed size a single-part remote object would have for a `plen`-byte plaintext. A
-/// markerless live body is always single-part — a composite is tombstoned at K with its plaintext in
-/// the shadow — so this is exact where the pending-set rebuild applies it
-/// ([`crate::bucket`]).
-pub(crate) fn single_part_framed_len(plen: u64) -> Option<u64> {
-    hypha_format::offset::ciphertext_len(plen, hypha_format::offset::HLEN)
-        .checked_add(SINGLE_TRAILER_LEN as u64)
+/// Reject an impossible plaintext/framed-size pair without fetching the trailer. Listings do not
+/// carry checksum metadata, so the small valid-size set is the strongest zero-read test available.
+pub(crate) fn single_part_framed_len_matches(plen: u64, framed: u64) -> bool {
+    let ciphertext = hypha_format::offset::ciphertext_len(plen, hypha_format::offset::HLEN);
+    [
+        None,
+        Some(ChecksumAlgorithm::Crc32),
+        Some(ChecksumAlgorithm::Crc32c),
+        Some(ChecksumAlgorithm::Crc64Nvme),
+        Some(ChecksumAlgorithm::Sha1),
+        Some(ChecksumAlgorithm::Sha256),
+    ]
+    .into_iter()
+    .filter_map(|algorithm| ciphertext.checked_add(single_trailer_len(algorithm) as u64))
+    .any(|candidate| candidate == framed)
 }
 
 #[derive(Clone)]
@@ -82,6 +91,7 @@ pub(crate) struct RemoteFacts {
     pub plen: u64,
     pub cetag: String,
     pub mtime_ms: i64,
+    pub checksum: Option<hypha_format::StoredChecksum>,
 }
 
 impl RemoteFacts {
@@ -98,6 +108,11 @@ impl RemoteFacts {
                 .last_modified
                 .and_then(|t| t.to_millis().ok())
                 .unwrap_or_default(),
+            checksum: head
+                .metadata
+                .as_ref()
+                .and_then(meta::decode_checksum)
+                .or_else(|| crate::s3::checksum::from_backend_head(head)),
         }
     }
 }
@@ -179,6 +194,9 @@ impl Tiering {
             passthrough.insert(meta::CTYPE.to_string(), meta::encode_content_type(ct));
         }
         let facts = self.remote_facts(bucket, key, &head).await?;
+        if let Some(checksum) = &facts.checksum {
+            passthrough.insert(meta::CHECKSUM.to_string(), meta::encode_checksum(checksum));
+        }
         self.settle_evict_locked(
             bucket,
             key,
@@ -249,7 +267,10 @@ impl Tiering {
         key: &str,
         marker_body: &str,
     ) -> Result<()> {
-        if self.raise_marker_if_absent(bucket, key, marker_body).await? {
+        if self
+            .raise_marker_if_absent(bucket, key, marker_body)
+            .await?
+        {
             return Ok(());
         }
         self.meta
@@ -333,6 +354,7 @@ impl Tiering {
             } else {
                 remote_mtime
             },
+            checksum: f.checksum.clone(),
         })
     }
 
@@ -344,10 +366,24 @@ impl Tiering {
     /// byte count is the length. `None` ⇒ the bytes don't authenticate as a hypha trailer: the
     /// object was never written through hypha, or is foreign/tampered.
     pub(crate) async fn read_tail(&self, bucket: &str, key: &str) -> Result<Option<Tail>> {
-        let out = self
-            .remote
-            .get(bucket, key, Some(format!("bytes=-{MAX_TAIL_LEN}")))
-            .await?;
+        self.read_tail_at(bucket, key, None).await
+    }
+
+    pub(crate) async fn read_tail_at(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: Option<&str>,
+    ) -> Result<Option<Tail>> {
+        let range = Some(format!("bytes=-{MAX_TAIL_LEN}"));
+        let out = match if_match {
+            Some(etag) => {
+                self.remote
+                    .get_range_if_match(bucket, key, range, etag.to_string())
+                    .await?
+            }
+            None => self.remote.get(bucket, key, range).await?,
+        };
         let total = out.content_range().and_then(parse_content_range_total);
         let bytes = out
             .body
@@ -405,12 +441,18 @@ impl Tiering {
             .last_modified()
             .map(|t| t.to_millis().unwrap_or_default())
             .unwrap_or_else(now_ms);
+        let checksum = out
+            .metadata
+            .as_ref()
+            .and_then(meta::decode_checksum)
+            .or_else(|| crate::s3::checksum::from_backend_get(&out));
         let body = out.body;
 
         let trailer = SingleTrailer {
             trailer_key: self.trailer_key.clone(),
             object_key: key.to_string(),
             mtime_ms,
+            checksum,
         };
         let (framed_len, enc) = codec::encrypt_stream(self.env.clone(), body, plen, trailer)
             .await
@@ -420,12 +462,11 @@ impl Tiering {
                 bucket,
                 key,
                 enc,
-                Some(framed_len as i64),
-                HashMap::new(),
-                None,
-                None,
-                None,
-                content_type,
+                PutOptions {
+                    content_length: Some(framed_len as i64),
+                    content_type,
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(UploadOutcome::Uploaded)
@@ -547,12 +588,12 @@ impl Tiering {
                 bucket,
                 key,
                 body,
-                Some(plen as i64),
-                md,
-                None,
-                Some(quote(&meta::evict_sentinel_etag())),
-                None,
-                None,
+                PutOptions {
+                    content_length: Some(plen as i64),
+                    metadata: md,
+                    if_match: Some(quote(&meta::evict_sentinel_etag())),
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(())
@@ -582,6 +623,7 @@ impl Tiering {
         bucket: &str,
         key: &str,
         cetag: &str,
+        plen: u64,
         pt: Option<ByteRange<u64>>,
     ) -> Result<StreamingBlob> {
         if meta::is_composite_etag(cetag) {
@@ -618,12 +660,11 @@ impl Tiering {
             Ok(match &pt {
                 None => {
                     let out = self.remote.get(bucket, key, None).await?;
-                    let ct_len = envelope_len(key, out.content_length)?;
+                    let ct_len = envelope_len(plen);
                     codec::decrypt_full(self.env.clone(), out.body, ct_len).await?
                 }
                 Some(pt) => {
-                    let rhead = self.remote.head(bucket, key).await?;
-                    let ct_len = envelope_len(key, rhead.content_length)?;
+                    let ct_len = envelope_len(plen);
                     codec::decrypt_range(
                         self.env.clone(),
                         self.remote.clone(),
@@ -633,6 +674,69 @@ impl Tiering {
                         pt.clone(),
                     )
                 }
+            })
+        }
+    }
+
+    pub(crate) async fn decrypt_remote_body_at(
+        &self,
+        bucket: &str,
+        key: &str,
+        cetag: &str,
+        pt: Option<ByteRange<u64>>,
+        generation: &str,
+    ) -> Result<StreamingBlob> {
+        let Some(tail) = self.read_tail_at(bucket, key, Some(generation)).await? else {
+            self.halt.foreign_object(bucket, key).await
+        };
+        if tail.footer.client_etag() != cetag {
+            return Err(Error::PreconditionFailed);
+        }
+        if meta::is_composite_etag(cetag) {
+            Ok(match &pt {
+                None => {
+                    let out = self
+                        .remote
+                        .get_range_if_match(
+                            bucket,
+                            key,
+                            Some(format!("bytes=0-{}", tail.body_ct_len - 1)),
+                            generation.to_string(),
+                        )
+                        .await?;
+                    let part_lens = tail.windows.iter().map(|w| w.end - w.start).collect();
+                    codec::decrypt_composite_full(self.env.clone(), out.body, part_lens)
+                }
+                Some(pt) => {
+                    let segments = composite_segments(&tail.windows, &tail.plens, pt);
+                    codec::decrypt_composite_at(
+                        self.env.clone(),
+                        self.remote.clone(),
+                        bucket.to_string(),
+                        key.to_string(),
+                        segments,
+                        Some(generation.to_string()),
+                    )
+                }
+            })
+        } else {
+            Ok(match &pt {
+                None => {
+                    let out = self
+                        .remote
+                        .get_range_if_match(bucket, key, None, generation.to_string())
+                        .await?;
+                    codec::decrypt_full(self.env.clone(), out.body, tail.body_ct_len).await?
+                }
+                Some(pt) => codec::decrypt_range_at(
+                    self.env.clone(),
+                    self.remote.clone(),
+                    bucket.to_string(),
+                    key.to_string(),
+                    tail.body_ct_len,
+                    pt.clone(),
+                    Some(generation.to_string()),
+                ),
             })
         }
     }
@@ -668,12 +772,11 @@ impl Tiering {
                 bucket,
                 &meta::shadow_key(key),
                 body,
-                Some(plen as i64),
-                md,
-                None,
-                None,
-                None,
-                None,
+                PutOptions {
+                    content_length: Some(plen as i64),
+                    metadata: md,
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(())
@@ -727,7 +830,15 @@ impl Tiering {
         // The tombstone is where a `x-amz-meta-*` pass-through and the storage class live while the
         // body is remote-only — the remote object carries neither (the trailer holds facts, not
         // client metadata), so anything dropped here is unrecoverable.
-        let mut md = meta::passthrough_metadata(&head.metadata.unwrap_or_default());
+        let checksum = crate::s3::checksum::from_backend_head(&head);
+        let mut md = head
+            .metadata
+            .as_ref()
+            .map(meta::passthrough_metadata)
+            .unwrap_or_default();
+        if let Some(checksum) = checksum {
+            md.insert(meta::CHECKSUM.to_string(), meta::encode_checksum(&checksum));
+        }
         md.insert(meta::TOMB.to_string(), meta::TOMB_EVICT.to_string());
         md.insert(meta::PLEN.to_string(), plen.to_string());
         md.insert(meta::CETAG.to_string(), body_etag.clone());
@@ -843,16 +954,10 @@ fn clip_part_to_range(
     }
 }
 
-/// The age-envelope length of a single-part remote object: its Content-Length minus the tail
-/// trailer, which must never reach the decryptor.
-fn envelope_len(key: &str, content_length: Option<i64>) -> Result<u64> {
-    let framed = content_length
-        .filter(|&n| n >= 0)
-        .ok_or_else(|| Error::Backend("remote response missing content-length".into()))?
-        as u64;
-    framed
-        .checked_sub(SINGLE_TRAILER_LEN as u64)
-        .ok_or_else(|| Error::Backend(format!("remote object {key:?} shorter than a trailer")))
+/// The authenticated plaintext length fixes the age-envelope boundary independently of the
+/// variable trailer behind it.
+fn envelope_len(plen: u64) -> u64 {
+    hypha_format::offset::ciphertext_len(plen, hypha_format::offset::HLEN)
 }
 
 pub(crate) fn now_ms() -> i64 {

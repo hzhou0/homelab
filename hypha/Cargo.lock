@@ -1735,6 +1735,7 @@ dependencies = [
  "aws-sdk-s3",
  "base64-simd",
  "bytes",
+ "crc-fast",
  "dashmap",
  "fastbloom",
  "futures",

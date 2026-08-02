@@ -1773,7 +1773,7 @@ async fn bursty_same_key_overwrites_converge_on_the_last_acked_generation() {
     // the remote object's byte count names the generation without decrypting anything.
     let framed =
         hypha_format::offset::ciphertext_len(last.len() as u64, hypha_format::offset::HLEN)
-            + hypha_format::SINGLE_TRAILER_LEN as u64;
+            + hypha_format::single_trailer_len(None) as u64;
 
     wait_until(
         15_000,

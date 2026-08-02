@@ -50,7 +50,9 @@ impl Error {
             Some("NoSuchBucket") => Error::NoSuchBucket,
             Some("BucketNotEmpty") => Error::BucketNotEmpty,
             Some("PreconditionFailed") | Some("412") => Error::PreconditionFailed,
-            Some("BadDigest") | Some("InvalidDigest") => Error::BadDigest,
+            Some("BadDigest") | Some("InvalidDigest") | Some("XAmzContentChecksumMismatch") => {
+                Error::BadDigest
+            }
             _ => Error::Backend(format!("{err:?}")),
         }
     }

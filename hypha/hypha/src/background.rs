@@ -267,7 +267,8 @@ async fn rehydrate(
         }
         let land = async {
             let body = codec::blob_to_bytestream(
-                tier.decrypt_remote_body(bucket, key, cetag, None).await?,
+                tier.decrypt_remote_body(bucket, key, cetag, plen, None)
+                    .await?,
             );
             tier.land_shadow_locked(bucket, key, body, plen, cetag)
                 .await
@@ -283,7 +284,8 @@ async fn rehydrate(
         let md = meta::passthrough_metadata(tomb);
         let land = async move {
             let body = codec::blob_to_bytestream(
-                tier.decrypt_remote_body(bucket, key, cetag, None).await?,
+                tier.decrypt_remote_body(bucket, key, cetag, plen, None)
+                    .await?,
             );
             tier.land_rehydrated_single_locked(bucket, key, body, plen, md)
                 .await

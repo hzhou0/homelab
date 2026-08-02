@@ -23,6 +23,28 @@ for bin in minio s3s-e2e; do
   command -v "$bin" >/dev/null || { echo "error: '$bin' not on PATH" >&2; exit 1; }
 done
 
+# Fail closed when upstream adds a suite or fixture; otherwise the supported-surface filters could
+# silently omit new coverage.
+if [ "$#" -eq 0 ]; then
+  UNCLASSIFIED=()
+  while IFS= read -r entry; do
+    case "$entry" in
+      Basic | Basic/Essential | Basic/Put | Basic/Copy | \
+        Advanced | Advanced/STS | Advanced/Multipart | Advanced/Tagging | \
+        Advanced/ListPagination | Advanced/PresignedUrl | */*/*) ;;
+      *) UNCLASSIFIED+=("$entry") ;;
+    esac
+  done < <(s3s-e2e --list)
+  if [ "${#UNCLASSIFIED[@]}" -ne 0 ]; then
+    echo "error: unclassified s3s-e2e suites or fixtures:" >&2
+    printf '  %s\n' "${UNCLASSIFIED[@]}" >&2
+    exit 1
+  fi
+  set -- \
+    --filter '^Basic/' \
+    --filter '^Advanced/(Multipart|ListPagination|PresignedUrl)/'
+fi
+
 # A free loopback port, pure bash: a failed /dev/tcp connect means nothing is listening there.
 free_port() {
   local p
@@ -73,14 +95,11 @@ until curl -s -o /dev/null "http://127.0.0.1:$HYPHA_PORT/"; do
 done
 
 echo "→ running s3s-e2e"
-# Path-style + checksum trailers off, matching the aws-sdk client config in tests/common (hypha's
-# SigV4 verification doesn't accept the SDK's default flexible-checksum trailers).
+# The runner forces path-style access itself.
 # Not `exec`: the EXIT trap must still fire to tear down hypha + MinIO.
 env \
   AWS_ENDPOINT_URL="http://127.0.0.1:$HYPHA_PORT" \
   AWS_ACCESS_KEY_ID="$HYPHA_ACCESS" AWS_SECRET_ACCESS_KEY="$HYPHA_SECRET" \
   AWS_REGION=us-east-1 \
-  AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
-  AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
   AWS_EC2_METADATA_DISABLED=true \
   s3s-e2e "$@"

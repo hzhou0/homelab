@@ -23,6 +23,58 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_AL
 
 use crate::config::S3Endpoint;
 use crate::error::{Error, Result};
+use hypha_format::ChecksumAlgorithm;
+
+#[derive(Clone, Debug)]
+pub struct PutChecksum {
+    pub algorithm: ChecksumAlgorithm,
+    pub value: Option<String>,
+}
+
+#[derive(Default)]
+pub struct PutOptions {
+    pub content_length: Option<i64>,
+    pub metadata: HashMap<String, String>,
+    pub content_md5: Option<String>,
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+    pub content_type: Option<String>,
+    pub checksum: Option<PutChecksum>,
+}
+
+pub struct CopyRequest<'a> {
+    pub destination_bucket: &'a str,
+    pub destination_key: &'a str,
+    pub source_bucket: &'a str,
+    pub source_key: &'a str,
+    pub source_if_match: String,
+    pub metadata: HashMap<String, String>,
+    pub content_type: Option<String>,
+}
+
+pub struct UploadPartRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+    pub part_number: i32,
+    pub body: ByteStream,
+    pub content_length: Option<i64>,
+}
+
+pub struct UploadPartCopyRequest<'a> {
+    pub destination: UploadPartDestination<'a>,
+    pub source_bucket: &'a str,
+    pub source_key: &'a str,
+    pub source_range: Option<String>,
+    pub source_if_match: Option<String>,
+}
+
+pub struct UploadPartDestination<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+    pub part_number: i32,
+}
 
 /// One entry of a `ListParts` page.
 ///
@@ -111,6 +163,7 @@ impl Backend {
             .bucket(self.backend_bucket(bucket))
             .key(key)
             .set_range(range)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
             .send()
             .await
             .map_err(Error::from_sdk)
@@ -125,11 +178,23 @@ impl Backend {
         key: &str,
         if_match: String,
     ) -> Result<GetObjectOutput> {
+        self.get_range_if_match(bucket, key, None, if_match).await
+    }
+
+    pub async fn get_range_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<String>,
+        if_match: String,
+    ) -> Result<GetObjectOutput> {
         self.client
             .get_object()
             .bucket(self.backend_bucket(bucket))
             .key(key)
+            .set_range(range)
             .if_match(if_match)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
             .send()
             .await
             .map_err(Error::from_sdk)
@@ -140,6 +205,7 @@ impl Backend {
             .head_object()
             .bucket(self.backend_bucket(bucket))
             .key(key)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
             .send()
             .await
             .map_err(Error::from_sdk)
@@ -147,37 +213,58 @@ impl Backend {
 
     /// PUT a body already in its final on-remote form (ciphertext, for hypha's objects).
     /// `content_length` must be `Some` for a non-seekable `ByteStream` — S3 needs it up front.
-    #[allow(clippy::too_many_arguments)]
     pub async fn put(
         &self,
         bucket: &str,
         key: &str,
         body: ByteStream,
-        content_length: Option<i64>,
-        metadata: HashMap<String, String>,
-        content_md5: Option<String>,
-        if_match: Option<String>,
-        if_none_match: Option<String>,
-        content_type: Option<String>,
+        options: PutOptions,
     ) -> Result<PutObjectOutput> {
-        self.client
+        let mut request = self
+            .client
             .put_object()
             .bucket(self.backend_bucket(bucket))
             .key(key)
             .body(body)
-            .set_content_length(content_length)
-            .set_metadata(Some(metadata))
-            .set_content_type(content_type)
+            .set_content_length(options.content_length)
+            .set_metadata(Some(options.metadata))
+            .set_content_type(options.content_type)
             // Client `Content-MD5` forwarded to the cache (cached-mode PUT) so the backend
             // validates the plaintext and returns `BadDigest` atomically — nothing lands on a bad
             // digest, and any prior body stays intact. `None` for hypha's own writes (ciphertext,
             // whose integrity is the trailer's job).
-            .set_content_md5(content_md5)
-            .set_if_match(if_match)
-            .set_if_none_match(if_none_match)
-            .send()
-            .await
-            .map_err(Error::from_sdk)
+            .set_content_md5(options.content_md5)
+            .set_if_match(options.if_match)
+            .set_if_none_match(options.if_none_match);
+        if let Some(checksum) = options.checksum {
+            let algorithm = match checksum.algorithm {
+                ChecksumAlgorithm::Crc32 => aws_sdk_s3::types::ChecksumAlgorithm::Crc32,
+                ChecksumAlgorithm::Crc32c => aws_sdk_s3::types::ChecksumAlgorithm::Crc32C,
+                ChecksumAlgorithm::Crc64Nvme => aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme,
+                ChecksumAlgorithm::Sha1 => aws_sdk_s3::types::ChecksumAlgorithm::Sha1,
+                ChecksumAlgorithm::Sha256 => aws_sdk_s3::types::ChecksumAlgorithm::Sha256,
+            };
+            request = request.checksum_algorithm(algorithm.clone());
+            request = match algorithm {
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => {
+                    request.set_checksum_crc32(checksum.value)
+                }
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => {
+                    request.set_checksum_crc32_c(checksum.value)
+                }
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => {
+                    request.set_checksum_crc64_nvme(checksum.value)
+                }
+                aws_sdk_s3::types::ChecksumAlgorithm::Sha1 => {
+                    request.set_checksum_sha1(checksum.value)
+                }
+                aws_sdk_s3::types::ChecksumAlgorithm::Sha256 => {
+                    request.set_checksum_sha256(checksum.value)
+                }
+                _ => unreachable!("hypha only constructs supported checksum algorithms"),
+            };
+        }
+        request.send().await.map_err(Error::from_sdk)
     }
 
     /// PUT a small in-memory body (tombstone sentinel, zero-byte twin) with optional conditions.
@@ -217,31 +304,21 @@ impl Backend {
     /// always replaced because the cache carrier contains Hypha's namespaced projection as well as
     /// the client's values; forwarding the backend source metadata implicitly would bypass the
     /// `COPY`/`REPLACE` decision already made by the S3 handler.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn copy(
-        &self,
-        dst_bucket: &str,
-        dst_key: &str,
-        src_bucket: &str,
-        src_key: &str,
-        src_if_match: String,
-        metadata: HashMap<String, String>,
-        content_type: Option<String>,
-    ) -> Result<CopyObjectOutput> {
+    pub async fn copy(&self, request: CopyRequest<'_>) -> Result<CopyObjectOutput> {
         let copy_source = format!(
             "{}/{}",
-            self.backend_bucket(src_bucket),
-            encode_copy_source_key(src_key)
+            self.backend_bucket(request.source_bucket),
+            encode_copy_source_key(request.source_key)
         );
         self.client
             .copy_object()
-            .bucket(self.backend_bucket(dst_bucket))
-            .key(dst_key)
+            .bucket(self.backend_bucket(request.destination_bucket))
+            .key(request.destination_key)
             .copy_source(copy_source)
-            .copy_source_if_match(src_if_match)
+            .copy_source_if_match(request.source_if_match)
             .metadata_directive(MetadataDirective::Replace)
-            .set_metadata(Some(metadata))
-            .set_content_type(content_type)
+            .set_metadata(Some(request.metadata))
+            .set_content_type(request.content_type)
             .send()
             .await
             .map_err(Error::from_sdk)
@@ -484,24 +561,15 @@ impl Backend {
             .map_err(Error::from_sdk)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn upload_part(
-        &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: i32,
-        body: ByteStream,
-        content_length: Option<i64>,
-    ) -> Result<UploadPartOutput> {
+    pub async fn upload_part(&self, request: UploadPartRequest<'_>) -> Result<UploadPartOutput> {
         self.client
             .upload_part()
-            .bucket(self.backend_bucket(bucket))
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(body)
-            .set_content_length(content_length)
+            .bucket(self.backend_bucket(request.bucket))
+            .key(request.key)
+            .upload_id(request.upload_id)
+            .part_number(request.part_number)
+            .body(request.body)
+            .set_content_length(request.content_length)
             .send()
             .await
             .map_err(Error::from_sdk)
@@ -513,30 +581,24 @@ impl Backend {
     ///
     /// The SDK sends `x-amz-copy-source` verbatim, so the key must arrive already URL-encoded; the
     /// bucket prefix is applied to the source bucket, as it is to every other backend bucket ref.
-    #[allow(clippy::too_many_arguments)]
     pub async fn upload_part_copy(
         &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: i32,
-        src_bucket: &str,
-        src_key: &str,
-        src_range: Option<String>,
+        request: UploadPartCopyRequest<'_>,
     ) -> Result<UploadPartCopyOutput> {
         let copy_source = format!(
             "{}/{}",
-            self.backend_bucket(src_bucket),
-            encode_copy_source_key(src_key)
+            self.backend_bucket(request.source_bucket),
+            encode_copy_source_key(request.source_key)
         );
         self.client
             .upload_part_copy()
-            .bucket(self.backend_bucket(bucket))
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
+            .bucket(self.backend_bucket(request.destination.bucket))
+            .key(request.destination.key)
+            .upload_id(request.destination.upload_id)
+            .part_number(request.destination.part_number)
             .copy_source(copy_source)
-            .set_copy_source_range(src_range)
+            .set_copy_source_range(request.source_range)
+            .set_copy_source_if_match(request.source_if_match)
             .send()
             .await
             .map_err(Error::from_sdk)

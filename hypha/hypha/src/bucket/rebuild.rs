@@ -101,8 +101,6 @@ async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result
     }
 }
 
-/// The closed form over plaintext length answers this from the two listings for any overwrite that
-/// changed the length; only a same-length overwrite pays a trailer read.
 async fn same_generation(
     tier: &Tiering,
     bucket: &str,
@@ -111,9 +109,10 @@ async fn same_generation(
     etag: &str,
     remote_framed: u64,
 ) -> Result<bool> {
-    match crate::tier::single_part_framed_len(plen) {
-        Some(expect) if expect != remote_framed => Ok(false),
-        _ => tier.remote_generation_matches(bucket, key, etag).await,
+    if crate::tier::single_part_framed_len_matches(plen, remote_framed) {
+        tier.remote_generation_matches(bucket, key, etag).await
+    } else {
+        Ok(false)
     }
 }
 

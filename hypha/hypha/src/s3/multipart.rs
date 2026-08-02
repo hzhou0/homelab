@@ -9,14 +9,16 @@ use std::collections::HashMap;
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
+use hypha_core::backend::{PutOptions, UploadPartRequest};
 use hypha_core::error::Error;
 use hypha_core::meta;
-use hypha_format::offset::{ciphertext_len, plaintext_len_from, HLEN};
-use hypha_format::{encode_trailer, Footer, FooterKind};
+use hypha_format::offset::{plaintext_len_from, HLEN};
+use hypha_format::{encode_trailer, Footer, FooterKind, StoredChecksum};
 
+use super::checksum;
+use super::copy::CopySourceConditions;
 use super::{
-    copied_part_retag, parse_content_md5, resolve_storage_class, ts_ms, write_metadata, Hypha,
-    MAX_INLINE_PLAINTEXT,
+    parse_content_md5, resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
 };
 use crate::codec;
 use crate::gc::Plaintext;
@@ -61,6 +63,36 @@ struct ResolvedPart {
     stash_nonce: String,
 }
 
+#[derive(Clone, Copy)]
+struct PartTarget<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    upload_id: &'a str,
+    number: i32,
+}
+
+struct PartStream {
+    body: StreamingBlob,
+    plaintext_len: u64,
+    expected_md5: Option<[u8; 16]>,
+    checksum: Option<checksum::RequestedChecksum>,
+}
+
+struct PartRecord<'a> {
+    remote_etag: &'a str,
+    plaintext_md5: &'a str,
+    stash_nonce: &'a str,
+    checksum: &'a str,
+}
+
+struct LoadedPart {
+    plaintext_md5: String,
+    stash_nonce: String,
+    checksum: Option<StoredChecksum>,
+}
+
+type LoadedParts = HashMap<(i32, String), LoadedPart>;
+
 impl Hypha {
     pub(super) async fn op_create_multipart_upload(
         &self,
@@ -72,6 +104,7 @@ impl Hypha {
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
         let _gate = self.check_bucket(&bucket)?;
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
+        let upload_checksum = checksum::MultipartChecksum::from_create(&input)?;
 
         // Held (shared) across the remote create and the `u`-record write, so the orphan sweep's
         // try-lock/re-check handshake can tell a create still in flight from a leak — without
@@ -90,16 +123,20 @@ impl Hypha {
         // The upload's own record: client key as the body (keys may carry bytes an ASCII
         // metadata header can't), and — in its metadata — the pass-through carrier this upload
         // will settle with, parked here because complete is where it reaches the tombstone.
+        let mut carrier = write_metadata(
+            input.metadata.as_ref(),
+            &storage_class,
+            input.content_type.as_deref(),
+        );
+        if let Some(policy) = upload_checksum {
+            policy.store(&mut carrier);
+        }
         self.meta()
             .put_small(
                 &bucket,
                 &meta::mpu_upload_key(&upload_id),
                 key.clone().into_bytes(),
-                write_metadata(
-                    input.metadata.as_ref(),
-                    &storage_class,
-                    input.content_type.as_deref(),
-                ),
+                carrier,
                 None,
                 None,
             )
@@ -109,6 +146,8 @@ impl Hypha {
             bucket: Some(input.bucket),
             key: Some(key),
             upload_id: Some(upload_id),
+            checksum_algorithm: upload_checksum.map(|p| checksum::algorithm_dto(p.algorithm)),
+            checksum_type: upload_checksum.map(|p| checksum::kind_dto(p.kind)),
             ..Default::default()
         };
         Ok(S3Response::new(resp))
@@ -141,11 +180,12 @@ impl Hypha {
             .as_deref()
             .map(parse_content_md5)
             .transpose()?;
+        let upload_checksum = self.require_upload(&bucket, &input.upload_id).await?;
+        let checksum_request =
+            checksum::MultipartChecksum::upload_part_request(upload_checksum, &input)?;
         let body = input
             .body
             .ok_or_else(|| Error::Invalid("UploadPart requires a body".into()))?;
-
-        self.require_upload(&bucket, &input.upload_id).await?;
         let _part_guard = self
             .tier
             .mpu_part_locks
@@ -154,45 +194,60 @@ impl Hypha {
 
         // Past the byte source, a part is a part: encrypt as a pure age file, stream to the remote,
         // record its facts. The copy path (`op_upload_part_copy`) shares this tail.
-        let pmd5 = self
+        let digests = self
             .stream_part(
-                &bucket,
-                &key,
-                &input.upload_id,
-                part_number,
-                plen,
-                body,
-                expect_md5,
+                PartTarget {
+                    bucket: &bucket,
+                    key: &key,
+                    upload_id: &input.upload_id,
+                    number: part_number,
+                },
+                PartStream {
+                    body,
+                    plaintext_len: plen,
+                    expected_md5: expect_md5,
+                    checksum: checksum_request,
+                },
             )
             .await?;
         self.clear_fold_intent_for_part(&bucket, &input.upload_id, part_number)
             .await?;
 
-        let resp = UploadPartOutput {
-            e_tag: Some(ETag::Strong(pmd5)),
+        let mut resp = UploadPartOutput {
+            e_tag: Some(ETag::Strong(digests.etag)),
             ..Default::default()
         };
+        if let Some(value) = &digests.checksum {
+            let value = checksum::dto(value, 1);
+            resp.checksum_crc32 = value.checksum_crc32;
+            resp.checksum_crc32c = value.checksum_crc32c;
+            resp.checksum_crc64nvme = value.checksum_crc64nvme;
+            resp.checksum_sha1 = value.checksum_sha1;
+            resp.checksum_sha256 = value.checksum_sha256;
+        }
         Ok(S3Response::new(resp))
     }
 
     /// The shared tail of `UploadPart` and the re-encrypt leg of `UploadPartCopy`: one plaintext
     /// part body becomes its own pure age file on the remote's native upload. Returns the part's
     /// plaintext MD5, computed inline as the body streams.
-    #[allow(clippy::too_many_arguments)]
     async fn stream_part(
         &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: i32,
-        plen: u64,
-        body: StreamingBlob,
-        expect_md5: Option<[u8; 16]>,
-    ) -> S3Result<String> {
-        let (ct_len, enc, mut etag_rx) =
-            codec::encrypt_blob_with_etag(self.env(), body, plen, None, expect_md5)
-                .await
-                .map_err(Error::Io)?;
+        target: PartTarget<'_>,
+        input: PartStream,
+    ) -> S3Result<crate::codec::ObjectDigests> {
+        let (ct_len, enc, etag_rx) = codec::encrypt_blob_with_etag(
+            self.env(),
+            input.body,
+            input.plaintext_len,
+            codec::EncryptOptions {
+                expected_md5: input.expected_md5,
+                checksum: input.checksum,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(Error::Io)?;
 
         // Retain the ciphertext if this part admits no successor — one predicate, so the
         // decision here and complete's fold decision cannot drift apart. When it fires the encrypted
@@ -200,43 +255,41 @@ impl Hypha {
         // no size distinction, so a 4 KiB part and a 4 GiB one take the same path. The retained copy
         // is keyed by a nonce minted now, because that write starts before the remote has returned
         // the `retag` that names this generation everywhere else.
-        let stash_nonce = meta::admits_no_successor(part_number, ct_len, MIN_REMOTE_PART)
+        let stash_nonce = meta::admits_no_successor(target.number, ct_len, MIN_REMOTE_PART)
             .then(mint_nonce)
             .unwrap_or_default();
 
         let uploaded = if stash_nonce.is_empty() {
             self.remote()
-                .upload_part(
-                    bucket,
-                    key,
-                    upload_id,
-                    part_number,
-                    enc,
-                    Some(ct_len as i64),
-                )
+                .upload_part(UploadPartRequest {
+                    bucket: target.bucket,
+                    key: target.key,
+                    upload_id: target.upload_id,
+                    part_number: target.number,
+                    body: enc,
+                    content_length: Some(ct_len as i64),
+                })
                 .await
         } else {
-            let stash_key = meta::mpu_stash_key(upload_id, part_number, &stash_nonce);
+            let stash_key = meta::mpu_stash_key(target.upload_id, target.number, &stash_nonce);
             let (to_remote, to_cache) = codec::tee(enc);
             tokio::try_join!(
-                self.remote().upload_part(
-                    bucket,
-                    key,
-                    upload_id,
-                    part_number,
-                    to_remote,
-                    Some(ct_len as i64),
-                ),
+                self.remote().upload_part(UploadPartRequest {
+                    bucket: target.bucket,
+                    key: target.key,
+                    upload_id: target.upload_id,
+                    part_number: target.number,
+                    body: to_remote,
+                    content_length: Some(ct_len as i64),
+                }),
                 self.meta().put(
-                    bucket,
+                    target.bucket,
                     &stash_key,
                     to_cache,
-                    Some(ct_len as i64),
-                    HashMap::new(),
-                    None,
-                    None,
-                    None,
-                    None,
+                    PutOptions {
+                        content_length: Some(ct_len as i64),
+                        ..Default::default()
+                    },
                 ),
             )
             .map(|(out, _)| out)
@@ -244,7 +297,7 @@ impl Hypha {
         let out = match uploaded {
             Ok(out) => out,
             Err(e) => {
-                return Err(match etag_rx.try_recv() {
+                return Err(match etag_rx.await {
                     Ok(Err(_)) => {
                         s3_error!(BadDigest, "Content-MD5 does not match the request body")
                     }
@@ -259,25 +312,45 @@ impl Hypha {
             .ok_or_else(|| Error::Backend("part upload returned no ETag".into()))?
             .trim_matches('"')
             .to_string();
-        let pmd5 = etag_rx
+        let digests = etag_rx
             .await
             .map_err(|_| Error::Backend("MD5 task dropped before completing".into()))?
             .map_err(|_| s3_error!(BadDigest, "Content-MD5 does not match the request body"))?;
+        let pmd5 = digests.etag.clone();
+        let encoded_checksum = digests
+            .checksum
+            .as_ref()
+            .map(checksum::MultipartChecksum::encode_part)
+            .unwrap_or_default();
 
-        self.record_part(bucket, upload_id, part_number, &retag, &pmd5, &stash_nonce)
-            .await?;
-        Ok(pmd5)
+        self.record_part(
+            target,
+            PartRecord {
+                remote_etag: &retag,
+                plaintext_md5: &pmd5,
+                stash_nonce: &stash_nonce,
+                checksum: &encoded_checksum,
+            },
+        )
+        .await?;
+        Ok(digests)
     }
 
     /// Fail with `NoSuchUpload` unless the upload's record is in `<meta>` — the eventual complete
     /// needs these records.
-    async fn require_upload(&self, bucket: &str, upload_id: &str) -> S3Result<()> {
+    async fn require_upload(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+    ) -> S3Result<Option<checksum::MultipartChecksum>> {
         match self
             .meta()
             .head(bucket, &meta::mpu_upload_key(upload_id))
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(head) => {
+                checksum::MultipartChecksum::from_metadata(&head.metadata.unwrap_or_default())
+            }
             Err(Error::NotFound) => Err(s3_error!(NoSuchUpload, "unknown upload id")),
             Err(e) => Err(e.into()),
         }
@@ -291,23 +364,20 @@ impl Hypha {
     /// remote's part size at complete.
     async fn record_part(
         &self,
-        bucket: &str,
-        upload_id: &str,
-        part_number: i32,
-        retag: &str,
-        pmd5: &str,
-        stash_nonce: &str,
+        target: PartTarget<'_>,
+        record: PartRecord<'_>,
     ) -> Result<(), Error> {
         self.meta()
             .put_small(
-                bucket,
+                target.bucket,
                 &meta::mpu_part_key(
-                    upload_id,
+                    target.upload_id,
                     meta::MpuPart {
-                        part_number,
-                        retag,
-                        pmd5,
-                        stash_nonce,
+                        part_number: target.number,
+                        retag: record.remote_etag,
+                        pmd5: record.plaintext_md5,
+                        stash_nonce: record.stash_nonce,
+                        checksum: record.checksum,
                     },
                 ),
                 Vec::new(),
@@ -446,11 +516,7 @@ impl Hypha {
         Ok(retained.body)
     }
 
-    /// **UploadPartCopy**: the copy-source is an alternate byte source for a part. Fast path —
-    /// a whole, unranged, single-part, remote-resident source is one age file, so its body copies
-    /// **server-side** with `pmd5` = the source cetag and no bytes through hypha; everything else
-    /// (composite sources, ranged copies, parts complete's fold would need) re-encrypts via
-    /// `stream_part`.
+    /// **UploadPartCopy**: the copy-source is an alternate plaintext byte source for a part.
     pub(super) async fn op_upload_part_copy(
         &self,
         req: S3Request<UploadPartCopyInput>,
@@ -467,23 +533,27 @@ impl Hypha {
         let (src_bucket, src_key) = parse_copy_source(&input.copy_source)?;
         meta::validate_client_key(&src_key).map_err(|e| Error::Invalid(e.to_string()))?;
 
-        self.require_upload(&bucket, &input.upload_id).await?;
+        let upload_checksum = self.require_upload(&bucket, &input.upload_id).await?;
         let _part_guard = self
             .tier
             .mpu_part_locks
             .lock_part(&bucket, &input.upload_id, part_number)
             .await;
 
-        let (facts, _md, live) = self
+        let source = self
             .resolve_copy_source(
                 &src_bucket,
                 &src_key,
-                input.copy_source_if_match.as_ref(),
-                input.copy_source_if_none_match.as_ref(),
-                input.copy_source_if_modified_since.as_ref(),
-                input.copy_source_if_unmodified_since.as_ref(),
+                CopySourceConditions {
+                    if_match: input.copy_source_if_match.as_ref(),
+                    if_none_match: input.copy_source_if_none_match.as_ref(),
+                    if_modified_since: input.copy_source_if_modified_since.as_ref(),
+                    if_unmodified_since: input.copy_source_if_unmodified_since.as_ref(),
+                },
             )
             .await?;
+        let facts = &source.facts;
+        let live = source.live;
 
         // The copy range over the source's PLAINTEXT: the whole object, or `copy-source-range`.
         let pt = match input.copy_source_range.as_deref() {
@@ -498,69 +568,60 @@ impl Hypha {
             ));
         }
         let whole = pt == (0..facts.plen);
-        let composite = meta::is_composite_etag(&facts.cetag);
-
-        // Fast path: a whole, unranged, single-part, remote-resident source is one age file — copy
-        // its body range server-side (trailer excluded), `pmd5` = source cetag (a single-part cetag
-        // *is* its plaintext MD5). Declined when the part admits no successor: complete's fold needs
-        // the ciphertext retained, which only the re-encrypt tee produces — a server-side copy never
-        // routes the bytes through hypha, so there is nothing to stash.
-        let body_ct_len = ciphertext_len(part_plen, HLEN);
-        let pmd5 = if !live
-            && !composite
-            && whole
-            && !meta::admits_no_successor(part_number, body_ct_len, MIN_REMOTE_PART)
-        {
+        let plaintext = if live {
+            let range = (!whole).then(|| format!("bytes={}-{}", pt.start, pt.end - 1));
             let out = self
-                .remote()
-                .upload_part_copy(
-                    &bucket,
-                    &key,
-                    &input.upload_id,
-                    part_number,
+                .data()
+                .get_range_if_match(&src_bucket, &src_key, range, source.generation.clone())
+                .await?;
+            codec::bytestream_to_blob(out.body)
+        } else {
+            let sub = (!whole).then(|| pt.clone());
+            self.tier
+                .decrypt_remote_body_at(
                     &src_bucket,
                     &src_key,
-                    Some(format!("bytes=0-{}", body_ct_len - 1)),
+                    &facts.cetag,
+                    sub,
+                    &source.generation,
                 )
-                .await?;
-            let retag = copied_part_retag(&out)?;
-            let pmd5 = facts.cetag.clone();
-            self.record_part(&bucket, &input.upload_id, part_number, &retag, &pmd5, "")
-                .await?;
-            pmd5
-        } else {
-            // Re-encrypt path: obtain the source plaintext (whole or ranged), then it's a part
-            // like any other.
-            let plaintext = if live {
-                let range = (!whole).then(|| format!("bytes={}-{}", pt.start, pt.end - 1));
-                let out = self.data().get(&src_bucket, &src_key, range).await?;
-                codec::bytestream_to_blob(out.body)
-            } else {
-                let sub = (!whole).then(|| pt.clone());
-                self.tier
-                    .decrypt_remote_body(&src_bucket, &src_key, &facts.cetag, sub)
-                    .await?
-            };
-            self.stream_part(
-                &bucket,
-                &key,
-                &input.upload_id,
-                part_number,
-                part_plen,
-                plaintext,
-                None,
-            )
-            .await?
+                .await?
         };
+        let digests = self
+            .stream_part(
+                PartTarget {
+                    bucket: &bucket,
+                    key: &key,
+                    upload_id: &input.upload_id,
+                    number: part_number,
+                },
+                PartStream {
+                    body: plaintext,
+                    plaintext_len: part_plen,
+                    expected_md5: None,
+                    checksum: upload_checksum
+                        .map(|policy| checksum::RequestedChecksum::computed(policy.algorithm)),
+                },
+            )
+            .await?;
         self.clear_fold_intent_for_part(&bucket, &input.upload_id, part_number)
             .await?;
 
+        let mut result = CopyPartResult {
+            e_tag: Some(ETag::Strong(digests.etag)),
+            last_modified: Some(ts_ms(tier::now_ms())),
+            ..Default::default()
+        };
+        if let Some(value) = &digests.checksum {
+            let value = checksum::dto(value, 1);
+            result.checksum_crc32 = value.checksum_crc32;
+            result.checksum_crc32c = value.checksum_crc32c;
+            result.checksum_crc64nvme = value.checksum_crc64nvme;
+            result.checksum_sha1 = value.checksum_sha1;
+            result.checksum_sha256 = value.checksum_sha256;
+        }
         let resp = UploadPartCopyOutput {
-            copy_part_result: Some(CopyPartResult {
-                e_tag: Some(ETag::Strong(pmd5)),
-                last_modified: Some(ts_ms(facts.mtime_ms)),
-                ..Default::default()
-            }),
+            copy_part_result: Some(result),
             ..Default::default()
         };
         Ok(S3Response::new(resp))
@@ -570,7 +631,7 @@ impl Hypha {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let input = req.input;
+        let mut input = req.input;
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
@@ -579,6 +640,7 @@ impl Hypha {
 
         let requested = input
             .multipart_upload
+            .take()
             .and_then(|m| m.parts)
             .unwrap_or_default();
         if requested.is_empty() {
@@ -622,6 +684,18 @@ impl Hypha {
             Err(Error::NotFound) => return Err(s3_error!(NoSuchUpload, "unknown upload id")),
             Err(e) => return Err(e.into()),
         };
+        let upload_checksum = checksum::MultipartChecksum::from_metadata(&carrier)?;
+        if upload_checksum.is_some()
+            && (!requested
+                .iter()
+                .enumerate()
+                .all(|(index, part)| part.part_number == Some(index as i32 + 1)))
+        {
+            return Err(s3_error!(
+                InvalidPartOrder,
+                "checksummed parts must start at 1 and be consecutive"
+            ));
+        }
 
         // 1. Recover per-part facts and geometry, then compose the client ETag, total plaintext
         //    length, and offset table. Two reads, no per-part HEAD:
@@ -630,7 +704,9 @@ impl Hypha {
         //
         //    The client's part ETag selects its cache record; intersecting that record with the
         //    remote's live generation rejects a superseded re-upload without trusting stale facts.
-        let mut pmd5_by_part = self.load_part_pmd5s(&bucket, &upload_id).await?;
+        let mut pmd5_by_part = self
+            .load_part_pmd5s(&bucket, &upload_id, upload_checksum)
+            .await?;
         let fold_intent = self.fold_intent(&bucket, &upload_id).await?;
         let mut live: HashMap<(i32, String), u64> = self
             .remote()
@@ -646,7 +722,9 @@ impl Hypha {
         if let Some(intent) = fold_intent {
             let record_matches = pmd5_by_part
                 .get(&(intent.part_number, intent.retag.clone()))
-                .is_some_and(|(pmd5, nonce)| pmd5 == &intent.pmd5 && nonce == &intent.stash_nonce);
+                .is_some_and(|part| {
+                    part.plaintext_md5 == intent.pmd5 && part.stash_nonce == intent.stash_nonce
+                });
             if !record_matches {
                 return Err(Error::Backend(
                     "multipart fold intent has no matching part record".into(),
@@ -659,14 +737,12 @@ impl Hypha {
                     && live.contains_key(&(*part_number, retag.clone()))
             });
             let pure_is_live = replacement_is_live
-                || pmd5_by_part
-                    .iter()
-                    .any(|((part_number, retag), (pmd5, nonce))| {
-                        *part_number == intent.part_number
-                            && pmd5 == &intent.pmd5
-                            && nonce == &intent.stash_nonce
-                            && live.contains_key(&(*part_number, retag.clone()))
-                    });
+                || pmd5_by_part.iter().any(|((part_number, retag), part)| {
+                    *part_number == intent.part_number
+                        && part.plaintext_md5 == intent.pmd5
+                        && part.stash_nonce == intent.stash_nonce
+                        && live.contains_key(&(*part_number, retag.clone()))
+                });
             if !pure_is_live {
                 let original = self
                     .retained_part_body(
@@ -680,14 +756,14 @@ impl Hypha {
                     .await?;
                 let out = self
                     .remote()
-                    .upload_part(
-                        &bucket,
-                        &key,
-                        &upload_id,
-                        intent.part_number,
-                        original,
-                        Some(intent.ciphertext_len as i64),
-                    )
+                    .upload_part(UploadPartRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        upload_id: &upload_id,
+                        part_number: intent.part_number,
+                        body: original,
+                        content_length: Some(intent.ciphertext_len as i64),
+                    })
                     .await?;
                 let retag = out
                     .e_tag()
@@ -696,18 +772,36 @@ impl Hypha {
                     })?
                     .trim_matches('"')
                     .to_string();
+                let part_checksum = pmd5_by_part
+                    .get(&(intent.part_number, intent.retag.clone()))
+                    .and_then(|part| part.checksum.as_ref())
+                    .cloned();
+                let encoded_checksum = part_checksum
+                    .as_ref()
+                    .map(checksum::MultipartChecksum::encode_part)
+                    .unwrap_or_default();
                 self.record_part(
-                    &bucket,
-                    &upload_id,
-                    intent.part_number,
-                    &retag,
-                    &intent.pmd5,
-                    &intent.stash_nonce,
+                    PartTarget {
+                        bucket: &bucket,
+                        key: &key,
+                        upload_id: &upload_id,
+                        number: intent.part_number,
+                    },
+                    PartRecord {
+                        remote_etag: &retag,
+                        plaintext_md5: &intent.pmd5,
+                        stash_nonce: &intent.stash_nonce,
+                        checksum: &encoded_checksum,
+                    },
                 )
                 .await?;
                 pmd5_by_part.insert(
                     (intent.part_number, retag.clone()),
-                    (intent.pmd5, intent.stash_nonce),
+                    LoadedPart {
+                        plaintext_md5: intent.pmd5,
+                        stash_nonce: intent.stash_nonce,
+                        checksum: part_checksum,
+                    },
                 );
                 live.insert((intent.part_number, retag), intent.ciphertext_len);
             }
@@ -715,6 +809,8 @@ impl Hypha {
         }
 
         let mut pmd5s = Vec::with_capacity(requested.len());
+        let mut part_checksums = Vec::with_capacity(requested.len());
+        let mut part_plens = Vec::with_capacity(requested.len());
         let mut remote_parts = Vec::with_capacity(requested.len());
         let mut resolved = Vec::with_capacity(requested.len());
         let mut total_plen: u64 = 0;
@@ -733,22 +829,34 @@ impl Hypha {
                 .value()
                 .trim_matches('"')
                 .to_string();
-            let current =
-                pmd5_by_part
-                    .iter()
-                    .find_map(|((record_n, retag), (record_pmd5, stash_nonce))| {
-                        (*record_n == n && record_pmd5 == &pmd5)
-                            .then(|| {
-                                live.get(&(n, retag.clone())).map(|size| ResolvedPart {
+            let current = pmd5_by_part.iter().find_map(|((record_n, retag), record)| {
+                (*record_n == n && record.plaintext_md5 == pmd5)
+                    .then(|| {
+                        live.get(&(n, retag.clone())).map(|size| {
+                            (
+                                ResolvedPart {
                                     number: n,
                                     retag: retag.clone(),
                                     size: *size,
-                                    stash_nonce: stash_nonce.clone(),
-                                })
-                            })
-                            .flatten()
-                    });
-            let part = current.ok_or_else(|| s3_error!(InvalidPart, "no such uploaded part"))?;
+                                    stash_nonce: record.stash_nonce.clone(),
+                                },
+                                record.checksum.clone(),
+                            )
+                        })
+                    })
+                    .flatten()
+            });
+            let (part, part_checksum) =
+                current.ok_or_else(|| s3_error!(InvalidPart, "no such uploaded part"))?;
+            if let Some(policy) = upload_checksum {
+                let stored = part_checksum.as_ref().ok_or_else(|| {
+                    s3_error!(InvalidPart, "uploaded part is missing its checksum")
+                })?;
+                if policy.completed_part(cp)? != stored.value {
+                    return Err(s3_error!(InvalidPart, "part checksum does not match"));
+                }
+                part_checksums.push(stored.clone());
+            }
             let plen = plaintext_len_from(part.size, HLEN).ok_or_else(|| {
                 Error::Backend(format!(
                     "part {n} size {} inconsistent with HLEN",
@@ -756,6 +864,7 @@ impl Hypha {
                 ))
             })?;
             total_plen += plen;
+            part_plens.push(plen);
             ct_acc += part.size;
             table.push(ct_acc);
             pmd5s.push(pmd5);
@@ -772,6 +881,13 @@ impl Hypha {
         let cetag = meta::composite_etag(&pmd5s)
             .ok_or_else(|| Error::Backend("empty part md5 set".into()))?;
         let mtime_ms = tier::now_ms();
+        let object_checksum = checksum::MultipartChecksum::complete(
+            upload_checksum,
+            &input,
+            &part_checksums,
+            &part_plens,
+            requested.len() as u32,
+        )?;
 
         // 2. Build the terminating trailer — the object's one facts + parts-table carrier —
         //    and place it as the object's final bytes so the native complete below commits body and
@@ -783,6 +899,7 @@ impl Hypha {
             plen: total_plen,
             mtime_ms,
             md5,
+            checksum: object_checksum.clone(),
         };
         let trailer = encode_trailer(&self.tier.trailer_key, &key, ct_acc, &footer, &table);
 
@@ -836,14 +953,14 @@ impl Hypha {
             let folded = codec::append_bytes(stashed, trailer.clone());
             let fout = self
                 .remote()
-                .upload_part(
-                    &bucket,
-                    &key,
-                    &upload_id,
-                    last.number,
-                    folded,
-                    Some(folded_len as i64),
-                )
+                .upload_part(UploadPartRequest {
+                    bucket: &bucket,
+                    key: &key,
+                    upload_id: &upload_id,
+                    part_number: last.number,
+                    body: folded,
+                    content_length: Some(folded_len as i64),
+                })
                 .await?;
             let fold_etag = fout.e_tag().ok_or_else(|| {
                 Error::Backend("folded final part upload returned no ETag".into())
@@ -859,14 +976,14 @@ impl Hypha {
             let trailer_pn = last.number + 1;
             let fout = self
                 .remote()
-                .upload_part(
-                    &bucket,
-                    &key,
-                    &upload_id,
-                    trailer_pn,
-                    aws_sdk_s3::primitives::ByteStream::from(trailer.clone()),
-                    Some(trailer.len() as i64),
-                )
+                .upload_part(UploadPartRequest {
+                    bucket: &bucket,
+                    key: &key,
+                    upload_id: &upload_id,
+                    part_number: trailer_pn,
+                    body: aws_sdk_s3::primitives::ByteStream::from(trailer.clone()),
+                    content_length: Some(trailer.len() as i64),
+                })
                 .await?;
             // The remote just accepted this part, so it must echo its ETag; an empty one would
             // silently build a mismatched CompletedPart and fail (or corrupt) the native complete.
@@ -898,6 +1015,10 @@ impl Hypha {
             }
             return Err(e.into());
         }
+        let mut carrier = meta::passthrough_metadata(&carrier);
+        if let Some(value) = &object_checksum {
+            carrier.insert(meta::CHECKSUM.to_string(), meta::encode_checksum(value));
+        }
         self.tier
             .settle_evict_locked(&bucket, &key, total_plen, &cetag, mtime_ms, carrier)
             .await?;
@@ -909,12 +1030,21 @@ impl Hypha {
         // A new composite at K supersedes the previous generation's shadow, which lands at the same
         // shadow key but under the old generation's ETag and so is unreachable.
         self.orphans.owe(&bucket, &key);
-        let resp = CompleteMultipartUploadOutput {
+        let mut resp = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),
             key: Some(key),
             e_tag: Some(ETag::Strong(cetag)),
             ..Default::default()
         };
+        if let Some(value) = &object_checksum {
+            let value = checksum::dto(value, requested.len() as u32);
+            resp.checksum_crc32 = value.checksum_crc32;
+            resp.checksum_crc32c = value.checksum_crc32c;
+            resp.checksum_crc64nvme = value.checksum_crc64nvme;
+            resp.checksum_sha1 = value.checksum_sha1;
+            resp.checksum_sha256 = value.checksum_sha256;
+            resp.checksum_type = value.checksum_type;
+        }
         Ok(S3Response::new(resp))
     }
 
@@ -1010,9 +1140,11 @@ impl Hypha {
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         meta::validate_client_key(&key).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.require_upload(&bucket, &input.upload_id).await?;
+        let upload_checksum = self.require_upload(&bucket, &input.upload_id).await?;
 
-        let pmd5_by_part = self.load_part_pmd5s(&bucket, &input.upload_id).await?;
+        let pmd5_by_part = self
+            .load_part_pmd5s(&bucket, &input.upload_id, upload_checksum)
+            .await?;
         let mut parts: Vec<Part> = self
             .remote()
             .list_parts(&bucket, &key, &input.upload_id)
@@ -1020,11 +1152,22 @@ impl Hypha {
             .into_iter()
             .filter(|p| p.number <= meta::MAX_CLIENT_PART)
             .filter_map(|p| {
-                pmd5_by_part.get(&(p.number, p.etag)).map(|(pmd5, _)| Part {
-                    part_number: Some(p.number),
-                    e_tag: Some(ETag::Strong(pmd5.clone())),
-                    size: plaintext_len_from(p.size, HLEN).map(|n| n as i64),
-                    ..Default::default()
+                pmd5_by_part.get(&(p.number, p.etag)).map(|record| {
+                    let mut part = Part {
+                        part_number: Some(p.number),
+                        e_tag: Some(ETag::Strong(record.plaintext_md5.clone())),
+                        size: plaintext_len_from(p.size, HLEN).map(|n| n as i64),
+                        ..Default::default()
+                    };
+                    if let Some(value) = &record.checksum {
+                        let value = checksum::dto(value, 1);
+                        part.checksum_crc32 = value.checksum_crc32;
+                        part.checksum_crc32c = value.checksum_crc32c;
+                        part.checksum_crc64nvme = value.checksum_crc64nvme;
+                        part.checksum_sha1 = value.checksum_sha1;
+                        part.checksum_sha256 = value.checksum_sha256;
+                    }
+                    part
                 })
             })
             .collect();
@@ -1051,6 +1194,8 @@ impl Hypha {
                 .flatten(),
             is_truncated: Some(is_truncated),
             storage_class: Some(StorageClass::from(meta::STANDARD.to_string())),
+            checksum_algorithm: upload_checksum.map(|p| checksum::algorithm_dto(p.algorithm)),
+            checksum_type: upload_checksum.map(|p| checksum::kind_dto(p.kind)),
             parts: Some(page),
             ..Default::default()
         };
@@ -1067,7 +1212,8 @@ impl Hypha {
         &self,
         bucket: &str,
         upload_id: &str,
-    ) -> Result<HashMap<(i32, String), (String, String)>, Error> {
+        upload_checksum: Option<checksum::MultipartChecksum>,
+    ) -> Result<LoadedParts, Error> {
         let prefix = meta::mpu_prefix(upload_id);
         let mut out = HashMap::new();
         let mut token: Option<String> = None;
@@ -1087,8 +1233,14 @@ impl Hypha {
                 if let Some(full) = obj.key {
                     if let Some(p) = meta::parse_mpu_part(&full) {
                         out.insert(
-                            (p.part_number, p.retag.to_string()),
-                            (p.pmd5.to_string(), p.stash_nonce.to_string()),
+                            (p.part_number, meta::expand_mpu_digest(p.retag)),
+                            LoadedPart {
+                                plaintext_md5: meta::expand_mpu_digest(p.pmd5),
+                                stash_nonce: p.stash_nonce.to_string(),
+                                checksum: upload_checksum
+                                    .filter(|_| !p.checksum.is_empty())
+                                    .and_then(|policy| policy.decode_part(p.checksum)),
+                            },
                         );
                     }
                 }

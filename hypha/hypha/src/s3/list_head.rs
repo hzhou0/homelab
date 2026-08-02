@@ -146,29 +146,34 @@ impl Hypha {
         if meta::validate_client_key(&key).is_err() {
             return Err(Error::NotFound.into());
         }
-        let (content_length, e_tag, last_modified, md) =
+        let (content_length, e_tag, last_modified, checksum_value, md) =
             match self.resolve_key(&bucket, &key).await? {
                 KeyState::Absent => return Err(Error::NotFound.into()),
                 KeyState::Remote { facts, md } => (
                     Some(facts.plen as i64),
-                    Some(ETag::Strong(facts.cetag)),
+                    Some(ETag::Strong(facts.cetag.clone())),
                     Some(ts_ms(facts.mtime_ms)),
+                    facts
+                        .checksum
+                        .map(|value| (value, super::get::checksum_count(&facts.cetag))),
                     md,
                 ),
-                KeyState::CacheBody { head, md } => (
-                    head.content_length,
-                    head.e_tag
-                        .as_ref()
-                        .map(|e| ETag::Strong(e.trim_matches('"').to_string())),
-                    head.last_modified
-                        .and_then(|t| t.to_millis().ok())
-                        .map(ts_ms),
-                    md,
-                ),
+                KeyState::CacheBody { head, md } => {
+                    let facts = crate::tier::RemoteFacts::from_cache_head(&head);
+                    (
+                        head.content_length,
+                        Some(ETag::Strong(facts.cetag)),
+                        head.last_modified
+                            .and_then(|t| t.to_millis().ok())
+                            .map(ts_ms),
+                        facts.checksum.map(|value| (value, 1)),
+                        md,
+                    )
+                }
             };
         super::record_bytes(content_length.unwrap_or_default().max(0) as u64);
 
-        let resp = HeadObjectOutput {
+        let mut resp = HeadObjectOutput {
             content_length,
             e_tag,
             last_modified,
@@ -180,6 +185,22 @@ impl Hypha {
             accept_ranges: Some("bytes".to_string()),
             ..Default::default()
         };
+        if req
+            .input
+            .checksum_mode
+            .as_ref()
+            .is_some_and(|mode| mode.as_str() == ChecksumMode::ENABLED)
+        {
+            if let Some((value, count)) = checksum_value {
+                let value = super::checksum::dto(&value, count);
+                resp.checksum_crc32 = value.checksum_crc32;
+                resp.checksum_crc32c = value.checksum_crc32c;
+                resp.checksum_crc64nvme = value.checksum_crc64nvme;
+                resp.checksum_sha1 = value.checksum_sha1;
+                resp.checksum_sha256 = value.checksum_sha256;
+                resp.checksum_type = value.checksum_type;
+            }
+        }
         Ok(S3Response::new(resp))
     }
 

@@ -9,17 +9,22 @@ use std::ops::Range;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use futures::StreamExt as _;
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
+use hypha_core::backend::{
+    CopyRequest, PutOptions, UploadPartCopyRequest, UploadPartDestination, UploadPartRequest,
+};
 use hypha_core::error::Error;
 use hypha_core::meta;
-use hypha_format::{encode_trailer, Footer};
+use hypha_format::{encode_trailer, ChecksumKind, Footer, StoredChecksum};
 
 use super::multipart::{parse_copy_source, MIN_REMOTE_PART};
 use super::overlay::{KeyState, WriteMode};
 use super::put::evaluate_precondition;
-use super::{copied_part_retag, resolve_storage_class, ts_ms, write_metadata, Hypha};
+use super::{checksum, copied_part_retag, resolve_storage_class, ts_ms, write_metadata, Hypha};
+use crate::bucket::Readout;
 use crate::codec::{self, SingleTrailer};
 use crate::gc::Plaintext;
 use crate::tier::{self, RemoteFacts};
@@ -30,6 +35,52 @@ use crate::tier::{self, RemoteFacts};
 /// so none may fall below it. Even a maximal object (10 000 × 4 GiB parts ≈ 40 TiB) needs well under
 /// 9 000 copy parts, leaving room for the trailer part under S3's 10 000-part ceiling.
 const COPY_PART_CT: u64 = 5 * 1024 * 1024 * 1024;
+const MAX_COPY_PLAINTEXT: u64 = 5 * 1024 * 1024 * 1024;
+
+pub(super) struct ResolvedCopySource {
+    pub facts: RemoteFacts,
+    pub md: HashMap<String, String>,
+    pub live: bool,
+    pub generation: String,
+    _ticket: Readout,
+}
+
+pub(super) struct CopySourceConditions<'a> {
+    pub if_match: Option<&'a ETagCondition>,
+    pub if_none_match: Option<&'a ETagCondition>,
+    pub if_modified_since: Option<&'a Timestamp>,
+    pub if_unmodified_since: Option<&'a Timestamp>,
+}
+
+#[derive(Clone, Copy)]
+struct ObjectRef<'a> {
+    bucket: &'a str,
+    key: &'a str,
+}
+
+struct CopyCommit<'a> {
+    source: ObjectRef<'a>,
+    destination: ObjectRef<'a>,
+    resolved: &'a ResolvedCopySource,
+    checksum: Option<&'a StoredChecksum>,
+    metadata: HashMap<String, String>,
+}
+
+struct RemoteCopyCommit<'a> {
+    source: ObjectRef<'a>,
+    destination: ObjectRef<'a>,
+    source_generation: &'a str,
+    source_etag: &'a str,
+    plaintext_len: u64,
+    body_ciphertext_len: u64,
+    trailer: Vec<u8>,
+    content_type: Option<String>,
+}
+
+struct CopyOutcome {
+    etag: String,
+    mtime_ms: i64,
+}
 
 impl Hypha {
     pub(super) async fn op_copy_object(
@@ -51,22 +102,60 @@ impl Hypha {
         let (_gate, write_mode) = self.prepare_write(&bucket, &key).await?;
 
         // Shared with UploadPartCopy .
-        let (facts, src_md, source_live) = self
+        let source = self
             .resolve_copy_source(
                 &src_bucket,
                 &src_key,
-                input.copy_source_if_match.as_ref(),
-                input.copy_source_if_none_match.as_ref(),
-                input.copy_source_if_modified_since.as_ref(),
-                input.copy_source_if_unmodified_since.as_ref(),
+                CopySourceConditions {
+                    if_match: input.copy_source_if_match.as_ref(),
+                    if_none_match: input.copy_source_if_none_match.as_ref(),
+                    if_modified_since: input.copy_source_if_modified_since.as_ref(),
+                    if_unmodified_since: input.copy_source_if_unmodified_since.as_ref(),
+                },
             )
             .await?;
+        let facts = &source.facts;
+        let src_md = &source.md;
+        let source_live = source.live;
+        if facts.plen > MAX_COPY_PLAINTEXT {
+            return Err(s3_error!(
+                EntityTooLarge,
+                "CopyObject source exceeds the 5 GiB limit"
+            ));
+        }
+        let requested_checksum = input
+            .checksum_algorithm
+            .as_ref()
+            .map(checksum::parse_algorithm)
+            .transpose()?;
+        let destination_checksum = match requested_checksum {
+            None => facts.checksum.clone(),
+            Some(algorithm)
+                if facts
+                    .checksum
+                    .as_ref()
+                    .is_some_and(|value| value.algorithm == algorithm) =>
+            {
+                facts.checksum.clone()
+            }
+            Some(algorithm) => Some(
+                self.hash_copy_source(
+                    &source,
+                    ObjectRef {
+                        bucket: &src_bucket,
+                        key: &src_key,
+                    },
+                    algorithm,
+                )
+                .await?,
+            ),
+        };
 
         let replace = input
             .metadata_directive
             .as_ref()
             .is_some_and(|d| d.as_str() == MetadataDirective::REPLACE);
-        let dst_passthrough = if replace {
+        let mut dst_passthrough = if replace {
             write_metadata(
                 input.metadata.as_ref(),
                 &storage_class,
@@ -74,11 +163,14 @@ impl Hypha {
             )
         } else {
             write_metadata(
-                Some(&meta::decode_user_metadata(&src_md)),
+                Some(&meta::decode_user_metadata(src_md)),
                 &storage_class,
-                meta::content_type(&src_md).as_deref(),
+                meta::content_type(src_md).as_deref(),
             )
         };
+        if let Some(value) = &destination_checksum {
+            dst_passthrough.insert(meta::CHECKSUM.to_string(), meta::encode_checksum(value));
+        }
 
         // Representation, not deployment mode, selects the transport. A live source is a
         // single-part plaintext cache body, so a ready cached destination can use one atomic
@@ -89,41 +181,41 @@ impl Hypha {
         // so even a live source must commit remotely. Stream that source snapshot through the
         // single-part durable path rather than acknowledging a body no reader would see.
         if source_live {
-            return match write_mode {
+            let commit = CopyCommit {
+                source: ObjectRef {
+                    bucket: &src_bucket,
+                    key: &src_key,
+                },
+                destination: ObjectRef {
+                    bucket: &bucket,
+                    key: &key,
+                },
+                resolved: &source,
+                checksum: destination_checksum.as_ref(),
+                metadata: dst_passthrough,
+            };
+            let outcome = match write_mode {
                 WriteMode::Cached => {
                     // Admission gate  — see `op_put_object_cached`.
                     if !self.tier.pressure.admit() {
                         return Err(Error::SlowDown.into());
                     }
-                    self.commit_cached_copy(
-                        &bucket,
-                        &key,
-                        &src_bucket,
-                        &src_key,
-                        &facts,
-                        dst_passthrough,
-                    )
-                    .await
+                    self.commit_cached_copy(commit).await?
                 }
-                WriteMode::Durable => {
-                    self.commit_live_source_durable_copy(
-                        &bucket,
-                        &key,
-                        &src_bucket,
-                        &src_key,
-                        &facts,
-                        dst_passthrough,
-                    )
-                    .await
-                }
+                WriteMode::Durable => self.commit_live_source_durable_copy(commit).await?,
             };
+            return Ok(copy_response(outcome, destination_checksum.as_ref()));
         }
 
         // One bounded tail GET of the source's remote trailer (MAC-verified at K_src) fixes the
         // body/trailer boundary and, for a composite, the offset table — both body-relative, so they
         // carry over to K_dst unchanged. Foreign/unverifiable halts the deployment, as on any read
         // (`crate::halt`).
-        let Some(tail) = self.tier.read_tail(&src_bucket, &src_key).await? else {
+        let Some(tail) = self
+            .tier
+            .read_tail_at(&src_bucket, &src_key, Some(&source.generation))
+            .await?
+        else {
             self.tier.halt.foreign_object(&src_bucket, &src_key).await
         };
         let body_ct_len = tail.body_ct_len;
@@ -138,6 +230,7 @@ impl Hypha {
         let mtime_ms = tier::now_ms();
         let footer = Footer {
             mtime_ms,
+            checksum: destination_checksum.clone(),
             ..tail.footer.clone()
         };
         let table: Vec<u64> = tail.windows.iter().map(|w| w.end).collect();
@@ -145,29 +238,24 @@ impl Hypha {
 
         self.tier.mark_transit_locked(&bucket, &key).await?;
         let dst_ct = meta::content_type(&dst_passthrough);
-        let commit = if body_ct_len >= MIN_REMOTE_PART {
-            self.commit_copy_multipart(
-                &bucket,
-                &key,
-                &src_bucket,
-                &src_key,
-                body_ct_len,
-                &trailer,
-                dst_ct,
-            )
-            .await
-        } else {
-            self.commit_copy_reencrypt(
-                &bucket,
-                &key,
-                &src_bucket,
-                &src_key,
-                &facts,
+        let commit = self
+            .commit_remote_copy(RemoteCopyCommit {
+                source: ObjectRef {
+                    bucket: &src_bucket,
+                    key: &src_key,
+                },
+                destination: ObjectRef {
+                    bucket: &bucket,
+                    key: &key,
+                },
+                source_generation: &source.generation,
+                source_etag: &facts.cetag,
+                plaintext_len: facts.plen,
+                body_ciphertext_len: body_ct_len,
                 trailer,
-                dst_ct,
-            )
-            .await
-        };
+                content_type: dst_ct,
+            })
+            .await;
         if let Err(e) = commit {
             // Settle K_dst to whatever the remote actually holds — the same repair as a crashed PUT.
             if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
@@ -191,15 +279,13 @@ impl Hypha {
         // through native multipart, so the destination can be either shape.
         self.gc.touch(&bucket, &key, Plaintext::of(&facts.cetag));
         self.orphans.owe(&bucket, &key);
-        let resp = CopyObjectOutput {
-            copy_object_result: Some(CopyObjectResult {
-                e_tag: Some(ETag::Strong(facts.cetag.clone())),
-                last_modified: Some(ts_ms(mtime_ms)),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        Ok(S3Response::new(resp))
+        Ok(copy_response(
+            CopyOutcome {
+                etag: facts.cetag.clone(),
+                mtime_ms,
+            },
+            destination_checksum.as_ref(),
+        ))
     }
 
     /// A live cached source copied into a ready cached destination. The backend copy is the commit,
@@ -208,28 +294,20 @@ impl Hypha {
     /// `copy_source_if_match` is not the client's condition repeated. It binds the backend operation
     /// to the physical generation whose facts were evaluated above, closing HEAD → copy without
     /// making cached unconditional PUTs take the process write lock.
-    #[allow(clippy::too_many_arguments)]
-    async fn commit_cached_copy(
-        &self,
-        bucket: &str,
-        key: &str,
-        src_bucket: &str,
-        src_key: &str,
-        facts: &RemoteFacts,
-        dst_passthrough: HashMap<String, String>,
-    ) -> S3Result<S3Response<CopyObjectOutput>> {
-        let content_type = meta::content_type(&dst_passthrough);
+    async fn commit_cached_copy(&self, commit: CopyCommit<'_>) -> S3Result<CopyOutcome> {
+        let facts = &commit.resolved.facts;
+        let content_type = meta::content_type(&commit.metadata);
         let copied = match self
             .data()
-            .copy(
-                bucket,
-                key,
-                src_bucket,
-                src_key,
-                format!("\"{}\"", facts.cetag),
-                dst_passthrough,
+            .copy(CopyRequest {
+                destination_bucket: commit.destination.bucket,
+                destination_key: commit.destination.key,
+                source_bucket: commit.source.bucket,
+                source_key: commit.source.key,
+                source_if_match: commit.resolved.generation.clone(),
+                metadata: commit.metadata,
                 content_type,
-            )
+            })
             .await
         {
             Ok(out) => out,
@@ -239,7 +317,7 @@ impl Hypha {
                 return Err(e.into())
             }
             Err(e) => {
-                self.buckets.unaccount(bucket);
+                self.buckets.unaccount(commit.destination.bucket);
                 return Err(e.into());
             }
         };
@@ -247,7 +325,7 @@ impl Hypha {
         let result = match copied.copy_object_result() {
             Some(result) => result,
             None => {
-                self.buckets.unaccount(bucket);
+                self.buckets.unaccount(commit.destination.bucket);
                 return Err(Error::Backend("cache copy returned no result".into()).into());
             }
         };
@@ -258,57 +336,54 @@ impl Hypha {
             Some(etag) if !etag.is_empty() => etag,
             _ => {
                 // The copy committed but cannot be named by a marker. R2 must derive it next run.
-                self.buckets.unaccount(bucket);
+                self.buckets.unaccount(commit.destination.bucket);
                 return Err(Error::Backend("cache copy returned no ETag".into()).into());
             }
         };
         if etag != facts.cetag {
             // A normal cache body is a single-part plaintext object, so its native ETag is stable
             // across copy. Do not publish inconsistent facts if a backend implements otherwise.
-            self.buckets.unaccount(bucket);
+            self.buckets.unaccount(commit.destination.bucket);
             return Err(Error::Backend(format!(
                 "cache copy changed plaintext ETag from {} to {etag}",
                 facts.cetag
             ))
             .into());
         }
-        let mtime_ms = result
-            .last_modified()
-            .and_then(|value| value.to_millis().ok())
-            .unwrap_or_else(tier::now_ms);
+        let mtime_ms = tier::now_ms();
 
-        self.markers.owe(bucket, key, etag.clone());
-        self.gc.touch(bucket, key, Plaintext::AtKey);
-        self.orphans.owe(bucket, key);
+        self.markers.owe(
+            commit.destination.bucket,
+            commit.destination.key,
+            etag.clone(),
+        );
+        self.gc.touch(
+            commit.destination.bucket,
+            commit.destination.key,
+            Plaintext::AtKey,
+        );
+        self.orphans
+            .owe(commit.destination.bucket, commit.destination.key);
         super::record_bytes(facts.plen);
-
-        Ok(S3Response::new(CopyObjectOutput {
-            copy_object_result: Some(CopyObjectResult {
-                e_tag: Some(ETag::Strong(etag)),
-                last_modified: Some(ts_ms(mtime_ms)),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
+        Ok(CopyOutcome { etag, mtime_ms })
     }
 
     /// A live source copied into a destination that is currently running durable semantics (a
     /// restore window in a cached deployment). Open a generation-bound cache GET before marking the
     /// destination, then use the ordinary single-part remote commit. Live cache bodies are always
     /// single-part and capped below the remote PUT limit.
-    #[allow(clippy::too_many_arguments)]
     async fn commit_live_source_durable_copy(
         &self,
-        bucket: &str,
-        key: &str,
-        src_bucket: &str,
-        src_key: &str,
-        facts: &RemoteFacts,
-        dst_passthrough: HashMap<String, String>,
-    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        commit: CopyCommit<'_>,
+    ) -> S3Result<CopyOutcome> {
+        let facts = &commit.resolved.facts;
         let source = self
             .data()
-            .get_if_match(src_bucket, src_key, format!("\"{}\"", facts.cetag))
+            .get_if_match(
+                commit.source.bucket,
+                commit.source.key,
+                commit.resolved.generation.clone(),
+            )
             .await?;
         let source_len = source.content_length().unwrap_or(0).max(0) as u64;
         if source_len != facts.plen {
@@ -326,60 +401,79 @@ impl Hypha {
             })?;
         let body = codec::bytestream_to_blob(source.body);
 
-        let _guard = self.write_lock(bucket, key).await;
+        let _guard = self
+            .write_lock(commit.destination.bucket, commit.destination.key)
+            .await;
         let mtime_ms = tier::now_ms();
-        self.tier.mark_transit_locked(bucket, key).await?;
+        self.tier
+            .mark_transit_locked(commit.destination.bucket, commit.destination.key)
+            .await?;
 
         let trailer = SingleTrailer {
             trailer_key: self.tier.trailer_key.clone(),
-            object_key: key.to_string(),
+            object_key: commit.destination.key.to_string(),
             mtime_ms,
+            checksum: commit.checksum.cloned(),
         };
         let (framed_len, encrypted, etag_rx) = match codec::encrypt_blob_with_etag(
             self.env(),
             body,
             facts.plen,
-            Some(trailer),
-            Some(raw_md5),
+            codec::EncryptOptions {
+                trailer: Some(trailer),
+                expected_md5: Some(raw_md5),
+                ..Default::default()
+            },
         )
         .await
         {
             Ok(value) => value,
             Err(e) => {
-                if let Err(repair) = self.tier.repair_locked(bucket, key).await {
-                    tracing::warn!(key, error = %repair, "repair after failed live-source copy did not settle");
+                if let Err(repair) = self
+                    .tier
+                    .repair_locked(commit.destination.bucket, commit.destination.key)
+                    .await
+                {
+                    tracing::warn!(key = commit.destination.key, error = %repair, "repair after failed live-source copy did not settle");
                 }
                 return Err(Error::Io(e).into());
             }
         };
 
-        let content_type = meta::content_type(&dst_passthrough);
+        let content_type = meta::content_type(&commit.metadata);
         if let Err(e) = self
             .remote()
             .put(
-                bucket,
-                key,
+                commit.destination.bucket,
+                commit.destination.key,
                 encrypted,
-                Some(framed_len as i64),
-                HashMap::new(),
-                None,
-                None,
-                None,
-                content_type,
+                PutOptions {
+                    content_length: Some(framed_len as i64),
+                    content_type,
+                    ..Default::default()
+                },
             )
             .await
         {
-            if let Err(repair) = self.tier.repair_locked(bucket, key).await {
-                tracing::warn!(key, error = %repair, "repair after failed live-source copy commit did not settle");
+            if let Err(repair) = self
+                .tier
+                .repair_locked(commit.destination.bucket, commit.destination.key)
+                .await
+            {
+                tracing::warn!(key = commit.destination.key, error = %repair, "repair after failed live-source copy commit did not settle");
             }
             return Err(e.into());
         }
 
         let etag = match etag_rx.await {
-            Ok(Ok(etag)) => etag,
+            Ok(Ok(digests)) => digests.etag,
             other => {
-                if let Err(repair) = self.tier.repair_locked(bucket, key).await {
-                    tracing::warn!(key, error = %repair, "repair after indeterminate live-source copy did not settle");
+                if let Err(repair) = self
+                    .tier
+                    .repair_locked(commit.destination.bucket, commit.destination.key)
+                    .await
+                {
+                    tracing::warn!(key = commit.destination.key, error = %repair, "repair after indeterminate live-source copy did not settle");
                 }
                 return Err(match other {
                     Ok(Err(_)) => {
@@ -394,175 +488,161 @@ impl Hypha {
         };
 
         self.tier
-            .settle_evict_locked(bucket, key, facts.plen, &etag, mtime_ms, dst_passthrough)
+            .settle_evict_locked(
+                commit.destination.bucket,
+                commit.destination.key,
+                facts.plen,
+                &etag,
+                mtime_ms,
+                commit.metadata,
+            )
             .await?;
-        self.gc.touch(bucket, key, Plaintext::AtKey);
-        self.orphans.owe(bucket, key);
+        self.gc.touch(
+            commit.destination.bucket,
+            commit.destination.key,
+            Plaintext::AtKey,
+        );
+        self.orphans
+            .owe(commit.destination.bucket, commit.destination.key);
         super::record_bytes(facts.plen);
-
-        Ok(S3Response::new(CopyObjectOutput {
-            copy_object_result: Some(CopyObjectResult {
-                e_tag: Some(ETag::Strong(etag)),
-                last_modified: Some(ts_ms(mtime_ms)),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
+        Ok(CopyOutcome { etag, mtime_ms })
     }
 
-    /// Large-body commit . Owns the native upload, so a failure aborts it best-effort — a
-    /// leftover is a sweepable orphan regardless.
-    ///
-    /// The native upload writes no `u`-record (nothing client-addressable), so the create lock is
-    /// its only shield from the orphan sweep: held shared from before the remote create until the
-    /// multipart is done, it makes the sweep's exclusive probe fail for the whole copy.
-    #[allow(clippy::too_many_arguments)]
-    async fn commit_copy_multipart(
-        &self,
-        bucket: &str,
-        key: &str,
-        src_bucket: &str,
-        src_key: &str,
-        body_ct_len: u64,
-        trailer: &[u8],
-        content_type: Option<String>,
-    ) -> Result<(), Error> {
-        let _create_guard = self.tier.mpu_create_locks.read(bucket, key).await;
+    async fn commit_remote_copy(&self, commit: RemoteCopyCommit<'_>) -> Result<(), Error> {
+        if commit.body_ciphertext_len < MIN_REMOTE_PART {
+            let plaintext = self
+                .tier
+                .decrypt_remote_body_at(
+                    commit.source.bucket,
+                    commit.source.key,
+                    commit.source_etag,
+                    None,
+                    commit.source_generation,
+                )
+                .await?;
+            let (body_len, encrypted, _digests) = codec::encrypt_blob_with_etag(
+                self.env(),
+                plaintext,
+                commit.plaintext_len,
+                codec::EncryptOptions::default(),
+            )
+            .await
+            .map_err(Error::Io)?;
+            let framed_len = body_len + commit.trailer.len() as u64;
+            return self
+                .remote()
+                .put(
+                    commit.destination.bucket,
+                    commit.destination.key,
+                    codec::append_bytes(encrypted, commit.trailer),
+                    PutOptions {
+                        content_length: Some(framed_len as i64),
+                        content_type: commit.content_type,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ());
+        }
+
+        // The native upload writes no client-addressable record, so this shared create lock is its
+        // only shield from the orphan sweep until completion or the best-effort abort below.
+        let _create_guard = self
+            .tier
+            .mpu_create_locks
+            .read(commit.destination.bucket, commit.destination.key)
+            .await;
         let created = self
             .remote()
-            .create_multipart(bucket, key, HashMap::new(), content_type)
+            .create_multipart(
+                commit.destination.bucket,
+                commit.destination.key,
+                HashMap::new(),
+                commit.content_type,
+            )
             .await?;
         let upload_id = created
             .upload_id()
             .ok_or_else(|| Error::Backend("remote returned no upload id".into()))?
             .to_string();
 
-        let result = self
-            .copy_body_parts(
-                bucket,
-                key,
-                src_bucket,
-                src_key,
-                &upload_id,
-                body_ct_len,
-                trailer,
-            )
-            .await;
+        let result = async {
+            let ranges = copy_part_ranges(commit.body_ciphertext_len);
+            let mut parts = Vec::with_capacity(ranges.len() + 1);
+            for (index, range) in ranges.iter().enumerate() {
+                let part_number = index as i32 + 1;
+                let copied = self
+                    .remote()
+                    .upload_part_copy(UploadPartCopyRequest {
+                        destination: UploadPartDestination {
+                            bucket: commit.destination.bucket,
+                            key: commit.destination.key,
+                            upload_id: &upload_id,
+                            part_number,
+                        },
+                        source_bucket: commit.source.bucket,
+                        source_key: commit.source.key,
+                        source_range: Some(format!("bytes={}-{}", range.start, range.end - 1)),
+                        source_if_match: Some(commit.source_generation.to_string()),
+                    })
+                    .await?;
+                parts.push(
+                    CompletedPart::builder()
+                        .part_number(part_number)
+                        .e_tag(copied_part_retag(&copied)?)
+                        .build(),
+                );
+            }
+
+            let trailer_part = ranges.len() as i32 + 1;
+            let trailer_len = commit.trailer.len() as i64;
+            let uploaded = self
+                .remote()
+                .upload_part(UploadPartRequest {
+                    bucket: commit.destination.bucket,
+                    key: commit.destination.key,
+                    upload_id: &upload_id,
+                    part_number: trailer_part,
+                    body: ByteStream::from(commit.trailer),
+                    content_length: Some(trailer_len),
+                })
+                .await?;
+            let trailer_etag = uploaded
+                .e_tag()
+                .ok_or_else(|| Error::Backend("trailer part upload returned no ETag".into()))?;
+            parts.push(
+                CompletedPart::builder()
+                    .part_number(trailer_part)
+                    .e_tag(trailer_etag)
+                    .build(),
+            );
+            self.remote()
+                .complete_multipart(
+                    commit.destination.bucket,
+                    commit.destination.key,
+                    &upload_id,
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
         if result.is_err() {
-            if let Err(ae) = self.remote().abort_multipart(bucket, key, &upload_id).await {
-                tracing::warn!(key = %key, error = %ae, "aborting the copy's dangling native upload failed; the sweep reclaims it");
+            if let Err(error) = self
+                .remote()
+                .abort_multipart(
+                    commit.destination.bucket,
+                    commit.destination.key,
+                    &upload_id,
+                )
+                .await
+            {
+                tracing::warn!(key = commit.destination.key, %error, "aborting the copy's dangling native upload failed; the sweep reclaims it");
             }
         }
         result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn copy_body_parts(
-        &self,
-        bucket: &str,
-        key: &str,
-        src_bucket: &str,
-        src_key: &str,
-        upload_id: &str,
-        body_ct_len: u64,
-        trailer: &[u8],
-    ) -> Result<(), Error> {
-        let ranges = copy_part_ranges(body_ct_len);
-        let mut parts: Vec<CompletedPart> = Vec::with_capacity(ranges.len() + 1);
-        for (i, r) in ranges.iter().enumerate() {
-            let pn = (i + 1) as i32;
-            let out = self
-                .remote()
-                .upload_part_copy(
-                    bucket,
-                    key,
-                    upload_id,
-                    pn,
-                    src_bucket,
-                    src_key,
-                    Some(format!("bytes={}-{}", r.start, r.end - 1)),
-                )
-                .await?;
-            let retag = copied_part_retag(&out)?;
-            parts.push(
-                CompletedPart::builder()
-                    .part_number(pn)
-                    .e_tag(retag)
-                    .build(),
-            );
-        }
-
-        // The fresh trailer as the sole final part, always above every copied body part — so the
-        // small-final-part fold multipart needs never arises here .
-        let trailer_pn = ranges.len() as i32 + 1;
-        let tout = self
-            .remote()
-            .upload_part(
-                bucket,
-                key,
-                upload_id,
-                trailer_pn,
-                ByteStream::from(trailer.to_vec()),
-                Some(trailer.len() as i64),
-            )
-            .await?;
-        let tetag = tout
-            .e_tag()
-            .ok_or_else(|| Error::Backend("trailer part upload returned no ETag".into()))?;
-        parts.push(
-            CompletedPart::builder()
-                .part_number(trailer_pn)
-                .e_tag(tetag)
-                .build(),
-        );
-
-        let completed = CompletedMultipartUpload::builder()
-            .set_parts(Some(parts))
-            .build();
-        self.remote()
-            .complete_multipart(bucket, key, upload_id, completed)
-            .await?;
-        Ok(())
-    }
-
-    /// Small-body commit : the source is one age file, so decrypt it whole and re-encrypt as one
-    /// age file (age's framed length is fixed by the plaintext length, so body_ct_len — and thus the
-    /// prebuilt trailer's table — is unchanged), with the fresh trailer appended inline in one PUT.
-    #[allow(clippy::too_many_arguments)]
-    async fn commit_copy_reencrypt(
-        &self,
-        bucket: &str,
-        key: &str,
-        src_bucket: &str,
-        src_key: &str,
-        facts: &RemoteFacts,
-        trailer: Vec<u8>,
-        content_type: Option<String>,
-    ) -> Result<(), Error> {
-        let plaintext = self
-            .tier
-            .decrypt_remote_body(src_bucket, src_key, &facts.cetag, None)
-            .await?;
-        let (body_len, enc, _etag_rx) =
-            codec::encrypt_blob_with_etag(self.env(), plaintext, facts.plen, None, None)
-                .await
-                .map_err(Error::Io)?;
-        let framed_len = body_len + trailer.len() as u64;
-        let framed = codec::append_bytes(enc, trailer);
-        self.remote()
-            .put(
-                bucket,
-                key,
-                framed,
-                Some(framed_len as i64),
-                HashMap::new(),
-                None,
-                None,
-                None,
-                content_type,
-            )
-            .await?;
-        Ok(())
     }
 
     /// Resolve a copy source's facts, cache-side user metadata, and residency through the restore
@@ -573,20 +653,117 @@ impl Hypha {
         &self,
         src_bucket: &str,
         src_key: &str,
-        if_match: Option<&ETagCondition>,
-        if_none_match: Option<&ETagCondition>,
-        if_modified_since: Option<&Timestamp>,
-        if_unmodified_since: Option<&Timestamp>,
-    ) -> S3Result<(RemoteFacts, HashMap<String, String>, bool)> {
-        let (facts, md, live) = match self.resolve_key(src_bucket, src_key).await? {
+        conditions: CopySourceConditions<'_>,
+    ) -> S3Result<ResolvedCopySource> {
+        let (state, ticket) = self.resolve_key_with_ticket(src_bucket, src_key).await?;
+        let (facts, md, live, generation) = match state {
             KeyState::Absent => return Err(s3_error!(NoSuchKey, "copy source does not exist")),
-            KeyState::Remote { facts, md } => (facts, md, false),
-            KeyState::CacheBody { head, md } => (RemoteFacts::from_cache_head(&head), md, true),
+            KeyState::Remote { facts, md } => {
+                let head = self.remote().head(src_bucket, src_key).await?;
+                let generation = head
+                    .e_tag()
+                    .ok_or_else(|| Error::Backend("copy source has no physical ETag".into()))?
+                    .to_string();
+                let Some(tail) = self
+                    .tier
+                    .read_tail_at(src_bucket, src_key, Some(&generation))
+                    .await?
+                else {
+                    self.tier.halt.foreign_object(src_bucket, src_key).await
+                };
+                if tail.footer.plen != facts.plen
+                    || tail.footer.client_etag() != facts.cetag
+                    || tail.footer.mtime_ms != facts.mtime_ms
+                    || tail.footer.checksum != facts.checksum
+                {
+                    return Err(Error::OperationAborted.into());
+                }
+                (facts, md, false, generation)
+            }
+            KeyState::CacheBody { head, md } => {
+                let facts = RemoteFacts::from_cache_head(&head);
+                let generation = format!("\"{}\"", facts.cetag);
+                (facts, md, true, generation)
+            }
         };
-        evaluate_precondition(if_match, if_none_match, Some(&facts.cetag))?;
-        evaluate_copy_source_time(if_modified_since, if_unmodified_since, facts.mtime_ms)?;
-        Ok((facts, md, live))
+        evaluate_precondition(
+            conditions.if_match,
+            conditions.if_none_match,
+            Some(&facts.cetag),
+        )?;
+        evaluate_copy_source_time(
+            conditions.if_modified_since,
+            conditions.if_unmodified_since,
+            facts.mtime_ms,
+        )?;
+        Ok(ResolvedCopySource {
+            facts,
+            md,
+            live,
+            generation,
+            _ticket: ticket,
+        })
     }
+
+    async fn hash_copy_source(
+        &self,
+        source: &ResolvedCopySource,
+        location: ObjectRef<'_>,
+        algorithm: hypha_format::ChecksumAlgorithm,
+    ) -> S3Result<StoredChecksum> {
+        let mut body = if source.live {
+            let out = self
+                .data()
+                .get_range_if_match(
+                    location.bucket,
+                    location.key,
+                    None,
+                    source.generation.clone(),
+                )
+                .await?;
+            codec::bytestream_to_blob(out.body)
+        } else {
+            self.tier
+                .decrypt_remote_body_at(
+                    location.bucket,
+                    location.key,
+                    &source.facts.cetag,
+                    None,
+                    &source.generation,
+                )
+                .await?
+        };
+        let mut hasher = checksum::Hasher::new(algorithm);
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::Backend(format!("reading copy source: {e}")))?;
+            hasher.update(&chunk);
+        }
+        Ok(hasher.finalize(ChecksumKind::FullObject))
+    }
+}
+
+fn copy_response(
+    outcome: CopyOutcome,
+    checksum_value: Option<&StoredChecksum>,
+) -> S3Response<CopyObjectOutput> {
+    let mut result = CopyObjectResult {
+        e_tag: Some(ETag::Strong(outcome.etag.clone())),
+        last_modified: Some(ts_ms(outcome.mtime_ms)),
+        ..Default::default()
+    };
+    if let Some(value) = checksum_value {
+        let value = checksum::dto(value, super::get::checksum_count(&outcome.etag));
+        result.checksum_crc32 = value.checksum_crc32;
+        result.checksum_crc32c = value.checksum_crc32c;
+        result.checksum_crc64nvme = value.checksum_crc64nvme;
+        result.checksum_sha1 = value.checksum_sha1;
+        result.checksum_sha256 = value.checksum_sha256;
+        result.checksum_type = value.checksum_type;
+    }
+    S3Response::new(CopyObjectOutput {
+        copy_object_result: Some(result),
+        ..Default::default()
+    })
 }
 
 /// Split `[0, total)` into server-side copy-part ranges, each in `[5 MiB, COPY_PART_CT]`. The caller

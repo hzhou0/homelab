@@ -33,6 +33,7 @@ rand = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }
 base64-simd = { workspace = true }
+crc-fast = { workspace = true }
 futures = { workspace = true }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }

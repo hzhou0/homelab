@@ -8,7 +8,7 @@ use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
 use super::scan::{Artifact, Candidate};
-use crate::tier::{quote, single_part_framed_len, Tiering};
+use crate::tier::{quote, single_part_framed_len_matches, Tiering};
 
 /// Reclaim the candidate, or decline to. `Ok(0)` is a decline — a gate refused, or a writer moved the
 /// key — and is not a failure: every reason to decline is either transient or self-healing, and the
@@ -115,21 +115,16 @@ async fn cache_still_holds_generation(
 
 /// Whether the remote holds *this* candidate's generation.
 ///
-/// A single-part object's framed size is a closed-form function of its plaintext length, so a HEAD
-/// settles the common case: any other generation of a different length is refused on one round trip.
-/// Only a same-plaintext-length candidate is ambiguous, and only it pays the trailer's `cetag` — the
-/// same triage the pending-set rebuild runs . A composite has no such closed form (its remote
-/// form is per-part age files), so it goes straight to the trailer.
+/// Size rejects impossible single-part generations before the authenticated tail comparison.
 async fn remote_holds_generation(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<bool> {
     let (bucket, etag) = (&candidate.bucket, &candidate.etag);
-
     if !meta::is_composite_etag(etag) {
         let framed = match tier.remote.head(bucket, key).await {
             Ok(head) => head.content_length().unwrap_or(0).max(0) as u64,
             Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
             Err(e) => return Err(e),
         };
-        if single_part_framed_len(candidate.bytes) != Some(framed) {
+        if !single_part_framed_len_matches(candidate.bytes, framed) {
             return Ok(false);
         }
     }

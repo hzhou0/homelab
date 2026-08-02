@@ -56,9 +56,19 @@ impl Hypha {
     /// The ticket a `Restoring` bucket hands out is held for the whole remote answer: a cached-mode
     /// write admitted while it is out cannot supersede what this read will report.
     pub(super) async fn resolve_key(&self, bucket: &str, key: &str) -> S3Result<KeyState> {
-        let state = match self.buckets.read_ticket(bucket).map_err(refuse)? {
+        let (state, _ticket) = self.resolve_key_with_ticket(bucket, key).await?;
+        Ok(state)
+    }
+
+    pub(super) async fn resolve_key_with_ticket(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<(KeyState, Readout)> {
+        let ticket = self.buckets.read_ticket(bucket).map_err(refuse)?;
+        let state = match &ticket {
             Readout::Cache => self.resolve_key_cache(bucket, key).await?,
-            Readout::Remote(_ticket) => self.resolve_key_remote(bucket, key).await?,
+            Readout::Remote(_) => self.resolve_key_remote(bucket, key).await?,
         };
         // The read half of the recency feed, here rather than at each caller because *this* is what
         // "an op that resolves a single key" means — GET, HEAD, GetObjectAttributes, and both copy
@@ -74,7 +84,7 @@ impl Hypha {
             }
             KeyState::CacheBody { .. } => self.gc.touch(bucket, key, Plaintext::AtKey),
         }
-        Ok(state)
+        Ok((state, ticket))
     }
 
     /// The tombstone classifier every cache-authoritative read shares .

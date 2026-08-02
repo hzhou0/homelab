@@ -91,6 +91,7 @@ The facts contain:
 - plaintext length;
 - client-visible modification time;
 - raw MD5 used by the client ETag;
+- optional plaintext flexible checksum, including its algorithm and full-object/composite type;
 - client part count.
 
 For multipart objects, cumulative ciphertext offsets define the encrypted window of every client
@@ -116,10 +117,10 @@ A persisted fold intent lets a retry restore the pure part before attempting ano
 - no entry for a deleted key.
 
 Tombstones have fixed 16-byte bodies. Eviction-tombstone metadata carries plaintext length, client
-ETag, original modification time, content type, storage class, and client metadata; transition
-tombstones carry only their kind because the remote is authoritative until they settle. Client PUTs
-equal to an internal sentinel are rejected so LIST classification by `(size, ETag)` cannot be
-spoofed.
+ETag, checksum, original modification time, content type, storage class, and client metadata;
+transition tombstones carry only their kind because the remote is authoritative until they settle.
+Client PUTs equal to an internal sentinel are rejected so LIST classification by `(size, ETag)`
+cannot be spoofed.
 
 `<meta>` divides its keyspace into non-overlapping ranges:
 
@@ -237,6 +238,12 @@ Startup lists remote buckets, resolves their markers, removes clean markers befo
 dispatches required recovery. The volume watcher periodically verifies that every ready bucket
 still has its sync marker.
 
+A ready classification is derived once at startup and held for the run — the bucket map is the
+single authority, which is exactly what makes a lost volume detectable: a ready bucket whose marker
+vanished is a disagreement, not a namespace to re-derive. Recovery is therefore restart, never
+in-place repair: restart re-runs resolution before anything is served, whereas re-deriving the map
+under a live volume would trust a cache that may already have served false 404s.
+
 Detected violations—including a foreign remote object, a vanished remote object behind an eviction
 tombstone, or a ready namespace losing its sync marker—write a halt marker to the remote, stop the
 server, and exit with code `86`. A later start sees the halt marker and exits before spawning
@@ -264,12 +271,18 @@ next run skip recovery.
 Implemented behavior includes:
 
 - SigV4 authentication against one configured client access-key pair;
-- plaintext ETags and `Content-MD5` validation;
+- plaintext ETags, `Content-MD5`, and flexible checksums. Single-part writes support CRC32, CRC32C,
+  CRC64NVME, SHA1, and SHA256; multipart writes support composite checksums and full-object CRCs;
 - byte-range GETs;
 - PUT `If-Match` and `If-None-Match`;
 - copy-source ETag and time preconditions;
-- representation-aware copy: live sources copy atomically within the cache and raise a reconcile
-  marker, while remote-resident sources reuse the durable ciphertext-copy path;
+- generation-bound copy-source reads through the same cache/remote view as other key reads;
+- `CopyObject` up to 5 GiB: live sources copy atomically within the cache, while remote-resident
+  sources use an internal multipart copy of the encrypted body plus a fresh destination-bound
+  trailer and mtime. It preserves source ETag/part geometry and unchanged checksums; selecting a
+  different checksum restreams the source plaintext to derive it;
+- `UploadPartCopy` always restreams the exact plaintext range through decrypt, checksum, encrypt,
+  remote part upload, and a matching durable MPU record;
 - client metadata, `Content-Type`, and non-archive storage-class labels;
 - up to 1,000 keys in `DeleteObjects`;
 - part numbers 1–10,000 and S3 multipart ordering/minimum-size rules;
@@ -279,7 +292,6 @@ Current surface limits:
 
 - `PutObject` and `UploadPart` require `Content-Length` and accept at most 4 GiB of plaintext;
 - destination `CopyObject` conditions are unavailable in the `s3s` 0.14 request type;
-- flexible checksum fields are not implemented;
 - bucket versioning is always reported disabled and versioned operations are not implemented;
 - ACL, policy, lifecycle, CORS, tagging, object lock, retention, archive restore, replication
   configuration, and SSE configuration are outside the implemented surface.
@@ -310,6 +322,10 @@ same-key rehydrate before waiting for the write lock.
 GC runs in both modes:
 
 - it removes abandoned multipart records, stale twins, transition debris, and orphan shadows;
+- an in-progress remote multipart upload whose cache record is gone is **aborted, never restored**:
+  a record-less upload is one no client can address (`require_upload` refuses it), and the create
+  lock's read-shared/exclusive-probe handshake guarantees a record-less upload is a leak rather than
+  a create whose record has not landed yet;
 - in cached mode, it may evict durable plaintext bodies when measured cache usage exceeds the high
   water mark;
 - it persists a deployment-wide Bloom recency ring and uses bounded, yield-weighted probes rather
@@ -454,17 +470,6 @@ is therefore unsupported.
     0.14 request type;
   - review the remaining 0.15 breaking changes and rerun the external conformance suite.
   The relevant upstream fix is [s3s#629](https://github.com/s3s-project/s3s/issues/629).
-- **Implement flexible checksums.** Validate and persist single-part plaintext checksums inline,
-  then add multipart checksum-of-checksums behavior. The checksum cases in `s3s-e2e` remain
-  intentionally deselected.
-- **Restore multipart upload state after cache loss.** Namespace restore reconstructs completed
-  objects but not the per-part records needed by `ListParts` and `CompleteMultipartUpload`.
-  `ListMultipartUploads` still sees the remote upload, but it cannot be completed through Hypha
-  after its cache records are lost.
-- **Decide whether to replace restart recovery for mid-life cache loss.** The current volume watcher
-  halts the process because a ready bucket may already have served false 404s. Restart then selects
-  namespace restore. In-place recovery remains deliberately deferred.
-
 ### Additional verification
 
 - Add stock `rage` interoperability coverage after stripping Hypha's trailer.

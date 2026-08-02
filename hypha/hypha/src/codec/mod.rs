@@ -9,7 +9,7 @@
 mod encrypt;
 mod tee;
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use futures::{Future, Stream, TryStreamExt as _};
 use hypha_format::offset::CHUNK_CIPHERTEXT;
-use hypha_format::{Envelope, RangeReader, RangeSource};
+use hypha_format::{Envelope, RangeReader, RangeSource, StoredChecksum};
 use s3s::dto::StreamingBlob;
 use s3s_aws::conv::{try_from_aws, try_into_aws};
 use tokio::io::{AsyncReadExt as _, ReadBuf};
@@ -29,15 +29,23 @@ use tokio_util::io::{ReaderStream, SyncIoBridge};
 
 use hypha_core::Backend;
 
-pub use encrypt::{encrypt_blob_with_etag, encrypt_stream};
+pub use encrypt::{encrypt_blob_with_etag, encrypt_stream, EncryptOptions};
 pub use tee::tee;
 
 /// The client's `Content-MD5` and the digest its body actually produced disagreed.
-#[derive(Debug)]
-pub struct DigestMismatch;
+#[derive(Debug, PartialEq, Eq)]
+pub enum DigestMismatch {
+    Md5,
+    Checksum,
+}
+
+pub struct ObjectDigests {
+    pub etag: String,
+    pub checksum: Option<StoredChecksum>,
+}
 
 /// Resolves with the hex plaintext MD5 once the encrypted body has been handed over in full.
-pub type EtagReceiver = tokio::sync::oneshot::Receiver<Result<String, DigestMismatch>>;
+pub type EtagReceiver = tokio::sync::oneshot::Receiver<Result<ObjectDigests, DigestMismatch>>;
 
 /// The facts a single-part commit stamps into its tail trailer, alongside the body. The MD5 isn't
 /// here: it's computed inline as the plaintext streams  and folded into the trailer at stream
@@ -47,6 +55,7 @@ pub struct SingleTrailer {
     pub trailer_key: hypha_format::TrailerKey,
     pub object_key: String,
     pub mtime_ms: i64,
+    pub checksum: Option<StoredChecksum>,
 }
 
 pub fn blob_to_bytestream(blob: StreamingBlob) -> ByteStream {
@@ -108,6 +117,18 @@ pub fn decrypt_range(
     ct_len: u64,
     pt: Range<u64>,
 ) -> StreamingBlob {
+    decrypt_range_at(env, backend, bucket, key, ct_len, pt, None)
+}
+
+pub fn decrypt_range_at(
+    env: Arc<Envelope>,
+    backend: Backend,
+    bucket: String,
+    key: String,
+    ct_len: u64,
+    pt: Range<u64>,
+    if_match: Option<String>,
+) -> StreamingBlob {
     let (reader, writer) = tokio::io::simplex(CHUNK_CIPHERTEXT as usize);
     let handle = Handle::current();
     let h = handle.clone();
@@ -118,30 +139,22 @@ pub fn decrypt_range(
             key,
             base: 0,
             len: ct_len,
+            if_match,
             handle: h.clone(),
         };
         let mut dst = SyncIoBridge::new_with_handle(writer, h);
-        if let Err(e) = pump_decrypt_range(&env, source, pt.clone(), &mut dst) {
+        let result = (|| -> hypha_core::error::Result<()> {
+            let mut dec = env.decrypt(RangeReader::new(source))?;
+            dec.seek(SeekFrom::Start(pt.start))?;
+            io::copy(&mut dec.take(pt.end - pt.start), &mut dst)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
             tracing::error!(error = %e, "decrypt (range) failed mid-stream");
         }
         let _ = dst.shutdown();
     });
     StreamingBlob::wrap(ReaderStream::new(reader))
-}
-
-fn pump_decrypt_range(
-    env: &Envelope,
-    source: RemoteRangeSource,
-    pt: Range<u64>,
-    dst: &mut impl Write,
-) -> hypha_core::error::Result<()> {
-    // Decryptor::new reads the age header from ciphertext offset 0 (RangeReader opens there),
-    // then the seek maps the plaintext offset to a fresh ranged GET of the covering chunks.
-    let mut dec = env.decrypt(RangeReader::new(source))?;
-    dec.seek(SeekFrom::Start(pt.start))?;
-    let mut limited = dec.take(pt.end - pt.start);
-    io::copy(&mut limited, dst)?;
-    Ok(())
 }
 
 /// A [`RangeSource`] over a byte window `[base, base+len)` of a remote object, re-opened by
@@ -155,6 +168,7 @@ struct RemoteRangeSource {
     key: String,
     base: u64,
     len: u64,
+    if_match: Option<String>,
     handle: Handle,
 }
 
@@ -180,10 +194,18 @@ impl RangeSource for RemoteRangeSource {
         }
         // Bounded end, so reads never bleed into the next part of a composite.
         let range = format!("bytes={}-{}", self.base + offset, self.base + self.len - 1);
-        let out = self
-            .handle
-            .block_on(self.backend.get(&self.bucket, &self.key, Some(range)))
-            .map_err(io::Error::other)?;
+        let out = match &self.if_match {
+            Some(etag) => self.handle.block_on(self.backend.get_range_if_match(
+                &self.bucket,
+                &self.key,
+                Some(range),
+                etag.clone(),
+            )),
+            None => self
+                .handle
+                .block_on(self.backend.get(&self.bucket, &self.key, Some(range))),
+        }
+        .map_err(io::Error::other)?;
         let reader = SyncIoBridge::new_with_handle(out.body.into_async_read(), self.handle.clone());
         Ok(Box::new(reader))
     }
@@ -345,14 +367,48 @@ pub fn decrypt_composite(
     key: String,
     segments: Vec<PartSegment>,
 ) -> StreamingBlob {
+    decrypt_composite_at(env, backend, bucket, key, segments, None)
+}
+
+pub fn decrypt_composite_at(
+    env: Arc<Envelope>,
+    backend: Backend,
+    bucket: String,
+    key: String,
+    segments: Vec<PartSegment>,
+    if_match: Option<String>,
+) -> StreamingBlob {
     let (reader, writer) = tokio::io::simplex(CHUNK_CIPHERTEXT as usize);
     let handle = Handle::current();
     let h = handle.clone();
     tokio::task::spawn_blocking(move || {
         let mut dst = SyncIoBridge::new_with_handle(writer, h.clone());
-        if let Err(e) =
-            pump_decrypt_composite(&env, &backend, &bucket, &key, segments, &h, &mut dst)
-        {
+        let result = (|| -> hypha_core::error::Result<()> {
+            for segment in segments {
+                let (ct, pt) = match segment {
+                    PartSegment::Whole(ct) => (ct, None),
+                    PartSegment::Partial { ct, pt } => (ct, Some(pt)),
+                };
+                let source = RemoteRangeSource {
+                    backend: backend.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    base: ct.start,
+                    len: ct.end - ct.start,
+                    if_match: if_match.clone(),
+                    handle: h.clone(),
+                };
+                let mut dec = env.decrypt(RangeReader::new(source))?;
+                if let Some(pt) = pt {
+                    dec.seek(SeekFrom::Start(pt.start))?;
+                    io::copy(&mut dec.take(pt.end - pt.start), &mut dst)?;
+                } else {
+                    io::copy(&mut dec, &mut dst)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
             tracing::error!(error = %e, "decrypt (composite) failed mid-stream");
         }
         let _ = dst.shutdown();
@@ -360,46 +416,11 @@ pub fn decrypt_composite(
     StreamingBlob::wrap(ReaderStream::new(reader))
 }
 
-fn pump_decrypt_composite(
-    env: &Envelope,
-    backend: &Backend,
-    bucket: &str,
-    key: &str,
-    segments: Vec<PartSegment>,
-    handle: &Handle,
-    dst: &mut impl Write,
-) -> hypha_core::error::Result<()> {
-    for seg in segments {
-        let (ct, pt) = match seg {
-            PartSegment::Whole(ct) => (ct, None),
-            PartSegment::Partial { ct, pt } => (ct, Some(pt)),
-        };
-        let source = RemoteRangeSource {
-            backend: backend.clone(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            base: ct.start,
-            len: ct.end - ct.start,
-            handle: handle.clone(),
-        };
-        let mut dec = env.decrypt(RangeReader::new(source))?;
-        match pt {
-            None => {
-                io::copy(&mut dec, dst)?;
-            }
-            Some(pt) => {
-                dec.seek(SeekFrom::Start(pt.start))?;
-                io::copy(&mut dec.take(pt.end - pt.start), dst)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub(crate) mod testutil {
     use super::*;
     use std::collections::VecDeque;
+    use std::io::Write as _;
 
     /// A body delivered in `chunk`-sized frames, yielding `Pending` between them when `jitter` is
     /// set — the polling pattern a real socket produces, and the one a codec that assumes its
@@ -469,7 +490,7 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use hypha_format::SINGLE_TRAILER_LEN;
+    use hypha_format::MIN_SINGLE_TRAILER_LEN;
 
     use super::testutil::*;
     use super::*;
@@ -481,7 +502,7 @@ mod tests {
         let mut object = age_file(&env, &plaintext);
         let ct_len = object.len() as u64;
         // A trailer the decryptor must not mistake for a truncated final chunk.
-        object.extend_from_slice(&[0xAB; SINGLE_TRAILER_LEN]);
+        object.extend_from_slice(&[0xAB; MIN_SINGLE_TRAILER_LEN]);
 
         let body = decrypt_full(env, framed_bytestream(&object, 4096), ct_len)
             .await

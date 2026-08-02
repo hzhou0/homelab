@@ -1,6 +1,7 @@
 //! Authenticated object facts and multipart geometry. Physical tail order is
-//! `table ‖ facts ‖ tag(16) ‖ version(2)`; the fixed-size facts struct sits at a known offset from
-//! the end, so its `count` sizes the table and the 2-byte version dispatches the format.
+//! `table ‖ checksum ‖ facts ‖ tag(16) ‖ version(2)`; the fixed-size facts struct sits at a known
+//! offset from the end, so its checksum descriptor and part count size the preceding fields and the
+//! 2-byte version dispatches the format.
 //!
 //! The trailer sits **outside** the age envelope(s): age's reader is EOF-delimited, so trailing
 //! bytes would be pulled into the final chunk and fail authentication (`trailing_bytes_break_*`
@@ -18,8 +19,8 @@ use crate::offset::{plaintext_len_from, HLEN};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Trailer format version, stored as the object's final two bytes; bump on any layout or crypto
-/// change (e.g. if `HLEN` ever changes — see `offset::HLEN`).
+/// Trailer format version, stored as the object's final two bytes. This is the first on-disk
+/// contract; layout changes before the initial release remain version 1.
 pub const VERSION: u16 = 1;
 
 /// Truncated HMAC-SHA256 tag length (128-bit forgery resistance).
@@ -34,17 +35,60 @@ pub const MAX_PARTS: usize = 10_000;
 pub const PART_ENTRY_LEN: usize = 8;
 pub const MAX_TABLE_LEN: usize = MAX_PARTS * PART_ENTRY_LEN;
 pub const FACTS_LEN: usize = size_of::<FactsRepr>();
-/// A single-part object's trailer: no parts table, so the tail is exactly `facts ‖ tag ‖ version`.
-/// Fixed, so a single-part read's envelope length is `content_length − SINGLE_TRAILER_LEN`.
-pub const SINGLE_TRAILER_LEN: usize = FACTS_LEN + TAG_LEN + VERSION_LEN;
+pub const MIN_SINGLE_TRAILER_LEN: usize = FACTS_LEN + TAG_LEN + VERSION_LEN;
+pub const MAX_SINGLE_TRAILER_LEN: usize = MIN_SINGLE_TRAILER_LEN + 32;
 /// The largest possible trailer. One speculative suffix GET of this many bytes always captures
-/// `table ‖ facts ‖ tag ‖ version` for any object, so composite reads never need a second round trip.
-pub const MAX_TAIL_LEN: usize = MAX_TABLE_LEN + SINGLE_TRAILER_LEN;
+/// `table ‖ checksum ‖ facts ‖ tag ‖ version` for any object, so composite reads never need a
+/// second round trip.
+pub const MAX_TAIL_LEN: usize = MAX_TABLE_LEN + MAX_SINGLE_TRAILER_LEN;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FooterKind {
     Single = 0,
     Composite = 1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChecksumAlgorithm {
+    Crc32 = 1,
+    Crc32c = 2,
+    Crc64Nvme = 3,
+    Sha1 = 4,
+    Sha256 = 5,
+}
+
+impl ChecksumAlgorithm {
+    pub const fn digest_len(self) -> usize {
+        match self {
+            Self::Crc32 | Self::Crc32c => 4,
+            Self::Crc64Nvme => 8,
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChecksumKind {
+    FullObject = 1,
+    Composite = 2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredChecksum {
+    pub algorithm: ChecksumAlgorithm,
+    pub kind: ChecksumKind,
+    pub value: Vec<u8>,
+}
+
+impl StoredChecksum {
+    pub fn new(algorithm: ChecksumAlgorithm, kind: ChecksumKind, value: Vec<u8>) -> Option<Self> {
+        (value.len() == algorithm.digest_len()).then_some(Self {
+            algorithm,
+            kind,
+            value,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +101,7 @@ pub struct Footer {
     /// Raw MD5: of the plaintext (single) or of the concatenated per-part plaintext MD5s
     /// (composite) — see [`Footer::client_etag`].
     pub md5: [u8; 16],
+    pub checksum: Option<StoredChecksum>,
 }
 
 /// Wire form of the facts struct: all little-endian byte arrays ⇒ align 1, no padding, and no
@@ -69,6 +114,7 @@ struct FactsRepr {
     plen: [u8; 8],
     mtime_ms: [u8; 8],
     md5: [u8; 16],
+    checksum_descriptor: u8,
 }
 
 impl Footer {
@@ -79,14 +125,39 @@ impl Footer {
             plen: self.plen.to_le_bytes(),
             mtime_ms: self.mtime_ms.to_le_bytes(),
             md5: self.md5,
+            checksum_descriptor: self
+                .checksum
+                .as_ref()
+                .map_or(0, |value| (value.kind as u8) << 4 | value.algorithm as u8),
         }
     }
 
-    fn from_repr(r: &FactsRepr) -> Option<Self> {
+    fn from_repr(r: &FactsRepr, checksum_value: &[u8]) -> Option<Self> {
         let kind = match r.kind {
             0 => FooterKind::Single,
             1 => FooterKind::Composite,
             _ => return None,
+        };
+        let algorithm = match r.checksum_descriptor & 0x0f {
+            0 if r.checksum_descriptor == 0 => None,
+            1 => Some(ChecksumAlgorithm::Crc32),
+            2 => Some(ChecksumAlgorithm::Crc32c),
+            3 => Some(ChecksumAlgorithm::Crc64Nvme),
+            4 => Some(ChecksumAlgorithm::Sha1),
+            5 => Some(ChecksumAlgorithm::Sha256),
+            _ => return None,
+        };
+        let checksum = match algorithm {
+            None if checksum_value.is_empty() => None,
+            None => return None,
+            Some(algorithm) => {
+                let kind = match r.checksum_descriptor >> 4 {
+                    1 => ChecksumKind::FullObject,
+                    2 => ChecksumKind::Composite,
+                    _ => return None,
+                };
+                StoredChecksum::new(algorithm, kind, checksum_value.to_vec())
+            }
         };
         Some(Self {
             kind,
@@ -94,6 +165,7 @@ impl Footer {
             plen: u64::from_le_bytes(r.plen),
             mtime_ms: i64::from_le_bytes(r.mtime_ms),
             md5: r.md5,
+            checksum,
         })
     }
 
@@ -105,6 +177,26 @@ impl Footer {
             FooterKind::Single => hex,
             FooterKind::Composite => format!("{hex}-{}", self.count),
         }
+    }
+}
+
+pub const fn single_trailer_len(algorithm: Option<ChecksumAlgorithm>) -> usize {
+    MIN_SINGLE_TRAILER_LEN
+        + match algorithm {
+            Some(algorithm) => algorithm.digest_len(),
+            None => 0,
+        }
+}
+
+fn checksum_algorithm(descriptor: u8) -> Option<Option<ChecksumAlgorithm>> {
+    match descriptor & 0x0f {
+        0 if descriptor == 0 => Some(None),
+        1 if matches!(descriptor >> 4, 1 | 2) => Some(Some(ChecksumAlgorithm::Crc32)),
+        2 if matches!(descriptor >> 4, 1 | 2) => Some(Some(ChecksumAlgorithm::Crc32c)),
+        3 if matches!(descriptor >> 4, 1 | 2) => Some(Some(ChecksumAlgorithm::Crc64Nvme)),
+        4 if matches!(descriptor >> 4, 1 | 2) => Some(Some(ChecksumAlgorithm::Sha1)),
+        5 if matches!(descriptor >> 4, 1 | 2) => Some(Some(ChecksumAlgorithm::Sha256)),
+        _ => None,
     }
 }
 
@@ -127,20 +219,22 @@ impl TrailerKey {
 }
 
 /// The authenticated tag over a trailer. `object_key` goes **last**: everything before it is
-/// fixed-width or self-delimiting (version, body length, fixed facts, and a table whose length is
-/// `count·8` from the facts), so the variable-length key can't shift a field boundary.
+/// fixed-width or self-delimiting (version, body length, fixed facts, checksum, and a table whose
+/// length is `count·8` from the facts), so the variable-length key can't shift a field boundary.
 fn compute_tag(
     key: &TrailerKey,
     version: u16,
     object_key: &str,
     body_ct_len: u64,
     facts: &[u8],
+    checksum: &[u8],
     table: &[u8],
 ) -> [u8; TAG_LEN] {
     let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
     mac.update(&version.to_le_bytes());
     mac.update(&body_ct_len.to_le_bytes());
     mac.update(facts);
+    mac.update(checksum);
     mac.update(table);
     mac.update(object_key.as_bytes());
     let full = mac.finalize().into_bytes();
@@ -162,6 +256,10 @@ pub fn encode_trailer(
 ) -> Vec<u8> {
     let facts = footer.to_repr();
     let facts_bytes = bytemuck::bytes_of(&facts);
+    let checksum_bytes = footer
+        .checksum
+        .as_ref()
+        .map_or(&[][..], |checksum| checksum.value.as_slice());
 
     let mut table_bytes = Vec::with_capacity(table.len() * PART_ENTRY_LEN);
     for &off in table {
@@ -174,11 +272,16 @@ pub fn encode_trailer(
         object_key,
         body_ct_len,
         facts_bytes,
+        checksum_bytes,
         &table_bytes,
     );
 
-    let mut out = Vec::with_capacity(table_bytes.len() + SINGLE_TRAILER_LEN);
+    let mut out = Vec::with_capacity(
+        table_bytes.len()
+            + single_trailer_len(footer.checksum.as_ref().map(|value| value.algorithm)),
+    );
     out.extend_from_slice(&table_bytes);
+    out.extend_from_slice(checksum_bytes);
     out.extend_from_slice(facts_bytes);
     out.extend_from_slice(&tag);
     out.extend_from_slice(&VERSION.to_le_bytes());
@@ -206,7 +309,7 @@ pub fn decode_tail(
     tail: &[u8],
 ) -> Option<Tail> {
     let n = tail.len();
-    if n < SINGLE_TRAILER_LEN {
+    if n < MIN_SINGLE_TRAILER_LEN {
         return None;
     }
     // version ‖ tag ‖ facts sit at fixed offsets from the end.
@@ -218,18 +321,25 @@ pub fn decode_tail(
     let stored_tag = &tail[tag_off..ver_off];
     let facts_off = tag_off - FACTS_LEN;
     let facts_bytes = &tail[facts_off..tag_off];
-    let footer = Footer::from_repr(bytemuck::try_from_bytes::<FactsRepr>(facts_bytes).ok()?)?;
+    let facts = bytemuck::try_from_bytes::<FactsRepr>(facts_bytes).ok()?;
+    let checksum_len =
+        checksum_algorithm(facts.checksum_descriptor)?.map_or(0, ChecksumAlgorithm::digest_len);
+    let checksum_off = facts_off.checked_sub(checksum_len)?;
+    let checksum_bytes = &tail[checksum_off..facts_off];
+    let footer = Footer::from_repr(facts, checksum_bytes)?;
 
     let table_len = match footer.kind {
         FooterKind::Single => 0,
         FooterKind::Composite => (footer.count as usize).checked_mul(PART_ENTRY_LEN)?,
     };
-    if facts_off < table_len {
+    if checksum_off < table_len {
         return None; // table not fully present in the tail buffer
     }
-    let table_bytes = &tail[facts_off - table_len..facts_off];
+    let table_bytes = &tail[checksum_off - table_len..checksum_off];
 
-    let trailer_total = (table_len + SINGLE_TRAILER_LEN) as u64;
+    let trailer_total = (table_len
+        + single_trailer_len(footer.checksum.as_ref().map(|value| value.algorithm)))
+        as u64;
     let body_ct_len = object_len.checked_sub(trailer_total)?;
 
     let expect = compute_tag(
@@ -238,6 +348,7 @@ pub fn decode_tail(
         object_key,
         body_ct_len,
         facts_bytes,
+        checksum_bytes,
         table_bytes,
     );
     if expect[..].ct_eq(stored_tag).unwrap_u8() != 1 {
@@ -293,13 +404,17 @@ mod tests {
             plen,
             mtime_ms: 1_700_000_000_000,
             md5: [0xab; 16],
+            checksum: None,
         }
     }
 
     #[test]
     fn facts_size_is_minimal_and_unpadded() {
-        // 1 + 4 + 8 + 8 + 16, align 1 ⇒ no padding.
-        assert_eq!(FACTS_LEN, 37);
+        // All fields are byte arrays or bytes, so the wire struct has no native padding.
+        assert_eq!(FACTS_LEN, 38);
+        assert_eq!(single_trailer_len(None), 56);
+        assert_eq!(single_trailer_len(Some(ChecksumAlgorithm::Crc32)), 60);
+        assert_eq!(single_trailer_len(Some(ChecksumAlgorithm::Sha256)), 88);
     }
 
     #[test]
@@ -314,6 +429,42 @@ mod tests {
         assert_eq!(tail.footer, f);
         assert_eq!(tail.body_ct_len, body_ct);
         assert!(tail.windows.is_empty());
+    }
+
+    #[test]
+    fn checksums_use_only_their_digest_length() {
+        let k = key();
+        let body_ct = ciphertext_len(500, HLEN);
+        for algorithm in [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
+            ChecksumAlgorithm::Crc64Nvme,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+        ] {
+            let mut footer = single(500);
+            footer.checksum = StoredChecksum::new(
+                algorithm,
+                ChecksumKind::FullObject,
+                vec![algorithm as u8; algorithm.digest_len()],
+            );
+            let blob = encode_trailer(&k, "obj/checksum", body_ct, &footer, &[]);
+            assert_eq!(blob.len(), single_trailer_len(Some(algorithm)));
+
+            let decoded = decode_tail(&k, "obj/checksum", body_ct + blob.len() as u64, &blob)
+                .expect("verifies");
+            assert_eq!(decoded.footer, footer);
+
+            let mut tampered = blob;
+            tampered[0] ^= 1;
+            assert!(decode_tail(
+                &k,
+                "obj/checksum",
+                body_ct + tampered.len() as u64,
+                &tampered,
+            )
+            .is_none());
+        }
     }
 
     #[test]
@@ -334,6 +485,11 @@ mod tests {
             plen: plens.iter().sum(),
             mtime_ms: 1,
             md5: [0x11; 16],
+            checksum: StoredChecksum::new(
+                ChecksumAlgorithm::Sha256,
+                ChecksumKind::Composite,
+                vec![0x22; 32],
+            ),
         };
         let blob = encode_trailer(&k, "obj/multi", body_ct, &f, &table);
         let object_len = body_ct + blob.len() as u64;
@@ -391,7 +547,7 @@ mod tests {
             w.write_all(&plaintext).unwrap();
             w.finish().unwrap();
             let ct_len = ct.len();
-            ct.extend_from_slice(&[0u8; SINGLE_TRAILER_LEN]);
+            ct.extend_from_slice(&[0u8; MIN_SINGLE_TRAILER_LEN]);
 
             let mut out = Vec::new();
             let res = env

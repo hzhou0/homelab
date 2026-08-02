@@ -9,9 +9,11 @@ use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use std::collections::HashMap;
 
+use hypha_core::backend::PutOptions;
 use hypha_core::error::Error;
 use hypha_core::meta;
 
+use super::checksum;
 use super::overlay::WriteMode;
 use super::{
     parse_content_md5, resolve_storage_class, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
@@ -19,6 +21,16 @@ use super::{
 use crate::codec::{self, SingleTrailer};
 use crate::gc::Plaintext;
 use crate::tier;
+
+struct CachedPut<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    body: StreamingBlob,
+    plaintext_len: u64,
+    metadata: HashMap<String, String>,
+    content_md5: Option<String>,
+    checksum: Option<checksum::RequestedChecksum>,
+}
 
 impl Hypha {
     pub(super) async fn op_put_object(
@@ -51,6 +63,7 @@ impl Hypha {
             .as_deref()
             .map(parse_content_md5)
             .transpose()?;
+        let checksum_request = checksum::put_request(&input)?;
 
         let (plen, body) = require_inline_body(&mut input)?;
 
@@ -77,13 +90,17 @@ impl Hypha {
             trailer_key: self.tier.trailer_key.clone(),
             object_key: key.clone(),
             mtime_ms,
+            checksum: None,
         };
-        let (framed_len, enc, mut etag_rx) = match codec::encrypt_blob_with_etag(
+        let (framed_len, enc, etag_rx) = match codec::encrypt_blob_with_etag(
             self.env(),
             body,
             plen,
-            Some(trailer),
-            expect_md5,
+            codec::EncryptOptions {
+                trailer: Some(trailer),
+                expected_md5: expect_md5,
+                checksum: checksum_request,
+            },
         )
         .await
         {
@@ -101,12 +118,11 @@ impl Hypha {
                 &bucket,
                 &key,
                 enc,
-                Some(framed_len as i64),
-                HashMap::new(),
-                None,
-                None,
-                None,
-                input.content_type.clone(),
+                PutOptions {
+                    content_length: Some(framed_len as i64),
+                    content_type: input.content_type.clone(),
+                    ..Default::default()
+                },
             )
             .await
         {
@@ -115,15 +131,15 @@ impl Hypha {
             }
             // A Content-MD5 mismatch cuts the ciphertext stream short, so it reaches us as a
             // backend fault; the digest channel is what tells the two apart .
-            return Err(match etag_rx.try_recv() {
-                Ok(Err(_)) => s3_error!(BadDigest, "Content-MD5 does not match the request body"),
+            return Err(match etag_rx.await {
+                Ok(Err(_)) => s3_error!(BadDigest, "digest does not match the request body"),
                 _ => e.into(),
             });
         }
         // The PUT consumed the whole framed body, footer included — the etag is ready. Its loss
         // means the encrypt task died mid-commit; repair settles K from the remote either way.
-        let etag = match etag_rx.await {
-            Ok(Ok(e)) => e,
+        let digests = match etag_rx.await {
+            Ok(Ok(digests)) => digests,
             other => {
                 if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
                     tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
@@ -131,25 +147,23 @@ impl Hypha {
                 return Err(match other {
                     // A short body the remote nonetheless accepted: reject it, don't project it.
                     Ok(Err(_)) => {
-                        s3_error!(BadDigest, "Content-MD5 does not match the request body")
+                        s3_error!(BadDigest, "digest does not match the request body")
                     }
                     _ => Error::Backend("MD5 task dropped before completing".into()).into(),
                 });
             }
         };
+        let etag = digests.etag;
+        let mut metadata = write_metadata(
+            input.metadata.as_ref(),
+            &storage_class,
+            input.content_type.as_deref(),
+        );
+        if let Some(value) = &digests.checksum {
+            metadata.insert(meta::CHECKSUM.to_string(), meta::encode_checksum(value));
+        }
         self.tier
-            .settle_evict_locked(
-                &bucket,
-                &key,
-                plen,
-                &etag,
-                mtime_ms,
-                write_metadata(
-                    input.metadata.as_ref(),
-                    &storage_class,
-                    input.content_type.as_deref(),
-                ),
-            )
+            .settle_evict_locked(&bucket, &key, plen, &etag, mtime_ms, metadata)
             .await?;
 
         super::record_bytes(plen);
@@ -158,10 +172,19 @@ impl Hypha {
         // bytes the next PUT immediately takes back. Always `AtKey`: a PUT is single-part, so its
         // plaintext lives at K whether it stays cached or is rehydrated back there later.
         self.gc.touch(&bucket, &key, Plaintext::AtKey);
-        let resp = PutObjectOutput {
+        let mut resp = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag)),
             ..Default::default()
         };
+        if let Some(value) = &digests.checksum {
+            let value = checksum::dto(value, 1);
+            resp.checksum_crc32 = value.checksum_crc32;
+            resp.checksum_crc32c = value.checksum_crc32c;
+            resp.checksum_crc64nvme = value.checksum_crc64nvme;
+            resp.checksum_sha1 = value.checksum_sha1;
+            resp.checksum_sha256 = value.checksum_sha256;
+            resp.checksum_type = value.checksum_type;
+        }
         Ok(S3Response::new(resp))
     }
 
@@ -215,6 +238,7 @@ impl Hypha {
         if let Some(h) = input.content_md5.as_deref() {
             parse_content_md5(h)?;
         }
+        let checksum_request = checksum::put_request(&input)?;
         let content_md5 = input.content_md5.clone();
         let (plen, body) = require_inline_body(&mut input)?;
         let md = write_metadata(
@@ -224,21 +248,30 @@ impl Hypha {
         );
 
         let conditional = input.if_match.is_some() || input.if_none_match.is_some();
-        let etag = if conditional {
+        let _guard = if conditional {
             // The lock covers resolve → evaluate → commit → marker , the linearization point.
-            let _guard = self.write_lock(&bucket, &key).await;
+            let guard = self.write_lock(&bucket, &key).await;
             let current = self.resolve_current_client_etag(&bucket, &key).await?;
             evaluate_precondition(
                 input.if_match.as_ref(),
                 input.if_none_match.as_ref(),
                 current.as_deref(),
             )?;
-            self.commit_cached(&bucket, &key, body, plen, md, content_md5)
-                .await?
+            Some(guard)
         } else {
-            self.commit_cached(&bucket, &key, body, plen, md, content_md5)
-                .await?
+            None
         };
+        let (etag, stored_checksum) = self
+            .commit_cached(CachedPut {
+                bucket: &bucket,
+                key: &key,
+                body,
+                plaintext_len: plen,
+                metadata: md,
+                content_md5,
+                checksum: checksum_request,
+            })
+            .await?;
 
         super::record_bytes(plen);
         self.gc.touch(&bucket, &key, Plaintext::AtKey);
@@ -246,10 +279,20 @@ impl Hypha {
         // unreachable . Unconditional here because the unconditional branch above never read K and
         // so cannot know — the actor resolves it.
         self.orphans.owe(&bucket, &key);
-        Ok(S3Response::new(PutObjectOutput {
+        let mut output = PutObjectOutput {
             e_tag: Some(ETag::Strong(etag)),
             ..Default::default()
-        }))
+        };
+        if let Some(value) = &stored_checksum {
+            let value = checksum::dto(value, 1);
+            output.checksum_crc32 = value.checksum_crc32;
+            output.checksum_crc32c = value.checksum_crc32c;
+            output.checksum_crc64nvme = value.checksum_crc64nvme;
+            output.checksum_sha1 = value.checksum_sha1;
+            output.checksum_sha256 = value.checksum_sha256;
+            output.checksum_type = value.checksum_type;
+        }
+        Ok(S3Response::new(output))
     }
 
     /// Land a cached-mode PUT: plaintext body to `<data>` at K (native ETag), which **is** the
@@ -259,41 +302,40 @@ impl Hypha {
     /// Returns the client ETag.
     async fn commit_cached(
         &self,
-        bucket: &str,
-        key: &str,
-        body: StreamingBlob,
-        plen: u64,
-        md: HashMap<String, String>,
-        content_md5: Option<String>,
-    ) -> S3Result<String> {
-        let body = codec::blob_to_bytestream(body);
+        input: CachedPut<'_>,
+    ) -> S3Result<(String, Option<hypha_format::StoredChecksum>)> {
+        let body = codec::blob_to_bytestream(input.body);
 
         let out = self
             .data()
             .put(
-                bucket,
-                key,
+                input.bucket,
+                input.key,
                 body,
-                Some(plen as i64),
-                md,
-                content_md5,
-                None,
-                None,
-                None,
+                PutOptions {
+                    content_length: Some(input.plaintext_len as i64),
+                    metadata: input.metadata,
+                    content_md5: input.content_md5,
+                    checksum: input
+                        .checksum
+                        .as_ref()
+                        .map(checksum::RequestedChecksum::backend),
+                    ..Default::default()
+                },
             )
             .await
             .map_err(|e| match e {
                 // The cache validated the digest against the body and refused it, so nothing landed
                 // — a clean client error, and the one failure here that is *not* indeterminate.
                 Error::BadDigest => {
-                    s3_error!(BadDigest, "Content-MD5 does not match the request body")
+                    s3_error!(BadDigest, "digest does not match the request body")
                 }
                 other => {
                     // Everything else may have landed and lost its response, leaving K live with no
                     // marker queued behind it. This run can no longer claim the bucket's pending set
                     // is a complete account of itself, so it withdraws the claim  — no clean
                     // marker, and the next run's R2 rebuilds the set from both namespaces.
-                    self.buckets.unaccount(bucket);
+                    self.buckets.unaccount(input.bucket);
                     other.into()
                 }
             })?;
@@ -303,8 +345,12 @@ impl Hypha {
             .trim_matches('"')
             .to_string();
 
-        self.markers.owe(bucket, key, etag.clone());
-        Ok(etag)
+        let stored_checksum = input
+            .checksum
+            .map(|request| checksum::from_backend_put(&out, request.algorithm))
+            .transpose()?;
+        self.markers.owe(input.bucket, input.key, etag.clone());
+        Ok((etag, stored_checksum))
     }
 }
 

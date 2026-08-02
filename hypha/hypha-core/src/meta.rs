@@ -17,6 +17,7 @@ pub const SCLASS: &str = "sc";
 /// Client `Content-Type`. Unlike the rest of the pass-through it is *also* written to the remote
 /// object natively (*Remote objects*), so it is the one client value a restore recovers.
 pub const CTYPE: &str = "ct";
+pub const CHECKSUM: &str = "cs";
 
 pub const STANDARD: &str = "STANDARD";
 
@@ -170,6 +171,56 @@ pub fn content_type(stored: &std::collections::HashMap<String, String>) -> Optio
     )
 }
 
+pub fn encode_checksum(checksum: &hypha_format::StoredChecksum) -> String {
+    use hypha_format::{ChecksumAlgorithm::*, ChecksumKind::*};
+    let algorithm = match checksum.algorithm {
+        Crc32 => "c32",
+        Crc32c => "c32c",
+        Crc64Nvme => "c64",
+        Sha1 => "s1",
+        Sha256 => "s256",
+    };
+    let kind = match checksum.kind {
+        FullObject => "f",
+        Composite => "c",
+    };
+    format!(
+        "{algorithm}.{kind}.{}",
+        base64_simd::URL_SAFE_NO_PAD.encode_to_string(&checksum.value)
+    )
+}
+
+pub fn decode_checksum(
+    stored: &std::collections::HashMap<String, String>,
+) -> Option<hypha_format::StoredChecksum> {
+    decode_checksum_value(stored.get(CHECKSUM)?)
+}
+
+pub fn decode_checksum_value(encoded: &str) -> Option<hypha_format::StoredChecksum> {
+    use hypha_format::{ChecksumAlgorithm, ChecksumKind, StoredChecksum};
+    let mut fields = encoded.split('.');
+    let algorithm = match fields.next()? {
+        "c32" => ChecksumAlgorithm::Crc32,
+        "c32c" => ChecksumAlgorithm::Crc32c,
+        "c64" => ChecksumAlgorithm::Crc64Nvme,
+        "s1" => ChecksumAlgorithm::Sha1,
+        "s256" => ChecksumAlgorithm::Sha256,
+        _ => return None,
+    };
+    let kind = match fields.next()? {
+        "f" => ChecksumKind::FullObject,
+        "c" => ChecksumKind::Composite,
+        _ => return None,
+    };
+    let value = base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(fields.next()?.as_bytes())
+        .ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    StoredChecksum::new(algorithm, kind, value)
+}
+
 /// Drop internal facts when promoting a tombstone; carrying `tomb` onto the live body would
 /// misclassify it on subsequent reads.
 pub fn passthrough_metadata(
@@ -177,7 +228,9 @@ pub fn passthrough_metadata(
 ) -> std::collections::HashMap<String, String> {
     metadata
         .iter()
-        .filter(|(k, _)| k.starts_with(USER_PREFIX) || k.as_str() == SCLASS || k.as_str() == CTYPE)
+        .filter(|(k, _)| {
+            k.starts_with(USER_PREFIX) || matches!(k.as_str(), SCLASS | CTYPE | CHECKSUM)
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
@@ -301,23 +354,43 @@ pub struct MpuPart<'a> {
     pub pmd5: &'a str,
     /// Names this part's retained ciphertext ([`mpu_stash_key`]); empty when it wasn't retained.
     pub stash_nonce: &'a str,
+    /// Base64url plaintext checksum digest; empty when the upload has no flexible checksum.
+    pub checksum: &'a str,
 }
 
 /// Cache (`<meta>`): per-part record for a multipart upload, its facts encoded **in the key** so
 /// complete recovers them with one LIST and no per-part HEAD . A re-uploaded part writes a
 /// *new* key, and the stale one is resolved away at complete by the remote's `ListParts`. `retag`
-/// and `pmd5` are hex and `stash_nonce` is base64url, so none contain `;` or a control byte and the
+/// digests and `stash_nonce` use base64url, so none contain `;` or a control byte and the
 /// `;`-delimited form is unambiguous; the zero-padded number keeps LIST order and lets
 /// [`parse_mpu_part`] reject the `u` upload record.
 pub fn mpu_part_key(upload_id: &str, part: MpuPart<'_>) -> String {
+    let retag = compact_mpu_digest(part.retag);
+    let pmd5 = compact_mpu_digest(part.pmd5);
     format!(
-        "{}p{:05};{};{};{}",
+        "{}p{:05};{};{};{};{}",
         mpu_range(upload_id),
         part.part_number,
-        part.retag.trim_matches('"'),
-        part.pmd5,
-        part.stash_nonce
+        retag,
+        pmd5,
+        part.stash_nonce,
+        part.checksum,
     )
+}
+
+fn compact_mpu_digest(value: &str) -> String {
+    let value = value.trim_matches('"');
+    match hex::decode(value) {
+        Ok(raw) if raw.len() == 16 => base64_simd::URL_SAFE_NO_PAD.encode_to_string(&raw),
+        _ => value.to_string(),
+    }
+}
+
+pub fn expand_mpu_digest(value: &str) -> String {
+    match base64_simd::URL_SAFE_NO_PAD.decode_to_vec(value.as_bytes()) {
+        Ok(raw) if raw.len() == 16 => hex::encode(raw),
+        _ => value.to_string(),
+    }
 }
 
 /// Parse an mpu part record key; `None` for the upload's own `u` record, fold-intent `f` record, a
@@ -328,16 +401,18 @@ pub fn parse_mpu_part(key: &str) -> Option<MpuPart<'_>> {
         .rsplit(CTRL as char)
         .next()?
         .strip_prefix('p')?
-        .splitn(4, ';');
+        .splitn(5, ';');
     let part_number: i32 = it.next()?.parse().ok()?;
     let retag = it.next()?;
     let pmd5 = it.next()?;
     let stash_nonce = it.next()?;
+    let checksum = it.next()?;
     (!pmd5.is_empty()).then_some(MpuPart {
         part_number,
         retag,
         pmd5,
         stash_nonce,
+        checksum,
     })
 }
 
@@ -944,6 +1019,7 @@ mod tests {
             retag,
             pmd5,
             stash_nonce: "",
+            checksum: "",
         }
     }
 
@@ -961,7 +1037,10 @@ mod tests {
         let (retag, pmd5): (&'static str, &'static str) =
             ("ab".repeat(16).leak(), "cd".repeat(16).leak());
         let k = mpu_part_key("up-1", part(7, retag, pmd5));
-        assert_eq!(parse_mpu_part(&k), Some(part(7, retag, pmd5)));
+        let parsed = parse_mpu_part(&k).unwrap();
+        assert_eq!(expand_mpu_digest(parsed.retag), retag);
+        assert_eq!(expand_mpu_digest(parsed.pmd5), pmd5);
+        assert_eq!(parsed.part_number, 7);
 
         // Quoted remote ETags are normalized on the way in.
         let quoted = format!("\"{retag}\"");
@@ -972,7 +1051,10 @@ mod tests {
                 ..part(42, retag, pmd5)
             },
         );
-        assert_eq!(parse_mpu_part(&kq), Some(part(42, retag, pmd5)));
+        let parsed = parse_mpu_part(&kq).unwrap();
+        assert_eq!(expand_mpu_digest(parsed.retag), retag);
+        assert_eq!(expand_mpu_digest(parsed.pmd5), pmd5);
+        assert_eq!(parsed.part_number, 42);
 
         // A retained part carries the nonce naming its ciphertext.
         let stashed = MpuPart {
@@ -980,7 +1062,10 @@ mod tests {
             ..part(10_000, retag, pmd5)
         };
         let ks = mpu_part_key("up-1", stashed);
-        assert_eq!(parse_mpu_part(&ks), Some(stashed));
+        let parsed = parse_mpu_part(&ks).unwrap();
+        assert_eq!(expand_mpu_digest(parsed.retag), retag);
+        assert_eq!(expand_mpu_digest(parsed.pmd5), pmd5);
+        assert_eq!(parsed.stash_nonce, stashed.stash_nonce);
         assert_eq!(
             mpu_stash_key("up-1", 10_000, "AAAA-nonce_1"),
             "\u{1}\u{1}mup-1\u{1}c10000;AAAA-nonce_1"
