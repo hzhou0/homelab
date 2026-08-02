@@ -33,7 +33,7 @@ async fn meta_keys(h: &Harness, prefix: &str) -> Vec<String> {
     keys_in(h, h.meta_bucket(B), prefix).await
 }
 
-/// Keys in GC's own bucket — one per deployment, not per client bucket (§8).
+/// Keys in GC's own bucket — one per deployment, not per client bucket.
 async fn gc_keys(h: &Harness, prefix: &str) -> Vec<String> {
     keys_in(h, h.gc_bucket(), prefix).await
 }
@@ -78,7 +78,7 @@ async fn writes_feed_the_ring_and_a_full_slice_is_persisted() {
     }
 }
 
-/// Reads feed the ring as well as writes (§8) — the property a read-only ring gets backwards, and
+/// Reads feed the ring as well as writes — the property a read-only ring gets backwards, and
 /// the one this test has to isolate: a restart leaves the current slice empty, so a rotation after
 /// it can only have been driven by the HEADs. It also exercises the restore path, since the slice
 /// the writes rotated out is read back at startup.
@@ -150,7 +150,7 @@ async fn repeated_touches_of_one_key_do_not_rotate() {
     );
 }
 
-/// A completed upload's records are left for the sweep (§6) rather than deleted on the client path,
+/// A completed upload's records are left for the sweep rather than deleted on the client path,
 /// so the reclaim is what keeps them from accumulating forever.
 #[tokio::test]
 async fn completed_upload_records_are_reclaimed() {
@@ -203,7 +203,7 @@ async fn completed_upload_records_are_reclaimed() {
 }
 
 /// Plant a twin for `key` carrying facts nothing at `key` projects — the shape every crash between a
-/// twin write and the K write meant to accompany it leaves behind (§6).
+/// twin write and the K write meant to accompany it leaves behind.
 async fn plant_twin(h: &Harness, key: &str, mtime_ms: i64) -> String {
     let twin = meta::Facts {
         client_etag: md5_hex(b"whatever this twin claims"),
@@ -259,7 +259,7 @@ async fn orphan_twins_are_reclaimed_and_the_live_one_is_not() {
     );
 }
 
-/// A transition mark whose bracket died is resolved by any read (§7), so the sweep's job is the keys
+/// A transition mark whose bracket died is resolved by any read, so the sweep's job is the keys
 /// nothing reads — which would otherwise hold one indefinitely and pay a remote HEAD on every LIST
 /// page that covers them. Asserted without touching the key through hypha, since a read would repair
 /// it and prove nothing.
@@ -325,4 +325,145 @@ async fn in_progress_upload_records_survive_the_sweep() {
             .any(|k| meta::parse_mpu_upload_id(k) == Some(upload_id.as_str())),
         "the sweep reclaimed an upload the remote is still running"
     );
+}
+
+/// The reverse sweep: a remote multipart upload whose cache `u`-record is gone — a create that
+/// died between its remote create and its record write, or one the cache volume lost — is aborted by
+/// GC, parts and all. An upload hypha created, whose record exists, survives the same passes.
+#[tokio::test]
+async fn orphaned_remote_uploads_are_aborted_and_live_ones_survive() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    // An upload hypha never created, planted straight on the remote: no cache record exists for it.
+    let remote = h.raw_remote();
+    let remote_bucket = h.remote_bucket(B);
+    let orphan = remote
+        .create_multipart_upload()
+        .bucket(&remote_bucket)
+        .key("orphan")
+        .send()
+        .await
+        .expect("remote create")
+        .upload_id()
+        .expect("upload id")
+        .to_string();
+    let orphan_part = pattern_seeded(MIN_PART, 7);
+    remote
+        .upload_part()
+        .bucket(&remote_bucket)
+        .key("orphan")
+        .upload_id(&orphan)
+        .part_number(1)
+        .body(bytes_body(&orphan_part))
+        .send()
+        .await
+        .expect("orphan part");
+
+    // A live upload through hypha, whose record must shield it from the same sweep.
+    let live = create_mpu(&client, B, "live").await;
+
+    wait_until(
+        10_000,
+        "the orphaned upload to be aborted by the sweep",
+        || {
+            let client = client.clone();
+            let live = live.clone();
+            async move { listed_uploads(&client).await == vec![("live".to_string(), live)] }
+        },
+    )
+    .await;
+
+    // The orphan's part went with it — ListParts on a dead upload fails.
+    let parts = remote
+        .list_parts()
+        .bucket(&remote_bucket)
+        .key("orphan")
+        .upload_id(&orphan)
+        .send()
+        .await;
+    assert_eq!(
+        sdk_err_code(&parts.unwrap_err()).as_deref(),
+        Some("NoSuchUpload"),
+        "aborting the upload removes its parts"
+    );
+
+    // The live upload was never touched: it still completes.
+    let live_part = pattern_seeded(MIN_PART, 9);
+    let e1 = upload_part(&client, B, "live", &live, 1, &live_part).await;
+    let etag = complete_mpu(&client, B, "live", &live, &[(1, e1)]).await;
+    assert_eq!(etag, expected_composite_etag(&[&live_part]));
+    assert_eq!(get_all(&client, B, "live").await, live_part);
+}
+
+/// The try-lock handshake: a create still in flight — remote create done, record not yet
+/// written — holds the create lock, so the sweep defers instead of aborting a live upload.
+#[tokio::test]
+async fn an_in_flight_create_is_not_aborted_by_the_sweep() {
+    let h = Harness::durable_with_faults().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    // Freeze the create at its record write, after the remote upload already exists. The create
+    // lock is held across that whole window.
+    let mut paused = h
+        .cache_faults()
+        .pause_next_prefix(hyper::Method::PUT, format!("/{}/%01%01m", h.meta_bucket(B)));
+    let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    let creating = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let up = create_mpu(&client, B, "paused").await;
+            let _ = created_tx.send(up);
+        })
+    };
+    paused.reached().await;
+    let in_flight_id = listed_uploads(&client).await.pop().map(|(_, id)| id);
+
+    // Several sweep intervals while the create is frozen: the sweep must defer, never abort.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(
+        listed_uploads(&client).await,
+        vec![("paused".to_string(), in_flight_id.clone().unwrap())],
+        "the sweep aborted an upload whose create was still in flight"
+    );
+
+    paused.release();
+    let recorded = tokio::time::timeout(Duration::from_secs(5), created_rx)
+        .await
+        .expect("create never finished")
+        .expect("create failed");
+    assert_eq!(
+        recorded,
+        in_flight_id.unwrap(),
+        "the recorded upload is the one the sweep saw"
+    );
+    creating.await.expect("create task");
+
+    // The record landed; further passes leave it alone and it still completes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let part = pattern_seeded(MIN_PART, 11);
+    let e1 = upload_part(&client, B, "paused", &recorded, 1, &part).await;
+    let etag = complete_mpu(&client, B, "paused", &recorded, &[(1, e1)]).await;
+    assert_eq!(etag, expected_composite_etag(&[&part]));
+}
+
+/// In-progress uploads as `(client key, upload id)`, in listing order.
+async fn listed_uploads(client: &aws_sdk_s3::Client) -> Vec<(String, String)> {
+    client
+        .list_multipart_uploads()
+        .bucket(B)
+        .send()
+        .await
+        .expect("list_multipart_uploads")
+        .uploads()
+        .iter()
+        .map(|u| {
+            (
+                u.key().unwrap_or_default().to_string(),
+                u.upload_id().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
 }

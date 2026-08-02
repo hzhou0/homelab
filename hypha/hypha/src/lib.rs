@@ -46,7 +46,7 @@ pub async fn build_service(
 ) -> Result<(S3Service, Lifecycle, BucketCtl), BoxError> {
     let env = hypha_format::Envelope::new(&config.master_passphrase)
         .map_err(|e| format!("parsing master passphrase: {e}"))?;
-    // Trailer authentication key: same master passphrase, distinct KDF domain (§6).
+    // Trailer authentication key: same master passphrase, distinct KDF domain.
     let trailer_key = hypha_format::TrailerKey::derive(&config.master_passphrase);
 
     let remote = Backend::connect(&config.remote, config.role_prefix(REMOTE_ROLE));
@@ -67,6 +67,7 @@ pub async fn build_service(
         locks: keylocks::KeyLocks::default(),
         upload_locks: keylocks::KeyLocks::default(),
         mpu_part_locks: keylocks::KeyLocks::default(),
+        create_locks: keylocks::KeyLocks::default(),
         cached: config.mode == Mode::Cached,
         halt,
         pressure: std::sync::Arc::new(crate::pressure::Pressure::new(
@@ -88,7 +89,7 @@ pub async fn build_service(
     let (startup_tier, startup_buckets) = (tier.clone(), buckets.clone());
 
     // The repair queue's only strong sender goes to `Lifecycle`, so dropping that at drain is what
-    // closes the channel — the proof that every obligation has finished (§7).
+    // closes the channel — the proof that every obligation has finished.
     let (markers, run_seal, marker_actor) = markers::spawn(
         tier.clone(),
         buckets.clone(),
@@ -96,7 +97,7 @@ pub async fn build_service(
         config.reconcile.concurrency,
     );
 
-    // Orphaned shadow bodies (§8), cached mode's third obligation of the marker shape: a write that
+    // Orphaned shadow bodies, cached mode's third obligation of the marker shape: a write that
     // supersedes a composite leaves its rehydrated plaintext unreachable, and — unlike an evictable
     // body — nothing ever touches it again for the recency ring to rank. Same queue/seal/marker
     // structure as `markers`, and for the same reason: the enqueue sits after the commit.
@@ -106,7 +107,7 @@ pub async fn build_service(
         Duration::from_millis(config.reconcile.interval_ms),
     );
 
-    // The GC actor (§8), both modes: debris accumulates wherever the client path acked before its
+    // The GC actor, both modes: debris accumulates wherever the client path acked before its
     // cleanup was done, and recency is fed by every op that resolves or lands a key. It owns its own
     // cadence and stops when the last handle — the one `Hypha` holds — drops.
     let (gc, gc_actor) = gc::spawn(
@@ -119,7 +120,7 @@ pub async fn build_service(
 
     // Spawned here rather than inside `Hypha` so the drain has a handle to join: the transitions it
     // runs hold K's write lock across a fetch, and one killed between landing a body and deleting its
-    // twin leaves exactly the hybrid state §8 orders every path to avoid.
+    // twin leaves exactly the hybrid state orders every path to avoid.
     let (background, background_actor) =
         background::spawn(tier.clone(), config.background, shutdown.clone());
 
@@ -139,7 +140,7 @@ pub async fn build_service(
     // cannot hold up the drain.
     let bucket_ctl = app.buckets.clone();
 
-    // The one failure a running process still has to watch for (§7): its cache volume vanishing
+    // The one failure a running process still has to watch for: its cache volume vanishing
     // underneath it, which would have a ready bucket answering 404 for objects that exist.
     let volume_watch = tokio::spawn(
         volume_watch::VolumeWatch::new(
@@ -150,7 +151,7 @@ pub async fn build_service(
         .run(shutdown.clone()),
     );
 
-    // The cached-mode reconcile sweep (§7): a background duty that trails cache writes onto the
+    // The cached-mode reconcile sweep: a background duty that trails cache writes onto the
     // remote. Durable mode has no pending set, so no sweep.
     let replication = (config.mode == Mode::Cached).then(|| {
         let replication = replication::ReplicationTask::new(
@@ -191,7 +192,7 @@ pub async fn build_service(
     Ok((b.build(), lifecycle, bucket_ctl))
 }
 
-/// The two ends of a run that the object path itself cannot own (§7): the startup clear that makes
+/// The two ends of a run that the object path itself cannot own: the startup clear that makes
 /// every bucket dirty on disk before a write can land, and the drain that proves quiescence before
 /// writing any clean marker back.
 pub struct Lifecycle {
@@ -207,11 +208,11 @@ pub struct Lifecycle {
     /// the seal; *dropping* it only closes the channel, which an abort does too.
     seal: Option<markers::RunSeal>,
     marker_actor: JoinHandle<()>,
-    /// The same pair for the shadow-orphan queue (§8), held separately so a shadow reclaim that never
+    /// The same pair for the shadow-orphan queue, held separately so a shadow reclaim that never
     /// lands cannot withhold a *pending-set* clean marker and send the next run into a full rebuild.
     orphan_seal: Option<gc::orphans::OrphanSeal>,
     orphan_actor: JoinHandle<()>,
-    /// The startup shadow sweeps (§8). Joined before the orphan seal, since a sweep only earns its
+    /// The startup shadow sweeps. Joined before the orphan seal, since a sweep only earns its
     /// bucket's accounting by finishing — after the seal has read the accounting it counts for
     /// nothing, and the sweep is one prefix listing.
     sweeps: JoinSet<()>,
@@ -227,7 +228,7 @@ impl Lifecycle {
     pub async fn startup(&mut self) -> Result<(), BoxError> {
         self.sweeps = bucket::resolve_all(&self.tier, &self.buckets).await?;
         // Seed the backpressure counter from a full pending-set census before the listener opens,
-        // while no marker can move underneath it (§7). The sweep seeds nothing itself: from here the
+        // while no marker can move underneath it. The sweep seeds nothing itself: from here the
         // count is exact by raise/clear accounting.
         if self.tier.pressure.enabled() {
             let (pending, oldest_age_ms) = replication::census(&self.tier).await;
@@ -238,7 +239,7 @@ impl Lifecycle {
     }
 
     /// Seal the run: [`markers::MarkerActor`] then makes its final attempt and writes the clean
-    /// markers. Awaited *before* the active claim is released (§7) — a passive that promotes first
+    /// markers. Awaited *before* the active claim is released — a passive that promotes first
     /// could take writes into a bucket this run is about to vouch for.
     ///
     /// Called only when the connection drain completed. A drain that timed out cannot bound the work
@@ -438,7 +439,7 @@ where
         halt_until_exit().await
     }
 
-    // Step 1 of the quiescence proof (§7): when this resolves, every handler has returned and no new
+    // Step 1 of the quiescence proof: when this resolves, every handler has returned and no new
     // one can start, so every marker obligation that will ever exist has been raised. On timeout the
     // seal is skipped entirely — a connection may still commit a write, and the claim a clean marker
     // makes is about work we can no longer bound.
@@ -483,7 +484,7 @@ where
     Ok(())
 }
 
-/// Per-phase shutdown budgets (§9). Deliberately not configurable: they are a property of the pod's
+/// Per-phase shutdown budgets. Deliberately not configurable: they are a property of the pod's
 /// `terminationGracePeriod`, which has to be at least their sum plus the `preStop` delay, so the two
 /// numbers only mean anything together. Overrunning any of them is safe — it costs the next run a
 /// recovery scan, and leaves debris every sweep already handles — but never silent.

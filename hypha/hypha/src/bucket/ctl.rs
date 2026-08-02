@@ -47,12 +47,12 @@ pub(crate) struct BucketState {
     gate: Arc<Gate>,
     /// Both cache projections are known to exist, so a write can skip asking the actor.
     provisioned: bool,
-    /// This run accounts for the bucket's pending-marker set (§6) — its clean marker was present at
+    /// This run accounts for the bucket's pending-marker set — its clean marker was present at
     /// startup, a reconcile pass rebuilt the set, or this run created the bucket empty. Positive
     /// evidence only: **absence is the default**, so a bucket left dirty by an earlier crash and
     /// untouched since simply is not accounted and ends the run dirty.
     accounted: bool,
-    /// The same claim for orphaned shadow bodies (§8), tracked separately because the two failures cost
+    /// The same claim for orphaned shadow bodies, tracked separately because the two failures cost
     /// wildly different recoveries: an unaccounted pending set means a full two-cursor rebuild, an
     /// unaccounted shadow range means one prefix listing. Folding them together would let a few leaked
     /// bytes trigger the expensive pass.
@@ -171,7 +171,7 @@ impl BucketCtl {
     }
 
     /// Ensure the bucket's cache projections exist so a write can land ahead of the restore sweep
-    /// that would otherwise provision them (§7). Request-reply, but **coalesced**: an already-known
+    /// that would otherwise provision them. Request-reply, but **coalesced**: an already-known
     /// bucket answers from the shared set without touching the queue, and concurrent first-callers
     /// for one bucket all wait on a single head+create pair. A flood of writes into a lost-volume
     /// bucket therefore costs the backend one provisioning round, not one per request.
@@ -220,7 +220,7 @@ impl BucketCtl {
         status(&self.states, bucket)
     }
 
-    /// Classify a read, taking a ticket if the answer must come from the remote (§7), held for the
+    /// Classify a read, taking a ticket if the answer must come from the remote, held for the
     /// whole answer: a cached-mode write admitted while it is out defers to durable semantics.
     pub fn read_ticket(&self, bucket: &str) -> std::result::Result<Readout, Refusal> {
         gate(&self.states, bucket)
@@ -254,7 +254,7 @@ impl BucketCtl {
             .collect()
     }
 
-    /// Record that this run accounts for `bucket`'s pending set (§6). Startup calls it for a bucket
+    /// Record that this run accounts for `bucket`'s pending set. Startup calls it for a bucket
     /// whose clean marker was present; the task calls it for a bucket a pass rebuilt or a create
     /// established empty.
     pub(crate) fn account_for(&self, bucket: &str) {
@@ -279,7 +279,7 @@ impl BucketCtl {
             .collect()
     }
 
-    /// The shadow-range equivalent (§8): its marker was present at startup, or this run's backstop
+    /// The shadow-range equivalent: its marker was present at startup, or this run's backstop
     /// sweep judged every shadow in it.
     pub(crate) fn account_shadows_for(&self, bucket: &str) {
         update(&self.states, bucket, |s| s.shadows_accounted = true);
@@ -326,7 +326,7 @@ impl BucketCtl {
 /// it.
 ///
 /// The shadow sweeps it dispatches are returned rather than detached: each one only earns its bucket's
-/// accounting by finishing, so the drain joins them before it reads that accounting back (§8).
+/// accounting by finishing, so the drain joins them before it reads that accounting back.
 pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<JoinSet<()>> {
     let mut sweeps = JoinSet::new();
     for (bucket, _) in tier.remote.list_buckets().await? {
@@ -471,7 +471,7 @@ struct BucketActor {
     /// [`MAX_CONCURRENT`] entries and only a panic needs it.
     running: HashMap<String, Id>,
     /// Provisioning runs *outside* the per-bucket task — the task for a lost-volume bucket is busy with
-    /// the restore sweep, and a write must not queue behind it (§7 — serving is never gated) — so it is
+    /// the restore sweep, and a write must not queue behind it (serving is never gated) — so it is
     /// its own set of tasks with its own waiters.
     provisions: JoinSet<ProvisionResult>,
     provisioning: HashMap<String, Provisioning>,
@@ -693,7 +693,7 @@ impl BucketTask {
     /// leaves cache projections nobody can reach, which the next create of the name resets.
     ///
     /// A duplicate create of a live bucket returns the remote's result and leaves cache and marker
-    /// untouched (it may be mid-restore). Safe without a lock: the actor is the sole writer (§7).
+    /// untouched (it may be mid-restore). Safe without a lock: the actor is the sole writer.
     async fn create(&self, bucket: &str) -> Result<()> {
         match self.tier.remote.head_bucket(bucket).await {
             Ok(()) if status(&self.states, bucket) == BucketStatus::Absent => {
@@ -723,7 +723,7 @@ impl BucketTask {
                 birth(&self.states, bucket, BucketStatus::Ready);
                 // Re-applied here because `update` cannot create an entry, so the work above recorded
                 // nothing. A bucket this run created starts empty, so every write went through the
-                // marker queue, which the drain proves empty before writing any clean marker (§6).
+                // marker queue, which the drain proves empty before writing any clean marker.
                 // Accounted only on this branch: a duplicate create of a pre-existing bucket
                 // establishes nothing about a pending set that may predate the run.
                 update(&self.states, bucket, |s| {
@@ -780,7 +780,7 @@ impl BucketTask {
             tracing::warn!(bucket, role = "data", %error, "deleted bucket projection cleanup failed");
         }
         // The meta drain deletes the bucket's pending markers outright; count them back off the
-        // backpressure counter, which their removal never ran through `clear_marker_cas` (§7).
+        // backpressure counter, which their removal never ran through `clear_marker_cas`.
         match drain_and_delete_if_exists(&self.tier.meta, bucket).await {
             Ok(drained) => self.tier.pressure.drained(drained),
             Err(error) => {
@@ -791,7 +791,7 @@ impl BucketTask {
     }
 
     /// Whether the bucket holds any client-visible object, read from the same source a LIST of it
-    /// would use (§7): the cache namespace once the bucket is `Ready`, the remote while it is
+    /// would use: the cache namespace once the bucket is `Ready`, the remote while it is
     /// `Restoring`. Reserved keys are hypha's own and no client can see them, so they do not hold a
     /// bucket open — which is why the remote arm pages rather than trusting one entry.
     async fn namespace_empty(&self, bucket: &str) -> Result<bool> {
@@ -967,13 +967,13 @@ async fn drain_and_delete_if_exists(backend: &hypha_core::Backend, bucket: &str)
             break;
         }
         // Pending markers are `<meta>`'s bare-K range; a control-byte lead is a twin or MPU record.
-        // Only the `<meta>` caller reads the count back, for the backpressure counter (§7).
+        // Only the `<meta>` caller reads the count back, for the backpressure counter.
         markers += keys
             .iter()
             .filter(|k| !k.starts_with(meta::CTRL as char))
             .count();
         // Keys go one at a time: `<meta>`'s twin/mpu keys carry the 0x01 control byte the batch
-        // DeleteObjects XML body can't represent (§6). Buckets are rare, so the per-key cost is fine.
+        // DeleteObjects XML body can't represent. Buckets are rare, so the per-key cost is fine.
         let deletes = keys.iter().map(|k| backend.delete(bucket, k));
         futures::future::try_join_all(deletes).await?;
         if page.is_truncated != Some(true) {

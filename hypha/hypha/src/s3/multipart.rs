@@ -38,7 +38,7 @@ fn mpu_part_lock_key(bucket: &str, upload_id: &str, part_number: i32) -> String 
 
 /// S3/MinIO reject any multipart part below 5 MiB except the upload's final part. hypha's trailer
 /// normally occupies that final-part slot, so a client's last data part this small must instead
-/// *carry* the trailer (the fold in `op_complete_multipart_upload`, §7); `op_upload_part` retains
+/// *carry* the trailer (the fold in `op_complete_multipart_upload`); `op_upload_part` retains
 /// such a part's ciphertext up front so complete can re-upload it as `part ‖ trailer`.
 pub(super) const MIN_REMOTE_PART: u64 = 5 * 1024 * 1024;
 
@@ -77,6 +77,11 @@ impl Hypha {
         let _gate = self.check_bucket(&bucket)?;
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
 
+        // Held across the remote create and the `u`-record write, so the orphan sweep's
+        // try-lock/re-check handshake can tell a create still in flight from a leak.
+        let create_lock_key = tier::create_lock_key(&bucket, &key);
+        let _create_guard = self.tier.create_locks.lock(&create_lock_key).await;
+
         let created = self
             .remote()
             .create_multipart(&bucket, &key, HashMap::new(), input.content_type.clone())
@@ -88,7 +93,7 @@ impl Hypha {
 
         // The upload's own record: client key as the body (keys may carry bytes an ASCII
         // metadata header can't), and — in its metadata — the pass-through carrier this upload
-        // will settle with, parked here because complete is where it reaches the tombstone (§7).
+        // will settle with, parked here because complete is where it reaches the tombstone.
         self.meta()
             .put_small(
                 &bucket,
@@ -149,7 +154,7 @@ impl Hypha {
         let _part_guard = self.tier.mpu_part_locks.lock(&lock_key).await;
 
         // Past the byte source, a part is a part: encrypt as a pure age file, stream to the remote,
-        // record its facts. The copy path (`op_upload_part_copy`) shares this tail (§7).
+        // record its facts. The copy path (`op_upload_part_copy`) shares this tail.
         let pmd5 = self
             .stream_part(
                 &bucket,
@@ -171,7 +176,7 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// The shared tail of `UploadPart` and the re-encrypt leg of `UploadPartCopy` (§7): one plaintext
+    /// The shared tail of `UploadPart` and the re-encrypt leg of `UploadPartCopy`: one plaintext
     /// part body becomes its own pure age file on the remote's native upload. Returns the part's
     /// plaintext MD5, computed inline as the body streams.
     #[allow(clippy::too_many_arguments)]
@@ -190,7 +195,7 @@ impl Hypha {
                 .await
                 .map_err(Error::Io)?;
 
-        // Retain the ciphertext if this part admits no successor (§7) — one predicate, so the
+        // Retain the ciphertext if this part admits no successor — one predicate, so the
         // decision here and complete's fold decision cannot drift apart. When it fires the encrypted
         // stream is split and driven into the remote and the cache in one pass: no buffering, and
         // no size distinction, so a 4 KiB part and a 4 GiB one take the same path. The retained copy
@@ -249,7 +254,7 @@ impl Hypha {
             }
         };
         // The remote accepted the part, so it must echo the ETag that identifies it — an empty
-        // `retag` would silently fail to match this part at complete (§6).
+        // `retag` would silently fail to match this part at complete.
         let retag = out
             .e_tag()
             .ok_or_else(|| Error::Backend("part upload returned no ETag".into()))?
@@ -279,7 +284,7 @@ impl Hypha {
         }
     }
 
-    /// Persist a part's facts in the record KEY (§6): `pmd5` (the plaintext MD5, unknowable to the
+    /// Persist a part's facts in the record KEY: `pmd5` (the plaintext MD5, unknowable to the
     /// remote), `retag` (its last-write-wins token), and the nonce naming any retained ciphertext. A
     /// re-upload writes a new key; the stale one is resolved away at complete by the remote's
     /// `ListParts`, which is also what points the fold at the right retained copy. Survives process
@@ -411,7 +416,7 @@ impl Hypha {
         }
     }
 
-    /// The ciphertext retained for a final part (§7), size-verified against the recorded value — the
+    /// The ciphertext retained for a final part, size-verified against the recorded value — the
     /// guard that a fold/unfold re-upload concatenates from exactly the bytes the ETag was computed
     /// over. Absence means the upload never reached the retain path, so there is nothing to recover.
     async fn retained_part_body(
@@ -442,7 +447,7 @@ impl Hypha {
         Ok(retained.body)
     }
 
-    /// **UploadPartCopy** (§7): the copy-source is an alternate byte source for a part. Fast path —
+    /// **UploadPartCopy**: the copy-source is an alternate byte source for a part. Fast path —
     /// a whole, unranged, single-part, remote-resident source is one age file, so its body copies
     /// **server-side** with `pmd5` = the source cetag and no bytes through hypha; everything else
     /// (composite sources, ranged copies, parts complete's fold would need) re-encrypts via
@@ -594,7 +599,7 @@ impl Hypha {
             .and_then(|part| part.part_number)
             .ok_or_else(|| s3_error!(InvalidPart, "part entry missing part number"))?;
 
-        // The whole bracket runs under K's write lock (§7).
+        // The whole bracket runs under K's write lock.
         let _guard = self.write_lock(&bucket, &key).await;
         // Only the final part can be folded. Same-part UploadPart calls share this lock, so the
         // intent below can never be mistaken for a later client re-upload; other parts stay parallel.
@@ -602,7 +607,7 @@ impl Hypha {
         let _part_guard = self.tier.mpu_part_locks.lock(&part_lock_key).await;
 
         // The upload record also carries the pass-through metadata + storage class recorded at
-        // create (§7); settle stamps them onto the tombstone below.
+        // create; settle stamps them onto the tombstone below.
         let carrier = match self
             .meta()
             .head(&bucket, &meta::mpu_upload_key(&upload_id))
@@ -614,7 +619,7 @@ impl Hypha {
         };
 
         // 1. Recover per-part facts and geometry, then compose the client ETag, total plaintext
-        //    length, and offset table. Two reads, no per-part HEAD (§6/§7):
+        //    length, and offset table. Two reads, no per-part HEAD:
         //    · one LIST of the upload's records → `(part, retag) → pmd5` (facts live in the keys);
         //    · one `ListParts` of the remote upload → each live `(part, retag)`'s ciphertext size.
         //
@@ -708,7 +713,7 @@ impl Hypha {
         let mut remote_parts = Vec::with_capacity(requested.len());
         let mut resolved = Vec::with_capacity(requested.len());
         let mut total_plen: u64 = 0;
-        // Parts table (§6): cumulative ciphertext end-offset after each part, taken from the
+        // Parts table: cumulative ciphertext end-offset after each part, taken from the
         // remote's own part sizes — the exact bytes the native complete will concatenate.
         let mut table = Vec::with_capacity(requested.len());
         let mut ct_acc: u64 = 0;
@@ -763,7 +768,7 @@ impl Hypha {
             .ok_or_else(|| Error::Backend("empty part md5 set".into()))?;
         let mtime_ms = tier::now_ms();
 
-        // 2. Build the terminating trailer (§6) — the object's one facts + parts-table carrier —
+        // 2. Build the terminating trailer — the object's one facts + parts-table carrier —
         //    and place it as the object's final bytes so the native complete below commits body and
         //    facts in one atomic op. A crash from here on leaves only the dangling native upload,
         //    swept like any abandoned one.
@@ -783,7 +788,7 @@ impl Hypha {
         // final. The same `admits_no_successor` predicate decided at upload time that this part's
         // ciphertext had to be retained, which is what makes the fold possible at all: an
         // in-progress part cannot be read back. K is byte-identical either way (same
-        // concatenation), so reads are unaffected (§7).
+        // concatenation), so reads are unaffected.
         let last = resolved
             .last()
             .cloned()
@@ -791,7 +796,7 @@ impl Hypha {
         if meta::admits_no_successor(last.number, last.size, MIN_REMOTE_PART) {
             // The generation the caller named, not whichever the listing offered: its record carries
             // the nonce naming the ciphertext retained for it, so the fold re-uploads exactly the
-            // bytes the composite ETag was just computed over (§6).
+            // bytes the composite ETag was just computed over.
             if last.stash_nonce.is_empty() {
                 return Err(Error::Backend(format!(
                     "final part {} ciphertext not retained; cannot fold trailer",
@@ -881,7 +886,7 @@ impl Hypha {
             .complete_multipart(&bucket, &key, &upload_id, completed)
             .await
         {
-            // Failed or indeterminate commit: settle K to whatever the remote holds (§7) and
+            // Failed or indeterminate commit: settle K to whatever the remote holds and
             // leave the native upload as a sweepable orphan.
             if let Err(re) = self.tier.repair_locked(&bucket, &key).await {
                 tracing::warn!(key = %key, error = %re, "repair after failed commit did not settle; leftover mark repaired on next access");
@@ -894,10 +899,10 @@ impl Hypha {
 
         // A completed composite is remote-resident with only a tombstone at K, so what a future
         // eviction could take — and therefore what this write is a statement of interest in — is the
-        // shadow the first read will land (§8).
+        // shadow the first read will land.
         self.gc.touch(&bucket, &key, Plaintext::of(&cetag));
         // A new composite at K supersedes the previous generation's shadow, which lands at the same
-        // shadow key but under the old generation's ETag and so is unreachable (§8).
+        // shadow key but under the old generation's ETag and so is unreachable.
         self.orphans.owe(&bucket, &key);
         let resp = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),
@@ -927,11 +932,11 @@ impl Hypha {
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
-    /// **ListMultipartUploads** (§7): a straight proxy of the remote's own — hypha creates each
+    /// **ListMultipartUploads**: a straight proxy of the remote's own — hypha creates each
     /// native upload at the client key and returns the remote's id verbatim, so the page needs no
     /// translation and the remote's own `(key, upload_id)` ordering makes
     /// `key-marker`/`upload-id-marker` correct, which no cache-side record could offer (they are
-    /// keyed by upload id alone). Remote-as-truth resolves both crash windows by construction (§7).
+    /// keyed by upload id alone). Remote-as-truth resolves both crash windows by construction.
     pub(super) async fn op_list_multipart_uploads(
         &self,
         req: S3Request<ListMultipartUploadsInput>,
@@ -958,7 +963,7 @@ impl Hypha {
                 upload_id: u.upload_id,
                 initiated: u.initiated.and_then(|t| t.to_millis().ok()).map(ts_ms),
                 // The class the client asked for at create lives in the cache record, and reporting
-                // it would cost a fetch per upload — the cosmetic corner LIST already accepts (§7).
+                // it would cost a fetch per upload — the cosmetic corner LIST already accepts.
                 storage_class: Some(StorageClass::from(meta::STANDARD.to_string())),
                 ..Default::default()
             })
@@ -987,7 +992,7 @@ impl Hypha {
         Ok(S3Response::new(resp))
     }
 
-    /// **ListParts** (§7): the remote's `ListParts` supplies the live part set and its ciphertext
+    /// **ListParts**: the remote's `ListParts` supplies the live part set and its ciphertext
     /// sizes; each entry's `retag` matches the mpu record holding that part's plaintext MD5 — the
     /// ETag the client saw at upload, and the one datum the remote cannot reproduce. Sizes convert
     /// back to plaintext through the closed form over the constant `HLEN`, and the reserved trailer
@@ -1048,7 +1053,7 @@ impl Hypha {
     }
 
     /// One LIST of an upload's part records → `(part_number, retag) → (pmd5, stash_nonce)` (facts
-    /// in the keys, §6). Both surviving and stale (re-uploaded-over) records appear; complete
+    /// in the keys). Both surviving and stale (re-uploaded-over) records appear; complete
     /// matches by the remote's winning `retag`, so the stale ones never resolve — which is also
     /// what points a fold at the retained ciphertext of exactly the winning generation. The
     /// upload's own `/u` record, the `c` retained-ciphertext objects, and any malformed key don't
@@ -1094,7 +1099,7 @@ impl Hypha {
     }
 }
 
-/// Resolve an `x-amz-copy-source` to a `(bucket, key)` this deployment can serve (§7). hypha has no
+/// Resolve an `x-amz-copy-source` to a `(bucket, key)` this deployment can serve. hypha has no
 /// versioning and no access-point/outpost addressing, so those forms are rejected rather than
 /// silently mishandled.
 pub(super) fn parse_copy_source(cs: &CopySource) -> S3Result<(String, String)> {

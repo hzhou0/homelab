@@ -94,7 +94,7 @@ pub(crate) fn spawn(
 /// Where a key's plaintext lives, and therefore what a touch is *about* — the one thing a caller has
 /// to tell GC, because it is the one thing GC cannot work out for itself.
 ///
-/// A shadow body is keyed by the digest of K (§6), so K is not recoverable from it: a probe of the
+/// A shadow body is keyed by the digest of K, so K is not recoverable from it: a probe of the
 /// shadow range holds a digest and nothing else, and a Bloom filter has no enumerable contents to
 /// search backwards through. The ring therefore has to have been fed the shadow's own key, which only
 /// the request that resolved through it knows to do.
@@ -102,7 +102,7 @@ pub(crate) fn spawn(
 pub(crate) enum Plaintext {
     /// At bare K: a live cache body, or where a single-part rehydrate will land it.
     AtKey,
-    /// In K's shadow body (§6). K then holds a composite's tombstone, which is never an eviction
+    /// In K's shadow body. K then holds a composite's tombstone, which is never an eviction
     /// candidate — so recording K would protect nothing that can be taken.
     InShadow,
 }
@@ -120,7 +120,7 @@ impl Plaintext {
 }
 
 impl Gc {
-    /// Record interest in a key (§8). Every op that resolves or lands a single key calls this — the
+    /// Record interest in a key. Every op that resolves or lands a single key calls this — the
     /// write path included, because a write is the strongest available statement of interest in a
     /// key and a read-only ring gets write-hot/read-cold keys exactly backwards.
     ///
@@ -284,7 +284,7 @@ impl GcActor {
         // and debris accrues wherever the client path acked before its cleanup was done. What mode
         // and accounting decide is only whether a *body* found there may be taken — durable mode
         // holds none, and a bucket whose pending set this run has not rebuilt is one whose cache
-        // cannot yet be read as exhaustive (§8).
+        // cannot yet be read as exhaustive.
         let evictable: HashSet<Arc<str>> = if self.tier.cached {
             let accounted = self.buckets.accounted();
             swept
@@ -327,7 +327,7 @@ impl GcActor {
     }
 
     /// Fold a finished pass back into the state it was judged against — the yields it taught, and the
-    /// one rung the ladder may move on the evidence of exactly one pass (§8).
+    /// one rung the ladder may move on the evidence of exactly one pass.
     fn settle(&mut self, report: PassReport) {
         let elapsed = report.elapsed;
         self.fold(report);
@@ -367,7 +367,7 @@ impl GcActor {
                 self.ladder.escalate();
             }
         }
-        // §8's one exception: a cache filling faster than a pass completes never reaches rung 1 by the
+        // one exception: a cache filling faster than a pass completes never reaches rung 1 by the
         // normal route, because the evidence never arrives. The two rungs that cost only work jump to
         // their bounds; the threshold never does.
         if usage.after.used > usage.before.used {
@@ -428,7 +428,7 @@ struct Plan {
     /// `Ready` buckets — where debris is swept.
     swept: Vec<String>,
     /// Buckets an eviction may take a body from. Empty in durable mode; a subset of `swept` in
-    /// cached, since eviction waits for a bucket's pending-set rebuild (§8).
+    /// cached, since eviction waits for a bucket's pending-set rebuild.
     evictable: HashSet<Arc<str>>,
     /// One entry per probe, already drawn against the cold yields and the learned prefixes.
     probes: Vec<Probe>,
@@ -509,14 +509,14 @@ impl Pass {
         // Rung 0, always first: debris and dead bytes are reclaim at zero rehydration risk — nobody
         // was ever going to read an abandoned upload's parts — so a target met from them alone evicts
         // nothing at all.
-        let mut swept = self.sweep_mpu_ranges().await;
+        let mut swept = self.sweep_uploads().await;
         if target > 0 {
             self.compact().await;
         }
 
         // The probes run in **both modes and under no pressure**, because the walk is not only the
         // eviction scan: two of the three debris classes are found by classifying entries it reads
-        // regardless (§8), and a durable deployment — which never evicts and so would never probe on
+        // regardless, and a durable deployment — which never evicts and so would never probe on
         // eviction's account alone — accrues both of them. It costs what the separate debris sweeps
         // it replaced cost, and the same pages serve eviction the moment there is pressure.
         let probed = self.probe().await;
@@ -533,6 +533,7 @@ impl Pass {
                 uploads = swept.uploads,
                 twins = swept.twins,
                 marks = swept.marks,
+                orphaned = swept.orphaned,
                 bytes = swept.bytes,
                 "swept debris"
             );
@@ -571,13 +572,15 @@ impl Pass {
     }
 
     /// The one debris class with a listing of its own: an upload's record range is named by a single
-    /// prefix, so it is swept exhaustively rather than sampled.
-    async fn sweep_mpu_ranges(&self) -> Swept {
+    /// prefix, so it is swept exhaustively rather than sampled. The same listing is what the orphan
+    /// half needs — a leak from a failed create is reclaimed within one interval rather than
+    /// surviving to the next restart — so the two are one pass.
+    async fn sweep_uploads(&self) -> Swept {
         let mut reclaimed = Swept::default();
         for chunk in self.plan.swept.chunks(self.plan.setting.concurrency.max(1)) {
             let sweeps = chunk
                 .iter()
-                .map(|bucket| debris::sweep_mpu_ranges(&self.tier, bucket));
+                .map(|bucket| debris::sweep_uploads(&self.tier, bucket));
             match futures::future::try_join_all(sweeps).await {
                 Ok(swept) => swept.into_iter().for_each(|one| reclaimed += one),
                 // A sweep reclaims nothing it cannot see; the next pass starts over from a fresh
@@ -592,7 +595,7 @@ impl Pass {
     }
 
     /// Run the pass's probes and return the candidates in the order eviction should consider them:
-    /// coldest age first, LastModified ascending within an age (§8).
+    /// coldest age first, LastModified ascending within an age.
     ///
     /// Two walks per bucket, one per namespace, and each returns everything its pages contained:
     /// `<data>` gives client bodies and transition marks, `<meta>` gives shadow bodies and twins.
@@ -668,7 +671,7 @@ impl Pass {
     }
 
     /// Evict coldest-first until `target` bytes are reclaimed, then keep taking **misses** up to the
-    /// opportunistic bound (§8): over-evicting an affirmatively cold key is nearly free in rehydration
+    /// opportunistic bound: over-evicting an affirmatively cold key is nearly free in rehydration
     /// risk, yet each eviction still costs a remote HEAD, a twin write, and a CAS, hence the bound.
     async fn evict(&self, candidates: Vec<(Candidate, Age)>, target: u64) -> u64 {
         let (tier, threshold) = (&self.tier, self.plan.setting.threshold);

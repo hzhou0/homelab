@@ -35,7 +35,7 @@ fn describe() {
     );
     describe_gauge!(
         "hypha_pending_markers",
-        "Keys in the pending set at the end of the last reconcile pass (§7)"
+        "Keys in the pending set at the end of the last reconcile pass "
     );
     describe_histogram!(
         "hypha_reconcile_pass_seconds",
@@ -44,7 +44,7 @@ fn describe() {
     describe_gauge!(
         "hypha_markers_owed",
         "Markers the queue is still retrying. Flat zero in health: an owed marker is the cache \
-         refusing small writes, and it is also the queue's only bound (§7)"
+         refusing small writes, and it is also the queue's only bound "
     );
     describe_gauge!(
         "hypha_buckets_dirty_at_drain",
@@ -61,11 +61,11 @@ fn describe() {
     describe_counter!(
         "hypha_backpressure_throttled",
         "Cached writes refused with 503 SlowDown after waiting out the reconcile backpressure \
-         timeout (§7)"
+         timeout"
     );
     describe_counter!(
         "hypha_gc_reclaimed_bytes_total",
-        "Bytes GC reclaimed, by whether they cost a client anything (§8: debris is free, eviction \
+        "Bytes GC reclaimed, by whether they cost a client anything (debris is free, eviction \
          is paid back as rehydration latency)"
     );
     describe_counter!(
@@ -75,12 +75,12 @@ fn describe() {
     describe_histogram!("hypha_gc_pass_seconds", "Duration of one scavenger pass");
     describe_gauge!(
         "hypha_gc_ladder_rung",
-        "The rung of §8's escalation ladder currently engaged. Its top with the byte target still \
+        "The rung of the escalation ladder currently engaged. Its top with the byte target still \
          unmet is the cache-undersized signal — the one GC condition an operator must act on"
     );
     describe_gauge!(
         "hypha_cache_used_bytes",
-        "Physical cache bytes in use (§8's usage source)"
+        "Physical cache bytes in use (the usage source)"
     );
     describe_gauge!("hypha_cache_capacity_bytes", "Physical cache capacity");
     describe_gauge!(
@@ -127,6 +127,8 @@ pub(crate) fn gc_debris_swept(swept: &crate::gc::Swept) {
     counter!("hypha_gc_debris_total", "class" => "upload_record").increment(swept.uploads as u64);
     counter!("hypha_gc_debris_total", "class" => "orphan_twin").increment(swept.twins as u64);
     counter!("hypha_gc_debris_total", "class" => "transition_mark").increment(swept.marks as u64);
+    counter!("hypha_gc_debris_total", "class" => "orphaned_upload")
+        .increment(swept.orphaned as u64);
     counter!("hypha_gc_reclaimed_bytes_total", "source" => "debris").increment(swept.bytes);
 }
 
