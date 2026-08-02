@@ -69,7 +69,7 @@ pub(super) async fn pending_set(tier: &Tiering, bucket: &str) -> Result<usize> {
 
 /// Rebuild the operation marker implied by the cache/remote comparison.
 async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result<bool> {
-    let (key, size, etag, remote_framed) = match sighting {
+    let (key, size, etag, remote_present) = match sighting {
         Sighting::RemoteOnly { key } => {
             return recover_remote_only(tier, bucket, &key).await;
         }
@@ -77,14 +77,14 @@ async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result
             key,
             size,
             etag,
-            remote_framed,
-        } => (key, size, etag, remote_framed),
+            remote_present,
+        } => (key, size, etag, remote_present),
     };
 
     match meta::classify_entry(size as i64, &etag) {
         // Settled, so nothing is owed — unless the remote no longer backs it, which is I2.
         Some(meta::TombKind::Evict) => {
-            if remote_framed.is_none() {
+            if !remote_present {
                 confirm_remote_lost_object(tier, bucket, &key).await?;
             }
             Ok(false)
@@ -92,27 +92,10 @@ async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result
         // A bracket that died before its commit. The repair rule owns it, on the next access;
         // settling it here would be this pass mutating `<data>`.
         Some(meta::TombKind::Transit) => Ok(false),
-        None => match remote_framed {
-            Some(framed) if same_generation(tier, bucket, &key, size, &etag, framed).await? => {
-                Ok(false)
-            }
+        None => match remote_present {
+            true if tier.remote_generation_matches(bucket, &key, &etag).await? => Ok(false),
             _ => raise_upload_marker(tier, bucket, &key, &etag).await,
         },
-    }
-}
-
-async fn same_generation(
-    tier: &Tiering,
-    bucket: &str,
-    key: &str,
-    plen: u64,
-    etag: &str,
-    remote_framed: u64,
-) -> Result<bool> {
-    if crate::tier::single_part_framed_len_matches(plen, remote_framed) {
-        tier.remote_generation_matches(bucket, key, etag).await
-    } else {
-        Ok(false)
     }
 }
 
@@ -200,7 +183,7 @@ enum Sighting {
         key: String,
         size: u64,
         etag: String,
-        remote_framed: Option<u64>,
+        remote_present: bool,
     },
     /// A committed cached delete whose marker had not landed before a crash.
     RemoteOnly { key: String },
@@ -231,7 +214,12 @@ async fn step(cache: &mut Cursor<'_>, remote: &mut Cursor<'_>) -> Result<Option<
             key: entry.key,
             size: entry.size,
             etag: entry.etag,
-            remote_framed: (order == KeyOrder::Equal).then(|| remote.pop().size),
+            remote_present: if order == KeyOrder::Equal {
+                remote.pop();
+                true
+            } else {
+                false
+            },
         }
     }))
 }

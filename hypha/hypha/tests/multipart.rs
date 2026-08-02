@@ -10,6 +10,22 @@ use hypha_core::meta;
 
 const B: &str = "mpu";
 
+async fn wait_for_mpu_cleanup(h: &Harness, upload_id: &str) {
+    let prefix = meta::mpu_prefix(upload_id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some(&prefix)).await;
+        if residue.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "multipart records were not swept for {upload_id}: {residue:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Out-of-order parts, ragged sizes, composite ETag, and whole + ranged composite GET off the
 /// trailer's offset table.
 #[tokio::test]
@@ -236,12 +252,7 @@ async fn multipart_reupload_resolution() {
         "part 2 must be the re-uploaded bytes"
     );
 
-    // mpu records live in the <meta> bucket's range A (0x01 0x01 m …).
-    let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
-    assert!(
-        residue.is_empty(),
-        "mpu records must be swept at complete, found {residue:?}"
-    );
+    wait_for_mpu_cleanup(&h, &up).await;
 }
 
 /// Two concurrent uploads of the same part number: the remote keeps one, complete resolves to it,
@@ -351,19 +362,7 @@ async fn multipart_abort_cleanup() {
         .await
         .expect("abort");
 
-    // mpu records live in the <meta> bucket's range A (0x01 0x01 m …).
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let residue = raw_list(&h.raw(), &h.meta_bucket(B), Some("\u{1}\u{1}m")).await;
-        if residue.is_empty() {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the sweep did not reclaim an aborted upload's records, found {residue:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_mpu_cleanup(&h, &up).await;
 
     // Completing an aborted upload fails, and the object was never created.
     let done = complete_mpu_res(
@@ -528,13 +527,9 @@ async fn multipart_last_part_number_folds_trailer() {
         "the trailer rode part 10000, so the object has two parts"
     );
 
-    // And the retained ciphertext that made the fold possible is swept at complete. Its stash key
-    // is `…m<id>0x01 c10000;<nonce>` in the <meta> bucket .
-    let leftovers = raw_list(&h.raw(), &h.meta_bucket(B), None).await;
-    assert!(
-        leftovers.iter().all(|k| !k.contains("c10000;")),
-        "retained part-10000 ciphertext must not outlive complete: {leftovers:?}"
-    );
+    // The retained ciphertext that made the fold possible is reclaimed with the rest of this
+    // upload's records by the asynchronous debris sweep.
+    wait_for_mpu_cleanup(&h, &up).await;
 }
 
 /// `ListParts` reports the *plaintext* view of an in-progress upload — client part numbers, the

@@ -8,7 +8,7 @@ use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
 use super::scan::{Artifact, Candidate};
-use crate::tier::{quote, single_part_framed_len_matches, Tiering};
+use crate::tier::{quote, Tiering};
 
 /// Reclaim the candidate, or decline to. `Ok(0)` is a decline — a gate refused, or a writer moved the
 /// key — and is not a failure: every reason to decline is either transient or self-healing, and the
@@ -114,20 +114,8 @@ async fn cache_still_holds_generation(
 }
 
 /// Whether the remote holds *this* candidate's generation.
-///
-/// Size rejects impossible single-part generations before the authenticated tail comparison.
 async fn remote_holds_generation(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<bool> {
     let (bucket, etag) = (&candidate.bucket, &candidate.etag);
-    if !meta::is_composite_etag(etag) {
-        let framed = match tier.remote.head(bucket, key).await {
-            Ok(head) => head.content_length().unwrap_or(0).max(0) as u64,
-            Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        if !single_part_framed_len_matches(candidate.bytes, framed) {
-            return Ok(false);
-        }
-    }
     match tier.remote_generation_matches(bucket, key, etag).await {
         Err(Error::NotFound) | Err(Error::NoSuchBucket) => Ok(false),
         other => other,

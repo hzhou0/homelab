@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
-use hypha_format::{decode_tail, single_trailer_len, ChecksumAlgorithm, Tail, TrailerKey};
+use hypha_format::{decode_tail, Tail, TrailerKey};
 use hypha_format::{Envelope, MAX_TAIL_LEN};
 use s3s::dto::StreamingBlob;
 
@@ -18,23 +18,6 @@ use hypha_core::{meta, Backend};
 use crate::codec::{self, PartSegment, SingleTrailer};
 use crate::halt::Halt;
 use crate::keylocks::{CreateLocks, KeyLocks};
-
-/// Reject an impossible plaintext/framed-size pair without fetching the trailer. Listings do not
-/// carry checksum metadata, so the small valid-size set is the strongest zero-read test available.
-pub(crate) fn single_part_framed_len_matches(plen: u64, framed: u64) -> bool {
-    let ciphertext = hypha_format::offset::ciphertext_len(plen, hypha_format::offset::HLEN);
-    [
-        None,
-        Some(ChecksumAlgorithm::Crc32),
-        Some(ChecksumAlgorithm::Crc32c),
-        Some(ChecksumAlgorithm::Crc64Nvme),
-        Some(ChecksumAlgorithm::Sha1),
-        Some(ChecksumAlgorithm::Sha256),
-    ]
-    .into_iter()
-    .filter_map(|algorithm| ciphertext.checked_add(single_trailer_len(algorithm) as u64))
-    .any(|candidate| candidate == framed)
-}
 
 #[derive(Clone)]
 pub struct Tiering {

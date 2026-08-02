@@ -231,8 +231,8 @@ Two cache markers select two distinct recovery passes:
 | pending-set rebuild | missing clean marker | cache namespace | recreate pending markers only |
 
 Namespace restore is additive and idempotent. It never overwrites an entry that appeared while the
-pass was running. Pending-set rebuild performs a streaming cache/remote merge and uses object size,
-then authenticated trailer facts where necessary, to detect missing or stale remote generations.
+pass was running. Pending-set rebuild performs a streaming cache/remote merge and authenticates the
+remote trailer of each intersecting live body to detect missing or stale remote generations.
 
 Startup lists remote buckets, resolves their markers, removes clean markers before serving, and
 dispatches required recovery. The volume watcher periodically verifies that every ready bucket

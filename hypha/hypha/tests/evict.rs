@@ -64,7 +64,15 @@ async fn is_evicted(h: &Harness, key: &str) -> bool {
 /// attributable to the pressure and not to a pass that evicts whatever it walks past.
 #[tokio::test]
 async fn pressure_evicts_a_cold_body_and_the_next_read_rehydrates_it() {
-    let h = cached_with_usage().await;
+    let h = Harness::builder(Mode::Cached)
+        .with_usage(CAPACITY)
+        .with_faults()
+        .tune(|c| {
+            c.gc.high_water = HIGH_WATER;
+            c.gc.low_water = LOW_WATER;
+        })
+        .start()
+        .await;
     h.create_bucket(B).await;
     let c = h.client();
     let body = pattern(64_000);
@@ -82,6 +90,14 @@ async fn pressure_evicts_a_cold_body_and_the_next_read_rehydrates_it() {
         "no pass sampled usage, so the window above proved nothing"
     );
 
+    // Generation verification is one authenticated suffix GET. A preliminary HEAD would be both
+    // redundant and the common-case request this fault makes visible.
+    h.remote_faults().fail_prefix_times(
+        hyper::Method::HEAD,
+        format!("/{}/cold", h.remote_bucket(B)),
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        10_000,
+    );
     h.usage().set_ratio(PRESSURED);
     wait_until(8_000, "the cold body to be evicted", || async {
         is_evicted(&h, "cold").await
@@ -219,9 +235,8 @@ async fn a_body_the_remote_does_not_hold_owes_a_marker_instead_of_a_tombstone() 
 /// *older* generation of the same key, so tombstoning would stamp the cache body's facts over the old
 /// plaintext and reads would return the old bytes under the new ETag and length.
 ///
-/// Both generations are the same length on purpose. That is the ambiguous case — the closed-form
-/// framed size settles every other one on a single HEAD — so this is the test that actually reaches
-/// the trailer's `cetag`.
+/// Both generations are the same length on purpose, so only the trailer's `cetag` distinguishes
+/// them.
 #[tokio::test]
 async fn a_remote_holding_an_older_generation_is_not_evicted() {
     let h = Harness::builder(Mode::Cached)
