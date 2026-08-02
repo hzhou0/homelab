@@ -142,7 +142,7 @@ impl Hypha {
         bucket: &str,
         key: &str,
     ) -> Result<Option<RemoteFacts>, Error> {
-        if let Some(_guard) = self.tier.locks.try_lock(key) {
+        if let Some(_guard) = self.tier.write_locks.try_lock(bucket, key) {
             return self.tier.repair_locked(bucket, key).await;
         }
         match self.remote().head(bucket, key).await {

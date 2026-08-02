@@ -412,6 +412,10 @@ impl Hypha {
 
     /// Large-body commit . Owns the native upload, so a failure aborts it best-effort — a
     /// leftover is a sweepable orphan regardless.
+    ///
+    /// The native upload writes no `u`-record (nothing client-addressable), so the create lock is
+    /// its only shield from the orphan sweep: held shared from before the remote create until the
+    /// multipart is done, it makes the sweep's exclusive probe fail for the whole copy.
     #[allow(clippy::too_many_arguments)]
     async fn commit_copy_multipart(
         &self,
@@ -423,6 +427,7 @@ impl Hypha {
         trailer: &[u8],
         content_type: Option<String>,
     ) -> Result<(), Error> {
+        let _create_guard = self.tier.mpu_create_locks.read(bucket, key).await;
         let created = self
             .remote()
             .create_multipart(bucket, key, HashMap::new(), content_type)

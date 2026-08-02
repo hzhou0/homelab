@@ -16,7 +16,7 @@ use hypha_core::{meta, Backend};
 
 use crate::codec::{self, PartSegment, SingleTrailer};
 use crate::halt::Halt;
-use crate::keylocks::KeyLocks;
+use crate::keylocks::{CreateLocks, KeyLocks};
 
 /// The framed size a single-part remote object would have for a `plen`-byte plaintext. A
 /// markerless live body is always single-part — a composite is tombstoned at K with its plaintext in
@@ -27,13 +27,6 @@ pub(crate) fn single_part_framed_len(plen: u64) -> Option<u64> {
         .checked_add(SINGLE_TRAILER_LEN as u64)
 }
 
-/// The [`Tiering::create_locks`] key for a `CreateMultipartUpload`: `(bucket, key)`, the one
-/// identity the op knows before its remote create — the upload id does not exist yet, so it cannot
-/// key the lock.
-pub(crate) fn create_lock_key(bucket: &str, key: &str) -> String {
-    format!("create\0{bucket}\0{key}")
-}
-
 #[derive(Clone)]
 pub struct Tiering {
     pub data: Backend,
@@ -42,21 +35,25 @@ pub struct Tiering {
     pub env: Arc<Envelope>,
     pub trailer_key: TrailerKey,
     /// The **write** lock table: conditional writes, the durable finalize, GC tombstone
-    /// transitions, and rehydrate all serialize on it.
-    pub locks: KeyLocks,
+    /// transitions, and rehydrate all serialize on it. `(bucket, key)`.
+    pub write_locks: KeyLocks,
     /// The **upload** lock table — a *second* instance, reconcile-only. Same-key reconcile
     /// passes mutually exclude here so an unserialized older upload can't finish after a newer one
     /// and leave the remote stale, while a replication upload never blocks a client's conditional PUT
-    /// (which takes `locks`, not this). Held via `try_lock`: a pass that finds K busy coalesces onto
+    /// (which takes `write_locks`, not this). Held via `try_lock`: a pass that finds K busy coalesces onto
     /// the in-flight upload rather than queuing, so this table never accumulates waiters.
+    /// `(bucket, key)`.
     pub upload_locks: KeyLocks,
+    /// Per-`(bucket, upload_id, part)`; UploadPart and UploadPartCopy re-uploads on one part, and
+    /// complete's fold of the final part, serialize on it.
     pub mpu_part_locks: KeyLocks,
-    /// The **create** lock table: per-`(bucket, key)`, held from before the remote
-    /// `CreateMultipartUpload` until the cache `u`-record is written. That ordering is what lets the
-    /// orphan sweep ([`crate::gc::debris`]) distinguish a create still in flight (lock held, record
-    /// not yet) from a leak (lock free, record absent) — and it must be held *before* the remote
-    /// create, because the upload becomes listable the instant that returns.
-    pub create_locks: KeyLocks,
+    /// The **create** lock table: per-`(bucket, key)`, held **shared** from before the remote
+    /// `CreateMultipartUpload` until the cache `u`-record is written — by the copy path too, whose
+    /// native upload writes no record. That ordering is what lets the orphan sweep
+    /// ([`crate::gc::debris`]) distinguish a create still in flight (any read holder) from a leak
+    /// (only its exclusive probe wins) — and it must be held *before* the remote create, because the
+    /// upload becomes listable the instant that returns.
+    pub mpu_create_locks: CreateLocks,
     /// Cached mode. Decides who wins when a surviving cache entry and the remote disagree: in
     /// cached mode the cache write *is* the commit, so a generation the remote lacks is an acked
     /// write still owed to it — the pending set the clean marker accounts for. Durable mode
@@ -461,7 +458,7 @@ impl Tiering {
         key: &str,
         m_etag: &str,
     ) -> Result<()> {
-        let _guard = self.locks.lock(key).await;
+        let _guard = self.write_locks.lock(bucket, key).await;
         match self.data.head(bucket, key).await {
             // The genuine case: K is absent, so this marker is the record of the delete that made it
             // so, and the remote still has to be told.

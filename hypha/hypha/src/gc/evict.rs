@@ -35,7 +35,7 @@ async fn evict_body(tier: &Tiering, candidate: &Candidate, key: &str) -> Result<
     // so raising one off a stale listing entry could retype a client's acked DELETE into a PUT. The
     // lock plus this re-read pin the generation both gates are judging — the candidate came from a
     // listing that may predate a write, a delete, or another pass's tombstone.
-    let _guard = tier.locks.lock(key).await;
+    let _guard = tier.write_locks.lock(bucket, key).await;
     if !cache_still_holds_generation(tier, bucket, key, etag).await? {
         return Ok(0);
     }

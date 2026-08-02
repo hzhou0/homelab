@@ -72,13 +72,13 @@ impl Hypha {
 
     /// Take K's **write** lock for a client write , first telling any background transition on K
     /// to stop . Every client write-lock acquisition goes through here rather than
-    /// `tier.locks.lock` directly: a rehydrate holds the lock across a whole-object fetch, so
+    /// `tier.write_locks.lock` directly: a rehydrate holds the lock across a whole-object fetch, so
     /// without the cancel a conditional PUT, DELETE, or CompleteMultipartUpload on a hot key would
     /// park behind a multi-minute transfer. The cancel is a map lookup and needs no reply — see
     /// [`background`] for why the lock handoff is a sufficient rendezvous.
     pub(crate) async fn write_lock(&self, bucket: &str, key: &str) -> KeyGuard {
         self.background.cancel(bucket, key);
-        self.tier.locks.lock(key).await
+        self.tier.write_locks.lock(bucket, key).await
     }
 
     pub(crate) fn data(&self) -> &Backend {

@@ -171,7 +171,7 @@ impl ReplicationTask {
         let Ok((_gate, _)) = self.buckets.enter_write(bucket) else {
             return Ok(());
         };
-        let Some(_up) = self.tier.upload_locks.try_lock(key) else {
+        let Some(_up) = self.tier.upload_locks.try_lock(bucket, key) else {
             return Ok(());
         };
         let started = std::time::Instant::now();

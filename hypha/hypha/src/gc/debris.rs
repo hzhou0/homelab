@@ -53,10 +53,7 @@ pub(super) async fn sweep_uploads(tier: &Tiering, bucket: &str) -> Result<Swept>
             if ranges.remove(&upload_id).is_some() {
                 continue;
             }
-            let Some(_guard) = tier
-                .create_locks
-                .try_lock(&crate::tier::create_lock_key(bucket, &key))
-            else {
+            let Some(_guard) = tier.mpu_create_locks.try_lock(bucket, &key) else {
                 continue;
             };
             // The scan may predate the create's record write; only a fresh head settles it.
@@ -107,7 +104,7 @@ pub(super) async fn sweep_uploads(tier: &Tiering, bucket: &str) -> Result<Swept>
 pub(super) async fn repair_marks(tier: &Tiering, bucket: &str, marked: Vec<String>) -> usize {
     let mut repaired = 0;
     for key in marked {
-        let Some(_guard) = tier.locks.try_lock(&key) else {
+        let Some(_guard) = tier.write_locks.try_lock(bucket, &key) else {
             continue;
         };
         match tier.repair_locked(bucket, &key).await {
@@ -140,7 +137,7 @@ pub(super) async fn reclaim_twins(tier: &Tiering, bucket: &str, found: Vec<Strin
         let Some((base, _)) = meta::parse_twin(&twin) else {
             continue;
         };
-        let Some(_guard) = tier.locks.try_lock(base) else {
+        let Some(_guard) = tier.write_locks.try_lock(bucket, base) else {
             continue;
         };
         // "Cannot judge" is not "orphan": a HEAD that failed says nothing about what K holds, and

@@ -236,7 +236,7 @@ async fn rehydrate(
     plen: u64,
     token: &CancellationToken,
 ) -> Result<()> {
-    let _guard = tier.locks.lock(key).await;
+    let _guard = tier.write_locks.lock(bucket, key).await;
 
     // Cancelled while we were parked on the lock — or while an earlier holder ran. Checked before
     // any backend call so a cancelled transition costs nothing but the lock acquisition.

@@ -136,7 +136,7 @@ impl Hypha {
     ) -> S3Result<(WriteGuard, WriteMode)> {
         let (gate, admission) = self.enter_write(bucket)?;
         if admission == Admission::Durable {
-            let _guard = self.tier.locks.lock(key).await;
+            let _guard = self.tier.write_locks.lock(bucket, key).await;
             // The background restore may not have provisioned yet — ask the actor on demand
             // (coalesced, so a burst into a lost-volume bucket costs one round). Safe against a
             // concurrent delete's drain only because the gate above is held.

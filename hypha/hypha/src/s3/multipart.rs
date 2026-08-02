@@ -32,10 +32,6 @@ fn mint_nonce() -> String {
     base64_simd::URL_SAFE_NO_PAD.encode_to_string(rand::random::<[u8; 16]>())
 }
 
-fn mpu_part_lock_key(bucket: &str, upload_id: &str, part_number: i32) -> String {
-    format!("mpu\0{bucket}\0{upload_id}\0{part_number}")
-}
-
 /// S3/MinIO reject any multipart part below 5 MiB except the upload's final part. hypha's trailer
 /// normally occupies that final-part slot, so a client's last data part this small must instead
 /// *carry* the trailer (the fold in `op_complete_multipart_upload`); `op_upload_part` retains
@@ -77,10 +73,10 @@ impl Hypha {
         let _gate = self.check_bucket(&bucket)?;
         let storage_class = resolve_storage_class(input.storage_class.as_ref())?;
 
-        // Held across the remote create and the `u`-record write, so the orphan sweep's
-        // try-lock/re-check handshake can tell a create still in flight from a leak.
-        let create_lock_key = tier::create_lock_key(&bucket, &key);
-        let _create_guard = self.tier.create_locks.lock(&create_lock_key).await;
+        // Held (shared) across the remote create and the `u`-record write, so the orphan sweep's
+        // try-lock/re-check handshake can tell a create still in flight from a leak — without
+        // serializing concurrent creates on the same key, which share the read side.
+        let _create_guard = self.tier.mpu_create_locks.read(&bucket, &key).await;
 
         let created = self
             .remote()
@@ -150,8 +146,11 @@ impl Hypha {
             .ok_or_else(|| Error::Invalid("UploadPart requires a body".into()))?;
 
         self.require_upload(&bucket, &input.upload_id).await?;
-        let lock_key = mpu_part_lock_key(&bucket, &input.upload_id, part_number);
-        let _part_guard = self.tier.mpu_part_locks.lock(&lock_key).await;
+        let _part_guard = self
+            .tier
+            .mpu_part_locks
+            .lock_part(&bucket, &input.upload_id, part_number)
+            .await;
 
         // Past the byte source, a part is a part: encrypt as a pure age file, stream to the remote,
         // record its facts. The copy path (`op_upload_part_copy`) shares this tail.
@@ -469,8 +468,11 @@ impl Hypha {
         meta::validate_client_key(&src_key).map_err(|e| Error::Invalid(e.to_string()))?;
 
         self.require_upload(&bucket, &input.upload_id).await?;
-        let lock_key = mpu_part_lock_key(&bucket, &input.upload_id, part_number);
-        let _part_guard = self.tier.mpu_part_locks.lock(&lock_key).await;
+        let _part_guard = self
+            .tier
+            .mpu_part_locks
+            .lock_part(&bucket, &input.upload_id, part_number)
+            .await;
 
         let (facts, _md, live) = self
             .resolve_copy_source(
@@ -603,8 +605,11 @@ impl Hypha {
         let _guard = self.write_lock(&bucket, &key).await;
         // Only the final part can be folded. Same-part UploadPart calls share this lock, so the
         // intent below can never be mistaken for a later client re-upload; other parts stay parallel.
-        let part_lock_key = mpu_part_lock_key(&bucket, &upload_id, last_requested_n);
-        let _part_guard = self.tier.mpu_part_locks.lock(&part_lock_key).await;
+        let _part_guard = self
+            .tier
+            .mpu_part_locks
+            .lock_part(&bucket, &upload_id, last_requested_n)
+            .await;
 
         // The upload record also carries the pass-through metadata + storage class recorded at
         // create; settle stamps them onto the tombstone below.

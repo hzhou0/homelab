@@ -40,7 +40,7 @@ pub(super) async fn namespace(tier: &Tiering, bucket: &str) -> Result<()> {
 
         futures::stream::iter(keys.into_iter().map(Ok))
             .try_for_each_concurrent(CONCURRENCY, |key| async move {
-                let _guard = tier.locks.lock(&key).await;
+                let _guard = tier.write_locks.lock(bucket, &key).await;
                 tier.materialize_absent_locked(bucket, &key).await
             })
             .await?;

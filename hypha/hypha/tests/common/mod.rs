@@ -1968,26 +1968,18 @@ pub async fn raw_meta_put(
         .expect("raw meta put");
 }
 
-/// Plant an eviction tombstone over `key` exactly as GC's own transition would  — the facts twin
-/// first, then the evict sentinel carrying the authoritative facts — leaving the key resolvable from
-/// the remote and rehydratable on read. The caller is responsible for the remote already holding this
-/// generation; an eviction tombstone without it is invariant **I2**, not a valid state to plant.
+/// Plant an eviction tombstone over `key` exactly as GC's own transition leaves it: the evict
+/// sentinel carrying the authoritative facts at K, then the facts twin. The tombstone lands first so
+/// a sweep probing mid-plant never judges the twin against the live body that precedes the sentinel —
+/// the fixture writes without K's lock, so it must not expose the gap production hides between two
+/// locked writes. The caller is responsible for the remote already holding this generation; an
+/// eviction tombstone without it is invariant **I2**, not a valid state to plant.
 pub async fn plant_eviction_tombstone(h: &Harness, bucket: &str, key: &str, body: &[u8]) {
     let facts = hypha_core::meta::Facts {
         client_etag: md5_hex(body),
         plen: body.len() as u64,
         mtime_ms: 1,
     };
-    if let Some(twin) = facts.twin_key(key) {
-        h.raw()
-            .put_object()
-            .bucket(h.meta_bucket(bucket))
-            .key(twin)
-            .body(ByteStream::from(Vec::new()))
-            .send()
-            .await
-            .expect("plant twin");
-    }
     let mut md = HashMap::new();
     md.insert(
         hypha_core::meta::TOMB.to_string(),
@@ -2014,4 +2006,14 @@ pub async fn plant_eviction_tombstone(h: &Harness, bucket: &str, key: &str, body
         md,
     )
     .await;
+    if let Some(twin) = facts.twin_key(key) {
+        h.raw()
+            .put_object()
+            .bucket(h.meta_bucket(bucket))
+            .key(twin)
+            .body(ByteStream::from(Vec::new()))
+            .send()
+            .await
+            .expect("plant twin");
+    }
 }

@@ -123,7 +123,7 @@ async fn same_generation(
 /// the remote object standing and the marker unclearable. A generation that moved since the sighting
 /// owes its own marker, so there is nothing left here to infer.
 async fn raise_upload_marker(tier: &Tiering, bucket: &str, key: &str, etag: &str) -> Result<bool> {
-    let _guard = tier.locks.lock(key).await;
+    let _guard = tier.write_locks.lock(bucket, key).await;
     let head = match tier.data.head(bucket, key).await {
         Ok(h) => h,
         Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
@@ -138,7 +138,7 @@ async fn raise_upload_marker(tier: &Tiering, bucket: &str, key: &str, etag: &str
 /// A remote-only cursor sighting is either snapshot skew or an interrupted cached delete. R2 may
 /// trust cache absence because total volume loss is dispatched to R1 by the missing sync marker.
 async fn recover_remote_only(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
-    let _guard = tier.locks.lock(key).await;
+    let _guard = tier.write_locks.lock(bucket, key).await;
     if cache_has_entry(tier, bucket, key).await? || !remote_has_object(tier, bucket, key).await? {
         return Ok(false);
     }
@@ -150,7 +150,7 @@ async fn recover_remote_only(tier: &Tiering, bucket: &str, key: &str) -> Result<
 /// Invariant **I2**, confirmed under K's lock: the remote listing can predate the upload that
 /// settled this tombstone, so the violation needs a fresh read.
 async fn confirm_remote_lost_object(tier: &Tiering, bucket: &str, key: &str) -> Result<()> {
-    let _guard = tier.locks.lock(key).await;
+    let _guard = tier.write_locks.lock(bucket, key).await;
     if remote_has_object(tier, bucket, key).await? {
         return Ok(());
     }

@@ -64,10 +64,10 @@ pub async fn build_service(
         remote,
         env: std::sync::Arc::new(env),
         trailer_key,
-        locks: keylocks::KeyLocks::default(),
+        write_locks: keylocks::KeyLocks::default(),
         upload_locks: keylocks::KeyLocks::default(),
         mpu_part_locks: keylocks::KeyLocks::default(),
-        create_locks: keylocks::KeyLocks::default(),
+        mpu_create_locks: keylocks::CreateLocks::default(),
         cached: config.mode == Mode::Cached,
         halt,
         pressure: std::sync::Arc::new(crate::pressure::Pressure::new(
