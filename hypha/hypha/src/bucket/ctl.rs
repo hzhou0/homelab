@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 
@@ -340,10 +340,15 @@ impl BucketCtl {
 /// a rebuild raises through the same counter, so a raise landing between the count and the publish
 /// would be overwritten, and nothing re-seeds the gate for the rest of the run.
 pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<JoinSet<()>> {
+    let began = Instant::now();
     let (survey, pending, oldest_age_ms) = survey_all(tier).await?;
     take_clean_markers(tier, &survey).await?;
     tier.pressure.publish(pending, oldest_age_ms);
 
+    // Whether the last run's drain vouched for everything it left behind. What separates the two
+    // startup paths an operator compares, and it is decided here rather than measured after the
+    // fact: the recovery a bucket owes is raised in this loop and finished long after serving begins.
+    let mut recovering = false;
     let mut sweeps = JoinSet::new();
     for surveyed in survey {
         let Surveyed {
@@ -354,6 +359,7 @@ pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<J
             ..
         } = surveyed;
         if !synced {
+            recovering = true;
             buckets.restore(&bucket);
             continue;
         }
@@ -361,6 +367,7 @@ pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<J
         if accounted {
             buckets.account_for(&bucket);
         } else if tier.cached {
+            recovering = true;
             buckets.rebuild_pending(&bucket);
         }
         // Not a `Recovery`: that slot is a single one per bucket, deliberately, so that "never both a
@@ -370,9 +377,11 @@ pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<J
         if shadows_accounted {
             buckets.account_shadows_for(&bucket);
         } else if tier.cached {
+            recovering = true;
             orphans::dispatch_sweep(&mut sweeps, tier.clone(), buckets.clone(), bucket);
         }
     }
+    crate::metrics::startup(recovering, began.elapsed());
     Ok(sweeps)
 }
 

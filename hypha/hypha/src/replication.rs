@@ -18,6 +18,15 @@ use crate::tier::{Tiering, UploadOutcome};
 
 const MARKER_PAGE: i32 = 1000;
 
+/// How long a marker has been standing. Clamped at zero: the backend stamps `last_modified`, so a
+/// clock ahead of ours would otherwise read as a negative age and, unsigned, as an enormous one.
+fn marker_age_ms(now: i64, object: &aws_sdk_s3::types::Object) -> u64 {
+    object
+        .last_modified
+        .and_then(|t| t.to_millis().ok())
+        .map_or(0, |lm| (now - lm).max(0) as u64)
+}
+
 #[derive(Clone)]
 pub struct ReplicationTask {
     tier: Tiering,
@@ -108,13 +117,12 @@ impl ReplicationTask {
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|o| {
+                    let age = marker_age_ms(now, &o);
                     let key = o.key?;
                     if key.starts_with(meta::CTRL as char) {
                         return None; // range A/B leaked past the boundary — not a marker
                     }
-                    if let Some(lm) = o.last_modified.and_then(|t| t.to_millis().ok()) {
-                        oldest = oldest.max((now - lm).max(0) as u64);
-                    }
+                    oldest = oldest.max(age);
                     let m_etag = o.e_tag.unwrap_or_default().trim_matches('"').to_string();
                     Some((key, m_etag))
                 })
@@ -242,6 +250,7 @@ pub(crate) async fn census_bucket(tier: &Tiering, bucket: &str, now: i64) -> Res
             .await?;
         first = false;
         for o in page.contents.unwrap_or_default() {
+            let age = marker_age_ms(now, &o);
             let Some(key) = o.key else {
                 continue;
             };
@@ -249,9 +258,7 @@ pub(crate) async fn census_bucket(tier: &Tiering, bucket: &str, now: i64) -> Res
                 continue; // range A/B leaked past the boundary — not a marker
             }
             seen += 1;
-            if let Some(lm) = o.last_modified.and_then(|t| t.to_millis().ok()) {
-                oldest = oldest.max((now - lm).max(0) as u64);
-            }
+            oldest = oldest.max(age);
         }
         match page.next_continuation_token {
             Some(t) => token = Some(t),

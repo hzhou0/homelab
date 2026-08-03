@@ -27,7 +27,7 @@ pub(crate) struct OwedMarker {
     marker_body: String,
 }
 
-impl sealq::Dedup for OwedMarker {
+impl Dedup for OwedMarker {
     fn dedup_key(&self) -> (String, String) {
         (self.bucket.clone(), self.key.clone())
     }

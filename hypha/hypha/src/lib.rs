@@ -68,9 +68,7 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle, Buc
         mpu_create_locks: keylocks::CreateLocks::default(),
         cached: config.mode == Mode::Cached,
         halt,
-        pressure: std::sync::Arc::new(crate::pressure::Pressure::new(
-            &config.reconcile.backpressure,
-        )),
+        pressure: std::sync::Arc::new(pressure::Pressure::new(&config.reconcile.backpressure)),
     };
 
     // Cancelled at the start of the actor-quiescence phase. It exists because two of the actors
@@ -198,7 +196,7 @@ pub struct Lifecycle {
     /// answering *before* startup finishes, since "not ready yet" is precisely what they report.
     health: Health,
     tier: tier::Tiering,
-    buckets: bucket::BucketCtl,
+    buckets: BucketCtl,
     halt: halt::Halt,
     /// Cancelled once the obligations are settled, so no actor takes new work after that point.
     shutdown: CancellationToken,

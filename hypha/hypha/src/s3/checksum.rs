@@ -140,22 +140,44 @@ impl MultipartChecksum {
     }
 }
 
+/// The five checksum headers a request may carry. A trait rather than a function because s3s
+/// generates a separate input struct per operation, each with the same five field names.
+trait SuppliedChecksums {
+    fn supplied(&self) -> [(ChecksumAlgorithm, Option<&str>); 5];
+}
+
+macro_rules! supplied_checksums {
+    ($($input:ty),+ $(,)?) => {$(
+        impl SuppliedChecksums for $input {
+            fn supplied(&self) -> [(ChecksumAlgorithm, Option<&str>); 5] {
+                [
+                    (ChecksumAlgorithm::Crc32, self.checksum_crc32.as_deref()),
+                    (ChecksumAlgorithm::Crc32c, self.checksum_crc32c.as_deref()),
+                    (
+                        ChecksumAlgorithm::Crc64Nvme,
+                        self.checksum_crc64nvme.as_deref(),
+                    ),
+                    (ChecksumAlgorithm::Sha1, self.checksum_sha1.as_deref()),
+                    (ChecksumAlgorithm::Sha256, self.checksum_sha256.as_deref()),
+                ]
+            }
+        }
+    )+};
+}
+
+supplied_checksums!(
+    dto::PutObjectInput,
+    dto::UploadPartInput,
+    dto::CompleteMultipartUploadInput,
+);
+
 fn validate_complete(
     input: &dto::CompleteMultipartUploadInput,
     stored: Option<&StoredChecksum>,
     part_count: u32,
 ) -> S3Result<()> {
-    let supplied = [
-        (ChecksumAlgorithm::Crc32, input.checksum_crc32.as_deref()),
-        (ChecksumAlgorithm::Crc32c, input.checksum_crc32c.as_deref()),
-        (
-            ChecksumAlgorithm::Crc64Nvme,
-            input.checksum_crc64nvme.as_deref(),
-        ),
-        (ChecksumAlgorithm::Sha1, input.checksum_sha1.as_deref()),
-        (ChecksumAlgorithm::Sha256, input.checksum_sha256.as_deref()),
-    ];
-    let values = supplied
+    let values = input
+        .supplied()
         .into_iter()
         .filter_map(|(algorithm, value)| value.map(|value| (algorithm, value)))
         .collect::<Vec<_>>();
@@ -238,37 +260,13 @@ impl RequestedChecksum {
 }
 
 pub(crate) fn put_request(input: &dto::PutObjectInput) -> S3Result<Option<RequestedChecksum>> {
-    request(
-        input.checksum_algorithm.as_ref(),
-        [
-            (ChecksumAlgorithm::Crc32, input.checksum_crc32.as_deref()),
-            (ChecksumAlgorithm::Crc32c, input.checksum_crc32c.as_deref()),
-            (
-                ChecksumAlgorithm::Crc64Nvme,
-                input.checksum_crc64nvme.as_deref(),
-            ),
-            (ChecksumAlgorithm::Sha1, input.checksum_sha1.as_deref()),
-            (ChecksumAlgorithm::Sha256, input.checksum_sha256.as_deref()),
-        ],
-    )
+    request(input.checksum_algorithm.as_ref(), input.supplied())
 }
 
 pub(crate) fn upload_part_request(
     input: &dto::UploadPartInput,
 ) -> S3Result<Option<RequestedChecksum>> {
-    request(
-        input.checksum_algorithm.as_ref(),
-        [
-            (ChecksumAlgorithm::Crc32, input.checksum_crc32.as_deref()),
-            (ChecksumAlgorithm::Crc32c, input.checksum_crc32c.as_deref()),
-            (
-                ChecksumAlgorithm::Crc64Nvme,
-                input.checksum_crc64nvme.as_deref(),
-            ),
-            (ChecksumAlgorithm::Sha1, input.checksum_sha1.as_deref()),
-            (ChecksumAlgorithm::Sha256, input.checksum_sha256.as_deref()),
-        ],
-    )
+    request(input.checksum_algorithm.as_ref(), input.supplied())
 }
 
 fn request(
@@ -469,6 +467,20 @@ pub(crate) fn combine_crc(
     )
 }
 
+/// Copy a stored checksum onto a response that carries the five fields inline rather than as a
+/// nested `Checksum` — `UploadPartOutput`, `CopyPartResult` and `Part` each spell them out.
+macro_rules! apply_checksum {
+    ($target:expr, $checksum:expr, $part_count:expr) => {{
+        let value = crate::s3::checksum::dto($checksum, $part_count);
+        $target.checksum_crc32 = value.checksum_crc32;
+        $target.checksum_crc32c = value.checksum_crc32c;
+        $target.checksum_crc64nvme = value.checksum_crc64nvme;
+        $target.checksum_sha1 = value.checksum_sha1;
+        $target.checksum_sha256 = value.checksum_sha256;
+    }};
+}
+pub(crate) use apply_checksum;
+
 pub(crate) fn dto(checksum: &StoredChecksum, part_count: u32) -> Checksum {
     let mut encoded = base64_simd::STANDARD.encode_to_string(&checksum.value);
     if checksum.kind == ChecksumKind::Composite {
@@ -513,37 +525,35 @@ pub(crate) fn from_backend_put(
     )
 }
 
-pub(crate) fn from_backend_head(
-    output: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
-) -> Option<StoredChecksum> {
-    let values = [
-        (ChecksumAlgorithm::Crc32, output.checksum_crc32()),
-        (ChecksumAlgorithm::Crc32c, output.checksum_crc32_c()),
-        (ChecksumAlgorithm::Crc64Nvme, output.checksum_crc64_nvme()),
-        (ChecksumAlgorithm::Sha1, output.checksum_sha1()),
-        (ChecksumAlgorithm::Sha256, output.checksum_sha256()),
-    ];
-    values.into_iter().find_map(|(algorithm, value)| {
-        let value = decode_value(algorithm, value?).ok()?;
-        StoredChecksum::new(algorithm, ChecksumKind::FullObject, value)
-    })
+/// The same five, as the SDK's response accessors name them. The backend only ever stores a
+/// whole-object checksum, so the first one present is the answer.
+macro_rules! from_backend {
+    ($name:ident, $output:ty) => {
+        pub(crate) fn $name(output: &$output) -> Option<StoredChecksum> {
+            [
+                (ChecksumAlgorithm::Crc32, output.checksum_crc32()),
+                (ChecksumAlgorithm::Crc32c, output.checksum_crc32_c()),
+                (ChecksumAlgorithm::Crc64Nvme, output.checksum_crc64_nvme()),
+                (ChecksumAlgorithm::Sha1, output.checksum_sha1()),
+                (ChecksumAlgorithm::Sha256, output.checksum_sha256()),
+            ]
+            .into_iter()
+            .find_map(|(algorithm, value)| {
+                let value = decode_value(algorithm, value?).ok()?;
+                StoredChecksum::new(algorithm, ChecksumKind::FullObject, value)
+            })
+        }
+    };
 }
 
-pub(crate) fn from_backend_get(
-    output: &aws_sdk_s3::operation::get_object::GetObjectOutput,
-) -> Option<StoredChecksum> {
-    let values = [
-        (ChecksumAlgorithm::Crc32, output.checksum_crc32()),
-        (ChecksumAlgorithm::Crc32c, output.checksum_crc32_c()),
-        (ChecksumAlgorithm::Crc64Nvme, output.checksum_crc64_nvme()),
-        (ChecksumAlgorithm::Sha1, output.checksum_sha1()),
-        (ChecksumAlgorithm::Sha256, output.checksum_sha256()),
-    ];
-    values.into_iter().find_map(|(algorithm, value)| {
-        let value = decode_value(algorithm, value?).ok()?;
-        StoredChecksum::new(algorithm, ChecksumKind::FullObject, value)
-    })
-}
+from_backend!(
+    from_backend_head,
+    aws_sdk_s3::operation::head_object::HeadObjectOutput
+);
+from_backend!(
+    from_backend_get,
+    aws_sdk_s3::operation::get_object::GetObjectOutput
+);
 
 #[cfg(test)]
 mod tests {

@@ -49,7 +49,7 @@ impl Pressure {
             return;
         }
         self.pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             })
             .ok();
@@ -62,7 +62,7 @@ impl Pressure {
             return;
         }
         self.pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(n))
             })
             .ok();

@@ -16,7 +16,6 @@ use hypha_format::offset::{plaintext_len_from, HLEN};
 use hypha_format::{encode_trailer, Footer, FooterKind, StoredChecksum};
 
 use super::checksum;
-use super::copy::CopySourceConditions;
 use super::{
     parse_content_md5, resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
 };
@@ -218,12 +217,7 @@ impl Hypha {
             ..Default::default()
         };
         if let Some(value) = &digests.checksum {
-            let value = checksum::dto(value, 1);
-            resp.checksum_crc32 = value.checksum_crc32;
-            resp.checksum_crc32c = value.checksum_crc32c;
-            resp.checksum_crc64nvme = value.checksum_crc64nvme;
-            resp.checksum_sha1 = value.checksum_sha1;
-            resp.checksum_sha256 = value.checksum_sha256;
+            checksum::apply_checksum!(resp, value, 1);
         }
         Ok(S3Response::new(resp))
     }
@@ -235,7 +229,7 @@ impl Hypha {
         &self,
         target: PartTarget<'_>,
         input: PartStream,
-    ) -> S3Result<crate::codec::ObjectDigests> {
+    ) -> S3Result<codec::ObjectDigests> {
         let (ct_len, enc, etag_rx) = codec::encrypt_blob_with_etag(
             self.env(),
             input.body,
@@ -541,16 +535,7 @@ impl Hypha {
             .await;
 
         let source = self
-            .resolve_copy_source(
-                &src_bucket,
-                &src_key,
-                CopySourceConditions {
-                    if_match: input.copy_source_if_match.as_ref(),
-                    if_none_match: input.copy_source_if_none_match.as_ref(),
-                    if_modified_since: input.copy_source_if_modified_since.as_ref(),
-                    if_unmodified_since: input.copy_source_if_unmodified_since.as_ref(),
-                },
-            )
+            .resolve_copy_source(&src_bucket, &src_key, (&input).into())
             .await?;
         let facts = &source.facts;
         let live = source.live;
@@ -613,12 +598,7 @@ impl Hypha {
             ..Default::default()
         };
         if let Some(value) = &digests.checksum {
-            let value = checksum::dto(value, 1);
-            result.checksum_crc32 = value.checksum_crc32;
-            result.checksum_crc32c = value.checksum_crc32c;
-            result.checksum_crc64nvme = value.checksum_crc64nvme;
-            result.checksum_sha1 = value.checksum_sha1;
-            result.checksum_sha256 = value.checksum_sha256;
+            checksum::apply_checksum!(result, value, 1);
         }
         let resp = UploadPartCopyOutput {
             copy_part_result: Some(result),
@@ -1160,12 +1140,7 @@ impl Hypha {
                         ..Default::default()
                     };
                     if let Some(value) = &record.checksum {
-                        let value = checksum::dto(value, 1);
-                        part.checksum_crc32 = value.checksum_crc32;
-                        part.checksum_crc32c = value.checksum_crc32c;
-                        part.checksum_crc64nvme = value.checksum_crc64nvme;
-                        part.checksum_sha1 = value.checksum_sha1;
-                        part.checksum_sha256 = value.checksum_sha256;
+                        checksum::apply_checksum!(part, value, 1);
                     }
                     part
                 })

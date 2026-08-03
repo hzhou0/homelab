@@ -106,10 +106,8 @@ async fn owes_marker(tier: &Tiering, bucket: &str, sighting: Sighting) -> Result
 /// owes its own marker, so there is nothing left here to infer.
 async fn raise_upload_marker(tier: &Tiering, bucket: &str, key: &str, etag: &str) -> Result<bool> {
     let _guard = tier.write_locks.lock(bucket, key).await;
-    let head = match tier.data.head(bucket, key).await {
-        Ok(h) => h,
-        Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
-        Err(e) => return Err(e),
+    let Some(head) = tier.head_if_present(bucket, key).await? else {
+        return Ok(false);
     };
     if head.e_tag().unwrap_or_default().trim_matches('"') != etag {
         return Ok(false);

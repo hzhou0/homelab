@@ -83,6 +83,12 @@ fn describe() {
         "Physical cache bytes in use (the usage source)"
     );
     describe_gauge!("hypha_cache_capacity_bytes", "Physical cache capacity");
+    describe_histogram!(
+        "hypha_startup_seconds",
+        "Time from process start to serving, split by whether the last drain left anything to \
+         recover. The two paths are only comparable apart: a rebuild re-derives pending sets a \
+         clean start inherits"
+    );
     describe_gauge!(
         "hypha_cache_water_mark_bytes",
         "Where a pass starts evicting (high) and what it reclaims down to (low)"
@@ -93,6 +99,11 @@ pub(crate) fn s3_request(op: &'static str, failed: bool, elapsed: Duration) {
     let outcome = if failed { "error" } else { "ok" };
     counter!("hypha_s3_requests_total", "op" => op, "outcome" => outcome).increment(1);
     histogram!("hypha_s3_request_seconds", "op" => op).record(elapsed.as_secs_f64());
+}
+
+pub(crate) fn startup(recovering: bool, elapsed: Duration) {
+    let path = if recovering { "rebuild" } else { "clean" };
+    histogram!("hypha_startup_seconds", "path" => path).record(elapsed.as_secs_f64());
 }
 
 pub(crate) fn cache_read(hit: bool) {

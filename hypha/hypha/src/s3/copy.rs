@@ -52,6 +52,25 @@ pub(super) struct CopySourceConditions<'a> {
     pub if_unmodified_since: Option<&'a Timestamp>,
 }
 
+/// CopyObject and UploadPartCopy carry the same four preconditions under the same names, in
+/// separately generated input types.
+macro_rules! copy_source_conditions {
+    ($($input:ty),+ $(,)?) => {$(
+        impl<'a> From<&'a $input> for CopySourceConditions<'a> {
+            fn from(input: &'a $input) -> Self {
+                CopySourceConditions {
+                    if_match: input.copy_source_if_match.as_ref(),
+                    if_none_match: input.copy_source_if_none_match.as_ref(),
+                    if_modified_since: input.copy_source_if_modified_since.as_ref(),
+                    if_unmodified_since: input.copy_source_if_unmodified_since.as_ref(),
+                }
+            }
+        }
+    )+};
+}
+
+copy_source_conditions!(CopyObjectInput, UploadPartCopyInput);
+
 #[derive(Clone, Copy)]
 struct ObjectRef<'a> {
     bucket: &'a str,
@@ -103,16 +122,7 @@ impl Hypha {
 
         // Shared with UploadPartCopy .
         let source = self
-            .resolve_copy_source(
-                &src_bucket,
-                &src_key,
-                CopySourceConditions {
-                    if_match: input.copy_source_if_match.as_ref(),
-                    if_none_match: input.copy_source_if_none_match.as_ref(),
-                    if_modified_since: input.copy_source_if_modified_since.as_ref(),
-                    if_unmodified_since: input.copy_source_if_unmodified_since.as_ref(),
-                },
-            )
+            .resolve_copy_source(&src_bucket, &src_key, (&input).into())
             .await?;
         let facts = &source.facts;
         let src_md = &source.md;

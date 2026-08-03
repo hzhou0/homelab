@@ -309,6 +309,21 @@ impl Tiering {
         }
     }
 
+    /// The cache entry for K, where a missing bucket reads the same as a missing key. Every caller
+    /// is asking whether a generation it is holding is still the one at K, and a bucket deleted out
+    /// from under that question answers it just as well as an absent key does.
+    pub(crate) async fn head_if_present(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<HeadObjectOutput>> {
+        match self.data.head(bucket, key).await {
+            Ok(head) => Ok(Some(head)),
+            Err(Error::NotFound) | Err(Error::NoSuchBucket) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Resolve a remote object's plaintext facts from its tail trailer: **one speculative tail
     /// read**, single-part and composite alike — the trailer carries the complete facts either way,
     /// and its kind/count distinguish the two. Mid-bracket reads, repair, and the restore sweep all

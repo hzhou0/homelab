@@ -417,7 +417,7 @@ mod tests {
 
     fn decrypt(env: &Envelope, ct: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut env.decrypt(ct).unwrap(), &mut out).unwrap();
+        io::Read::read_to_end(&mut env.decrypt(ct).unwrap(), &mut out).unwrap();
         out
     }
 

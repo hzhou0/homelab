@@ -35,7 +35,7 @@ pub(crate) struct Superseded {
     key: String,
 }
 
-impl sealq::Dedup for Superseded {
+impl Dedup for Superseded {
     fn dedup_key(&self) -> (String, String) {
         (self.bucket.clone(), self.key.clone())
     }
@@ -292,10 +292,8 @@ pub(crate) async fn sweep(tier: &Tiering, bucket: &str) -> Result<usize> {
 /// exactly this generation, so reading it as unreachable would delete a shadow about to become live
 /// again.
 async fn still_reachable(tier: &Tiering, bucket: &str, key: &str, cetag: &str) -> Result<bool> {
-    let head = match tier.data.head(bucket, key).await {
-        Ok(head) => head,
-        Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
-        Err(e) => return Err(e),
+    let Some(head) = tier.head_if_present(bucket, key).await? else {
+        return Ok(false);
     };
     let md = head.metadata.as_ref();
     Ok(match md.and_then(meta::tomb_kind) {

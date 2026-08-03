@@ -105,10 +105,8 @@ async fn cache_still_holds_generation(
     key: &str,
     etag: &str,
 ) -> Result<bool> {
-    let head = match tier.data.head(bucket, key).await {
-        Ok(h) => h,
-        Err(Error::NotFound) | Err(Error::NoSuchBucket) => return Ok(false),
-        Err(e) => return Err(e),
+    let Some(head) = tier.head_if_present(bucket, key).await? else {
+        return Ok(false);
     };
     Ok(head.e_tag().unwrap_or_default().trim_matches('"') == etag)
 }

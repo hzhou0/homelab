@@ -23,6 +23,29 @@ struct PageView {
     common_prefixes: Vec<CommonPrefix>,
 }
 
+/// Where the next page resumes from: the greater of this page's last raw key and its last common
+/// prefix. With a delimiter the two interleave, so resuming from the last *content* key would
+/// re-roll a group already emitted. Raw, not projected — the anchor must advance past entries the
+/// projection drops, or a page with no client-visible entry could re-read itself forever.
+fn resume_anchor(
+    objs: &[aws_sdk_s3::types::Object],
+    prefixes: &[aws_sdk_s3::types::CommonPrefix],
+) -> Option<String> {
+    objs.iter()
+        .next_back()
+        .and_then(|o| o.key())
+        .map(str::to_string)
+        .into_iter()
+        .chain(
+            prefixes
+                .iter()
+                .next_back()
+                .and_then(|cp| cp.prefix())
+                .map(str::to_string),
+        )
+        .max()
+}
+
 /// Version byte for the hypha-owned v2 LIST cursor.
 const LIST_TOKEN_VERSION: u8 = 1;
 
@@ -256,29 +279,11 @@ impl Hypha {
         let objs = raw.contents.unwrap_or_default();
         let prefixes = raw.common_prefixes.unwrap_or_default();
 
-        // The next resume position, present only while truncated: the greater of the page's last raw
-        // key and its last common prefix — with a delimiter the two interleave, and resuming from the
-        // last *content* key would re-roll a group already emitted (the rule v1 applies to
-        // `NextMarker`). Raw, not projected: the anchor must advance past entries the projection
-        // drops, or a page with no client-visible entry could re-read itself forever.
-        let next_continuation_token = if is_truncated == Some(true) {
-            objs.iter()
-                .next_back()
-                .and_then(|o| o.key())
-                .map(str::to_string)
-                .into_iter()
-                .chain(
-                    prefixes
-                        .iter()
-                        .next_back()
-                        .and_then(|cp| cp.prefix())
-                        .map(str::to_string),
-                )
-                .max()
-                .map(|a| ListToken::new(eff_prefix.clone(), eff_delim.clone(), a).encode())
-        } else {
-            None
-        };
+        // v2 hands the anchor back inside its opaque token, so the prefix and delimiter it was taken
+        // under travel with it.
+        let next_continuation_token = resume_anchor(&objs, &prefixes)
+            .filter(|_| is_truncated == Some(true))
+            .map(|a| ListToken::new(eff_prefix.clone(), eff_delim.clone(), a).encode());
 
         let PageView {
             entries,
@@ -348,26 +353,10 @@ impl Hypha {
         let objs = raw.contents.unwrap_or_default();
         let prefixes = raw.common_prefixes.unwrap_or_default();
 
-        // v1's `NextMarker` is a *key*, not v2's opaque token, so hypha computes the resume
-        // position: the greater of the page's last raw key and its last common prefix (with a
-        // delimiter the two interleave, and resuming from the last *content* key would re-roll a
-        // group already emitted). Both sources hold nothing but client objects at client keys ,
-        // so the last raw key is always an XML-safe, strictly-increasing client key.
-        let next_marker = objs
-            .iter()
-            .next_back()
-            .and_then(|o| o.key())
-            .map(str::to_string)
-            .into_iter()
-            .chain(
-                prefixes
-                    .iter()
-                    .next_back()
-                    .and_then(|cp| cp.prefix())
-                    .map(str::to_string),
-            )
-            .max()
-            .filter(|_| is_truncated == Some(true));
+        // v1's `NextMarker` is the bare anchor rather than v2's opaque token, and it goes out over
+        // XML: both sources hold nothing but client objects at client keys, so the anchor is always
+        // an XML-safe, strictly-increasing client key.
+        let next_marker = resume_anchor(&objs, &prefixes).filter(|_| is_truncated == Some(true));
 
         let PageView {
             entries,
