@@ -215,40 +215,15 @@ impl ReplicationTask {
     }
 }
 
-/// Count the pending set and its oldest marker across every client bucket, without draining. The
-/// count seeds the backpressure counter once, at startup, before the listener opens; it is exact
+/// Count one bucket's pending set and its oldest marker, without draining. Summed across buckets it
+/// seeds the backpressure counter once, at startup, before the listener opens; the count is exact
 /// thereafter by raise/clear accounting, so the sweep never re-seeds it .
 ///
-/// Buckets come from the remote list — the same authority `resolve_all` classifies from — not from
-/// the state map's ready set, because "markers live only in ready buckets" is not an invariant the
-/// sweep can rely on: the marker actor raises into any non-Absent bucket, so a write admitted before
-/// a volume-loss restore can leave its marker in a bucket the map no longer calls `Ready`.
-pub(crate) async fn census(tier: &Tiering) -> (usize, u64) {
-    let now = crate::tier::now_ms();
-    let mut pending = 0;
-    let mut oldest_age_ms = 0;
-    let buckets = match tier.remote.list_buckets().await {
-        Ok(buckets) => buckets,
-        Err(e) => {
-            tracing::warn!(error = %e, "backpressure census could not list buckets; seeding zero");
-            return (0, 0);
-        }
-    };
-    for (bucket, _) in buckets {
-        match census_bucket(tier, &bucket, now).await {
-            Ok((count, oldest)) => {
-                pending += count;
-                oldest_age_ms = oldest_age_ms.max(oldest);
-            }
-            Err(e) => {
-                tracing::warn!(bucket, error = %e, "backpressure census for bucket failed")
-            }
-        }
-    }
-    (pending, oldest_age_ms)
-}
-
-async fn census_bucket(tier: &Tiering, bucket: &str, now: i64) -> Result<(usize, u64)> {
+/// The buckets it is called for come from the remote list, not the state map's ready set, because
+/// "markers live only in ready buckets" is not an invariant the sweep can rely on: the marker actor
+/// raises into any non-Absent bucket, so a write admitted before a volume-loss restore can leave its
+/// marker in a bucket the map no longer calls `Ready`.
+pub(crate) async fn census_bucket(tier: &Tiering, bucket: &str, now: i64) -> Result<(usize, u64)> {
     let mut token: Option<String> = None;
     let mut first = true;
     let mut seen = 0usize;

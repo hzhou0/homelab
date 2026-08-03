@@ -234,9 +234,20 @@ Namespace restore is additive and idempotent. It never overwrites an entry that 
 pass was running. Pending-set rebuild performs a streaming cache/remote merge and authenticates the
 remote trailer of each intersecting live body to detect missing or stale remote generations.
 
-Startup lists remote buckets, resolves their markers, removes clean markers before serving, and
-dispatches required recovery. The volume watcher periodically verifies that every ready bucket
-still has its sync marker.
+Startup lists remote buckets and surveys them in one pass — sync marker, both clean markers, and the
+bucket's pending-marker count — across buckets concurrently. The survey **reads only**, so any
+unexpected error exits with the cache exactly as it was found and the next run resolves from the
+same evidence. Only once every bucket has answered are the clean markers deleted, the backpressure
+gate seeded, and recovery dispatched. Nothing is served in between, so nothing can move between a
+marker being seen and being taken.
+
+The seed must be published before the first recovery is queued: a rebuild raises markers through the
+same counter and the seed is a *store*, so a raise landing between the count and the publish would
+be overwritten with nothing to re-seed it for the rest of the run. For the same reason every bucket
+is counted, unclean ones included — a rebuild counts only the markers it creates, leaving those the
+crashed run already wrote uncounted.
+
+The volume watcher periodically verifies that every ready bucket still has its sync marker.
 
 A ready classification is derived once at startup and held for the run — the bucket map is the
 single authority, which is exactly what makes a lost volume detectable: a ready bucket whose marker
@@ -252,8 +263,16 @@ background work.
 Graceful shutdown:
 
 1. stops accepting S3 requests and drains connections;
-2. joins marker and shadow obligations and writes clean evidence where earned;
+2. seals the run and writes the pending-set clean markers, then joins the startup shadow sweeps and
+   writes the shadow-clean evidence they earned;
 3. stops taking background work, drains actor queues, and joins actors.
+
+Step 2 is in that order deliberately. A sweep reads and deletes only shadow bodies, which are
+range-A keys, while the pending set the run seal vouches for is range C — so the run seal does not
+depend on the sweeps finishing. It does owe them the *shadow-clean* marker, which is why that seal
+comes after the join. Putting the join first would hold the marker that decides whether the next run
+rescans the whole pending set behind work whose worst case is leaked bytes. Both run concurrently
+either way, so the ordering costs no wall time.
 
 If a bounded shutdown phase times out, work is aborted without writing evidence that would let the
 next run skip recovery.
@@ -454,10 +473,9 @@ GC and rehydrate races, backend exhaustion, injected faults, admin endpoints, tr
 
 ## Deployment boundary
 
-The repository currently implements the single-process data plane. It does not contain the
-active-passive fencing controller, StatefulSet/chart, or promotion protocol described by the
-architecture. Running more than one write-capable Hypha process against the same deployment prefix
-is therefore unsupported.
+The repository implements the single-process data plane. Exactly one write-capable Hypha process may
+run against a deployment prefix, and Stage 6 makes that a property of the workload rather than
+something the process enforces. The chart that carries it is Stage 7.
 
 ## Outstanding work
 
@@ -478,55 +496,69 @@ is therefore unsupported.
   conditions, and ranged reads. Versioning, ACL, lifecycle, CORS, SSE configuration, and object-lock
   families remain out of scope rather than expected failures to fix.
 
-## Stage 6 — active-passive fencing
+## Stage 6 — single writer by construction
 
-Status: **not started**.
+Status: **decided; the work is Stage 7 chart work and startup latency**.
 
-Stage 6 adds `hypha-fence` and turns the single-process data plane into a two-replica
-active-passive service. Exactly one replica may serve or run active background duties. The passive
-keeps connections warm but owns no mutable data-plane state.
+Hypha runs as **one** replica. There is no active-passive pair, no ownership lease, no fencing
+controller, and no promotion protocol. Exclusivity is a property of the workload object, not
+something the process asserts about itself.
+
+### Why not active-passive
+
+An earlier design contended for a Kubernetes Lease and retargeted Cilium policies at the winning Pod
+UID. It was abandoned for three reasons.
+
+**The fence could not be more than best-effort.** Cross-object invariants are held by in-process key
+locks (`hypha/src/keylocks.rs`) and per-key conditional writes, so two live processes corrupt state
+in ways recovery does not cover. A Lease is a *time-based* claim: safe between cooperating
+processes, worthless against the stalled or partitioned former holder that is the whole reason to
+fence. The network fence that was meant to cover that case is eventually consistent — Cilium 1.19.3
+publishes no realized-policy acknowledgement — so the strongest guarantee available was still
+probabilistic.
+
+**The passive saved about a second and cost seventeen.** A promoting passive runs the same
+`Lifecycle::startup` as a cold process; it pre-pays only binary start and config load. Against that,
+the protocol added a 2 s acquire poll and, on crash, a 15 s lease expiry. A single-pod restart is
+faster than lease failover for both graceful shutdown and process crash.
+
+**Node loss is already fatal one layer down.** The SeaweedFS cache runs `replicas: 1`, node-pinned,
+with `replicationPlacement: "000"`, and both modes depend on it — durable mode keeps it as the
+namespace and ETag projection. Whole-node loss is the one scenario active-passive wins, and there is
+nothing left to fail over to.
+
+Storage-side fencing via SeaweedFS IAM keys was considered and rejected: it cannot cover the remote
+(which is not required to have an IAM API), whoever mints keys holds admin credentials the zombie
+would hold too, and identity propagation is no more synchronous than Cilium's.
 
 ### Required mechanism
 
-- Run two Hypha pods with stable StatefulSet pod identities. Fencing must select immutable pod-name
-  identities; it must not depend on relabeling an unreachable pod.
-- Run two leader-elected fencing-controller replicas.
-- Maintain an active lease and the invariant that only the lease holder is admitted to the cache
-  and remote path.
-- Implement failover in this order:
-  1. detect missed lease renewal;
-  2. remove the old active from the backend allow policy;
-  3. wait until the policy revision is confirmed on the cache endpoints;
-  4. reset the old identity's established connections and wait the configured settle interval;
-  5. promote the passive.
-- Never promote when the fence cannot be programmed and confirmed. Controller unavailability may
-  delay failover but must never create two writers.
-- Graceful handoff must finish the existing data-plane drain and clean-marker seal before releasing
-  the active claim.
+- A **single-replica StatefulSet**. The controller creates no replacement until the old Pod object
+  is fully deleted, so a partitioned node's still-running Pod blocks its own successor. This is
+  strictly stronger than the Lease it replaces, and it is why a `replicas: 1` Deployment will not
+  do: taint-based eviction marks the unreachable Pod terminating and the ReplicaSet immediately
+  creates a second one alongside it.
+- A plain Service selecting the workload labels. No UID selector, no sentinel, no selector patching.
+- `terminationGracePeriodSeconds` covering the request-drain, obligation-seal and actor-drain
+  budgets plus any `preStop` delay, so a planned restart always exits clean and the next start takes
+  the accounted path rather than a pending-set rebuild.
+- No Hypha egress default-deny. It existed only as the baseline the dynamic active-egress policy sat
+  on; with no passive to deny it fences nothing, and as exfil containment it is weak (the allow-list
+  must include the external remote) and costly (`toFQDNs` puts DNS through Cilium's proxy on a
+  latency-first path). The cluster is ingress default-deny only by deliberate choice.
 
-The cache-side fence is the load-bearing exclusion because cached writes cannot commit without it.
-The remote leg may be weaker when source-enforced egress survives a partition or is obscured by
-SNAT. The remaining exposure is a fenced old active finalizing an already in-flight multipart
-commit. If that risk is unacceptable, Stage 6 must use per-replica remote credentials that the
-controller can revoke.
-
-### Configuration and observability
-
-Add configuration for stable identity selectors, lease timings, fence-confirmation timeout,
-connection-drain behavior, and settle delay. Export the current role, failover count, and
-fence-confirmation latency. A passive must remain health-checkable and ready for promotion without
-being admitted as an active writer.
+The accepted cost is that **node loss requires an explicit assertion that the node is down** before a
+replacement runs — the `node.kubernetes.io/out-of-service` taint, applied by a human or by something
+that can verify power state. This is correct rather than regrettable: fencing is a physical
+assertion, and every scheme that tries to infer it from a peer lands on best-effort.
 
 ### Exit requirements
 
-An automated two-replica partition harness must prove:
-
-- the old active is refused by the backend before the new active can write;
-- an in-flight request cannot commit outside the confirmed drain window;
-- inability to confirm the fence prevents promotion;
-- graceful handoff seals obligations before promotion;
-- recovery after forced failover preserves every acknowledged durable write and only the documented
-  cached-mode loss window remains.
+- A rollout shows exactly one running Pod at every instant.
+- SIGTERM → next process serving is measured for a clean shutdown and for `SIGKILL`, and recorded
+  against the ~17 s lease path this replaces.
+- Recovery after an ungraceful stop preserves every acknowledged durable write, with only the
+  documented cached-mode loss window remaining.
 
 ## Stage 7 — packaging and production installs
 
@@ -534,12 +566,13 @@ Status: **not started**.
 
 Stage 7 delivers the cluster-admin-installed `hypha/` Helm chart:
 
-- the two-pod serving StatefulSet, Service, and HTTPRoute;
-- the leader-elected `hypha-fence` deployment and its least-privilege RBAC;
+- the single-replica serving StatefulSet, Service, and HTTPRoute;
 - references to the master-passphrase and remote-credential Secrets;
-- mode, backend, bucket-prefix, GC, reconcile, fencing, and shutdown settings;
-- dashboards and alerts for request health, cache hits, pending work, recovery, GC pressure, role,
-  failovers, and fence confirmation.
+- mode, backend, bucket-prefix, GC, reconcile, and shutdown settings;
+- a node-loss runbook: verify the machine is down, then apply `node.kubernetes.io/out-of-service`.
+  Never force-delete on suspicion;
+- dashboards and alerts for request health, cache hits, pending work, recovery, GC pressure, and
+  startup duration split by clean versus rebuild path.
 
 Install the chart twice with distinct deployment prefixes or remote accounts:
 
@@ -554,9 +587,9 @@ budgets plus any `preStop` delay.
 - `helm lint hypha` and rendered-manifest validation pass.
 - The full workspace, SeaweedFS cache-contract suite, exhaustion suite, and `s3s-e2e` supported
   selection pass against the packaged deployment.
-- The Stage 6 partition and graceful-handoff harness passes with the charted resources.
+- The Stage 6 single-writer and restart-timing checks pass against the charted resources.
 - Both cached and durable endpoints are live behind the shared Gateway.
 - A real client completes an end-to-end write/read/restart exercise against each endpoint, including
   the ZeroFS durable-endpoint check.
-- Dashboards expose pending-marker growth, dirty drains, cache pressure, invariant halts, role, and
-  failover/fence health before either endpoint is considered production-ready.
+- Dashboards expose pending-marker growth, dirty drains, cache pressure, invariant halts, and
+  restart duration before either endpoint is considered production-ready.

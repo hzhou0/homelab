@@ -41,9 +41,7 @@ pub use s3::Hypha;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
-pub async fn build_service(
-    config: &Config,
-) -> Result<(S3Service, Lifecycle, BucketCtl), BoxError> {
+pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle, BucketCtl), BoxError> {
     let env = hypha_format::Envelope::new(&config.master_passphrase)
         .map_err(|e| format!("parsing master passphrase: {e}"))?;
     // Trailer authentication key: same master passphrase, distinct KDF domain.
@@ -227,13 +225,6 @@ impl Lifecycle {
 
     pub async fn startup(&mut self) -> Result<(), BoxError> {
         self.sweeps = bucket::resolve_all(&self.tier, &self.buckets).await?;
-        // Seed the backpressure counter from a full pending-set census before the listener opens,
-        // while no marker can move underneath it. The sweep seeds nothing itself: from here the
-        // count is exact by raise/clear accounting.
-        if self.tier.pressure.enabled() {
-            let (pending, oldest_age_ms) = replication::census(&self.tier).await;
-            self.tier.pressure.publish(pending, oldest_age_ms);
-        }
         self.health.started();
         Ok(())
     }
@@ -265,22 +256,24 @@ impl Lifecycle {
     }
 
     async fn settle(&mut self) {
+        // Sealed before the sweeps are joined: they write only shadow bodies, in range A, and what
+        // this vouches for is the range-C pending set. Waiting on them first would hold the marker
+        // that decides whether the next run rescans that whole set behind work whose worst case is
+        // leaked bytes. What they do owe is the shadow-clean marker, sealed below.
+        if let Some(run_seal) = self.seal.take() {
+            run_seal.seal();
+        }
+        if let Err(e) = (&mut self.marker_actor).await {
+            tracing::warn!(error = %e, "marker actor did not finish; clean markers withheld");
+        }
         while let Some(swept) = self.sweeps.join_next().await {
             if let Err(e) = swept {
                 tracing::warn!(error = %e, "startup shadow sweep did not finish");
             }
         }
-        if let Some(run_seal) = self.seal.take() {
-            run_seal.seal();
-        }
         if let Some(orphan_seal) = self.orphan_seal.take() {
             orphan_seal.seal();
         }
-        if let Err(e) = (&mut self.marker_actor).await {
-            tracing::warn!(error = %e, "marker actor did not finish; clean markers withheld");
-        }
-        // Awaited after the markers: this one only ever leaks bytes, so it must not delay the
-        // obligation that decides whether the next run rescans for acked writes.
         if let Err(e) = (&mut self.orphan_actor).await {
             tracing::warn!(error = %e, "shadow actor did not finish; shadow-clean markers withheld");
         }

@@ -228,7 +228,10 @@ mod tests {
     async fn try_lock_reflects_held_state_and_cleans_up() {
         let locks = KeyLocks::default();
         let held = locks.lock("b", "k").await;
-        assert!(locks.try_lock("b", "k").is_none(), "held key must fail try_lock");
+        assert!(
+            locks.try_lock("b", "k").is_none(),
+            "held key must fail try_lock"
+        );
         drop(held);
         let got = locks.try_lock("b", "k").expect("free key must try_lock");
         assert_eq!(locks.entries(), 1);

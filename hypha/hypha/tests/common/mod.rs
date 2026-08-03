@@ -27,9 +27,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use hypha_core::config::{
-    Backpressure, Background, ClientAuth, Config, Gc, Mode, Recency, Reconcile, S3Endpoint, Serving,
-    Usage,
-    DATA_ROLE, META_ROLE, REMOTE_ROLE,
+    Background, Backpressure, ClientAuth, Config, Gc, Mode, Recency, Reconcile, S3Endpoint,
+    Serving, Usage, DATA_ROLE, META_ROLE, REMOTE_ROLE,
 };
 
 /// The client-facing credentials hypha authenticates its own S3 clients with  — distinct from

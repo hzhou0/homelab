@@ -743,7 +743,11 @@ async fn list_pagination_spans_the_restore_flip() {
         .send()
         .await
         .expect("first list page");
-    assert_eq!(page1.is_truncated(), Some(true), "a 400-key namespace cannot fit one page of 50");
+    assert_eq!(
+        page1.is_truncated(),
+        Some(true),
+        "a 400-key namespace cannot fit one page of 50"
+    );
     let mut all: Vec<String> = page1
         .contents()
         .iter()
@@ -767,7 +771,11 @@ async fn list_pagination_spans_the_restore_flip() {
             req = req.continuation_token(t.clone());
         }
         let page = req.send().await.expect("continuation list page");
-        all.extend(page.contents().iter().filter_map(|o| o.key().map(str::to_string)));
+        all.extend(
+            page.contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string)),
+        );
         match page.next_continuation_token() {
             Some(t) if page.is_truncated() == Some(true) => token = Some(t.to_string()),
             _ => {

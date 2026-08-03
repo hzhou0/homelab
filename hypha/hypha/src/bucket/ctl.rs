@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
+use futures::{StreamExt as _, TryStreamExt as _};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,10 @@ use crate::tier::Tiering;
 const MAX_CONCURRENT: usize = 16;
 
 const MAX_QUEUED_BUCKET_REQUESTS: usize = 4;
+
+/// Startup marker reads and deletes in flight. Higher than [`MAX_CONCURRENT`] because each is one
+/// round trip holding nothing, not a bucket mutation holding a slot for its duration.
+const RESOLVE_PROBES: usize = 64;
 
 /// How long a bucket whose recovery could not run waits before the pass is re-queued. Nothing else
 /// re-triggers one: the state map is resolved once at startup and never re-probed, so a pass that
@@ -318,8 +323,11 @@ impl BucketCtl {
 /// path used to pay on first touch. Buckets appear afterwards only through `CreateBucket`, which
 /// publishes its own entry.
 ///
-/// Reading both markers in one place is sound precisely because nothing is being served yet — no
-/// marker can move underneath the decision, and there is no second raiser to reconcile with.
+/// Reading the markers in one place is sound precisely because nothing is being served yet — no
+/// marker can move underneath the decision, and there is no second raiser to reconcile with. That is
+/// also what splits this into a read-only survey and the takes afterwards, at no cost: a survey that
+/// fails leaves every clean marker standing, so an unexpected startup fault does not cost the next
+/// run a rebuild.
 ///
 /// A cache bucket with no remote bucket is not resolved and never served: it is debris from a crash
 /// between `delete`'s remote commit and its cache drain, and a later create of the same name resets
@@ -327,17 +335,24 @@ impl BucketCtl {
 ///
 /// The shadow sweeps it dispatches are returned rather than detached: each one only earns its bucket's
 /// accounting by finishing, so the drain joins them before it reads that accounting back.
+///
+/// The backpressure seed is published before the first recovery is queued because it is a *store*:
+/// a rebuild raises through the same counter, so a raise landing between the count and the publish
+/// would be overwritten, and nothing re-seeds the gate for the rest of the run.
 pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<JoinSet<()>> {
-    let mut sweeps = JoinSet::new();
-    for (bucket, _) in tier.remote.list_buckets().await? {
-        let synced = marker_present(tier, &bucket, &meta::sync_marker_key()).await?;
-        // Durable mode has neither a pending set nor shadow bodies: it writes no clean markers of
-        // either kind and reads none back.
-        let accounted =
-            tier.cached && take_marker(tier, &bucket, &meta::clean_marker_key()).await?;
-        let shadows_accounted =
-            tier.cached && take_marker(tier, &bucket, &meta::shadow_clean_marker_key()).await?;
+    let (survey, pending, oldest_age_ms) = survey_all(tier).await?;
+    take_clean_markers(tier, &survey).await?;
+    tier.pressure.publish(pending, oldest_age_ms);
 
+    let mut sweeps = JoinSet::new();
+    for surveyed in survey {
+        let Surveyed {
+            bucket,
+            synced,
+            accounted,
+            shadows_accounted,
+            ..
+        } = surveyed;
         if !synced {
             buckets.restore(&bucket);
             continue;
@@ -361,25 +376,116 @@ pub(crate) async fn resolve_all(tier: &Tiering, buckets: &BucketCtl) -> Result<J
     Ok(sweeps)
 }
 
+struct Surveyed {
+    bucket: String,
+    synced: bool,
+    accounted: bool,
+    shadows_accounted: bool,
+    pending: usize,
+    oldest_age_ms: u64,
+}
+
+/// Reads only, so any error here leaves the cache as it was found.
+///
+/// Unclean buckets are counted too, though a rebuild is about to re-derive their sets: a rebuild
+/// counts only the markers it *creates*, leaving those the crashed run already wrote uncounted, and
+/// its walk never visits a key absent from both namespaces.
+async fn survey_all(tier: &Tiering) -> Result<(Vec<Surveyed>, usize, u64)> {
+    let now = crate::tier::now_ms();
+    let survey: Vec<Surveyed> = futures::stream::iter(tier.remote.list_buckets().await?)
+        .map(|(bucket, _)| survey_bucket(tier, bucket, now))
+        .buffer_unordered(RESOLVE_PROBES)
+        .try_collect()
+        .await?;
+
+    let pending = survey.iter().map(|s| s.pending).sum();
+    let oldest_age_ms = survey.iter().map(|s| s.oldest_age_ms).max().unwrap_or(0);
+    Ok((survey, pending, oldest_age_ms))
+}
+
+async fn survey_bucket(tier: &Tiering, bucket: String, now: i64) -> Result<Surveyed> {
+    let (sync, clean, shadow_clean) = (
+        meta::sync_marker_key(),
+        meta::clean_marker_key(),
+        meta::shadow_clean_marker_key(),
+    );
+    // The census reads range C and the probes read range A, so the four need no ordering.
+    let probes = tokio::try_join!(
+        marker_present(tier, &bucket, &sync),
+        clean_marker_present(tier, &bucket, &clean),
+        clean_marker_present(tier, &bucket, &shadow_clean),
+        count_pending(tier, &bucket, now),
+    );
+    let (synced, accounted, shadows_accounted, (pending, oldest_age_ms)) = match probes {
+        Ok(probes) => probes,
+        // The only error that describes the bucket rather than the backend: no cache projection at
+        // all, the volume loss the restore exists for. It reaches here from the census, since a LIST
+        // says `NoSuchBucket` where a HEAD reports the same absence as a bodyless `NotFound`.
+        Err(Error::NoSuchBucket) => (false, false, false, (0, 0)),
+        Err(e) => return Err(e),
+    };
+    Ok(Surveyed {
+        bucket,
+        synced,
+        accounted,
+        shadows_accounted,
+        pending,
+        oldest_age_ms,
+    })
+}
+
+/// Durable mode has neither a pending set nor shadow bodies: it writes no clean markers of either
+/// kind and reads none back.
+async fn clean_marker_present(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
+    Ok(tier.cached && marker_present(tier, bucket, key).await?)
+}
+
+/// Fatal like the probes beside it: the gate is seeded once and never again, so a scan that quietly
+/// contributed zero would run the whole run low.
+async fn count_pending(tier: &Tiering, bucket: &str, now: i64) -> Result<(usize, u64)> {
+    if !tier.pressure.enabled() {
+        return Ok((0, 0));
+    }
+    crate::replication::census_bucket(tier, bucket, now).await
+}
+
+/// `NotFound` here is both "no such key" and "no such bucket" — a missing bucket HEADs as a bodyless
+/// 404 that only `head_bucket` remaps. They need no telling apart: an absent marker and an absent
+/// projection both mean nothing vouches for this bucket.
 async fn marker_present(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
     match tier.meta.head(bucket, key).await {
         Ok(_) => Ok(true),
-        // `NoSuchBucket`: the whole cache projection is gone — the volume loss R1 exists for.
-        Err(Error::NotFound) | Err(Error::NoSuchBucket) => Ok(false),
+        Err(Error::NotFound) => Ok(false),
         Err(e) => Err(e),
     }
 }
 
-/// Read one of the two clean markers and delete it: from the moment hypha can take a write, no bucket
-/// on disk claims to be clean. A marker that will not delete fails startup rather than being served
+/// Delete every clean marker the survey saw: from the moment hypha can take a write, no bucket on
+/// disk claims to be clean. A marker that will not delete fails startup rather than being served
 /// around — skipping the recovery on it now would skip it again next run, by which time real orphans
 /// exist.
-async fn take_marker(tier: &Tiering, bucket: &str, key: &str) -> Result<bool> {
-    if !marker_present(tier, bucket, key).await? {
-        return Ok(false);
-    }
-    tier.meta.delete(bucket, key).await?;
-    Ok(true)
+///
+/// The first write of the run, and the reason the survey before it can stay read-only.
+async fn take_clean_markers(tier: &Tiering, survey: &[Surveyed]) -> Result<()> {
+    let standing: Vec<(String, String)> = survey
+        .iter()
+        .flat_map(|surveyed| {
+            let clean = surveyed.accounted.then(meta::clean_marker_key);
+            let shadow = surveyed
+                .shadows_accounted
+                .then(meta::shadow_clean_marker_key);
+            clean
+                .into_iter()
+                .chain(shadow)
+                .map(|key| (surveyed.bucket.clone(), key))
+        })
+        .collect();
+
+    futures::stream::iter(standing)
+        .map(|(bucket, key)| async move { tier.meta.delete(&bucket, &key).await })
+        .buffer_unordered(RESOLVE_PROBES)
+        .try_collect()
+        .await
 }
 
 /// Spawn the actor and return its handle beside the task, which drains whatever is still queued —

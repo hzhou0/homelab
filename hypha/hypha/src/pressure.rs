@@ -48,9 +48,11 @@ impl Pressure {
         if !self.enabled {
             return;
         }
-        self.pending.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        }).ok();
+        self.pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .ok();
     }
 
     /// `DeleteBucket` (or a namespace reset) drained a `<meta>` projection whose markers never ran
@@ -141,7 +143,10 @@ mod tests {
         let p = gate(1, 0);
         p.raised();
         p.raised();
-        assert!(!p.admit(), "an over-threshold set must refuse the next write at once");
+        assert!(
+            !p.admit(),
+            "an over-threshold set must refuse the next write at once"
+        );
     }
 
     #[test]
