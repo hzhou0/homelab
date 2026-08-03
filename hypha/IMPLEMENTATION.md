@@ -230,6 +230,11 @@ Two cache markers select two distinct recovery passes:
 | namespace restore | missing sync marker | remote | add missing tombstones and twins |
 | pending-set rebuild | missing clean marker | cache namespace | recreate pending markers only |
 
+A cache projection that does not exist at all carries no marker either, so it selects the namespace
+restore by the same evidence — a brand-new cache pointed at a served remote is one restore per
+remote bucket, not a distinct bootstrap path. The restore provisions both projections before it
+rebuilds into them, which is the only step the two triggers do not share.
+
 Namespace restore is additive and idempotent. It never overwrites an entry that appeared while the
 pass was running. Pending-set rebuild performs a streaming cache/remote merge and authenticates the
 remote trailer of each intersecting live body to detect missing or stale remote generations.

@@ -666,16 +666,14 @@ impl BucketActor {
             return;
         }
         let tier = self.tier.clone();
+        let states = self.states.clone();
         let provisioned = bucket.clone();
         let task = self
             .provisions
             .spawn(async move {
-                async {
-                    ensure_cache_bucket(&tier.data, &provisioned).await?;
-                    ensure_cache_bucket(&tier.meta, &provisioned).await
-                }
-                .await
-                .map_err(|e| e.to_string())
+                provision_cache(&tier, &states, &provisioned)
+                    .await
+                    .map_err(|e| e.to_string())
             })
             .id();
         self.provisioning.insert(
@@ -1013,8 +1011,7 @@ impl BucketTask {
     /// Create both projections and memoize that they exist, so the data plane's `provision` fast
     /// path answers from the set instead of re-probing the backend.
     async fn provision(&self, bucket: &str) -> Result<()> {
-        ensure_cache_bucket(&self.tier.data, bucket).await?;
-        ensure_cache_bucket(&self.tier.meta, bucket).await?;
+        provision_cache(&self.tier, &self.states, bucket).await?;
         update(&self.states, bucket, |s| s.provisioned = true);
         Ok(())
     }
@@ -1041,17 +1038,43 @@ impl BucketTask {
     }
 }
 
-/// A concurrent creator racing us is tolerated: a failed create that nonetheless leaves the bucket
-/// present is success — the actor's own tasks and its provisioning tasks both land here.
-async fn ensure_cache_bucket(backend: &hypha_core::Backend, bucket: &str) -> Result<()> {
-    match backend.head_bucket(bucket).await {
-        Ok(()) => Ok(()),
-        Err(Error::NoSuchBucket) => match backend.create_bucket(bucket).await {
-            Ok(()) => Ok(()),
-            Err(create) => backend.head_bucket(bucket).await.map_err(|_| create),
-        },
-        Err(e) => Err(e),
+/// Only a bucket entitled to be missing a projection gets one created. `Restoring` and `Absent` are
+/// those two phases — a restore rebuilds into what this creates, a create is establishing the
+/// bucket.
+///
+/// A `Ready` bucket has both projections by definition: its namespace *is* the authority, and the
+/// survey read a sync marker out of `<meta>` to classify it that way. An absent one there is
+/// [`Invariant::CacheVolumeLost`], and creating it is worse than serving the loss — the pending-set
+/// rebuild is entitled to read cache absence as the client's own deletes ([`rebuild`]), so an empty
+/// `<data>` under a synced bucket makes it raise a delete marker for every key the remote still
+/// holds, and the sweep propagate them.
+async fn provision_cache(tier: &Tiering, states: &BucketStates, bucket: &str) -> Result<()> {
+    for (role, backend) in [("data", &tier.data), ("meta", &tier.meta)] {
+        match backend.head_bucket(bucket).await {
+            Ok(()) => continue,
+            Err(Error::NoSuchBucket) => {}
+            Err(e) => return Err(e),
+        }
+        if status(states, bucket) == BucketStatus::Ready {
+            tier.halt
+                .raise(Violation {
+                    invariant: Invariant::CacheVolumeLost,
+                    bucket: bucket.to_string(),
+                    key: None,
+                    detail: format!(
+                        "the <{role}> projection of a ready bucket is absent: the cache volume was \
+                         lost under a namespace hypha is serving as authoritative"
+                    ),
+                })
+                .await
+        }
+        // A concurrent creator racing us is tolerated: a failed create that nonetheless leaves the
+        // bucket present is success.
+        if let Err(create) = backend.create_bucket(bucket).await {
+            backend.head_bucket(bucket).await.map_err(|_| create)?;
+        }
     }
+    Ok(())
 }
 
 async fn drain_and_delete_if_exists(backend: &hypha_core::Backend, bucket: &str) -> Result<usize> {

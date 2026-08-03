@@ -1763,17 +1763,30 @@ async fn bursty_same_key_overwrites_converge_on_the_last_acked_generation() {
     let c = h.client();
     let key = "burst";
 
+    // Pinned because an unqualified PUT does not mean "no checksum": the SDK sends one anyway and
+    // picks the algorithm itself ("currently Crc32", as its own source puts it), hypha stores what
+    // the client sent, and that choice sizes the trailer `framed` below has to predict.
     let mut last = Vec::new();
     for i in 0..16u8 {
         let body = pattern_seeded(20_000 + i as usize * 97, i);
-        put(&c, B, key, &body).await;
+        c.put_object()
+            .bucket(B)
+            .key(key)
+            .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+            .body(bytes_body(&body))
+            .content_length(body.len() as i64)
+            .send()
+            .await
+            .expect("burst put");
         last = body;
     }
     // Every body has a distinct plaintext length and the framed size is a closed form of it , so
-    // the remote object's byte count names the generation without decrypting anything.
+    // the remote object's byte count names the generation without decrypting anything. Consecutive
+    // generations differ by 97 plaintext bytes, so a mismatch of a few bytes is a wrong *formula*
+    // rather than a stale generation.
     let framed =
         hypha_format::offset::ciphertext_len(last.len() as u64, hypha_format::offset::HLEN)
-            + hypha_format::single_trailer_len(None) as u64;
+            + hypha_format::single_trailer_len(Some(hypha_format::ChecksumAlgorithm::Crc32)) as u64;
 
     wait_until(
         15_000,

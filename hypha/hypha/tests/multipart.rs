@@ -1007,6 +1007,12 @@ async fn multipart_cache_wipe_restores_facts_and_part_geometry() {
         "the restored trailer table must retain the original part boundary"
     );
 
+    // The reads above are answered from the remote while the bucket restores, so none of them
+    // implies the pass has reached this key yet.
+    wait_until(30_000, "the restore materializes the key", || async {
+        raw_exists(&h, &h.cache_bucket(B), key).await
+    })
+    .await;
     let cached = h
         .raw()
         .head_object()

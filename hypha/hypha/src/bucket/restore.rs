@@ -5,7 +5,7 @@
 
 use futures::TryStreamExt as _;
 
-use hypha_core::error::{Error, Result};
+use hypha_core::error::Result;
 use hypha_core::meta;
 
 use crate::halt::{Invariant, Violation};
@@ -22,7 +22,7 @@ const PROBE_KEYS: i32 = 1000;
 /// The caller writes the sync marker once this returns — that write is the only "done" signal, so a
 /// pass that fails part-way simply re-runs.
 pub(super) async fn namespace(tier: &Tiering, bucket: &str) -> Result<()> {
-    probe_for_native_objects(tier, bucket).await?;
+    halt_on_leaked_plaintext(tier, bucket).await?;
 
     let mut token: Option<String> = None;
     loop {
@@ -52,25 +52,26 @@ pub(super) async fn namespace(tier: &Tiering, bucket: &str) -> Result<()> {
     }
 }
 
-/// Invariant **I1**, as a bounded probe: one `<data>` page up front rather than a full cache listing
-/// correlated against the remote for the whole pass.
+/// Halt if `<data>` holds a live plaintext body — [`Invariant::PlaintextDuringRestore`]. Every entry
+/// a restoring bucket's projection may legitimately hold is a tombstone, because writes run durable
+/// for the whole restore; a body means the mode gate leaked and a write was acked into the namespace
+/// this pass is about to declare authoritative without having reconciled it.
 ///
-/// **A bug detector, not a correctness gate.** The sample is decisive in the failure R1 exists for,
-/// where a lost volume leaves `<data>` empty, and merely a sample on a crash-resumed pass. Missing
-/// one costs nothing — the restore is additive, so it cannot overwrite the body, and the cached
-/// write that produced it owed a pending marker by the ordinary route. What the check buys is
-/// catching the leak *loudly*, near the code that caused it.
-async fn probe_for_native_objects(tier: &Tiering, bucket: &str) -> Result<()> {
-    let page = match tier
+/// **A bug detector, not a correctness gate**, which is why it samples one page instead of
+/// correlating the whole cache against the remote for the length of the pass. The sample is decisive
+/// in the failure a restore exists for — a lost volume leaves `<data>` empty, so anything in it was
+/// written by this run — and merely a sample on a crash-resumed pass. Missing one costs nothing: the
+/// restore is additive, so it cannot overwrite the body, and the write that produced it owed a
+/// pending marker by the ordinary route. What the check buys is catching the leak *loudly*, next to
+/// the code that caused it.
+async fn halt_on_leaked_plaintext(tier: &Tiering, bucket: &str) -> Result<()> {
+    // `NoSuchBucket` deliberately propagates rather than reading as an empty namespace: the recovery
+    // provisions before it restores, so a missing projection is this check's own premise failing —
+    // and swallowing it would skip the sample in the state that most warrants one.
+    let page = tier
         .data
         .list(bucket, None, None, None, None, Some(PROBE_KEYS))
-        .await
-    {
-        Ok(p) => p,
-        // Not provisioned yet: the emptiest a namespace gets.
-        Err(Error::NoSuchBucket) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+        .await?;
     for o in page.contents.unwrap_or_default() {
         let etag = o.e_tag.clone().unwrap_or_default();
         if meta::classify_entry(o.size.unwrap_or(0), etag.trim_matches('"')).is_some() {

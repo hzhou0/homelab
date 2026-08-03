@@ -112,10 +112,8 @@ async fn drop_sync_marker(h: &Harness) {
 
 /// Destroy both cache projections, buckets and all — a cache volume loss.
 ///
-/// The buckets go too, not just their objects, and that is what makes the tests below deterministic
-/// rather than racy: startup discovers buckets by listing `<meta>`, so a bucket with no `<meta>`
-/// projection owes no obligation at boot and its restore is triggered by the *first client request*
-/// — which is then guaranteed to be the one that observes the bucket restoring.
+/// The buckets go too, not just their objects: an absent projection and a projection with no sync
+/// marker are the same evidence to the survey, and the restore provisions what it finds missing.
 async fn destroy_cache(h: &Harness) {
     let raw = h.raw();
     for bucket in [h.cache_bucket(B), h.meta_bucket(B)] {
@@ -153,8 +151,18 @@ async fn open_restore_window(h: &mut Harness) {
     .buffer_unordered(16)
     .collect::<Vec<_>>()
     .await;
-    wait_until(30_000, "the seed reaches the remote", || async {
-        remote_present(h, &format!("seed-{:04}", WINDOW_KEYS - 1)).await
+    // Counted, not sampled at the lexicographically last key: a failed `reconcile_key` is retried on
+    // a *later* pass, so the last key can land while a scattered few are still owed and the tests
+    // below then list a namespace short of what they seeded.
+    //
+    // The budget covers the whole sweep (~40 s for `WINDOW_KEYS` in a debug build), not the tail of
+    // it — a cache that acks promptly leaves all of the sweep inside this wait, where a slower one
+    // overlaps most of it with the writes above.
+    wait_until(90_000, "the whole seed reaches the remote", || async {
+        raw_list(&h.raw_remote(), &h.remote_bucket(B), Some("seed-"))
+            .await
+            .len()
+            == WINDOW_KEYS
     })
     .await;
 
@@ -389,6 +397,79 @@ async fn restore_preserves_client_metadata_on_entries_it_finds() {
         head.storage_class().map(|s| s.as_str()),
         Some("STANDARD_IA")
     );
+}
+
+/// A cache with no projections *at all* — a fresh volume pointed at a remote that has been served
+/// before — is the same recovery as one whose sync marker died. The survey has no marker to read
+/// either way, so the pass it picks is the same one; the restore just creates the projections it
+/// finds missing before rebuilding into them.
+///
+/// Both modes, because the survey probes a durable deployment with the sync-marker HEAD alone: a
+/// backend that answered a missing *bucket* with anything but the key-level 404 would classify it as
+/// an unreadable cache rather than an untrusted one, and durable mode has no second probe to catch it.
+async fn brand_new_cache_restores_every_remote_bucket(mode: hypha_core::config::Mode) {
+    let other = "recov-second";
+    let mut h = Harness::with_mode(mode).await;
+    h.create_bucket(B).await;
+    h.create_bucket(other).await;
+    let c = h.client();
+
+    let body = pattern(4096);
+    put(&c, B, "alpha", &body).await;
+    put(&c, other, "beta", &body).await;
+    wait_until(15_000, "both keys reach the remote", || async {
+        remote_present(&h, "alpha").await && raw_exists(&h, &h.remote_bucket(other), "beta").await
+    })
+    .await;
+
+    h.stop_hypha().await;
+    for bucket in [
+        h.cache_bucket(B),
+        h.meta_bucket(B),
+        h.cache_bucket(other),
+        h.meta_bucket(other),
+        h.gc_bucket(),
+    ] {
+        drop_backend_bucket(&h, &bucket).await;
+    }
+    h.start_hypha().await;
+    h.await_ready().await;
+    let c = h.client();
+
+    assert_eq!(get_all(&c, B, "alpha").await, body);
+    assert_eq!(get_all(&c, other, "beta").await, body);
+
+    wait_until(30_000, "both namespaces to be restored", || async {
+        sync_marker_present(&h).await
+            && raw_exists(&h, &h.meta_bucket(other), &meta::sync_marker_key()).await
+    })
+    .await;
+
+    assert_eq!(h.bucket_status(B), hypha::BucketStatus::Ready);
+    assert_eq!(h.bucket_status(other), hypha::BucketStatus::Ready);
+    assert!(
+        data_class(&h, "alpha").await.is_some(),
+        "the restore must leave a tombstone at every remote key"
+    );
+    assert!(
+        h.raw()
+            .head_bucket()
+            .bucket(h.gc_bucket())
+            .send()
+            .await
+            .is_ok(),
+        "the recency ring's bucket is the GC actor's to recreate"
+    );
+}
+
+#[tokio::test]
+async fn a_brand_new_cache_restores_every_remote_bucket_cached() {
+    brand_new_cache_restores_every_remote_bucket(hypha_core::config::Mode::Cached).await;
+}
+
+#[tokio::test]
+async fn a_brand_new_cache_restores_every_remote_bucket_durable() {
+    brand_new_cache_restores_every_remote_bucket(hypha_core::config::Mode::Durable).await;
 }
 
 // ── R2: the pending-set rebuild touches markers and nothing else ──────────────────────────────
@@ -666,6 +747,67 @@ async fn a_marker_owed_to_a_live_bucket_whose_projection_vanished_halts() {
         recorded.contains("an owed marker's <meta> projection is gone"),
         "and it must be the marker queue's own detection, not the watchdog's: {recorded}"
     );
+}
+
+/// **I6 (`CacheVolumeLost`) from a third side** — `<data>`, rather than the sync marker or the
+/// marker queue.
+///
+/// A partial loss that leaves `<meta>` standing keeps the sync marker with it, so the survey calls
+/// the bucket synced and dispatches R2 rather than a restore. R2 is entitled to read cache absence
+/// as the client's own deletes, so provisioning the missing projection back — which is what every
+/// other phase's absence legitimately wants — would hand it an empty namespace and it would raise a
+/// delete marker for every key the remote still holds. The loss must halt at the provisioning step,
+/// before the pass that would launder it into client intent.
+#[tokio::test]
+async fn a_data_projection_vanishing_under_a_synced_bucket_halts() {
+    let mut h = Harness::cached_subprocess().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+    for i in 0..5 {
+        put(&c, B, &format!("k{i}"), &pattern(256)).await;
+    }
+    // Every one of them: the sweep orders nothing across keys, so the last put is not the last
+    // uploaded, and a key still owed at the kill would be legitimately absent from the remote below.
+    wait_until(15_000, "the keys reach the remote", || async {
+        for i in 0..5 {
+            if !remote_present(&h, &format!("k{i}")).await {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+
+    // Ungraceful, so no clean marker: the next run owes R2. `<meta>` — and the sync marker in it —
+    // survives, which is what makes this a *synced* bucket missing a projection.
+    h.kill_hypha().await;
+    drop_backend_bucket(&h, &h.cache_bucket(B)).await;
+    h.start_hypha_expecting_exit();
+
+    assert_halted(&mut h).await;
+    let recorded = get_all(
+        &h.raw_remote(),
+        &h.remote_bucket(B),
+        &meta::halt_marker_key(),
+    )
+    .await;
+    let recorded =
+        String::from_utf8(recorded).expect("the halt marker is plain text for an operator");
+    assert!(
+        recorded.contains("invariant: cache-volume-lost"),
+        "the recorded violation must name the invariant: {recorded}"
+    );
+    assert!(
+        recorded.contains("the <data> projection of a ready bucket is absent"),
+        "and it must name the projection that went: {recorded}"
+    );
+
+    for i in 0..5 {
+        assert!(
+            remote_present(&h, &format!("k{i}")).await,
+            "halting is only worth anything if it beats the deletes: k{i} is gone from the remote"
+        );
+    }
 }
 
 /// hypha's own keys live in the remote bucket alongside client objects (the halt marker), and

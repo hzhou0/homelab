@@ -36,9 +36,9 @@ pub(crate) enum Invariant {
     /// as committed, and the tombstone is the only remaining record that they existed.
     RemoteLostObject,
     /// A live bucket whose cache projection has gone out from under it — its sync marker missing,
-    /// or `<meta>` itself absent while the bucket map still holds the bucket. Nothing removes
-    /// either under a live bucket, and the run has been answering an absent key as the object's
-    /// absence ever since — answers it cannot identify, let alone take back.
+    /// or either projection itself absent while the bucket map still holds the bucket. Nothing
+    /// removes any of them under a live bucket, and the run has been answering an absent key as the
+    /// object's absence ever since — answers it cannot identify, let alone take back.
     CacheVolumeLost,
     /// A remote bucket hypha neither created nor resolved at startup. hypha owns both backends
     /// outright, so one that appears from nowhere means something else is writing the remote, and
