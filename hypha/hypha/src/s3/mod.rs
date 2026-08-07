@@ -13,7 +13,8 @@ mod put;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hypha_format::Envelope;
+use hypha_format::offset::{ciphertext_len, max_plaintext_within, HLEN};
+use hypha_format::{Envelope, MAX_SINGLE_TRAILER_LEN, MAX_TAIL_LEN};
 use s3s::dto::*;
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
@@ -96,9 +97,23 @@ impl Hypha {
     }
 }
 
-/// Plaintext cap for any single encrypted upload leg — a PutObject body or one part : the
-/// framed form (age envelope + footer) must never push past the remote's 5 GiB PUT/part cap.
-pub(crate) const MAX_INLINE_PLAINTEXT: u64 = 4 * 1024 * 1024 * 1024;
+/// The remote's per-PUT and per-part ceiling, which every framed upload leg must stay under.
+pub(crate) const REMOTE_UPLOAD_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Plaintext cap for a `PutObject` body: age envelope plus a single-object trailer.
+pub(crate) const MAX_PUT_PLAINTEXT: u64 =
+    max_plaintext_within(REMOTE_UPLOAD_LIMIT - MAX_SINGLE_TRAILER_LEN as u64, HLEN);
+
+/// Plaintext cap for one part. A part carries no trailer of its own, but a terminal part has no
+/// successor to hold the composite one and complete re-uploads it as `part ‖ trailer` — so every
+/// part reserves that room up front, where the client can still act on the rejection.
+pub(crate) const MAX_PART_PLAINTEXT: u64 =
+    max_plaintext_within(REMOTE_UPLOAD_LIMIT - MAX_TAIL_LEN as u64, HLEN);
+
+const _: () = assert!(
+    ciphertext_len(MAX_PUT_PLAINTEXT, HLEN) + MAX_SINGLE_TRAILER_LEN as u64 <= REMOTE_UPLOAD_LIMIT
+        && ciphertext_len(MAX_PART_PLAINTEXT, HLEN) + MAX_TAIL_LEN as u64 <= REMOTE_UPLOAD_LIMIT
+);
 
 /// Unix-ms mtime (twin / tombstone metadata) → an S3 `LastModified`.
 pub(crate) fn ts_ms(ms: i64) -> Timestamp {

@@ -1,0 +1,11 @@
+# Keep the build context (and cache invalidation) limited to Rust sources.
+target/
+chart/
+scripts/
+.idea/
+.claude/
+*.md
+.git/
+Dockerfile
+.dockerignore
+.gitignore

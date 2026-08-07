@@ -1,0 +1,117 @@
+name: hypha
+
+# Checks and tests over the Rust workspace, then the container image to GHCR.
+# Scoped to the hypha subtree in this monorepo.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hypha/**"
+      - ".github/workflows/hypha.yml"
+
+concurrency:
+  group: hypha-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hypha
+  # Same toolchain the image builds with, so a lint can't pass here and fail there (or vice versa).
+  RUST_VERSION: "1.96"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hypha
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hypha
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # --all-targets so the integration suites are type-checked too.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Install MinIO
+        run: |
+          curl --fail --silent --show-error --location \
+            https://dl.min.io/server/minio/release/linux-amd64/minio \
+            --output "$RUNNER_TEMP/minio"
+          chmod +x "$RUNNER_TEMP/minio"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Test
+        # The cached and chaos targets intentionally exercise long convergence and fault storms;
+        # load is ignored by default and remains an explicit opt-in benchmark.
+        run: |
+          cargo test --workspace --lib --bins
+          cargo test -p hypha-format --test roundtrip
+          cargo test -p hypha \
+            --test admin \
+            --test backend \
+            --test bracket \
+            --test checksum \
+            --test conformance \
+            --test copy \
+            --test evict \
+            --test exhaustion \
+            --test fuzz \
+            --test gc \
+            --test multipart \
+            --test recovery \
+            --test shadow \
+            --test tracing
+
+  build:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: hypha
+          file: hypha/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=hypha
+          cache-to: type=gha,mode=max,scope=hypha

@@ -19,7 +19,7 @@ pub const PAYLOAD_NONCE: u64 = 16;
 /// test in `envelope.rs`; a future age that changes it trips that test ⇒ bump the trailer version.
 pub const HLEN: u64 = 149;
 
-pub fn chunk_count(plaintext_len: u64) -> u64 {
+pub const fn chunk_count(plaintext_len: u64) -> u64 {
     if plaintext_len == 0 {
         1 // empty plaintext is one empty (tag-only) chunk, per spec
     } else {
@@ -27,8 +27,19 @@ pub fn chunk_count(plaintext_len: u64) -> u64 {
     }
 }
 
-pub fn ciphertext_len(plaintext_len: u64, header_len: u64) -> u64 {
+pub const fn ciphertext_len(plaintext_len: u64, header_len: u64) -> u64 {
     header_len + PAYLOAD_NONCE + plaintext_len + chunk_count(plaintext_len) * TAG
+}
+
+/// Inverts [`ciphertext_len`] over an *inequality*, unlike [`plaintext_len_from`]: tag granularity
+/// leaves most budgets unachievable exactly, so the result is the largest plaintext that fits.
+pub const fn max_plaintext_within(ciphertext_budget: u64, header_len: u64) -> u64 {
+    let payload = match ciphertext_budget.checked_sub(header_len + PAYLOAD_NONCE) {
+        Some(n) => n,
+        None => return 0,
+    };
+    // A trailing partial chunk still costs a whole tag, so a remainder under TAG buys no plaintext.
+    payload / CHUNK_CIPHERTEXT * CHUNK_PLAINTEXT + (payload % CHUNK_CIPHERTEXT).saturating_sub(TAG)
 }
 
 pub fn chunk_of(offset: u64) -> u64 {
@@ -103,6 +114,25 @@ mod tests {
             None
         );
         assert_eq!(plaintext_len_from(h, h), None);
+    }
+
+    #[test]
+    fn max_plaintext_is_the_largest_that_fits() {
+        let h = HLEN;
+        for budget in [
+            // one empty chunk, the smallest satisfiable budget
+            h + PAYLOAD_NONCE + TAG,
+            h + PAYLOAD_NONCE + TAG + 1,
+            h + PAYLOAD_NONCE + CHUNK_CIPHERTEXT,
+            h + PAYLOAD_NONCE + CHUNK_CIPHERTEXT + TAG - 1,
+        ] {
+            let plen = max_plaintext_within(budget, h);
+            assert!(ciphertext_len(plen, h) <= budget, "{budget} overshoots");
+            assert!(ciphertext_len(plen + 1, h) > budget, "{budget} undershoots");
+        }
+        // A budget too small for even an empty envelope saturates rather than underflowing.
+        assert_eq!(max_plaintext_within(0, h), 0);
+        assert_eq!(max_plaintext_within(h + PAYLOAD_NONCE, h), 0);
     }
 
     #[test]

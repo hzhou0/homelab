@@ -29,7 +29,7 @@ pub const VERSION_LEN: usize = 2;
 
 /// Max client parts in a composite — S3's full part range. The trailer costs a client no part
 /// number: it rides its own part above the highest client part where one is free, and folds into
-/// that part where none is (IMPLEMENTATION).
+/// that part where none is.
 pub const MAX_PARTS: usize = 10_000;
 /// One parts-table entry: a little-endian `u64` cumulative ciphertext end-offset.
 pub const PART_ENTRY_LEN: usize = 8;

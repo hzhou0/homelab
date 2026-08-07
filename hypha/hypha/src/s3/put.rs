@@ -15,9 +15,7 @@ use hypha_core::meta;
 
 use super::checksum;
 use super::overlay::WriteMode;
-use super::{
-    parse_content_md5, resolve_storage_class, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
-};
+use super::{parse_content_md5, resolve_storage_class, write_metadata, Hypha, MAX_PUT_PLAINTEXT};
 use crate::codec::{self, SingleTrailer};
 use crate::gc::Plaintext;
 use crate::tier;
@@ -363,10 +361,10 @@ fn require_inline_body(input: &mut PutObjectInput) -> S3Result<(u64, StreamingBl
         .filter(|&n| n >= 0)
         .ok_or_else(|| Error::Invalid("PutObject requires Content-Length".into()))?
         as u64;
-    if plen > MAX_INLINE_PLAINTEXT {
+    if plen > MAX_PUT_PLAINTEXT {
         return Err(s3_error!(
             EntityTooLarge,
-            "PutObject bodies over 4 GiB must use multipart upload"
+            "PutObject bodies over {MAX_PUT_PLAINTEXT} bytes must use multipart upload"
         ));
     }
     let body = input

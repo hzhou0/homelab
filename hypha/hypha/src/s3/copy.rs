@@ -29,12 +29,12 @@ use crate::codec::{self, SingleTrailer};
 use crate::gc::Plaintext;
 use crate::tier::{self, RemoteFacts};
 
-/// Ciphertext bytes per server-side copy part: the backend's 5 GiB part cap. A composite body can
-/// exceed one part, so `[0, body_ct_len)` is split into chunks this size, balanced so every copy
-/// part clears the 5 MiB minimum — each copy part is non-final (the trailer is the sole final part),
-/// so none may fall below it. Even a maximal object (10 000 × 4 GiB parts ≈ 40 TiB) needs well under
-/// 9 000 copy parts, leaving room for the trailer part under S3's 10 000-part ceiling.
-const COPY_PART_CT: u64 = 5 * 1024 * 1024 * 1024;
+/// Ciphertext bytes per server-side copy part. A framed body can exceed one part, so
+/// `[0, body_ct_len)` is split into chunks this size, balanced so every copy part clears the 5 MiB
+/// minimum — each is non-final (the trailer is the sole final part), so none may fall below it.
+/// `MAX_COPY_PLAINTEXT` holds the split to two parts, so the 10 000-part ceiling never binds.
+const COPY_PART_CT: u64 = super::REMOTE_UPLOAD_LIMIT;
+/// S3's `CopyObject` ceiling; a larger source is the client's to copy part by part.
 const MAX_COPY_PLAINTEXT: u64 = 5 * 1024 * 1024 * 1024;
 
 pub(super) struct ResolvedCopySource {

@@ -17,7 +17,7 @@ use hypha_format::{encode_trailer, Footer, FooterKind, StoredChecksum};
 
 use super::checksum;
 use super::{
-    parse_content_md5, resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_INLINE_PLAINTEXT,
+    parse_content_md5, resolve_storage_class, ts_ms, write_metadata, Hypha, MAX_PART_PLAINTEXT,
 };
 use crate::codec;
 use crate::gc::Plaintext;
@@ -168,10 +168,10 @@ impl Hypha {
             .filter(|&n| n >= 0)
             .ok_or_else(|| Error::Invalid("UploadPart requires Content-Length".into()))?
             as u64;
-        if plen > MAX_INLINE_PLAINTEXT {
+        if plen > MAX_PART_PLAINTEXT {
             return Err(s3_error!(
                 EntityTooLarge,
-                "parts are capped at {MAX_INLINE_PLAINTEXT} bytes"
+                "parts are capped at {MAX_PART_PLAINTEXT} bytes"
             ));
         }
         let expect_md5 = input
@@ -546,10 +546,10 @@ impl Hypha {
             Some(r) => parse_copy_source_range(r, facts.plen)?,
         };
         let part_plen = pt.end - pt.start;
-        if part_plen > MAX_INLINE_PLAINTEXT {
+        if part_plen > MAX_PART_PLAINTEXT {
             return Err(s3_error!(
                 EntityTooLarge,
-                "parts are capped at {MAX_INLINE_PLAINTEXT} bytes"
+                "parts are capped at {MAX_PART_PLAINTEXT} bytes"
             ));
         }
         let whole = pt == (0..facts.plen);
