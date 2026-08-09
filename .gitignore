@@ -4,3 +4,4 @@ kube-node/.aports
 agents/operator/*.kubeconfig
 **.tgz
 opnsense-operator/bin
+migration

@@ -6,13 +6,13 @@ description: >-
   that running install (the existing `cilium` Helm release in kube-system) with its values
   unchanged, then layers on the Cilium service mesh: Gateway API + the L7/Envoy proxy.
   On top it ships a single ingress Gateway bound to *.internal.haustorium.net, whose backing
-  cilium-gateway-<name> LoadBalancer (a MetalLB IP) the opnsense-operator turns into a wildcard
+  cilium-gateway-<name> LoadBalancer (an LB IPAM IP) the opnsense-operator turns into a wildcard
   Unbound DNS record. A wildcard TLS cert is issued by cert-manager (see the cert-manager chart).
-  Like metallb, this is foundational networking installed by a human (cluster-admin), not the
-  autonomous operator, and lives in kube-system rather than an app-*/tool-* namespace.
+  This is foundational networking installed by a human (cluster-admin), not the autonomous
+  operator, and lives in kube-system rather than an app-*/tool-* namespace.
 type: application
-version: 0.1.0
-appVersion: "1.19.3"
+version: 0.2.0
+appVersion: "1.19.6"
 keywords:
   - cilium
   - cni
@@ -20,10 +20,10 @@ keywords:
   - gateway-api
   - homelab
 dependencies:
-  # Pinned to the version of Cilium ALREADY RUNNING on the cluster (verify with
-  # `kubectl -n kube-system get ds cilium -o jsonpath='{...image}'` /
-  # `helm -n kube-system list`). Keeping it in lockstep makes adoption a no-op.
+  # 1.19.6 is the floor for IPv6 LB announcement: earlier 1.19 patches never join the
+  # solicited-node multicast group for LB addresses, so NDP for the v6 pool goes unanswered
+  # (cilium#46332). Do not pin below it while any Service requests an IPv6 family.
   - name: cilium
-    version: "1.19.3"
+    version: "1.19.6"
     repository: https://helm.cilium.io
     condition: cilium.enabled

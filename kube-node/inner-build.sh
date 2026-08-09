@@ -20,6 +20,12 @@ auto lo
 iface lo inet loopback
 EOF
 
+mkdir -p "$OVERLAY/etc/sysctl.d"
+cat > "$OVERLAY/etc/sysctl.d/90-ipv6-ra.conf" <<'EOF'
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2
+EOF
+
 rc_add() {
   mkdir -p "$OVERLAY/etc/runlevels/$2"
   ln -sf /etc/init.d/"$1" "$OVERLAY/etc/runlevels/$2/$1"
