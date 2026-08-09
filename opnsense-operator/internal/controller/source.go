@@ -2,6 +2,8 @@ package controller
 
 import (
 	"fmt"
+	"net/netip"
+	"sort"
 	"strings"
 
 	"github.com/hzhou0/homelab/opnsense-operator/internal/config"
@@ -27,11 +29,11 @@ const (
 type DesiredExposure struct {
 	Hosts       []opnsense.HostOverride
 	PortForward *opnsense.PortForward
-}
-
-// Empty reports whether the object asks for nothing (no DNS, no port-forward).
-func (d DesiredExposure) Empty() bool {
-	return len(d.Hosts) == 0 && d.PortForward == nil
+	PassRules   []opnsense.PassRule
+	// HasIntent distinguishes "nothing was asked for" from "something was asked
+	// for but no address has been assigned yet"; the latter must wait rather
+	// than tear down.
+	HasIntent bool
 }
 
 // Summary is a compact, human-readable description of what was wired up, written
@@ -41,13 +43,22 @@ func (d DesiredExposure) Summary() string {
 	if len(d.Hosts) > 0 {
 		names := make([]string, 0, len(d.Hosts))
 		for _, h := range d.Hosts {
-			names = append(names, h.FQDN())
+			names = append(names, fmt.Sprintf("%s(%s)", h.FQDN(), h.RecordType))
 		}
+		sort.Strings(names)
 		parts = append(parts, "dns="+strings.Join(names, ","))
 	}
 	if d.PortForward != nil {
 		p := d.PortForward
 		parts = append(parts, fmt.Sprintf("wan=%s/%s->%s:%s", p.Protocol, p.ExternalPort, p.TargetIP, p.LocalPort))
+	}
+	if len(d.PassRules) > 0 {
+		dests := make([]string, 0, len(d.PassRules))
+		for _, p := range d.PassRules {
+			dests = append(dests, fmt.Sprintf("%s/%s->[%s]", p.Protocol, p.Port, p.Destination))
+		}
+		sort.Strings(dests)
+		parts = append(parts, "wan6="+strings.Join(dests, ","))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -59,7 +70,7 @@ func (d DesiredExposure) Summary() string {
 // Service or a Gateway.
 type ExposureInput struct {
 	Annotations map[string]string
-	IP          string // resolved LoadBalancer IP
+	Addresses   []string
 	// DefaultPort and DefaultProtocol come from the object's port/listener and
 	// are used when the corresponding annotations are absent.
 	DefaultPort     string
@@ -71,8 +82,13 @@ type ExposureInput struct {
 // malformed input so the caller can surface it as an Event/condition.
 func ParseExposure(in ExposureInput, cfg *config.Config) (DesiredExposure, error) {
 	var d DesiredExposure
+	addresses, err := parseAddresses(in.Addresses)
+	if err != nil {
+		return d, err
+	}
 
 	for _, name := range splitList(in.Annotations[AnnHostname]) {
+		d.HasIntent = true
 		host, domain, err := splitFQDN(name)
 		if err != nil {
 			return d, err
@@ -80,10 +96,18 @@ func ParseExposure(in ExposureInput, cfg *config.Config) (DesiredExposure, error
 		if !cfg.DomainAllowed(name) {
 			return d, fmt.Errorf("hostname %q is outside managed domains %v", name, cfg.ManagedDomains)
 		}
-		d.Hosts = append(d.Hosts, opnsense.HostOverride{Host: host, Domain: domain, Address: in.IP})
+		for _, address := range addresses {
+			d.Hosts = append(d.Hosts, opnsense.HostOverride{
+				Host:       host,
+				Domain:     domain,
+				Address:    address.addr.String(),
+				RecordType: address.recordType,
+			})
+		}
 	}
 
 	if isTrue(in.Annotations[AnnExpose]) {
+		d.HasIntent = true
 		proto := strings.ToLower(strings.TrimSpace(in.Annotations[AnnProtocol]))
 		if proto == "" {
 			proto = in.DefaultProtocol
@@ -98,16 +122,75 @@ func ParseExposure(in ExposureInput, cfg *config.Config) (DesiredExposure, error
 			return d, fmt.Errorf("%s set but no port available (annotate %s/%s)", AnnExpose, AnnExternalPort, AnnInternalPort)
 		}
 
-		d.PortForward = &opnsense.PortForward{
-			Interface:    cfg.WANInterface,
-			Protocol:     proto,
-			ExternalPort: extPort,
-			TargetIP:     in.IP,
-			LocalPort:    localPort,
+		// Only translation can remap a port, and IPv6 is passed through
+		// untranslated. Refusing the whole object beats wiring up IPv4 and
+		// leaving IPv6 admitted on a port nothing listens on.
+		if extPort != localPort && hasIPv6(addresses) {
+			return d, fmt.Errorf("%s %s differs from %s %s, which cannot be honoured for an IPv6 address: IPv6 is not translated",
+				AnnExternalPort, extPort, AnnInternalPort, localPort)
+		}
+
+		// IPv4 is reached by translating the WAN address; IPv6 is globally
+		// routable, so it only needs the WAN's default-deny lifted.
+		for _, address := range addresses {
+			if !address.addr.Is4() {
+				d.PassRules = append(d.PassRules, opnsense.PassRule{
+					Interface:   cfg.WANInterface,
+					Protocol:    proto,
+					Destination: address.addr.String(),
+					Port:        extPort,
+				})
+				continue
+			}
+			if d.PortForward == nil {
+				d.PortForward = &opnsense.PortForward{
+					Interface:    cfg.WANInterface,
+					Protocol:     proto,
+					ExternalPort: extPort,
+					TargetIP:     address.addr.String(),
+					LocalPort:    localPort,
+				}
+			}
 		}
 	}
 
 	return d, nil
+}
+
+type parsedAddress struct {
+	addr       netip.Addr
+	recordType string
+}
+
+func hasIPv6(addresses []parsedAddress) bool {
+	for _, address := range addresses {
+		if !address.addr.Is4() {
+			return true
+		}
+	}
+	return false
+}
+
+func parseAddresses(values []string) ([]parsedAddress, error) {
+	addresses := make([]parsedAddress, 0, len(values))
+	seen := make(map[netip.Addr]struct{}, len(values))
+	for _, value := range values {
+		addr, err := netip.ParseAddr(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("invalid LoadBalancer IP %q: %w", value, err)
+		}
+		addr = addr.Unmap()
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+		recordType := "AAAA"
+		if addr.Is4() {
+			recordType = "A"
+		}
+		addresses = append(addresses, parsedAddress{addr: addr, recordType: recordType})
+	}
+	return addresses, nil
 }
 
 // splitFQDN splits a DNS name into its first label and the remaining domain.

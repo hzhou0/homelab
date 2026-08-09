@@ -44,25 +44,22 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	owner := opnsense.Owner{Kind: "Gateway", Namespace: gw.Namespace, Name: gw.Name}
 
-	ip := r.backingServiceIP(ctx, &gw)
 	in := ExposureInput{
 		Annotations:     gw.Annotations,
-		IP:              ip,
+		Addresses:       r.backingServiceAddresses(ctx, &gw),
 		DefaultPort:     firstListenerPort(&gw),
 		DefaultProtocol: "tcp",
 	}
 	return handle(ctx, r.Client, r.Recorder, r.Cfg, r.OPN, &gw, owner, in)
 }
 
-// backingServiceIP looks up the Cilium-provisioned Service for the Gateway and
-// returns its LoadBalancer IP, or "" if not found / not assigned.
-func (r *GatewayReconciler) backingServiceIP(ctx context.Context, gw *gatewayv1.Gateway) string {
+func (r *GatewayReconciler) backingServiceAddresses(ctx context.Context, gw *gatewayv1.Gateway) []string {
 	var svc corev1.Service
 	key := types.NamespacedName{Namespace: gw.Namespace, Name: ciliumGatewayPrefix + gw.Name}
 	if err := r.Get(ctx, key, &svc); err != nil {
-		return ""
+		return nil
 	}
-	return loadBalancerIP(&svc)
+	return loadBalancerAddresses(&svc)
 }
 
 // SetupWithManager wires the controller in and maps backing-Service events back

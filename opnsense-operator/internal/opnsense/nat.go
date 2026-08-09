@@ -3,6 +3,7 @@ package opnsense
 import (
 	"context"
 	"fmt"
+	"net/netip"
 
 	"github.com/hzhou0/opnsense-sdk/go-sdk/generated"
 )
@@ -69,6 +70,17 @@ func (c *Client) syncPortForward(ctx context.Context, owner Owner, desired *Port
 		return changed, fmt.Errorf("opnsense: add dnat rule: %w", err)
 	}
 	return true, nil
+}
+
+func validatePortForward(pf *PortForward) error {
+	if pf == nil {
+		return nil
+	}
+	target, err := netip.ParseAddr(pf.TargetIP)
+	if err != nil || !target.Unmap().Is4() {
+		return fmt.Errorf("opnsense: DNAT target %q is not IPv4", pf.TargetIP)
+	}
+	return nil
 }
 
 func addNATBody(p PortForward, desc string) generated.FirewallDNatControllerAddRuleActionJSONRequestBody {

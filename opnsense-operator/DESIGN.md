@@ -7,8 +7,9 @@ TCP enters through one Cilium Gateway behind a single LoadBalancer IP, and UDP s
 their own LoadBalancer IP. LoadBalancer IPs are assigned and L2-announced by Cilium (LB IPAM +
 L2 announcements; MetalLB was removed). Two things must be wired into the OPNsense firewall for
 each exposed service: an **internal DNS** record in Unbound (wildcard for the Gateway, or a
-specific name) pointing at the LB IP, and a **WAN port-forward (DNAT)** so the service is
-reachable from the internet. Today both are manual.
+specific name) pointing at the LB IP, and inbound WAN access — a **port-forward (DNAT)** for the
+RFC1918 IPv4 address, or a **pass rule** for a globally routable IPv6 address, which is routed
+directly and needs only the WAN's default-deny lifted. Today all of it is manual.
 
 This controller automates both, external-dns style: it watches LoadBalancer `Service`s and
 Gateway-API `Gateway`s, reads `homelab.lab/*` annotations, and reconciles Unbound host
@@ -29,6 +30,13 @@ Surface used:
   Apply with `UnboundServiceControllerReconfigureAction(ctx)`.
   Add/Set body = `{ host: { Enabled, Hostname*, Domain, Rr (A/AAAA), Server* (the IP),
   Description* } }`. Wildcard = `Hostname:"*"`, `Domain:"lab"`.
+- Firewall filter (WAN pass): `FirewallFilterControllerAdd/Set/Del/Search/RuleAction`.
+  Apply with `FirewallFilterControllerApplyAction(ctx, rollbackRevision)` (pass `""`).
+  Add/Set body = `{ rule: { Action ("pass"), Direction ("in"), Ipprotocol ("inet6"),
+  Protocol (upper case, unlike DNAT), Interface, SourceNet, DestinationNet, DestinationPort,
+  Description, Enabled, Quick, Sequence, ... } }`. Rules land in the automation ruleset, which is
+  evaluated ahead of the hand-maintained per-interface rules. Most of the model's booleans are
+  required and non-omitempty, so every one must be sent explicitly.
 - Firewall DNAT (port-forward): `FirewallDNatControllerAdd/Set/Del/Get/Search/ToggleRuleAction`.
   Apply with `FirewallDNatControllerApplyAction(ctx, rollbackRevision)` (pass `""`).
   Add/Set body = `{ rule: { Interface ("wan"), Protocol (tcp/udp), Port (external),
@@ -56,7 +64,8 @@ opnsense-operator/
       client.go              wraps *generated.Client: typed Search/Add/Set/Del + decode + apply
       dns.go                 host-override CRUD
       nat.go                 port-forward CRUD
-      model.go               HostOverride, PortForward, owner tag helpers
+      filter.go              WAN pass-rule CRUD
+      model.go               HostOverride, PortForward, PassRule, owner tag helpers
     config/config.go         env-driven config
   chart/                     Helm chart
   Dockerfile / Makefile
@@ -72,25 +81,32 @@ On a `Service` (type=LoadBalancer) or `Gateway`:
 
 - `homelab.lab/hostname` — comma-separated DNS names (wildcard allowed, e.g. `*.lab`) mapped to
   the object's LB IP. Split into host/domain on the first dot; `*` → wildcard host.
-- `homelab.lab/expose` = `"true"` — create a WAN DNAT port-forward to the object's IP.
+- `homelab.lab/expose` = `"true"` — admit WAN traffic to the object. IPv4 gets a DNAT
+  port-forward; IPv6 gets a WAN pass rule, since a globally routable address needs no translation.
 - `homelab.lab/external-port` — external WAN port (default: the service/listener port).
 - `homelab.lab/protocol` — `tcp`|`udp` (default: service port protocol; Gateways = tcp).
-- `homelab.lab/internal-port` — forwarded-to port (default: the service port).
+- `homelab.lab/internal-port` — forwarded-to port (default: the service port). IPv4 only: an IPv6
+  pass rule admits the external port untranslated, so a remap is rejected outright on an object
+  that has an IPv6 address. `FirewallDNatController` does accept `ipprotocol: inet6`, so this is a
+  deliberate choice not to NAT IPv6, not a limit of the API — revisit if a service ever needs it.
 
 A controller-wide **managed-domains** filter rejects hostnames outside the managed zones.
 
 ## Reconcile algorithm
 
-1. **Resolve IP.** Service → `.status.loadBalancer.ingress[0].ip`. Gateway → backing Cilium LB
-   Service (`cilium-gateway-<name>`), read its LB IP. No IP yet → requeue.
-2. **Desired state** from annotations → `DesiredExposure{ Hostnames, IP, PortForward }`.
+1. **Resolve IPs.** Service → every `.status.loadBalancer.ingress[].ip`. Gateway → backing Cilium
+   LB Service (`cilium-gateway-<name>`), read all its LB IPs. No IP yet → requeue.
+2. **Desired state** from annotations → `DesiredExposure{ Hosts, PortForward, PassRules }`.
 3. **Ownership tag.** Each OPNsense object carries
    `Description = "k8s:opnsense-operator:<kind>/<ns>/<name>[ ...]"`. Only rows matching our
    prefix + this owner are read/modified/deleted.
-4. **Diff.** Search overrides + DNAT rules, filter to owner, compute add/update/delete vs.
-   desired, apply via Add/Set(uuid)/Del.
-5. **Apply once** per reconcile (only if changed): `FirewallDNatControllerApplyAction` and/or
-   `UnboundServiceControllerReconfigureAction`, under a process-global mutex.
+4. **Diff.** Search overrides + DNAT rules + filter rules, narrow to owner, compute
+   add/update/delete vs. desired, apply via Add/Set(uuid)/Del. Each hostname gets A/AAAA rows for
+   all assigned addresses. Exposure splits by family: one DNAT rule for the first IPv4 address,
+   one pass rule per IPv6 address.
+5. **Apply once** per reconcile, per subsystem that changed: `UnboundServiceControllerReconfigureAction`,
+   `FirewallDNatControllerApplyAction`, `FirewallFilterControllerApplyAction`, under a
+   process-global mutex.
 6. **Finalizer** `homelab.lab/opnsense-operator`: on delete, remove all owned OPNsense objects,
    apply, then drop the finalizer.
 7. **Status.** Do not touch `Service.status.loadBalancer` (the LB controller — Cilium LB IPAM — owns it). Record results via
@@ -125,6 +141,8 @@ listed in the platform image allowlist for a complete catalogue.
 
 - Exact JSON field names for Search **rows** / Add **uuid** (decode against a live response).
 - DNAT `Pass`/`associated-rule-id`: confirm one Add creates both NAT + companion pass rule.
+- Automation-ruleset evaluation order vs. the WAN interface's own rules, and whether `Quick` on the
+  operator's IPv6 pass rules has the intended effect against a live config.
 - Gateway→backing-Service resolution naming on the installed Cilium version.
 - Whether `rollbackRevision`/savepoint is needed, or empty-string apply suffices for a
   single-writer controller.

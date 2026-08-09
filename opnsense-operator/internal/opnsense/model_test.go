@@ -5,7 +5,7 @@ import "testing"
 func TestDescribesOwner(t *testing.T) {
 	owner := Owner{Kind: "Service", Namespace: "app-grafana", Name: "grafana"}
 	other := Owner{Kind: "Service", Namespace: "app-grafana", Name: "grafana2"}
-	desc := dnsDescription(owner, HostOverride{Host: "grafana", Domain: "lab", Address: "10.0.0.100"})
+	desc := dnsDescription(owner, HostOverride{Host: "grafana", Domain: "lab", Address: "10.0.0.100", RecordType: "A"})
 
 	if !describesOwner(desc, owner) {
 		t.Fatalf("expected %q to be owned by %s", desc, owner.Tag())
@@ -19,11 +19,12 @@ func TestDescribesOwner(t *testing.T) {
 	}
 }
 
-func TestHostFromDescription(t *testing.T) {
+func TestHostOverrideKeyFromDescription(t *testing.T) {
 	owner := Owner{Kind: "Gateway", Namespace: "infra", Name: "gw"}
-	desc := dnsDescription(owner, HostOverride{Host: "*", Domain: "lab", Address: "10.0.0.100"})
-	if got := hostFromDescription(desc); got != "*.lab" {
-		t.Fatalf("hostFromDescription = %q, want %q", got, "*.lab")
+	host := HostOverride{Host: "*", Domain: "lab", Address: "2001:db8::100", RecordType: "AAAA"}
+	desc := dnsDescription(owner, host)
+	if got, want := hostOverrideKeyFromDescription(desc), hostOverrideKey(host); got != want {
+		t.Fatalf("hostOverrideKeyFromDescription = %q, want %q", got, want)
 	}
 }
 

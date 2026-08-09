@@ -1,7 +1,8 @@
 // Package opnsense wraps the generated OPNsense SDK client with a small, typed
-// surface tailored to this operator: managed DNS host overrides and WAN
-// port-forward (DNAT) rules, plus the find-by-description ownership model and
-// the batched apply/reconfigure steps OPNsense requires after mutations.
+// surface tailored to this operator: managed DNS host overrides, WAN
+// port-forward (DNAT) rules and WAN pass rules, plus the find-by-description
+// ownership model and the batched apply/reconfigure steps OPNsense requires
+// after mutations.
 //
 // The generated client returns raw *http.Response values (only request bodies
 // are typed), so this package centralises status checking and JSON decoding.
@@ -54,10 +55,17 @@ func New(cfg *config.Config) (*Client, error) {
 	return &Client{gen: gen, wan: cfg.WANInterface}, nil
 }
 
-// Sync converges OPNsense to the desired DNS overrides and (optional)
-// port-forward for a single owner, then applies the relevant subsystems. It is
+// Sync converges OPNsense to the desired DNS overrides, port-forward and WAN
+// pass rules for a single owner, then applies the relevant subsystems. It is
 // safe for concurrent callers.
-func (c *Client) Sync(ctx context.Context, owner Owner, dns []HostOverride, pf *PortForward) error {
+func (c *Client) Sync(ctx context.Context, owner Owner, dns []HostOverride, pf *PortForward, pass []PassRule) error {
+	if err := validatePortForward(pf); err != nil {
+		return err
+	}
+	if err := validatePassRules(pass); err != nil {
+		return err
+	}
+
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
 
@@ -69,7 +77,11 @@ func (c *Client) Sync(ctx context.Context, owner Owner, dns []HostOverride, pf *
 	if err != nil {
 		return err
 	}
-	return c.apply(ctx, dnsChanged, natChanged)
+	filterChanged, err := c.syncPassRules(ctx, owner, pass)
+	if err != nil {
+		return err
+	}
+	return c.apply(ctx, dnsChanged, natChanged, filterChanged)
 }
 
 // Delete removes every OPNsense object owned by the given Kubernetes object and
@@ -86,10 +98,14 @@ func (c *Client) Delete(ctx context.Context, owner Owner) error {
 	if err != nil {
 		return err
 	}
-	return c.apply(ctx, dnsChanged, natChanged)
+	filterChanged, err := c.syncPassRules(ctx, owner, nil)
+	if err != nil {
+		return err
+	}
+	return c.apply(ctx, dnsChanged, natChanged, filterChanged)
 }
 
-func (c *Client) apply(ctx context.Context, dnsChanged, natChanged bool) error {
+func (c *Client) apply(ctx context.Context, dnsChanged, natChanged, filterChanged bool) error {
 	if dnsChanged {
 		if err := c.decodeVoid(c.gen.UnboundServiceControllerReconfigureAction(ctx)); err != nil {
 			return fmt.Errorf("opnsense: reconfigure unbound: %w", err)
@@ -98,6 +114,11 @@ func (c *Client) apply(ctx context.Context, dnsChanged, natChanged bool) error {
 	if natChanged {
 		if err := c.decodeVoid(c.gen.FirewallDNatControllerApplyAction(ctx, "")); err != nil {
 			return fmt.Errorf("opnsense: apply dnat: %w", err)
+		}
+	}
+	if filterChanged {
+		if err := c.decodeVoid(c.gen.FirewallFilterControllerApplyAction(ctx, "")); err != nil {
+			return fmt.Errorf("opnsense: apply filter: %w", err)
 		}
 	}
 	return nil

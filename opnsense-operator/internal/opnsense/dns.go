@@ -12,33 +12,33 @@ import (
 // knows whether an Unbound reconfigure is needed). Passing a nil/empty desired
 // set deletes all of the owner's overrides.
 //
-// Matching is done entirely through the operator-authored description: existing
-// rows are keyed by their "host=" token, and a row is left untouched only when
-// its full description already equals the desired one (every mutable field is
-// encoded there).
+// Matching is done entirely through the operator-authored description. Hostname
+// and address form the identity so A and AAAA rows can coexist; the full
+// description remains the drift detector.
 func (c *Client) syncHostOverrides(ctx context.Context, owner Owner, desired []HostOverride) (bool, error) {
 	rows, err := c.decodeSearch(c.gen.UnboundSettingsControllerSearchHostOverrideAction(ctx))
 	if err != nil {
 		return false, fmt.Errorf("opnsense: search host overrides: %w", err)
 	}
 
-	// Existing rows owned by this object, keyed by FQDN.
+	// Address is part of the key because a dual-stack name has both A and AAAA rows.
 	existing := map[string]row{}
 	for _, r := range rows {
 		if describesOwner(r.Description, owner) {
-			existing[hostFromDescription(r.Description)] = r
+			existing[hostOverrideKeyFromDescription(r.Description)] = r
 		}
 	}
 
 	changed := false
-	desiredFQDNs := map[string]struct{}{}
+	desiredKeys := map[string]struct{}{}
 
 	for _, h := range desired {
 		fqdn := h.FQDN()
-		desiredFQDNs[fqdn] = struct{}{}
+		key := hostOverrideKey(h)
+		desiredKeys[key] = struct{}{}
 		wantDesc := dnsDescription(owner, h)
 
-		if cur, ok := existing[fqdn]; ok {
+		if cur, ok := existing[key]; ok {
 			if cur.Description == wantDesc {
 				continue // already correct
 			}
@@ -58,12 +58,12 @@ func (c *Client) syncHostOverrides(ctx context.Context, owner Owner, desired []H
 	}
 
 	// Delete owned rows no longer desired.
-	for fqdn, r := range existing {
-		if _, ok := desiredFQDNs[fqdn]; ok {
+	for key, r := range existing {
+		if _, ok := desiredKeys[key]; ok {
 			continue
 		}
 		if err := c.decodeVoid(c.gen.UnboundSettingsControllerDelHostOverrideAction(ctx, r.UUID)); err != nil {
-			return changed, fmt.Errorf("opnsense: del host override %s: %w", fqdn, err)
+			return changed, fmt.Errorf("opnsense: del host override %q: %w", key, err)
 		}
 		changed = true
 	}
@@ -77,7 +77,7 @@ func addHostBody(h HostOverride, desc string) generated.UnboundSettingsControlle
 	body.Host.Addptr = "0"
 	body.Host.Hostname = strptr(h.Host)
 	body.Host.Domain = h.Domain
-	body.Host.Rr = "A"
+	body.Host.Rr = generated.UnboundSettingsControllerAddHostOverrideActionJSONBodyHostRr(h.RecordType)
 	body.Host.Server = strptr(h.Address)
 	body.Host.Description = strptr(desc)
 	return body
@@ -89,7 +89,7 @@ func setHostBody(h HostOverride, desc string) generated.UnboundSettingsControlle
 	body.Host.Addptr = "0"
 	body.Host.Hostname = strptr(h.Host)
 	body.Host.Domain = h.Domain
-	body.Host.Rr = "A"
+	body.Host.Rr = generated.UnboundSettingsControllerSetHostOverrideActionJSONBodyHostRr(h.RecordType)
 	body.Host.Server = strptr(h.Address)
 	body.Host.Description = strptr(desc)
 	return body

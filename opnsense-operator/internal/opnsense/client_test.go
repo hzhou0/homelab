@@ -17,15 +17,20 @@ import (
 // substring (the generated client's paths embed the action name) and records
 // every call so tests can assert what the wrapper did.
 type fakeOPN struct {
-	mu       sync.Mutex
-	hostRows []map[string]string
-	natRows  []map[string]string
-	calls    []string
-	addBody  map[string]json.RawMessage // last add body per kind
+	mu         sync.Mutex
+	hostRows   []map[string]string
+	natRows    []map[string]string
+	filterRows []map[string]string
+	calls      []string
+	addBody    map[string]json.RawMessage // last add body per kind
+	addBodies  map[string][]json.RawMessage
 }
 
 func newFake() *fakeOPN {
-	return &fakeOPN{addBody: map[string]json.RawMessage{}}
+	return &fakeOPN{
+		addBody:   map[string]json.RawMessage{},
+		addBodies: map[string][]json.RawMessage{},
+	}
 }
 
 func (f *fakeOPN) record(token string) {
@@ -58,6 +63,7 @@ func (f *fakeOPN) handler() http.Handler {
 			f.record("dns.add")
 			f.mu.Lock()
 			f.addBody["dns"] = body
+			f.addBodies["dns"] = append(f.addBodies["dns"], body)
 			f.mu.Unlock()
 			writeSaved(w, "new-dns-uuid")
 		case strings.Contains(p, "set_host_override"):
@@ -86,6 +92,25 @@ func (f *fakeOPN) handler() http.Handler {
 			writeJSON(w, map[string]string{"result": "deleted"})
 		case strings.Contains(p, "d_nat/apply"):
 			f.record("nat.apply")
+			writeJSON(w, map[string]string{"status": "ok"})
+		case strings.Contains(p, "filter/search_rule"):
+			f.record("filter.search")
+			writeRows(w, f.filterRows)
+		case strings.Contains(p, "filter/add_rule"):
+			f.record("filter.add")
+			f.mu.Lock()
+			f.addBody["filter"] = body
+			f.addBodies["filter"] = append(f.addBodies["filter"], body)
+			f.mu.Unlock()
+			writeSaved(w, "new-filter-uuid")
+		case strings.Contains(p, "filter/set_rule"):
+			f.record("filter.set")
+			writeSaved(w, "")
+		case strings.Contains(p, "filter/del_rule"):
+			f.record("filter.del")
+			writeJSON(w, map[string]string{"result": "deleted"})
+		case strings.Contains(p, "filter/apply"):
+			f.record("filter.apply")
 			writeJSON(w, map[string]string{"status": "ok"})
 		default:
 			http.Error(w, "unhandled path: "+p, http.StatusNotFound)
@@ -128,8 +153,9 @@ func TestSyncCreatesDNSAndNAT(t *testing.T) {
 	owner := Owner{Kind: "Service", Namespace: "app-grafana", Name: "grafana"}
 
 	err := c.Sync(context.Background(), owner,
-		[]HostOverride{{Host: "grafana", Domain: "lab", Address: "10.0.0.100"}},
+		[]HostOverride{{Host: "grafana", Domain: "lab", Address: "10.0.0.100", RecordType: "A"}},
 		&PortForward{Interface: "wan", Protocol: "tcp", ExternalPort: "443", TargetIP: "10.0.0.100", LocalPort: "443"},
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +224,7 @@ func TestSyncCreatesDNSAndNAT(t *testing.T) {
 
 func TestSyncIdempotentNoChange(t *testing.T) {
 	owner := Owner{Kind: "Service", Namespace: "app-grafana", Name: "grafana"}
-	ho := HostOverride{Host: "grafana", Domain: "lab", Address: "10.0.0.100"}
+	ho := HostOverride{Host: "grafana", Domain: "lab", Address: "10.0.0.100", RecordType: "A"}
 
 	f := newFake()
 	// Pre-seed an existing row whose description already matches desired.
@@ -207,7 +233,7 @@ func TestSyncIdempotentNoChange(t *testing.T) {
 	}
 	c := newTestClient(t, f)
 
-	if err := c.Sync(context.Background(), owner, []HostOverride{ho}, nil); err != nil {
+	if err := c.Sync(context.Background(), owner, []HostOverride{ho}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -219,10 +245,10 @@ func TestSyncIdempotentNoChange(t *testing.T) {
 	}
 }
 
-func TestSyncUpdatesDriftedDNS(t *testing.T) {
+func TestSyncReplacesChangedDNSAddress(t *testing.T) {
 	owner := Owner{Kind: "Service", Namespace: "app-grafana", Name: "grafana"}
-	old := HostOverride{Host: "grafana", Domain: "lab", Address: "10.0.0.99"}
-	want := HostOverride{Host: "grafana", Domain: "lab", Address: "10.0.0.100"}
+	old := HostOverride{Host: "grafana", Domain: "lab", Address: "10.0.0.99", RecordType: "A"}
+	want := HostOverride{Host: "grafana", Domain: "lab", Address: "10.0.0.100", RecordType: "A"}
 
 	f := newFake()
 	f.hostRows = []map[string]string{
@@ -230,11 +256,11 @@ func TestSyncUpdatesDriftedDNS(t *testing.T) {
 	}
 	c := newTestClient(t, f)
 
-	if err := c.Sync(context.Background(), owner, []HostOverride{want}, nil); err != nil {
+	if err := c.Sync(context.Background(), owner, []HostOverride{want}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if f.called("dns.set") != 1 {
-		t.Errorf("expected one dns.set on drift; calls=%v", f.calls)
+	if f.called("dns.add") != 1 || f.called("dns.del") != 1 || f.called("dns.set") != 0 {
+		t.Errorf("expected changed address to be added and the old one deleted; calls=%v", f.calls)
 	}
 	if f.called("dns.reconfigure") != 1 {
 		t.Errorf("expected reconfigure after update; calls=%v", f.calls)
@@ -244,18 +270,23 @@ func TestSyncUpdatesDriftedDNS(t *testing.T) {
 func TestDeleteRemovesOwnedObjects(t *testing.T) {
 	owner := Owner{Kind: "Service", Namespace: "app-foo", Name: "foo"}
 	otherOwner := Owner{Kind: "Service", Namespace: "app-bar", Name: "bar"}
-	ho := HostOverride{Host: "foo", Domain: "lab", Address: "10.0.0.100"}
+	ho := HostOverride{Host: "foo", Domain: "lab", Address: "10.0.0.100", RecordType: "A"}
 	pf := PortForward{Interface: "wan", Protocol: "tcp", ExternalPort: "443", TargetIP: "10.0.0.100", LocalPort: "443"}
+	pass := PassRule{Interface: "wan", Protocol: "tcp", Destination: "2001:db8::100", Port: "443"}
 
 	f := newFake()
 	f.hostRows = []map[string]string{
 		{"uuid": "foo-dns", "description": dnsDescription(owner, ho)},
-		{"uuid": "bar-dns", "description": dnsDescription(otherOwner, HostOverride{Host: "bar", Domain: "lab", Address: "10.0.0.101"})},
+		{"uuid": "bar-dns", "description": dnsDescription(otherOwner, HostOverride{Host: "bar", Domain: "lab", Address: "10.0.0.101", RecordType: "A"})},
 	}
 	// DNAT search rows carry the description under `descr` (not `description`); the ownership match
 	// must read it back through that key or an owned rule looks unowned and is never cleaned up.
 	f.natRows = []map[string]string{
 		{"uuid": "foo-nat", "descr": natDescription(owner, pf)},
+	}
+	f.filterRows = []map[string]string{
+		{"uuid": "foo-filter", "description": passDescription(owner, pass)},
+		{"uuid": "bar-filter", "description": passDescription(otherOwner, pass)},
 	}
 	c := newTestClient(t, f)
 
@@ -268,7 +299,207 @@ func TestDeleteRemovesOwnedObjects(t *testing.T) {
 	if f.called("nat.del") != 1 {
 		t.Errorf("expected 1 nat.del, calls=%v", f.calls)
 	}
-	if f.called("dns.reconfigure") != 1 || f.called("nat.apply") != 1 {
+	if f.called("filter.del") != 1 {
+		t.Errorf("expected 1 filter.del (only owned), calls=%v", f.calls)
+	}
+	if f.called("dns.reconfigure") != 1 || f.called("nat.apply") != 1 || f.called("filter.apply") != 1 {
 		t.Errorf("expected reconfigure+apply after deletes, calls=%v", f.calls)
+	}
+}
+
+func TestSyncCreatesDualStackDNS(t *testing.T) {
+	f := newFake()
+	c := newTestClient(t, f)
+	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
+
+	err := c.Sync(context.Background(), owner, []HostOverride{
+		{Host: "media", Domain: "lab", Address: "10.0.0.101", RecordType: "A"},
+		{Host: "media", Domain: "lab", Address: "2001:db8::101", RecordType: "AAAA"},
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.called("dns.add") != 2 || f.called("dns.reconfigure") != 1 {
+		t.Fatalf("expected two adds and one reconfigure; calls=%v", f.calls)
+	}
+
+	got := map[string]string{}
+	for _, raw := range f.addBodies["dns"] {
+		var body struct {
+			Host struct {
+				Server string `json:"server"`
+				Rr     string `json:"rr"`
+			}
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode DNS body: %v", err)
+		}
+		got[body.Host.Server] = body.Host.Rr
+	}
+	if got["10.0.0.101"] != "A" || got["2001:db8::101"] != "AAAA" {
+		t.Fatalf("unexpected record types: %v", got)
+	}
+}
+
+func TestSyncRejectsIPv6DNAT(t *testing.T) {
+	f := newFake()
+	c := newTestClient(t, f)
+	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
+	pf := &PortForward{
+		Interface:    "wan",
+		Protocol:     "udp",
+		ExternalPort: "3478",
+		TargetIP:     "2001:db8::101",
+		LocalPort:    "3478",
+	}
+
+	err := c.Sync(context.Background(), owner, nil, pf, nil)
+	if err == nil || !strings.Contains(err.Error(), "is not IPv4") {
+		t.Fatalf("expected IPv6 DNAT rejection, got %v", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("IPv6 target must be rejected before OPNsense calls; calls=%v", f.calls)
+	}
+}
+
+func TestSyncAdoptsLegacyDNSDescription(t *testing.T) {
+	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
+	want := HostOverride{Host: "media", Domain: "lab", Address: "10.0.0.101", RecordType: "A"}
+	legacyDescription := ManagedPrefix + " owner=" + owner.Tag() + " host=media.lab ip=10.0.0.101"
+
+	f := newFake()
+	f.hostRows = []map[string]string{{"uuid": "legacy", "description": legacyDescription}}
+	c := newTestClient(t, f)
+	if err := c.Sync(context.Background(), owner, []HostOverride{want}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if f.called("dns.set") != 1 || f.called("dns.add") != 0 || f.called("dns.del") != 0 {
+		t.Fatalf("legacy row should be adopted and updated; calls=%v", f.calls)
+	}
+}
+
+func TestSyncCreatesPassRule(t *testing.T) {
+	f := newFake()
+	c := newTestClient(t, f)
+	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
+	pass := PassRule{Interface: "wan", Protocol: "udp", Destination: "2001:db8::101", Port: "3478"}
+
+	if err := c.Sync(context.Background(), owner, nil, nil, []PassRule{pass}); err != nil {
+		t.Fatal(err)
+	}
+	if f.called("filter.add") != 1 || f.called("filter.apply") != 1 {
+		t.Fatalf("expected one add and one apply; calls=%v", f.calls)
+	}
+	if f.called("nat.add") != 0 {
+		t.Fatalf("a pass rule must not create DNAT; calls=%v", f.calls)
+	}
+
+	// Every required non-omitempty flag must be populated, and the protocol must
+	// be upper case: the filter model rejects the lower-case spelling DNAT uses.
+	var body struct {
+		Rule struct {
+			Action          string `json:"action"`
+			Direction       string `json:"direction"`
+			Ipprotocol      string `json:"ipprotocol"`
+			Protocol        string `json:"protocol"`
+			Statetype       string `json:"statetype"`
+			Enabled         string `json:"enabled"`
+			Quick           string `json:"quick"`
+			Sequence        string `json:"sequence"`
+			Interface       string `json:"interface"`
+			SourceNet       string `json:"source_net"`
+			DestinationNet  string `json:"destination_net"`
+			DestinationPort string `json:"destination_port"`
+			Description     string `json:"description"`
+		}
+	}
+	if err := json.Unmarshal(f.addBody["filter"], &body); err != nil {
+		t.Fatalf("decode filter add body: %v", err)
+	}
+	r := body.Rule
+	if r.Action != "pass" || r.Direction != "in" || r.Ipprotocol != "inet6" || r.Protocol != "UDP" ||
+		r.Statetype != "keep" || r.Enabled != "1" || r.Quick != "1" || r.Sequence == "" {
+		t.Errorf("unexpected filter rule: %+v", r)
+	}
+	if r.Interface != "wan" || r.SourceNet != "any" ||
+		r.DestinationNet != "2001:db8::101" || r.DestinationPort != "3478" {
+		t.Errorf("unexpected filter match: %+v", r)
+	}
+	if !strings.Contains(r.Description, "owner=Service/app-media/media") {
+		t.Errorf("filter description missing owner tag: %q", r.Description)
+	}
+}
+
+func TestSyncReplacesChangedPassDestination(t *testing.T) {
+	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
+	old := PassRule{Interface: "wan", Protocol: "udp", Destination: "2001:db8::99", Port: "3478"}
+	want := PassRule{Interface: "wan", Protocol: "udp", Destination: "2001:db8::101", Port: "3478"}
+
+	f := newFake()
+	f.filterRows = []map[string]string{
+		{"uuid": "stale", "description": passDescription(owner, old)},
+	}
+	c := newTestClient(t, f)
+	if err := c.Sync(context.Background(), owner, nil, nil, []PassRule{want}); err != nil {
+		t.Fatal(err)
+	}
+	if f.called("filter.add") != 1 || f.called("filter.del") != 1 {
+		t.Fatalf("a renumbered address must not leave the old rule behind; calls=%v", f.calls)
+	}
+}
+
+func TestSyncPassRuleIdempotent(t *testing.T) {
+	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
+	pass := PassRule{Interface: "wan", Protocol: "udp", Destination: "2001:db8::101", Port: "3478"}
+
+	f := newFake()
+	f.filterRows = []map[string]string{
+		{"uuid": "existing", "description": passDescription(owner, pass)},
+	}
+	c := newTestClient(t, f)
+	if err := c.Sync(context.Background(), owner, nil, nil, []PassRule{pass}); err != nil {
+		t.Fatal(err)
+	}
+	if f.called("filter.add")+f.called("filter.set")+f.called("filter.del") != 0 {
+		t.Errorf("steady state must not mutate; calls=%v", f.calls)
+	}
+	if f.called("filter.apply") != 0 {
+		t.Errorf("no apply without a mutation; calls=%v", f.calls)
+	}
+}
+
+func TestSyncUpdatesDriftedPassRule(t *testing.T) {
+	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
+	pass := PassRule{Interface: "wan", Protocol: "udp", Destination: "2001:db8::101", Port: "3478"}
+	drifted := passDescription(owner, PassRule{
+		Interface: "wan", Protocol: "tcp", Destination: "2001:db8::101", Port: "3478",
+	})
+
+	f := newFake()
+	f.filterRows = []map[string]string{{"uuid": "drifted", "description": drifted}}
+	c := newTestClient(t, f)
+	if err := c.Sync(context.Background(), owner, nil, nil, []PassRule{pass}); err != nil {
+		t.Fatal(err)
+	}
+	if f.called("filter.set") != 1 || f.called("filter.add") != 0 || f.called("filter.del") != 0 {
+		t.Fatalf("same destination should be corrected in place; calls=%v", f.calls)
+	}
+	if f.called("filter.apply") != 1 {
+		t.Fatalf("expected apply after update; calls=%v", f.calls)
+	}
+}
+
+func TestSyncRejectsIPv4PassRule(t *testing.T) {
+	f := newFake()
+	c := newTestClient(t, f)
+	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
+	pass := PassRule{Interface: "wan", Protocol: "tcp", Destination: "10.0.0.101", Port: "443"}
+
+	err := c.Sync(context.Background(), owner, nil, nil, []PassRule{pass})
+	if err == nil || !strings.Contains(err.Error(), "is not IPv6") {
+		t.Fatalf("expected IPv4 pass-rule rejection, got %v", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("IPv4 destination must be rejected before OPNsense calls; calls=%v", f.calls)
 	}
 }

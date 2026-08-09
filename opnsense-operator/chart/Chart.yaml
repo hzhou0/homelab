@@ -1,12 +1,12 @@
 apiVersion: v2
 name: opnsense-operator
 description: >-
-  External-dns-style controller that reconciles Unbound DNS host overrides and
-  WAN port-forward (DNAT) rules in OPNsense from homelab.lab/* annotations on
-  LoadBalancer Services and Gateway-API Gateways.
+  External-dns-style controller that reconciles Unbound A/AAAA host overrides,
+  IPv4 WAN port-forward (DNAT) rules and IPv6 WAN pass rules in OPNsense from
+  homelab.lab/* annotations on LoadBalancer Services and Gateway-API Gateways.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.1.1
+appVersion: "0.1.3"
 keywords:
   - opnsense
   - external-dns

@@ -26,9 +26,10 @@ func (o Owner) Tag() string {
 
 // HostOverride is a single Unbound DNS host override the operator manages.
 type HostOverride struct {
-	Host    string // left label, e.g. "grafana" or "*" for a wildcard
-	Domain  string // zone, e.g. "lab"
-	Address string // target IP (the service's LoadBalancer IP)
+	Host       string // left label, e.g. "grafana" or "*" for a wildcard
+	Domain     string // zone, e.g. "lab"
+	Address    string // target IP (the service's LoadBalancer IP)
+	RecordType string // A or AAAA
 }
 
 // FQDN reconstructs the full name, e.g. "grafana.lab" or "*.lab".
@@ -45,11 +46,22 @@ type PortForward struct {
 	LocalPort    string // forwarded-to port
 }
 
+// PassRule is a single WAN filter rule the operator manages. A globally
+// routable IPv6 LoadBalancer address needs no translation, so exposing it is a
+// matter of admitting the traffic rather than redirecting it; the DNAT rule's
+// implicit "pass" has no IPv6 equivalent to piggyback on.
+type PassRule struct {
+	Interface   string // OPNsense interface name, e.g. "wan"
+	Protocol    string // "tcp" or "udp"
+	Destination string // globally routable LoadBalancer address
+	Port        string // destination port admitted on the WAN
+}
+
 // dnsDescription renders the full, human-readable description for a host
 // override. Equality of this string is used as the change detector during
 // reconciliation, so it must capture every mutable field.
 func dnsDescription(o Owner, h HostOverride) string {
-	return fmt.Sprintf("%s owner=%s host=%s ip=%s", ManagedPrefix, o.Tag(), h.FQDN(), h.Address)
+	return fmt.Sprintf("%s owner=%s host=%s ip=%s rr=%s", ManagedPrefix, o.Tag(), h.FQDN(), h.Address, h.RecordType)
 }
 
 // natDescription renders the full description for a port-forward rule.
@@ -58,16 +70,33 @@ func natDescription(o Owner, p PortForward) string {
 		ManagedPrefix, o.Tag(), p.Protocol, p.ExternalPort, p.TargetIP, p.LocalPort, p.Interface)
 }
 
+// passDescription renders the full description for a WAN pass rule.
+func passDescription(o Owner, p PassRule) string {
+	return fmt.Sprintf("%s owner=%s pass=%s/%s dest=%s iface=%s",
+		ManagedPrefix, o.Tag(), p.Protocol, p.Port, p.Destination, p.Interface)
+}
+
 // describesOwner reports whether an OPNsense description belongs to this owner.
 func describesOwner(desc string, o Owner) bool {
 	return strings.HasPrefix(desc, ManagedPrefix) && strings.Contains(desc, " owner="+o.Tag()+" ")
 }
 
-// hostFromDescription extracts the "host=" token previously written by
-// dnsDescription, so existing rows can be matched to desired FQDNs without
-// relying on the search endpoint's column names.
-func hostFromDescription(desc string) string {
-	return tokenValue(desc, "host=")
+func hostOverrideKey(h HostOverride) string {
+	return h.FQDN() + "\x00" + h.Address
+}
+
+func hostOverrideKeyFromDescription(desc string) string {
+	return tokenValue(desc, "host=") + "\x00" + tokenValue(desc, "ip=")
+}
+
+// Destination alone is the pass-rule identity: an owner has at most one
+// protocol/port pair, so its rules differ only by which address they admit.
+func passRuleKey(p PassRule) string {
+	return p.Destination
+}
+
+func passRuleKeyFromDescription(desc string) string {
+	return tokenValue(desc, "dest=")
 }
 
 // tokenValue returns the value of a "key=value" token in a space-delimited

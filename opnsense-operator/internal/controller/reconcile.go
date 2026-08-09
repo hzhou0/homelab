@@ -1,6 +1,6 @@
 // Package controller contains the Service and Gateway reconcilers that drive
-// OPNsense DNS host overrides and WAN port-forwards from homelab.lab/*
-// annotations, external-dns style.
+// OPNsense DNS host overrides, WAN port-forwards and WAN pass rules from
+// homelab.lab/* annotations, external-dns style.
 package controller
 
 import (
@@ -25,13 +25,13 @@ const requeueNotReady = 15 * time.Second
 // Syncer is the slice of the OPNsense client the reconcilers depend on. It is
 // an interface so tests can substitute a fake.
 type Syncer interface {
-	Sync(ctx context.Context, owner opnsense.Owner, dns []opnsense.HostOverride, pf *opnsense.PortForward) error
+	Sync(ctx context.Context, owner opnsense.Owner, dns []opnsense.HostOverride, pf *opnsense.PortForward, pass []opnsense.PassRule) error
 	Delete(ctx context.Context, owner opnsense.Owner) error
 }
 
 // handle runs the shared reconcile flow for any source object: finalizer
 // management, desired-state parsing, OPNsense sync, and status write-back. The
-// caller resolves the object-specific bits (IP, default port/protocol) into
+// caller resolves the object-specific bits (addresses, default port/protocol) into
 // ExposureInput.
 func handle(
 	ctx context.Context,
@@ -71,7 +71,7 @@ func handle(
 
 	// Nothing requested: make sure any previously-created state is removed and
 	// the finalizer released.
-	if desired.Empty() {
+	if !desired.HasIntent {
 		if controllerutil.ContainsFinalizer(obj, Finalizer) {
 			if err := opn.Delete(ctx, owner); err != nil {
 				return ctrl.Result{}, err
@@ -87,7 +87,7 @@ func handle(
 	}
 
 	// Need an IP before we can wire anything up.
-	if in.IP == "" {
+	if len(in.Addresses) == 0 {
 		l.Info("waiting for LoadBalancer IP")
 		return ctrl.Result{RequeueAfter: requeueNotReady}, nil
 	}
@@ -103,7 +103,7 @@ func handle(
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if err := opn.Sync(ctx, owner, desired.Hosts, desired.PortForward); err != nil {
+	if err := opn.Sync(ctx, owner, desired.Hosts, desired.PortForward, desired.PassRules); err != nil {
 		rec.Eventf(obj, corev1.EventTypeWarning, "SyncFailed", "OPNsense sync failed: %v", err)
 		return ctrl.Result{}, err
 	}
@@ -117,7 +117,7 @@ func handle(
 		if err := c.Patch(ctx, obj, client.MergeFrom(base)); err != nil {
 			return ctrl.Result{}, err
 		}
-		l.Info("reconciled OPNsense state", "ip", in.IP, "exposed", summary)
+		l.Info("reconciled OPNsense state", "addresses", in.Addresses, "exposed", summary)
 		rec.Eventf(obj, corev1.EventTypeNormal, "Synced", "OPNsense updated: %s", summary)
 	}
 	return ctrl.Result{}, nil
@@ -141,16 +141,12 @@ func removeAnnotation(obj client.Object, key string) {
 	obj.SetAnnotations(ann)
 }
 
-// loadBalancerIP returns the first assigned IP (or hostname) from a Service's
-// LoadBalancer status, or "" if none yet.
-func loadBalancerIP(svc *corev1.Service) string {
+func loadBalancerAddresses(svc *corev1.Service) []string {
+	addresses := make([]string, 0, len(svc.Status.LoadBalancer.Ingress))
 	for _, ing := range svc.Status.LoadBalancer.Ingress {
 		if ing.IP != "" {
-			return ing.IP
-		}
-		if ing.Hostname != "" {
-			return ing.Hostname
+			addresses = append(addresses, ing.IP)
 		}
 	}
-	return ""
+	return addresses
 }

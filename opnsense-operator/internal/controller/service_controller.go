@@ -43,7 +43,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	in := ExposureInput{
 		Annotations:     svc.Annotations,
-		IP:              loadBalancerIP(&svc),
+		Addresses:       loadBalancerAddresses(&svc),
 		DefaultPort:     firstServicePort(&svc),
 		DefaultProtocol: firstServiceProtocol(&svc),
 	}
