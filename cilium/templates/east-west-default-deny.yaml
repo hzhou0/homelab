@@ -9,9 +9,8 @@
 #   - apiserver-invoked admission webhooks       -> remote-node, kube-apiserver
 #     (kyverno:9443, cert-manager:9403, ... arrive cross-node as remote-node)
 #   - cilium health checks                       -> health
-# The Cilium Gateway (reserved:ingress) is deliberately NOT granted here — scoped per backend
-# namespace by gateway-ingress-policy.yaml, so a fenced pod is unreachable from the gateway
-# unless its namespace hosts a route. `cluster` is absent (would re-permit all pod-to-pod).
+# The Cilium Gateway (reserved:ingress) is deliberately NOT granted here — it is scoped per backend
+# namespace instead. `cluster` is absent: it would re-permit all pod-to-pod.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:

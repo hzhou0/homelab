@@ -1,26 +1,29 @@
 # homelab-cilium values
 
-# Upstream Cilium subchart values. `cilium:` is a near-verbatim copy of the live release
-# (`helm -n kube-system get values cilium`). Do NOT "tidy" these — they must match the cluster.
+# Upstream Cilium subchart values. Nothing installs Cilium outside this chart, so this is the
+# authoritative source for the CNI's configuration.
 cilium:
   enabled: true
 
   cluster:
     name: default
+  ipv6:
+    enabled: true
   ipam:
     operator:
       clusterPoolIPv4PodCIDRList: 10.42.0.0/16
-  # The live release recorded 127.0.0.1 (loopback kubeconfig); pinned to the routable IP so
-  # agent nodes can reach the API server under kube-proxy replacement.
+      # Must match the v6 half of k3s's --cluster-cidr.
+      clusterPoolIPv6PodCIDRList: [ fd52:ff39:512b:4200::/56 ]
+      clusterPoolIPv6MaskSize: 64
+  # k3s's kubeconfig carries 127.0.0.1; agent nodes need the routable address to reach the API
+  # server under kube-proxy replacement.
   k8sServiceHost: 10.0.0.22
   k8sServicePort: 6443
   kubeProxyReplacement: true
   operator:
     replicas: 1
-    # Keep cilium-operator (LB IPAM/L2, CRD reconcile) off the reclaimable spot node
-    # (node.kubernetes.io/capacity-type=spot). The agent DaemonSet is the CNI and must stay on every
-    # node, spot included, so it is deliberately not constrained. Preserves the chart's default
-    # host-spread podAntiAffinity.
+    # Keep cilium-operator off reclaimable capacity. The agent DaemonSet is the CNI and must stay on
+    # every node, spot included, so it is deliberately not constrained.
     affinity:
       nodeAffinity:
         requiredDuringSchedulingIgnoredDuringExecution:
@@ -48,14 +51,11 @@ cilium:
     ui:
       enabled: true
 
-  # Scope Cilium's datapath (and host firewall) to ethernet only. Without this, a node that
-  # rolls onto wifi (wlan0) would have Cilium manage that interface and the host firewall would
-  # lock down wifi ingress too. eth+ covers both nodes' wired NICs (server eth0, spot eth1).
+  # Scope Cilium's datapath (and host firewall) to ethernet only: a node that rolls onto wifi would
+  # otherwise have Cilium manage that interface and the host firewall would lock down wifi ingress.
   devices: "eth+"
 
-  # Host firewall. Compatible with tunnel/vxlan (host policy does NOT affect pod-to-pod traffic).
-  # The host policy's nodeSelector must be non-empty — empty `{}` matches pods too and takes the
-  # cluster down (see host-firewall.yaml).
+  # Compatible with tunnel/vxlan: host policy does NOT affect pod-to-pod traffic.
   hostFirewall:
     enabled: true
 
@@ -66,7 +66,7 @@ cilium:
     qps: 50
     burst: 100
 
-# East-west default-deny (the authoritative ingress fence). See templates/east-west-default-deny.yaml.
+# East-west default-deny (the authoritative ingress fence).
 eastWestDefaultDeny:
   enabled: true
   # MUST match the platform chart's networkPolicy.excludeNamespaces — one exclude-set split across
@@ -96,14 +96,17 @@ hostFirewall:
 loadBalancer:
   enabled: true
   pool:
-    name: lab-pool
+    name: v4
     start: "10.0.0.101"
     stop: "10.0.0.150"
-  # Dedicated single IP for the shared ingress Gateway. The gateway Service has no endpoints
-  # (Envoy is fronted by Cilium's BPF), so it needs its own pool rather than sharing lab-pool.
+  # The gateway Service has no endpoints (Envoy is fronted by Cilium's BPF), so it needs a
+  # dedicated single-IP pool.
   gatewayPool:
     name: gateway-pool
     ip: "10.0.0.100"
+  v6Pool:
+    name: v6
+    cidr: "2001:569:5bc1:7f00:ffff::/112"
   l2:
     name: lab-l2
     # Pin the announcer to the control-plane node: it must already be up for the cluster to function,
@@ -114,7 +117,7 @@ loadBalancer:
     interfaces: []
 
 # ---------------------------------------------------------------------------
-# Single shared ingress Gateway: *.internal.haustorium.net
+# Single shared ingress Gateway
 # ---------------------------------------------------------------------------
 gateway:
   enabled: true
@@ -136,7 +139,7 @@ gateway:
     - 10.0.1.140/32
 
   # Backends the gateway may reach on the reverse hop. A fenced namespace is unreachable from the
-  # gateway until listed here; namespaces in eastWestDefaultDeny.excludeNamespaces are already open.
+  # gateway until listed here.
   backendNamespaces:
     - app-homepage
     - monitoring
@@ -150,55 +153,43 @@ gateway:
 # ---------------------------------------------------------------------------
 # WireGuard remote-access tunnel
 # ---------------------------------------------------------------------------
-# A cluster-hosted WireGuard server so admins can tunnel in from off-LAN. Decrypted client
-# traffic is masqueraded to the pod IP, so Cilium sees the whole tunnel as this one endpoint;
-# an egress fence (templates/wireguard.yaml) then confines that endpoint to the ingress Gateway
-# and the LAN DNS only. See README "WireGuard remote-access tunnel".
+# A cluster-hosted WireGuard server so admins can tunnel in from off-LAN. Decrypted client traffic
+# is masqueraded to the pod IP, so Cilium sees the whole tunnel as a single endpoint to fence.
 wireguard:
   enabled: true
   namespace: wireguard
   image: lscr.io/linuxserver/wireguard:1.0.20260223
-  # One-shot privileged init that enables net.ipv4.ip_forward in the pod netns (see wireguard.yaml).
+  # One-shot privileged init that enables net.ipv4.ip_forward in the pod netns.
   sysctlInitImage: busybox:1.37
-  # UDP listen port; also the WAN port OPNsense must DNAT to loadBalancerIP.
   listenPort: 51820
-  # Pinned from lab-pool so the OPNsense WAN forward has a stable target. Keep out of any other
-  # Service's use.
+  # Pinned so the OPNsense WAN forward has a stable target. Keep out of any other Service's use.
   loadBalancerIP: "10.0.0.101"
-  # Must be the loadBalancer.l2 announcer host: that node alone answers loadBalancerIP, and the
-  # Service uses externalTrafficPolicy:Local (no off-node forward, real peer IP preserved).
+  # Must be the L2 announcer host: that node alone answers loadBalancerIP, and
+  # externalTrafficPolicy:Local will not forward off-node.
   nodeName: k3s-server
-  # Let opnsense-operator create the WAN UDP DNAT (homelab.lab/expose). Needs opnsense-operator
-  # installed. Off => wire the WAN:listenPort/udp forward by hand.
+  # Off => wire the WAN UDP forward by hand instead of letting opnsense-operator reconcile it.
   expose: true
   # Peer subnet; the server interface takes .1.
   serverAddress: "10.9.0.1/24"
-  # LAN resolver (OPNsense Unbound) the tunnel may reach — it answers *.internal.haustorium.net.
+  # LAN resolver (OPNsense Unbound) the tunnel may reach — it answers the internal wildcard.
   lanDNS: "10.0.0.1"
 
-  # Off by default: the tunnel is otherwise confined to the Gateway backends + LAN DNS. When on,
-  # the egress fence also permits the k3s API server (Cilium's kube-apiserver entity, which matches
-  # the host-network apiserver a plain toCIDR would miss) so an admin can run kubectl over the
-  # tunnel. You must ALSO add `address` to the peer's client AllowedIPs (gen-wireguard-client.sh -s),
-  # or the request never enters the tunnel.
+  # Opens the egress fence to the k3s API server for admin kubectl over the tunnel. Enabling it
+  # here is not enough — the peer must also route the API server in its client AllowedIPs.
   apiServer:
     enabled: true
-    # Client-side routing only (peer AllowedIPs). The server-side policy uses the kube-apiserver
-    # entity, so this CIDR is not consulted there.
+    # Client-side routing only. The server-side policy matches the kube-apiserver entity, so this
+    # CIDR is not consulted there.
     address: "10.0.0.22/32"
     port: 6443
 
-  # Server private key, injected at runtime from a Secret you precreate (never in Helm values or
-  # release state). The chart owns the `wireguard` namespace — do NOT `kubectl create` it yourself
-  # (Helm can't adopt an untagged namespace). Create the Secret AFTER the first `helm upgrade`; the
-  # pod stays in ContainerCreating until it exists, then starts:
-  #   wg genkey | kubectl -n wireguard create secret generic wireguard-privatekey \
-  #     --from-file=privatekey=/dev/stdin
+  # Injected at runtime from a Secret you precreate, so it never enters Helm release state. The
+  # chart owns the namespace, so create the Secret after the first upgrade (Helm can't adopt one).
   privateKeySecret:
     name: wireguard-privatekey
     key: privatekey
 
-  # Tunnel peers. publicKey/address are not secret. address is the peer's /32 in serverAddress's subnet.
+  # Not secret: public keys and tunnel addresses only.
   peers:
     - name: laptop
       publicKey: "IfvIa2dLZYVQ+DP/WMYW5Xg2BiVvhvdKLSR1WKk2Y1c="

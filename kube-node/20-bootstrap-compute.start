@@ -34,10 +34,8 @@ curl -sfL https://get.k3s.io | \
 
 rc-service k3s-agent restart
 
-# vg-nvme backs TopoLVM's node-local volumes (homelab-topolvm chart); nvme0n1p3 is the
-# same ex-Ceph partition, now an LVM PV instead of a Ceph OSD. compute-spot shares this
-# script but has no p3 (root claims the whole disk, see 10-provision.start), so skip
-# when the device isn't there.
+# vg-nvme backs TopoLVM's node-local volumes. compute-spot shares this script but has no
+# p3 (root claims the whole disk, see 10-provision.start), so skip when the device isn't there.
 if [ -b /dev/nvme0n1p3 ]; then
   apk add -q lvm2
   pvcreate /dev/nvme0n1p3

@@ -31,7 +31,28 @@ spec:
   serviceSelector:
     matchLabels:
       io.cilium.gateway/owning-gateway: {{ .Values.gateway.name | quote }}
+{{- with $lb.v6Pool.cidr }}
 ---
+# Global unicast with no NAT in front of it: an address handed out here is internet-routable the
+# moment it is assigned, gated only by the OPNsense WAN firewall.
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: {{ $lb.v6Pool.name }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  blocks:
+    - cidr: {{ . | quote }}
+  serviceSelector:
+    matchExpressions:
+      - key: io.cilium.gateway/owning-gateway
+        operator: DoesNotExist
+{{- end }}
+---
+# Selects services, not pools — one unselective policy announces every LB IP of both families,
+# ARP for v4 and NDP for v6.
 apiVersion: cilium.io/v2alpha1
 kind: CiliumL2AnnouncementPolicy
 metadata:

@@ -8,7 +8,6 @@
 #
 # Cilium's default-deny is per-direction, not per-protocol, so selecting the host with any ingress
 # rule default-denies ALL protocols. Re-allowing all UDP from world restores DHCP/DNS/NTP/vxlan.
-# Scope is cilium.devices: "eth+" — wlan0 stays out of the datapath.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:

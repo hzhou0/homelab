@@ -71,10 +71,10 @@ case "$NODE_ROLE" in
       mkpart boot fat32 1MiB 512MiB \
       set 1 esp on \
       mkpart root ext4 512MiB 100GiB \
-      mkpart ceph 100GiB 100%
+      mkpart lvm 100GiB 100%
     ;;
   db|compute-spot)
-    # compute-spot does not participate in ceph, so root claims the whole disk.
+    # compute-spot has no node-local storage to offer, so root claims the whole disk.
     parted -s -a optimal "$DISK" -- \
       mklabel gpt \
       mkpart boot fat32 1MiB 512MiB \

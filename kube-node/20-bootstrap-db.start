@@ -49,5 +49,5 @@ rc-service k3s-agent restart
 
 touch /etc/local.d/20-bootstrap.done
 echo "==> k3s db bootstrap complete. Run from control plane:"
-echo "  kubectl label nodes db node-role=database"
-echo "  kubectl taint nodes db workload=database:NoSchedule"
+echo "  kubectl label nodes $(hostname) node-role=database"
+echo "  kubectl taint nodes $(hostname) workload=database:NoSchedule"

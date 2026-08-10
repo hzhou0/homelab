@@ -4,8 +4,7 @@ apiVersion: v1
 kind: Namespace
 metadata:
   # A foundational (non-tier) namespace so Kyverno pod governance does not apply — the WireGuard
-  # container needs NET_ADMIN. It is deliberately NOT in eastWestDefaultDeny.excludeNamespaces:
-  # the pod stays default-denied and gets only the explicit grants below.
+  # container needs NET_ADMIN. It is deliberately left east-west fenced anyway.
   name: {{ $wg.namespace }}
   labels:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
@@ -15,7 +14,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   # No secret material: peer public keys are not sensitive, and the server private key is injected
-  # at runtime from the precreated privateKeySecret (see PostUp) so it never lands in Helm state.
+  # at runtime so it never lands in Helm state.
   name: wireguard-config
   namespace: {{ $wg.namespace }}
   labels:
@@ -26,11 +25,8 @@ data:
     [Interface]
     Address = {{ $wg.serverAddress }}
     ListenPort = {{ $wg.listenPort }}
-    # `wg set private-key` loads the key from the mounted Secret file (wg-quick brings the interface
-    # up keyless first, then this sets it). Key is mounted under /run — NOT /etc/wireguard, which in
-    # this image is a symlink to /config/wg_confs (the read-only conf mount). Masquerade pins decrypted
-    # peer traffic to the pod IP (eth0 = pod veth) so Cilium sees the whole tunnel as one endpoint for
-    # the egress fence below. ip_forward is enabled by the enable-forwarding initContainer.
+    # wg-quick brings the interface up keyless, then `wg set` loads the key from the mounted Secret.
+    # Masquerade pins decrypted peer traffic to the pod IP so Cilium sees one endpoint, not many.
     PostUp = wg set %i private-key /run/wireguard-keys/{{ $wg.privateKeySecret.key }}; iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
     PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
     {{- range $wg.peers }}
@@ -64,9 +60,8 @@ spec:
       labels:
         app.kubernetes.io/name: wireguard
     spec:
-      # Co-locate with the L2 announcer (loadBalancer.l2.nodeSelector): the LB IP is answered only
-      # by that node, and externalTrafficPolicy:Local won't forward off-node — so the pod must live
-      # there to receive tunnel traffic (and it keeps the real peer IP, no SNAT).
+      # Co-locate with the L2 announcer: only that node answers the LB IP, and
+      # externalTrafficPolicy:Local won't forward off-node, so the pod must live there.
       nodeSelector:
         kubernetes.io/hostname: {{ $wg.nodeName }}
       initContainers:
@@ -97,7 +92,7 @@ spec:
               mountPath: /config/wg_confs
               readOnly: true
             - name: privatekey
-              # NOT /etc/wireguard/* — that path is a symlink into the read-only conf mount here.
+              # NOT /etc/wireguard — in this image that path symlinks into the read-only conf mount.
               mountPath: /run/wireguard-keys
               readOnly: true
       volumes:
@@ -120,8 +115,8 @@ metadata:
   annotations:
     lbipam.cilium.io/ips: {{ $wg.loadBalancerIP | quote }}
     {{- if $wg.expose }}
-    # opnsense-operator reconciles the WAN UDP DNAT from these. No homelab.lab/hostname: its Unbound
-    # record would point at the internal LB IP, useless to an off-LAN peer (peers dial the WAN).
+    # No homelab.lab/hostname: its Unbound record resolves to the internal LB IP, which is useless
+    # to an off-LAN peer dialing the WAN.
     homelab.lab/expose: "true"
     homelab.lab/protocol: "udp"
     homelab.lab/external-port: {{ $wg.listenPort | quote }}
@@ -139,8 +134,7 @@ spec:
       port: {{ $wg.listenPort }}
       targetPort: {{ $wg.listenPort }}
 ---
-# The tunnel's inbound handshake. wireguard's namespace is fenced by east-west-default-deny, so
-# re-open UDP/listenPort from world (additive: enableDefaultDeny.ingress:false leaves the deny intact).
+# The namespace is fenced east-west, so the inbound handshake needs an additive re-open from world.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
@@ -163,14 +157,11 @@ spec:
             - port: {{ $wg.listenPort | quote }}
               protocol: UDP
 ---
-# Egress fence: peer traffic is masqueraded to this pod (above), so the tunnel is confined here by
-# default-deny egress. The gateway is an L7 LoadBalancer (Cilium Envoy): for an L7LB service Cilium
-# enforces THIS pod's egress against the backend Envoy ultimately routes to, NOT the reserved:ingress
-# proxy — so the allow-list is the gateway's own backend namespaces (mirrors
-# allow-gateway-ingress-to-backends) plus the hubble-ui pods that back hubble.internal. A
-# toEntities:ingress rule is a no-op here: it never matches that enforcement point. The LAN resolver
-# on :53 lets peers resolve *.internal; peer->server reply packets return statefully via conntrack,
-# so no world egress is needed as long as peers use PersistentKeepalive.
+# The gateway is an L7 LoadBalancer (Cilium Envoy): for an L7LB service Cilium enforces THIS pod's
+# egress against the backend Envoy ultimately routes to, NOT the reserved:ingress proxy — so a
+# toEntities:ingress rule is a no-op and the allow-list must name the backends directly.
+# Peer->server replies return statefully via conntrack, so no world egress is needed as long as
+# peers use PersistentKeepalive.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
@@ -195,7 +186,7 @@ spec:
         {{- end }}
     {{- end }}
     {{- if .Values.gateway.hubbleUI.enabled }}
-    # hubble-ui backs hubble.internal from kube-system; scope to its pods, not all of kube-system.
+    # Scope to the hubble-ui pods, not all of kube-system.
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: kube-system
@@ -210,8 +201,8 @@ spec:
             - port: "53"
               protocol: TCP
     {{- if $wg.apiServer.enabled }}
-    # Admin kubectl over the tunnel. The kube-apiserver entity matches the host-network apiserver
-    # (a toCIDR to the node IP would land on the host/remote-node identity, not world, and miss).
+    # The kube-apiserver entity matches the host-network apiserver; a toCIDR to the node IP would
+    # land on the host/remote-node identity and miss.
     - toEntities:
         - kube-apiserver
       toPorts:
@@ -220,9 +211,8 @@ spec:
               protocol: TCP
     {{- end }}
 ---
-# The gateway front door, granted to the tunnel by identity instead of allowedCIDRs (masquerade
-# hides the peer CIDR from a fromCIDR match). Additive re-open of reserved:ingress, mirroring
-# allow-clients-to-gateway-ingress.
+# The gateway front door, granted by identity rather than source CIDR: masquerade hides the peer
+# CIDR, so a fromCIDR match would never fire.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:

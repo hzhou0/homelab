@@ -17,8 +17,22 @@ there is no root build system or shared Go module beyond `opnsense-operator/`.
 
 ### Comment style
 
-Comments explain **why**, not what. The code and key names already say what. Prefer the shortest
-comment that captures the non-obvious reason; if nothing non-obvious remains, write no comment.
+**The default is no comment.** Silence is correct unless the comment carries something the code
+cannot. Comments explain **why**, not what — the code and key names already say what.
+
+Apply the deletion test before writing or keeping any comment: *delete it, and ask what a competent
+reader loses that they could not recover by reading the file and its siblings.* If the answer is
+"nothing", it stays deleted. Most comments fail this test. Err on the side of deleting.
+
+Hard limits, not preferences:
+- **Two lines.** A comment that needs more than two lines is either explaining something that should
+  be a better name or structure, or it is documentation that belongs in the README. It is never a
+  longer comment.
+- **Never name another file, resource, value, or chart.** Not "see `x.yaml`", not "mirrors
+  `other-pool`", not "the label below". Those rot the moment anything is renamed, and the reader can
+  already see the sibling. This includes comparisons to a sibling resource ("unlike `foo`, this …").
+- **Never restate configuration that exists elsewhere in the repo.** If a value, name, range, or
+  flag appears in a file, no comment or README may enumerate it a second time.
 
 Keep:
 - Non-obvious constraints or invariants (e.g. "empty `{}` also matches pods")
@@ -35,8 +49,13 @@ Remove — assume the reader knows the tools and can inspect the code:
 - Step-by-step operational commands (those belong in the README).
 - Cross-references to the README or design doc (the reader can find those).
 
-Same rule applies to README files: architecture and rationale stay; shell command sequences,
-migration procedures, and explanations of standard tooling go.
+Same rule applies to README files, and the deletion test applies there too. Architecture and
+rationale stay. Everything else goes: shell command sequences, migration procedures, explanations of
+standard tooling, and — most commonly missed — **any enumeration of what is already in
+`values.yaml`**. A README must never list a chart's values, pool names, IP ranges, namespaces, or
+image tags; state *why* the design is what it is and let the values file be the record of *what* it
+is. If a rename in `values.yaml` would falsify a sentence in the README, that sentence was
+duplicating config and should not exist.
 
 The same rule governs **source code** (Go, Rust, scripts) — doc comments included. Keep high-level
 reasoning, architectural notes, and surprising or nuanced behaviour. Remove anything that is:

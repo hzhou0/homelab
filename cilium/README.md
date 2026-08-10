@@ -1,43 +1,55 @@
 # homelab-cilium
 
-Cilium for the homelab, **installed by cluster-admin** into `kube-system`. Adopts the existing
-CLI-bootstrapped Cilium install (`kube-node/20-bootstrap-server.start`) and layers on the
-**service mesh** (Gateway API + L7/Envoy), **LB IPAM + L2 announcements** (replacing MetalLB),
-and a **single ingress Gateway** for `*.internal.haustorium.net`.
+Cilium for the homelab, **installed by cluster-admin** into `kube-system`. This chart owns the CNI
+outright — pod CIDRs, `kubeProxyReplacement`, tunnel mode — and layers on the **service mesh**
+(Gateway API + L7/Envoy), **LB IPAM + L2 announcements** (replacing MetalLB), and a **single ingress
+Gateway** for `*.internal.haustorium.net`.
 
 ## Why its own chart
 
 Cilium is the CNI: foundational networking that needs cluster-admin, lives in `kube-system`,
 and can't be operator-installed. Same rationale as `cert-manager/`.
 
-## Adopted config (do not "fix" it)
+`values.yaml` is the single source of the release's configuration. The node bootstrap installs no
+part of Cilium: running `cilium install` there would put a second, drifting copy of these settings in
+a shell script. The `cilium` CLI is a kubeconfig client — it belongs on whatever workstation runs
+Helm, alongside `kubectl`.
 
-`cilium:` in `values.yaml` is a near-verbatim copy of the live release (`helm -n kube-system get
-values cilium`): pod CIDR `10.42.0.0/16`, `kubeProxyReplacement: true`, `routingMode: tunnel` /
-`tunnelProtocol: vxlan`. Keeping these identical makes the mesh/LB rollout a no-op for existing
-networking.
+## Installing (two passes)
 
-> The live release recorded `k8sServiceHost: 127.0.0.1` (what the CLI inferred from k3s's loopback
-> kubeconfig). We pin `10.0.0.22` instead so agent nodes can reach the API server under kube-proxy
-> replacement — a deliberate difference.
+The chart instantiates Cilium custom resources, but cilium-operator registers those CRDs at runtime
+rather than shipping them in `crds/`. A single-pass install on a fresh cluster therefore fails on
+missing kinds. Pass 1 installs the CNI with every add-on gated off; pass 2 applies the real values
+once the operator has registered the CRDs, and must reset values so pass 1's gates don't persist.
 
-## Service mesh prerequisites
+Nodes stay `NotReady` until pass 1 lands — the k3s bootstrap disables flannel, so nothing else
+provides a CNI.
 
-Gateway API CRDs must be installed (already are on this cluster). `kubeProxyReplacement: true`
-requires k3s to run without its own kube-proxy — set `--disable-kube-proxy` in the bootstrap
-script and reconfigure existing nodes out-of-band before flipping the flag.
+## Prerequisites
+
+**Gateway API CRDs** must be applied out-of-band before pass 2 — nothing in this repo installs them,
+and Cilium requires them for Gateway API support. Pin the Gateway API release that Cilium's current
+minor conformance-tests against; a mismatch surfaces as Gateways never reconciling rather than as an
+install error. TCPRoute/UDPRoute are opt-in — Cilium disables L4 routing entirely when those CRDs
+are absent, and will not accept a Gateway that mixes them with HTTP/GRPC/TLS routes.
+
+`kubeProxyReplacement` requires k3s to run without its own kube-proxy, and Cilium must be pointed at
+a routable API server address rather than the loopback one k3s's kubeconfig carries, or agent nodes
+can't reach it.
 
 ## LoadBalancer IPs (Cilium LB IPAM + L2 — replaces MetalLB)
 
-Two pools under `loadBalancer:` in `values.yaml`:
+Cilium rather than MetalLB because the ingress Gateway's Service has **no endpoints** (Envoy is
+fronted by Cilium's BPF) and MetalLB-L2 won't announce an endpoint-less Service. That Gateway holds
+a dedicated single-IP pool so its address is stable across reinstalls.
 
-- **`gateway-pool`** — single stable IP (`10.0.0.100`) for the ingress Gateway. This is the key
-  reason Cilium (not MetalLB) does LB: the gateway Service has **no endpoints** (Envoy is fronted
-  by Cilium's BPF), and MetalLB-L2 won't announce an endpoint-less Service.
-- **`lab-pool`** — `10.0.0.101–150` for every other LoadBalancer Service.
+The announcer is pinned to `k3s-server`: the control plane must be up for the cluster to function at
+all, so hosting the LB IPs there means worker churn — the reclaimable spot node especially — never
+disturbs LB reachability.
 
-The L2 announcement policy is pinned to `k3s-server` (only node on the `10.0.0.x` LAN; the spot
-node is on `10.0.1.x` and can't ARP the pool).
+IPv6 exposure is not symmetric with IPv4. The v4 pool is RFC1918 and unreachable off-LAN until
+someone adds an OPNsense DNAT; the v6 pool is global unicast with no NAT, so an address is
+internet-routable the moment it is assigned and the WAN firewall is the only network-level gate.
 
 ## Host firewall (node lockdown)
 
@@ -67,7 +79,7 @@ so a node on wifi is not subject to the lockdown.
 ## WireGuard remote-access tunnel
 
 `wireguard.yaml` runs a cluster-hosted WireGuard server (`wireguard` namespace) so an admin can
-tunnel in from off-LAN. It is reachable at `wireguard.loadBalancerIP` (a pinned `lab-pool` IP).
+tunnel in from off-LAN. It is reachable at `wireguard.loadBalancerIP` (a pinned `v4` pool IP).
 With `wireguard.expose: true` the Service carries `homelab.lab/expose` + `protocol: udp`, so
 **opnsense-operator reconciles the `WAN:51820/udp` DNAT** — no manual forward (set `expose: false`
 to wire it by hand). UDP from world already passes the host firewall. No `homelab.lab/hostname`:

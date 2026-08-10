@@ -16,5 +16,4 @@ cat > /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl << 'TOML'
   runtime_type = "io.containerd.runsc.v1"
 TOML
 rc-service k3s restart 2>/dev/null || rc-service k3s-agent restart
-kubectl label node "$(hostname)" gvisor=true
 EOF

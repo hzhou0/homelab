@@ -55,12 +55,10 @@ The design prioritizes simplicity, minimal resource overhead, and strong backup/
 
 ### 2.3 TerraMaster D4-320 Configuration
 
-Connected to the database node via USB 3.2 Gen2 (10Gbps). Each drive is presented as an individual block device (no hardware RAID). Software RAID5 via mdadm provides single-drive fault tolerance. The RAID array is used for PostgreSQL tablespaces housing large/cold datasets.
-
-```bash
-mdadm --create /dev/md0 --level=raid5 --raid-devices=4 \
-  /dev/sda /dev/sdb /dev/sdc /dev/sdd
-```
+Connected to the database node via USB 3.2 Gen2 (10Gbps). Each drive is presented as an individual
+block device (no hardware RAID). A ZFS `raidz` pool over the four drives provides single-drive fault
+tolerance and is used for PostgreSQL tablespaces housing large/cold datasets. The pool is created by
+the node's bootstrap script, not by hand.
 
 ---
 
@@ -85,8 +83,8 @@ Each physical interface on OPNsense has its own subnet. Network segregation is a
 |--------|------|---------|---------|
 | LAN | 10.0.0.0/24 | Trusted wired devices, k3s nodes | 10.0.0.1 |
 | WIFI | 10.0.1.0/24 | Wireless clients (segregated) | 10.0.1.1 |
-| k3s Pods | 10.42.0.0/16 | Internal to cluster (CNI managed) | N/A |
-| k3s Services | 10.43.0.0/16 | Internal to cluster | N/A |
+| k3s Pods | 10.42.0.0/16 + ULA v6 | Internal to cluster (CNI managed) | N/A |
+| k3s Services | 10.43.0.0/16 + ULA v6 | Internal to cluster | N/A |
 | LB IP pool | 10.0.0.100–150 | LoadBalancer service IPs (Cilium LB IPAM + L2) | N/A |
 
 ### 3.3 OPNsense Interface Configuration
@@ -182,31 +180,29 @@ k3s is chosen for its single-binary design, minimal resource footprint, and clea
 
 ### 5.2 Node Topology
 
-| Node | Role | IP | Storage |
-|------|------|----|---------|
-| k3s-server | Server + worker | 10.0.0.21 | NVMe (OS 100GB, vg-nvme remainder) |
-| compute-2 | Worker | 10.0.0.22 | NVMe (OS 100GB, vg-nvme remainder) |
-| compute-3 | Worker | 10.0.0.23 | NVMe (OS 100GB, vg-nvme remainder) |
-| db | Worker (tainted) | 10.0.0.24 | NVMe (OS) + D4-320 (4× HDD) |
+| Node | Role | Storage |
+|------|------|---------|
+| `k3s-server` | Server + worker, control plane at 10.0.0.22 (DHCP reservation) | NVMe (OS 100GB, `vg-nvme` remainder) |
+| `k3s-compute-<6hex>` | Worker | NVMe (OS 100GB, `vg-nvme` remainder) |
+| `k3s-compute-spot` | Worker, reclaimable | none — root claims the whole disk |
+| `k3s-db` | Worker (tainted) | NVMe (OS) + D4-320 (4× HDD) |
+
+Compute roles are multi-instance and take a 6-char hash of the DMI product UUID in their hostname;
+singleton roles keep plain names. Worker addresses come from DHCP and are not fixed — only the
+control plane's is reserved. The spot node carries
+`node.kubernetes.io/capacity-type=spot`, which every singleton workload uses as an anti-affinity
+exclusion.
 
 ### 5.3 Installation
 
-Server node:
-
-```bash
-curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable=traefik --flannel-backend=none --disable-network-policy" sh -
-```
-
-Agent nodes:
-
-```bash
-curl -sfL https://get.k3s.io | K3S_URL=https://10.0.0.21:6443 K3S_TOKEN=<token> sh -
-```
+Nodes self-provision from role-specific Alpine ISOs; `kube-node/nodes.md` is the runbook. The
+cluster is dual-stack (IPv4 primary), so pod and service CIDRs carry a v6 half that is fixed at
+server init and can only be changed by rebuilding the cluster.
 
 ### 5.4 Disabled Default Components
 
 - **Traefik:** Disabled. Cilium Gateway API handles all TCP ingress through a single shared Gateway (one LoadBalancer IP). UDP services that cannot traverse the Gateway get their own dedicated LoadBalancer IP. LoadBalancer IPs are assigned by Cilium's built-in **LB IPAM** and ARP-announced by Cilium **L2 announcements** — MetalLB is not used (see `references/cilium.md`).
-- **Default CNI (Flannel):** Replaced with Cilium in native routing mode.
+- **Default CNI (Flannel):** Replaced with Cilium.
 - **Default network policy controller:** Disabled when using Cilium.
 
 ### 5.5 Database Node Isolation
@@ -242,7 +238,12 @@ Traffic flows through three layers:
 
 2. **North-south ingress** — The only externally accessible entry point for TCP is a shared `Gateway` object backed by a single LoadBalancer IP (assigned by Cilium LB IPAM, ARP-announced by Cilium L2). Traffic is routed by hostname via `HTTPRoute` objects. No TCP service is exposed via `type: LoadBalancer` directly — all inbound TCP must enter through the Gateway. UDP services that cannot traverse the Gateway each get their own dedicated LoadBalancer IP via `type: LoadBalancer`.
 
-3. **WAN exposure** — A custom OPNsense operator watches `Gateway` and `Service` objects for an annotation and creates/removes the corresponding WAN port forward rule via the OPNsense API. Status is written back to the standard Kubernetes status fields (`status.addresses` on `Gateway`, `status.loadBalancer.ingress` on `Service`), so `kubectl get gateway,svc -A` shows the full external exposure map.
+3. **WAN exposure** — A custom OPNsense operator watches `Gateway` and `Service` objects for the
+   `homelab.lab/*` annotations and creates/removes the corresponding WAN port forward rule via the
+   OPNsense API. `homelab.lab/hostname` drives an Unbound DNS override; `homelab.lab/expose` drives
+   the port forward. Status is written back to the standard Kubernetes status fields
+   (`status.addresses` on `Gateway`, `status.loadBalancer.ingress` on `Service`), so
+   `kubectl get gateway,svc -A` shows the full external exposure map.
 
 This follows the same annotation-driven pattern as the AWS Load Balancer Controller in EKS.
 
@@ -250,33 +251,24 @@ This follows the same annotation-driven pattern as the AWS Load Balancer Control
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: homelab-gateway
-  annotations:
-    opnsense.lab/expose: "true"       # operator creates WAN:443 → LoadBalancer IP
-spec:
-  gatewayClassName: cilium
-  listeners:
-  - name: https
-    port: 443
-    protocol: HTTPS
----
-apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: grafana
 spec:
   parentRefs:
-  - name: homelab-gateway
-  hostnames: ["grafana.lab", "grafana.home.example.com"]
+  - name: internal
+    namespace: cilium-gateway
+  hostnames: ["grafana.internal.haustorium.net"]
   rules:
   - backendRefs:
     - name: grafana
       port: 3000
 ```
 
-**UDP (dedicated IP, unchanged):**
+The Gateway itself is owned by the `cilium` chart and already annotated — an `HTTPRoute` attaching to
+it needs no annotations of its own.
+
+**UDP (dedicated IP):**
 
 ```yaml
 apiVersion: v1
@@ -284,8 +276,10 @@ kind: Service
 metadata:
   name: game-server-udp
   annotations:
-    opnsense.lab/expose: "true"
-    opnsense.lab/external-port: "27015"
+    homelab.lab/expose: "true"
+    homelab.lab/protocol: "udp"
+    homelab.lab/external-port: "27015"
+    homelab.lab/internal-port: "27015"
 spec:
   type: LoadBalancer
   ports:
@@ -293,10 +287,10 @@ spec:
     protocol: UDP
 ```
 
-**DNS** — Two wildcard zones both resolve to the Gateway's LoadBalancer IP, allowing any `HTTPRoute` hostname to work automatically without per-service DNS entries:
-
-- **Private (`*.lab`)** — Unbound wildcard host override: `*.lab → 10.0.0.100`. Any `.lab` query from the LAN resolves to the Gateway. See section 13.4.
-- **Public (`*.home.example.com`)** — Wildcard A record at the registrar pointing to the WAN IP. The OPNsense operator's port forward on the annotated Gateway routes inbound HTTPS to the Gateway LoadBalancer IP.
+**DNS** — A wildcard zone resolves to the Gateway's LoadBalancer IP, so any `HTTPRoute` hostname
+works without a per-service DNS entry. The Gateway carries `homelab.lab/hostname` for the internal
+wildcard, which the OPNsense operator turns into an Unbound override. It is internal-only: there is
+no `homelab.lab/expose` on it, and no public wildcard at a registrar. See section 13.4.
 
 UDP services are excluded from these wildcards; each retains an individual Unbound host override pointing to its own dedicated LoadBalancer IP.
 
@@ -335,24 +329,10 @@ k3s upgrades are performed one minor version at a time (e.g., v1.32 → v1.33 �
 
 ### 6.2 Recommended Configuration
 
-Cilium in native routing mode with Gateway API, Hubble observability, and the Cilium service mesh enabled in sidecarless mode.
-
-Gateway API CRDs must be installed before Cilium:
-
-```sh
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
-```
-
-Cilium install flags (run during bootstrap):
-
-```sh
-cilium install \
-  --set=ipam.operator.clusterPoolIPv4PodCIDRList="10.42.0.0/16" \
-  --set=gatewayAPI.enabled=true \
-  --set=hubble.relay.enabled=true \
-  --set=hubble.ui.enabled=true \
-  --set=envoy.enabled=true
-```
+Cilium with Gateway API, Hubble observability, and the Cilium service mesh in sidecarless mode. The
+`cilium` chart is the sole source of the CNI's configuration — nothing installs or configures Cilium
+outside it, and the node bootstrap deliberately installs no part of it. Gateway API CRDs are a
+prerequisite, applied out-of-band at the version Cilium's current minor conformance-tests against.
 
 **Hubble** taps the eBPF datapath and provides per-flow metrics, DNS query visibility, HTTP request/response metadata, service dependency maps, and drop reasons — all with zero application instrumentation. The Hubble UI is exposed as a service on the cluster.
 
@@ -362,7 +342,10 @@ cilium install \
 
 With Flannel (VXLAN), cross-node pod traffic is encapsulated inside regular UDP packets between node IPs. The Horaco switch sees normal LAN traffic. OPNsense is not involved in same-subnet traffic.
 
-With Cilium native routing, pod traffic routes directly between nodes without encapsulation, using eBPF-programmed routing tables. Lower overhead, same external behavior.
+Cilium runs in tunnel mode over VXLAN, so cross-node pod traffic is encapsulated between node IPs
+much as Flannel's was — the switch sees ordinary LAN traffic and OPNsense is not involved in
+same-subnet flows. Native routing would drop the encapsulation overhead but requires the underlay to
+carry pod CIDRs; tunnel mode keeps the physical network ignorant of them.
 
 In both cases, k3s handles cross-node pod networking automatically — no static routes or special OPNsense configuration required. The physical network only ever sees regular node-to-node communication.
 
@@ -381,7 +364,7 @@ Hypha's design — data path, conditional writes, encryption, tiering, and recov
 | Node Type | Storage | Provisioner | Use Case |
 |-----------|---------|-------------|----------|
 | Database node | Internal NVMe | Local Path Provisioner | WAL, default tablespace |
-| Database node | D4-320 (4× HDD, RAID5) | Direct mount | Large tablespaces |
+| Database node | D4-320 (4× HDD, ZFS raidz) | Direct mount | Large tablespaces |
 | Server + compute nodes | Spare NVMe partition | TopoLVM (`vg-nvme`) | SeaweedFS volumes (hypha's S3 cache) |
 
 ### 7.3 Storage Node Disk Partitioning
@@ -394,7 +377,13 @@ Each server/compute node's NVMe is partitioned during Alpine installation (`kube
 | nvme0n1p2 | 100GB | ext4 | Alpine OS + k3s |
 | nvme0n1p3 | Remainder | LVM PV (raw) | `vg-nvme` — SeaweedFS via TopoLVM |
 
-`p3` is the partition formerly earmarked for Ceph (still GPT-labelled `ceph`); it is now an LVM physical volume in the `vg-nvme` volume group. The `db` and `compute-spot` roles have no `p3` — root claims the whole disk — and provide no object storage.
+The `db` and `compute-spot` roles have no `p3` — root claims the whole disk — and provide no object
+storage.
+
+`vg-nvme` survives a k3s reinstall, and so do the logical volumes TopoLVM provisioned into it. Their
+`LogicalVolume` CRs do not, so after a cluster rebuild the old volumes linger as orphans that no
+controller will reclaim and that silently starve new PVCs. Match `lvs` output against
+`LogicalVolume` UIDs and `lvremove` anything unmatched.
 
 ### 7.4 Object Storage — Hypha
 
@@ -514,17 +503,17 @@ OPNsense's DHCP static mappings automatically register hostnames in Unbound. Dev
 
 Enable in OPNsense: **Services → Unbound DNS → General → Register DHCP leases ✅**
 
-**Wildcard zone for TCP services** — Instead of per-service host overrides, a single Unbound wildcard entry covers all TCP services routed through the Gateway:
+**Wildcard zone for TCP services** — Instead of per-service host overrides, a single Unbound wildcard
+override covers every TCP service routed through the Gateway, pointing at the Gateway's LoadBalancer
+IP. The operator creates it from the Gateway's `homelab.lab/hostname` annotation. The Gateway then
+routes by `Host:` header to the correct backend via `HTTPRoute`, so adding a TCP service requires
+only a new `HTTPRoute` — no DNS change.
 
-```
-Host Override: *.lab → 10.0.0.100  (Gateway LoadBalancer IP)
-```
+**UDP services** — Each UDP service retains an individual Unbound host override pointing to its own
+dedicated LoadBalancer IP.
 
-Any `<service>.lab` query from a LAN or WiFi device resolves to the Gateway. The Gateway then routes by `Host:` header to the correct backend via `HTTPRoute`. Adding a new TCP service requires only a new `HTTPRoute` — no DNS change needed.
-
-**UDP services** — Each UDP service retains an individual Unbound host override pointing to its own dedicated LoadBalancer IP (unchanged from before).
-
-**Public wildcard zone** — A wildcard A record `*.home.example.com → <WAN IP>` is configured at the DNS registrar. The OPNsense operator's WAN port forward on the annotated Gateway routes inbound HTTPS to the same Gateway LoadBalancer IP. An `HTTPRoute` can match on both the `.lab` and `.home.example.com` hostnames simultaneously to serve private and public clients from the same backend. See section 5.6.
+The internal wildcard is not published externally; reaching a service from off-LAN goes through the
+WireGuard tunnel rather than a public DNS record.
 
 ### 10.5 Comparison of DNS Privacy Approaches
 
@@ -582,23 +571,14 @@ Practical mitigation: encrypt all traffic at L3+ (HTTPS, WireGuard, TLS, encrypt
 
 ### 12.1 Node Provisioning
 
-Compute nodes are provisioned via a custom Alpine Linux ISO built with mkimage. The ISO embeds an answer file and deploy script that automates base configuration, disk partitioning (OS + vg-nvme split), SSH key installation, and hostname assignment.
+Nodes are provisioned from role-specific Alpine ISOs that self-install: boot one on bare metal and it
+partitions the disk, installs Alpine, joins the cluster, and sets up node-local storage without an
+operator at the console. The k3s join token is pre-shared and baked into the image, so it survives a
+control-plane rebuild and is the same for every role — treat the ISOs as secret-bearing.
 
-Deploy script usage:
-
-```bash
-# Usage: deploy-node.sh <node-number>
-# Sets hostname to k3s-node-N, IP assigned via OPNsense DHCP reservation
-
-sh deploy-node.sh 4
-```
-
-After OS install, join the cluster and enable storage:
-
-```bash
-curl -sfL https://get.k3s.io | K3S_URL=https://10.0.0.21:6443 K3S_TOKEN=<token> sh -
-kubectl label nodes k3s-node-4 vg=nvme
-```
+Neither provisioning phase can label or taint a node, since both need the API. Those are applied
+afterwards from a machine with a kubeconfig; `kube-node/nodes.md` lists which labels each role needs
+and what consumes them.
 
 ### 12.2 IP Address Management
 
@@ -620,7 +600,7 @@ To add a new compute node to the SeaweedFS/hypha pool:
 
 1. Provision the node with the standard Alpine ISO (includes the `vg-nvme` partition)
 2. Join the k3s cluster
-3. Create the volume group at bootstrap (`vgcreate vg-nvme /dev/nvme0n1p3`), then label the node: `kubectl label nodes compute-N vg=nvme`
+3. The bootstrap creates the volume group; label the node `vg=nvme` afterwards from a kubeconfig
 4. TopoLVM's lvmd/node plugins start on the node; add a SeaweedFS volume server (bump `volume.replicas`) to use the new capacity
 
 ### 12.5 UPS Recommendations
@@ -639,8 +619,8 @@ A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database 
 | 10.0.0.2 | Horaco unmanaged switch |
 | 10.0.0.3 | AX55 AP (AP mode) |
 | 10.0.0.4–20 | Reserved for infrastructure |
-| 10.0.0.21 | k3s server node |
-| 10.0.0.22–40 | k3s compute nodes |
+| 10.0.0.22 | k3s server node (DHCP reservation) |
+| 10.0.0.23–40 | reserved for future pinned cluster nodes |
 | 10.0.0.41–50 | Database / storage nodes |
 | 10.0.0.100–150 | Cilium LoadBalancer IP pool (LB IPAM + L2; .100 = shared Gateway) |
 | 10.0.0.200–250 | DHCP for other wired devices |
@@ -659,22 +639,23 @@ A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database 
 | 10.42.0.0/16 | k3s pod network (CNI managed) |
 | 10.43.0.0/16 | k3s service network |
 
+The cluster is dual-stack. Pods and services also carry a private ULA v6 range, so internal v6 is
+never routable. A Service gets a globally-routable v6 LoadBalancer address only by opting in with
+`ipFamilyPolicy` — and that address is reachable from the internet the moment it is assigned, gated
+solely by the OPNsense WAN firewall, with no NAT in the way as there is for v4.
+
 ### 13.4 Service DNS
 
-**Private wildcard (Unbound host override):**
+**Internal wildcard (Unbound host override, operator-managed):**
 
-| Hostname | IP | Purpose |
-|----------|----|---------|
-| `*.lab` (wildcard) | 10.0.0.100 | All TCP services — resolves to the Gateway LoadBalancer IP |
-| `<udp-svc>.lab` (per-service) | 10.0.0.101+ | Each UDP service — resolves to its own dedicated LoadBalancer IP |
+| Hostname | Resolves to | Purpose |
+|----------|-------------|---------|
+| the internal wildcard | Gateway LoadBalancer IP | All TCP services routed through the shared Gateway |
+| per-UDP-service record | that service's own LoadBalancer IP | Each UDP service |
 
-**Public wildcard (registrar DNS):**
-
-| Hostname | IP | Purpose |
-|----------|----|---------|
-| `*.home.example.com` (wildcard) | WAN IP | All public TCP services — routes via OPNsense port forward to Gateway |
-
-TCP services need only an `HTTPRoute` with the desired hostname — no additional DNS entry is required for either the private or public zone. UDP services each require a dedicated Unbound host override and their own LoadBalancer IP.
+TCP services need only an `HTTPRoute` with the desired hostname — no DNS entry. UDP services each
+require their own LoadBalancer IP and a dedicated Unbound override, which the operator creates from
+`homelab.lab/hostname`. Nothing is published in public DNS.
 
 ### 13.5 Reserved Ranges for Future Subnets
 

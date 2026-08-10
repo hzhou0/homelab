@@ -2,11 +2,8 @@
 # Clients → `ingress` proxy L3 allow-list. A vanilla k8s NetworkPolicy cannot match the reserved
 # `ingress` identity, so this front-door allow is Cilium-native.
 #
-# The reverse hop (ingress proxy → backend pods) is the second CCNP below. The fence deliberately
-# does NOT grant `ingress` cluster-wide, so the proxy can only reach fenced backends whose namespace
-# is in gateway.backendNamespaces — a route into a fenced namespace is dead until that namespace is
-# listed. Envoy re-identifies proxied traffic as reserved:ingress, which a namespaceSelector can't
-# match either, so the reverse hop is Cilium-native too.
+# `ingress` is deliberately NOT granted cluster-wide, so a route into a fenced namespace stays dead
+# until that namespace is listed as a backend.
 {{- if .Values.gateway.allowedCIDRs }}
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
@@ -43,9 +40,8 @@ spec:
 {{- end }}
 {{- if .Values.gateway.backendNamespaces }}
 ---
-# Reverse hop: Envoy `reserved:ingress` → backend pods, scoped to the namespaces that host routes.
-# Additive (enableDefaultDeny:false) — the east-west-default-deny fence owns the deny; this only
-# re-opens `ingress` for the listed backends, so the gateway's reach is an explicit allow-list.
+# Reverse hop: Envoy re-identifies proxied traffic as `reserved:ingress`, which a namespaceSelector
+# cannot match — so this hop needs a Cilium-native allow too. Additive; the east-west fence owns the deny.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
