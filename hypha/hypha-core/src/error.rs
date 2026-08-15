@@ -1,5 +1,6 @@
 //! Backend and protocol error mapping.
 
+use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use s3s::{S3Error, S3ErrorCode};
 
@@ -11,6 +12,11 @@ pub enum Error {
     NotFound,
     #[error("no such bucket")]
     NoSuchBucket,
+    /// The backend refused the caller, which is never a statement about whether the object or
+    /// bucket exists — a backend that hides what it will not serve answers this *instead of* an
+    /// absence, so the two must not collapse.
+    #[error("access denied")]
+    AccessDenied,
     /// A `DeleteBucket` whose client namespace still holds objects. hypha decides this itself rather
     /// than delegating to the backend's refusal — SeaweedFS deletes a non-empty bucket and its
     /// contents outright (`allowDeleteBucketNotEmpty` defaults on), so a delegated gate is no gate.
@@ -38,11 +44,20 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn from_sdk<E, R>(err: SdkError<E, R>) -> Self
+    pub fn from_sdk<E>(err: SdkError<E, HttpResponse>) -> Self
     where
         E: ProvideErrorMetadata + std::fmt::Debug,
-        R: std::fmt::Debug,
     {
+        // Status before code, for `403` alone. A HEAD carries no error document, so the SDK has no
+        // code to read and falls back to the single error its operation models — on `HeadObject`
+        // that is `NotFound`, which would turn every refusal into an absence and hand a caller a
+        // deletion it never saw. No other status needs this: a code that did parse is the more
+        // specific answer.
+        if let SdkError::ServiceError(e) = &err {
+            if e.raw().status().as_u16() == 403 {
+                return Error::AccessDenied;
+            }
+        }
         match err.code() {
             Some("NoSuchKey") | Some("404") | Some("NotFound") | Some("NoSuchUpload") => {
                 Error::NotFound
@@ -70,7 +85,12 @@ impl From<Error> for S3Error {
             Error::BadDigest => S3ErrorCode::BadDigest,
             Error::Invalid(_) => S3ErrorCode::InvalidRequest,
             // A decrypt/authentication failure is a server-side integrity fault, not client error.
-            Error::Crypto(_) | Error::Backend(_) | Error::Io(_) => S3ErrorCode::InternalError,
+            // `AccessDenied` belongs here for the same reason: the client that authenticated to
+            // hypha is not the caller the backend refused, and blaming it sends the operator to
+            // the wrong set of credentials.
+            Error::Crypto(_) | Error::Backend(_) | Error::AccessDenied | Error::Io(_) => {
+                S3ErrorCode::InternalError
+            }
         };
         S3Error::with_message(code, e.to_string())
     }

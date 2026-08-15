@@ -696,6 +696,16 @@ Remote requirements:
 The mapped remote namespace is expected to be private to one deployment. Foreign buckets or objects
 inside it are invariant violations, not things to ignore.
 
+**A refusal is not an absence**, and the backend is not obliged to make them look different. A HEAD
+carries no error document, so the SDK has no code to read and falls back to the one error the
+operation models — `NotFound` on `HeadObject` — while a backend that will not disclose what it hides
+answers `403` where a permissive one answers `404`. Both of those turn "you may not" into "it is not
+there", which is the most dangerous mistranslation available here: absence is what the pending-set
+rebuild reads as the client's own deletes. `403` is therefore mapped ahead of any error code, to its
+own variant that no absence check accepts, and the sites that legitimately cannot tell absence from
+refusal — creating the GC bucket is the only one — resolve it by attempting the write rather than by
+assuming. Every other site names the variants it means and lets the rest propagate.
+
 ## Verification
 
 `cargo test --workspace` runs the default harness: an isolated MinIO remote and cache per test, hypha

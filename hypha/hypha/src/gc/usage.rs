@@ -68,7 +68,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// data nodes each carrying some form of address, and a volume server's `DiskStatuses` carrying
 /// `all`/`used` byte counts. Every field is optional here, so a SeaweedFS that renames one degrades
 /// to "usage unknown" — GC stops evicting and warns — instead of panicking or, far worse, reading a
-/// missing field as an empty cache.
+/// missing field as an empty cache. That degradation is silent by construction, so each level of
+/// the topology accepts both spellings SeaweedFS has used: an unmatched shape and an empty one are
+/// the same value here, and only the alias keeps them apart.
 struct SeaweedFs {
     master: String,
     garbage_threshold: f64,
@@ -155,19 +157,19 @@ struct DirStatus {
 
 #[derive(Deserialize)]
 struct Topology {
-    #[serde(rename = "DataCenterInfos", default)]
+    #[serde(rename = "DataCenterInfos", alias = "DataCenters", default)]
     data_centers: Vec<DataCenter>,
 }
 
 #[derive(Deserialize)]
 struct DataCenter {
-    #[serde(rename = "RackInfos", default)]
+    #[serde(rename = "RackInfos", alias = "Racks", default)]
     racks: Vec<Rack>,
 }
 
 #[derive(Deserialize)]
 struct Rack {
-    #[serde(rename = "DataNodeInfos", default)]
+    #[serde(rename = "DataNodeInfos", alias = "DataNodes", default)]
     nodes: Vec<DataNode>,
 }
 
@@ -261,6 +263,17 @@ mod tests {
             status.volume_servers(),
             vec!["http://10.0.0.1:8080", "http://vol-1:8080"]
         );
+    }
+
+    /// The spelling SeaweedFS 4.37 actually serves; the `*Infos` names above are the older one.
+    #[test]
+    fn topology_reads_the_unsuffixed_spelling_too() {
+        let status: DirStatus = serde_json::from_str(
+            r#"{"Topology":{"DataCenters":[{"Racks":[
+                 {"DataNodes":[{"Url":"vol-1:8080","PublicUrl":"vol-1:8080"}]}]}]}}"#,
+        )
+        .expect("the current spelling parses");
+        assert_eq!(status.volume_servers(), vec!["http://vol-1:8080"]);
     }
 
     #[test]

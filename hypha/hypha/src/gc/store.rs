@@ -21,13 +21,17 @@ impl GcStore {
     /// lifecycle , and this bucket has none — it exists for the life of the deployment.
     pub(super) async fn ensure(&self) -> Result<()> {
         match self.backend.head_bucket(&self.bucket).await {
+            Ok(()) => return Ok(()),
+            // A backend that will not disclose a bucket it is hiding answers the HEAD with a
+            // refusal rather than an absence, so the two are indistinguishable from here. The
+            // create attempt is what separates them, and it carries the real reason when it fails.
+            Err(Error::NoSuchBucket | Error::AccessDenied) => {}
+            Err(e) => return Err(e),
+        }
+        match self.backend.create_bucket(&self.bucket).await {
             Ok(()) => Ok(()),
-            Err(Error::NoSuchBucket) => match self.backend.create_bucket(&self.bucket).await {
-                Ok(()) => Ok(()),
-                // A concurrent creator winning the race is success.
-                Err(e) => self.backend.head_bucket(&self.bucket).await.map_err(|_| e),
-            },
-            Err(e) => Err(e),
+            // A concurrent creator winning the race is success.
+            Err(e) => self.backend.head_bucket(&self.bucket).await.map_err(|_| e),
         }
     }
 
