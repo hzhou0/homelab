@@ -1,0 +1,4 @@
+{{- $expected := "homelab-monitoring" }}
+{{- if ne .Release.Name $expected }}
+{{- fail (printf "release must be named %q (got %q). The subchart derives Service names from the release name, and the gateway route backends are pinned to those names — a different release installs cleanly, runs healthy, and serves 500s from dangling HTTPRoute backends." $expected .Release.Name) }}
+{{- end }}

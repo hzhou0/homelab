@@ -41,5 +41,5 @@ than TopoLVM's scheduler extender (which would require patching the k3s schedule
 
 ```sh
 helm dependency build topolvm
-helm install homelab-topolvm topolvm -n topolvm-system --create-namespace
+helm install topolvm topolvm -n topolvm --create-namespace
 ```
