@@ -248,6 +248,121 @@ async fn copy_source_preconditions() {
     assert_eq!(get_all(&client, B, "dst/cond-ok").await, src);
 }
 
+#[tokio::test]
+async fn copy_destination_preconditions() {
+    for mode in [Mode::Durable, Mode::Cached] {
+        let h = Harness::with_mode(mode).await;
+        h.create_bucket(B).await;
+        let client = h.client();
+
+        let src = pattern_seeded(2048, 71);
+        let original = pattern_seeded(1024, 72);
+        put(&client, B, "src/dst-cond", &src).await;
+        let original_etag = put(&client, B, "dst/conditional", &original).await;
+
+        let stale = client
+            .copy_object()
+            .bucket(B)
+            .key("dst/conditional")
+            .copy_source(format!("{B}/src/dst-cond"))
+            .if_match("\"00000000000000000000000000000000\"")
+            .send()
+            .await
+            .expect_err("stale destination If-Match must fail");
+        assert_eq!(
+            stale.into_service_error().meta().code(),
+            Some("PreconditionFailed"),
+            "{mode:?}"
+        );
+
+        let occupied = client
+            .copy_object()
+            .bucket(B)
+            .key("dst/conditional")
+            .copy_source(format!("{B}/src/dst-cond"))
+            .if_none_match("*")
+            .send()
+            .await
+            .expect_err("destination If-None-Match must reject an existing key");
+        assert_eq!(
+            occupied.into_service_error().meta().code(),
+            Some("PreconditionFailed"),
+            "{mode:?}"
+        );
+        assert_eq!(get_all(&client, B, "dst/conditional").await, original);
+
+        client
+            .copy_object()
+            .bucket(B)
+            .key("dst/conditional")
+            .copy_source(format!("{B}/src/dst-cond"))
+            .if_match(format!("\"{original_etag}\""))
+            .send()
+            .await
+            .expect("matching destination If-Match copies");
+        assert_eq!(get_all(&client, B, "dst/conditional").await, src);
+
+        client
+            .copy_object()
+            .bucket(B)
+            .key("dst/create")
+            .copy_source(format!("{B}/src/dst-cond"))
+            .if_none_match("*")
+            .send()
+            .await
+            .expect("destination If-None-Match copies to an absent key");
+        assert_eq!(get_all(&client, B, "dst/create").await, src);
+
+        let absent = client
+            .copy_object()
+            .bucket(B)
+            .key("dst/missing")
+            .copy_source(format!("{B}/src/dst-cond"))
+            .if_match(format!("\"{original_etag}\""))
+            .send()
+            .await
+            .expect_err("destination If-Match must reject an absent key");
+        assert_eq!(
+            absent.into_service_error().meta().code(),
+            Some("PreconditionFailed"),
+            "{mode:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_conditional_copy_creates_linearize_under_contention() {
+    let h = Harness::cached().await;
+    h.create_bucket(B).await;
+    let body = pattern_seeded(2048, 73);
+    put(&h.client(), B, "src/contention", &body).await;
+
+    let tasks = (0..24).map(|_| {
+        let client = h.client();
+        tokio::spawn(async move {
+            client
+                .copy_object()
+                .bucket(B)
+                .key("dst/contention")
+                .copy_source(format!("{B}/src/contention"))
+                .if_none_match("*")
+                .send()
+                .await
+                .map_err(|error| sdk_err_code(&error))
+        })
+    });
+
+    let mut wins = 0;
+    for result in futures::future::join_all(tasks).await {
+        match result.expect("racer panicked") {
+            Ok(_) => wins += 1,
+            Err(code) => assert_eq!(code.as_deref(), Some("PreconditionFailed")),
+        }
+    }
+    assert_eq!(wins, 1);
+    assert_eq!(get_all(&h.client(), B, "dst/contention").await, body);
+}
+
 /// A same-key `REPLACE` copy is an in-place metadata edit: the body is unchanged, the metadata swaps.
 #[tokio::test]
 async fn copy_in_place_metadata_edit() {

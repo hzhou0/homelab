@@ -325,10 +325,10 @@ per part.
 
 Also implemented: SigV4 against one client access-key pair; plaintext ETags, `Content-MD5`, and
 flexible checksums (single-part CRC32/CRC32C/CRC64NVME/SHA1/SHA256, multipart composite checksums and
-full-object CRCs); byte-range GETs; copy-source ETag and time preconditions; generation-bound
-copy-source reads through the same cache/remote view as other reads; client metadata, `Content-Type`,
-and non-archive storage-class labels; up to 1,000 keys per `DeleteObjects`; part numbers 1–10,000 with
-S3's ordering and minimum-size rules.
+full-object CRCs); byte-range GETs; copy-source ETag and time preconditions; destination `CopyObject`
+ETag preconditions; generation-bound copy-source reads through the same cache/remote view as other
+reads; client metadata, `Content-Type`, and non-archive storage-class labels; up to 1,000 keys per
+`DeleteObjects`; part numbers 1–10,000 with S3's ordering and minimum-size rules.
 
 `CopyObject` handles up to 5 GiB: live sources copy atomically within the cache, while remote-resident
 sources use an internal multipart copy of the encrypted body plus a fresh destination-bound trailer
@@ -341,7 +341,6 @@ Surface limits:
 - `PutObject` and `UploadPart` require `Content-Length` and accept just under 5 GiB of plaintext —
   the remote's 5 GiB per-PUT limit applies to the *framed* body, so the cap is that limit less age's
   per-chunk tags and the trailer the leg may have to carry;
-- destination `CopyObject` conditions are unavailable in the `s3s` 0.14 request type;
 - bucket versioning is always reported disabled; versioned operations are not implemented;
 - ACL, policy, lifecycle, CORS, tagging, object lock, retention, archive restore, replication
   configuration, and SSE configuration are outside the surface.
@@ -711,12 +710,6 @@ multipart replacement and folding, restore and pending-set recovery, crash brack
 GC and rehydrate races, backend exhaustion, injected faults, admin endpoints, tracing, and load.
 
 ## Outstanding work
-
-**Upgrade `s3s` to 0.15.0 when published** (crates.io is still at 0.14.1). On the upgrade: remove the
-quoted-ETag workaround for `GetObjectAttributes` and update its tests; implement destination
-`CopyObject` `If-Match`/`If-None-Match`, whose fields are absent from the 0.14 request type; review the
-remaining breaking changes and rerun the external conformance suite. Upstream:
-[s3s#629](https://github.com/s3s-project/s3s/issues/629).
 
 Further verification wanted: stock `rage` interoperability coverage after stripping hypha's trailer; a
 real zero-loss client against the durable endpoint; and Ceph's `s3-tests` curated to the implemented

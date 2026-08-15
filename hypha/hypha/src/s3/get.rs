@@ -305,9 +305,6 @@ impl Hypha {
             };
 
         let resp = GetObjectAttributesOutput {
-            // Quoted here though AWS sends this one unquoted: s3s 0.14.1 quotes every ETag DTO value
-            // uniformly, an upstream bug (Nugine/s3s#629, fixed for 0.15.0). Harmless — every S3
-            // client trims quotes — drop this note on the s3s bump.
             e_tag: want(ObjectAttributes::ETAG).then(|| ETag::Strong(facts.cetag.clone())),
             object_size: want(ObjectAttributes::OBJECT_SIZE).then_some(facts.plen as i64),
             storage_class: want(ObjectAttributes::STORAGE_CLASS)

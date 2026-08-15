@@ -11,6 +11,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use futures::StreamExt as _;
 use s3s::dto::*;
+use s3s::header::{IF_MATCH, IF_NONE_MATCH};
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use hypha_core::backend::{
@@ -106,6 +107,8 @@ impl Hypha {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let if_match = parse_destination_condition(&req.headers, &IF_MATCH)?;
+        let if_none_match = parse_destination_condition(&req.headers, &IF_NONE_MATCH)?;
         let input = req.input;
         let bucket = input.bucket.clone();
         let key = input.key.clone();
@@ -182,6 +185,16 @@ impl Hypha {
             dst_passthrough.insert(meta::CHECKSUM.to_string(), meta::encode_checksum(value));
         }
 
+        let _destination_guard = self.write_lock(&bucket, &key).await;
+        if if_match.is_some() || if_none_match.is_some() {
+            let current_etag = self.resolve_current_client_etag(&bucket, &key).await?;
+            evaluate_precondition(
+                if_match.as_ref(),
+                if_none_match.as_ref(),
+                current_etag.as_deref(),
+            )?;
+        }
+
         // Representation, not deployment mode, selects the transport. A live source is a
         // single-part plaintext cache body, so a ready cached destination can use one atomic
         // cache-side copy and owe the normal PUT marker. Tombstoned sources — composites included —
@@ -229,11 +242,6 @@ impl Hypha {
             self.tier.halt.foreign_object(&src_bucket, &src_key).await
         };
         let body_ct_len = tail.body_ct_len;
-
-        // Whole bracket under K_dst's write lock . No destination precondition to resolve, and
-        // this copy's mark → commit → settle overwrites K_dst wholesale, so any leftover mark on it
-        // is simply superseded — no separate repair needed.
-        let _guard = self.write_lock(&bucket, &key).await;
 
         // The fresh trailer: the source footer with mtime re-minted, re-MAC'd over K_dst; the table
         // (empty for single-part) carries over. Built once — both commit paths preserve body_ct_len.
@@ -411,9 +419,6 @@ impl Hypha {
             })?;
         let body = codec::bytestream_to_blob(source.body);
 
-        let _guard = self
-            .write_lock(commit.destination.bucket, commit.destination.key)
-            .await;
         let mtime_ms = tier::now_ms();
         self.tier
             .mark_transit_locked(commit.destination.bucket, commit.destination.key)
@@ -750,6 +755,24 @@ impl Hypha {
         }
         Ok(hasher.finalize(ChecksumKind::FullObject))
     }
+}
+
+fn parse_destination_condition(
+    headers: &hyper::HeaderMap,
+    name: &hyper::header::HeaderName,
+) -> S3Result<Option<ETagCondition>> {
+    headers
+        .get(name)
+        .map(|value| {
+            ETagCondition::parse_http_header(value.as_bytes()).map_err(|_| {
+                s3_error!(
+                    InvalidRequest,
+                    "{} is not a valid ETag condition",
+                    name.as_str()
+                )
+            })
+        })
+        .transpose()
 }
 
 fn copy_response(

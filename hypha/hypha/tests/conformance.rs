@@ -1996,11 +1996,7 @@ async fn get_object_attributes_single_part() {
         .expect("get object attributes");
 
     assert_eq!(out.object_size(), Some(body.len() as i64));
-    // AWS returns this ETag unquoted; s3s quotes every ETag uniformly, so trim before comparing.
-    assert_eq!(
-        out.e_tag().map(|e| e.trim_matches('"')),
-        Some(etag.as_str())
-    );
+    assert_eq!(out.e_tag(), Some(etag.as_str()));
     assert_eq!(
         out.storage_class(),
         Some(&aws_sdk_s3::types::StorageClass::Standard)
@@ -2020,10 +2016,7 @@ async fn get_object_attributes_single_part() {
         .await
         .expect("get object attributes (etag only)");
     assert!(out2.object_size().is_none(), "unrequested field is omitted");
-    assert_eq!(
-        out2.e_tag().map(|e| e.trim_matches('"')),
-        Some(etag.as_str())
-    );
+    assert_eq!(out2.e_tag(), Some(etag.as_str()));
 }
 
 /// GetBucketVersioning is a benign stub: an empty configuration (no Status), so `aws s3 sync` / boto
