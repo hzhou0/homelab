@@ -1,0 +1,255 @@
+{{- if .Values.monitoring.dashboard.enabled }}
+{{- $ds := "${datasource}" }}
+{{/* Grafana's own template delimiters, kept out of Helm's hands. */ -}}
+{{ $op := "{{op}}" -}}
+{{ $outcome := "{{outcome}}" -}}
+{{ $result := "{{result}}" -}}
+{{ $path := "{{path}}" -}}
+{{ $class := "{{class}}" -}}
+{{ $source := "{{source}}" -}}
+{{ $mark := "{{mark}}" }}
+{{- range $name, $deployment := .Values.deployments }}
+{{- $ctx := dict "root" $ "deployment" $name }}
+{{- $fullname := include "hypha.fullname" $ctx }}
+{{- /* The selector lands inside JSON string literals, so its quotes have to survive as escapes. */}}
+{{- $sel := include "hypha.selector" $ctx | replace "\"" "\\\"" }}
+{{- $pod := printf "%s-[0-9]+" $fullname }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-dashboard
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "hypha.labels" $ctx | nindent 4 }}
+    {{ $.Values.monitoring.dashboard.label }}: "1"
+  annotations:
+    grafana_folder: {{ $.Values.monitoring.dashboard.folder | quote }}
+data:
+  {{ $fullname }}.json: |
+    {
+      "uid": "{{ $fullname }}",
+      "title": "Hypha — {{ $fullname }} ({{ $deployment.mode }})",
+      "tags": ["hypha", "s3", "storage"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "30s",
+      "time": { "from": "now-6h", "to": "now" },
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {},
+            "hide": 0
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1, "type": "stat", "title": "Serving",
+          "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "expr": "up{ {{ $sel }} }" }],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "fieldConfig": { "defaults": { "mappings": [
+            { "type": "value", "options": { "0": { "text": "down", "color": "red", "index": 0 },
+                                            "1": { "text": "up", "color": "green", "index": 1 } } }
+          ] }, "overrides": [] }
+        },
+        {
+          "id": 2, "type": "stat", "title": "Pending markers",
+          "description": "Keys acknowledged to a client but not yet on the remote. Zero in durable mode.",
+          "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "expr": "hypha_pending_markers{ {{ $sel }} }" }],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+        },
+        {
+          "id": 3, "type": "stat", "title": "Markers owed",
+          "description": "Flat zero in health: an owed marker is the cache refusing writes.",
+          "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "expr": "hypha_markers_owed{ {{ $sel }} }" }],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "red", "value": 1 }
+          ] } }, "overrides": [] }
+        },
+        {
+          "id": 4, "type": "stat", "title": "Buckets dirty at drain",
+          "description": "Buckets the last drain left unsealed; each costs the next start a recovery scan.",
+          "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "expr": "hypha_buckets_dirty_at_drain{ {{ $sel }} }" }],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "orange", "value": 1 }
+          ] } }, "overrides": [] }
+        },
+        {
+          "id": 5, "type": "stat", "title": "GC ladder rung",
+          "description": "0 unpressured, 1 interval, 2 concurrency, 3 threshold. Sustained 3 means the cache is undersized.",
+          "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "expr": "hypha_gc_ladder_rung{ {{ $sel }} }" }],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "fieldConfig": { "defaults": { "max": 3, "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "orange", "value": 2 }, { "color": "red", "value": 3 }
+          ] } }, "overrides": [] }
+        },
+        {
+          "id": 6, "type": "stat", "title": "Cache used",
+          "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "expr": "hypha_cache_used_bytes{ {{ $sel }} } / clamp_min(hypha_cache_capacity_bytes{ {{ $sel }} }, 1)" }],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1 }, "overrides": [] }
+        },
+
+        {
+          "id": 10, "type": "timeseries", "title": "S3 requests",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "legendFormat": "{{ $op }} {{ $outcome }}",
+                        "expr": "sum by (op, outcome) (rate(hypha_s3_requests_total{ {{ $sel }} }[5m]))" }],
+          "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+        },
+        {
+          "id": 11, "type": "timeseries", "title": "S3 latency",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [
+            { "refId": "A", "legendFormat": "p50",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(hypha_s3_request_seconds_bucket{ {{ $sel }} }[5m])))" },
+            { "refId": "B", "legendFormat": "p95",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(hypha_s3_request_seconds_bucket{ {{ $sel }} }[5m])))" },
+            { "refId": "C", "legendFormat": "p99",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(hypha_s3_request_seconds_bucket{ {{ $sel }} }[5m])))" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+        },
+
+        {
+          "id": 20, "type": "timeseries", "title": "Error ratio by operation",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "legendFormat": "{{ $op }}",
+                        "expr": "sum by (op) (rate(hypha_s3_requests_total{ {{ $sel }},outcome=\"error\"}[5m])) / clamp_min(sum by (op) (rate(hypha_s3_requests_total{ {{ $sel }} }[5m])), 0.001)" }],
+          "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] }
+        },
+        {
+          "id": 21, "type": "timeseries", "title": "Cache reads",
+          "description": "A miss is served from the remote and may raise a background rehydrate.",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "legendFormat": "{{ $result }}",
+                        "expr": "sum by (result) (rate(hypha_cache_reads_total{ {{ $sel }} }[5m]))" }],
+          "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+        },
+        {
+          "id": 22, "type": "timeseries", "title": "Cache pressure",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [
+            { "refId": "A", "legendFormat": "used", "expr": "hypha_cache_used_bytes{ {{ $sel }} }" },
+            { "refId": "B", "legendFormat": "capacity", "expr": "hypha_cache_capacity_bytes{ {{ $sel }} }" },
+            { "refId": "C", "legendFormat": "{{ $mark }} water", "expr": "hypha_cache_water_mark_bytes{ {{ $sel }} }" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] }
+        },
+
+        {
+          "id": 30, "type": "timeseries", "title": "Pending work",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [
+            { "refId": "A", "legendFormat": "pending markers", "expr": "hypha_pending_markers{ {{ $sel }} }" },
+            { "refId": "B", "legendFormat": "markers owed", "expr": "hypha_markers_owed{ {{ $sel }} }" }
+          ]
+        },
+        {
+          "id": 31, "type": "timeseries", "title": "Remote uploads and throttling",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [
+            { "refId": "A", "legendFormat": "upload {{ $outcome }}",
+              "expr": "sum by (outcome) (rate(hypha_remote_uploads_total{ {{ $sel }} }[5m]))" },
+            { "refId": "B", "legendFormat": "throttled writes",
+              "expr": "rate(hypha_backpressure_throttled{ {{ $sel }} }[5m])" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+        },
+        {
+          "id": 32, "type": "timeseries", "title": "Reconcile and upload p95",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [
+            { "refId": "A", "legendFormat": "reconcile pass",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(hypha_reconcile_pass_seconds_bucket{ {{ $sel }} }[15m])))" },
+            { "refId": "B", "legendFormat": "remote upload",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(hypha_remote_upload_seconds_bucket{ {{ $sel }} }[15m])))" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+        },
+
+        {
+          "id": 40, "type": "timeseries", "title": "Startup duration by path",
+          "description": "clean inherits the last drain's accounting; rebuild re-derives pending sets from the namespaces.",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 28 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "legendFormat": "{{ $path }} p95",
+                        "expr": "histogram_quantile(0.95, sum by (le, path) (rate(hypha_startup_seconds_bucket{ {{ $sel }} }[6h])))" }],
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+        },
+        {
+          "id": 41, "type": "timeseries", "title": "Starts by path",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "legendFormat": "{{ $path }}",
+                        "expr": "sum by (path) (increase(hypha_startup_seconds_count{ {{ $sel }} }[1h]))" }]
+        },
+        {
+          "id": 42, "type": "timeseries", "title": "Restarts and invariant halts",
+          "description": "Exit 86 is the invariant-violation status: the deployment refuses to serve until the halt marker is cleared.",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 28 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [
+            { "refId": "A", "legendFormat": "restarts (1h)",
+              "expr": "increase(kube_pod_container_status_restarts_total{namespace=\"{{ $.Release.Namespace }}\",container=\"hypha\",pod=~\"{{ $pod }}\"}[1h])" },
+            { "refId": "B", "legendFormat": "last exit code",
+              "expr": "kube_pod_container_status_last_terminated_exitcode{namespace=\"{{ $.Release.Namespace }}\",container=\"hypha\",pod=~\"{{ $pod }}\"}" }
+          ]
+        },
+
+        {
+          "id": 50, "type": "timeseries", "title": "GC escalation",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [
+            { "refId": "A", "legendFormat": "rung", "expr": "hypha_gc_ladder_rung{ {{ $sel }} }" },
+            { "refId": "B", "legendFormat": "pass p95",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(hypha_gc_pass_seconds_bucket{ {{ $sel }} }[1h])))" }
+          ]
+        },
+        {
+          "id": 51, "type": "timeseries", "title": "Reclaimed bytes",
+          "description": "Debris is free; eviction is paid back as rehydration latency.",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "legendFormat": "{{ $source }}",
+                        "expr": "sum by (source) (rate(hypha_gc_reclaimed_bytes_total{ {{ $sel }} }[30m]))" }],
+          "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] }
+        },
+        {
+          "id": 52, "type": "timeseries", "title": "Debris swept",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
+          "datasource": { "type": "prometheus", "uid": "{{ $ds }}" },
+          "targets": [{ "refId": "A", "legendFormat": "{{ $class }}",
+                        "expr": "sum by (class) (rate(hypha_gc_debris_total{ {{ $sel }} }[30m]))" }]
+        }
+      ]
+    }
+{{- end }}
+{{- end }}

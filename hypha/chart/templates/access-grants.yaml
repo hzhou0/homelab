@@ -1,0 +1,57 @@
+{{- /*
+Ingress allows layered on the cluster-wide east-west default deny. Scoped by source NAMESPACE
+only — a pod can self-apply any label, so labels are not a trust boundary; the namespace is.
+
+The gateway's own reverse hop is NOT granted here: it is an allow-list held by the cilium chart
+(gateway.backendNamespaces), so a route into this namespace stays dead until it is listed there.
+*/ -}}
+{{- range $name, $deployment := .Values.deployments }}
+{{- $ctx := dict "root" $ "deployment" $name }}
+{{- if $.Values.accessGrants.fromNamespaces }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-{{ include "hypha.fullname" $ctx }}-s3
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "hypha.labels" $ctx | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "hypha.selectorLabels" $ctx | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        {{- range $ns := $.Values.accessGrants.fromNamespaces }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns }}
+        {{- end }}
+      toPorts:
+        - ports:
+            - port: {{ $.Values.serving.port | quote }}
+              protocol: TCP
+{{- end }}
+{{- if $.Values.monitoring.namespace }}
+---
+# The admin listener is unauthenticated (probes and metrics), so its reach is one namespace wide.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-{{ include "hypha.fullname" $ctx }}-admin
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "hypha.labels" $ctx | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "hypha.selectorLabels" $ctx | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $.Values.monitoring.namespace }}
+      toPorts:
+        - ports:
+            - port: {{ $.Values.serving.adminPort | quote }}
+              protocol: TCP
+{{- end }}
+{{- end }}

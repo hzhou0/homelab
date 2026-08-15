@@ -70,11 +70,16 @@ seaweedfs:
       storageClass: topolvm-provisioner
       size: 10Gi
 
-  # Auth off — the S3 surface is plaintext; fenced by accessGrants below.
+  # Signed requests are mandatory, not optional: this SeaweedFS refuses an authenticated write when
+  # no identity is configured, and hypha always signs.
+  #
+  # The Secret is pre-created and named here. Without it the chart generates identities of its own
+  # and mounts those instead, silently — leaving the configured client's key unknown to the server.
   s3:
     enabled: true
     port: 8333
-    enableAuth: false
+    enableAuth: true
+    existingConfigSecret: seaweedfs-s3-auth
 
 # Gateway-routed UIs. The filer UI browses object *contents* (plaintext); the raw S3/volume
 # ports stay unrouted.

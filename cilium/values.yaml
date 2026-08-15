@@ -142,6 +142,7 @@ gateway:
   # gateway until listed here.
   backendNamespaces:
     - app-homepage
+    - hypha
     - monitoring
     - seaweedfs
     - tool-headlamp

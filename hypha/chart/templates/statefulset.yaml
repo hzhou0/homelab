@@ -1,0 +1,146 @@
+{{- range $name, $deployment := .Values.deployments }}
+{{- $ctx := dict "root" $ "deployment" $name "config" $deployment }}
+{{- $fullname := include "hypha.fullname" $ctx }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "hypha.labels" $ctx | nindent 4 }}
+spec:
+  # Not a value, and not a Deployment: exactly one write-capable process may run against a
+  # deployment prefix, and the StatefulSet controller is what enforces it — no replacement Pod is
+  # created until the old Pod object is fully deleted, so a partitioned node's still-running Pod
+  # blocks its own successor. A replicas:1 Deployment does not hold: taint-based eviction marks the
+  # unreachable Pod terminating and the ReplicaSet immediately creates a second one alongside it.
+  replicas: 1
+  serviceName: {{ $fullname }}
+  selector:
+    matchLabels:
+      {{- include "hypha.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hypha.selectorLabels" $ctx | nindent 8 }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include "hypha.config" $ctx | sha256sum }}
+        {{- with $.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # Kubelet would otherwise inject HYPHA_*_SERVICE_HOST/HYPHA_PORT_* for every Service in this
+      # namespace, and the config layer reads every HYPHA_-prefixed variable into a struct that
+      # rejects unknown fields — the process would refuse to boot next to its own Service.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ include "hypha.terminationGracePeriod" $ }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hypha
+          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}"
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          # The config file is resolved relative to the working directory.
+          workingDir: /etc/hypha
+          ports:
+            - name: s3
+              containerPort: {{ $.Values.serving.port }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ $.Values.serving.adminPort }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ $.Values.logLevel | quote }}
+            {{- $secret := required "secretName is required: credentials are never chart values" $.Values.secretName }}
+            {{- range $var, $key := dict
+                  "HYPHA_MASTER_PASSPHRASE" "masterPassphrase"
+                  "HYPHA_AUTH__ACCESS_KEY" "authAccessKey"
+                  "HYPHA_AUTH__SECRET_KEY" "authSecretKey"
+                  "HYPHA_REMOTE__ACCESS_KEY" "remoteAccessKey"
+                  "HYPHA_REMOTE__SECRET_KEY" "remoteSecretKey"
+                  "HYPHA_CACHE__ACCESS_KEY" "cacheAccessKey"
+                  "HYPHA_CACHE__SECRET_KEY" "cacheSecretKey" }}
+            - name: {{ $var }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ $key }}
+            {{- end }}
+          lifecycle:
+            preStop:
+              # Gives the gateway time to stop sending here before SIGTERM starts the drain. The
+              # readiness flip on SIGTERM is not enough on its own: endpoint propagation is
+              # asynchronous, and there is no second replica for traffic to land on.
+              sleep:
+                seconds: {{ $.Values.preStopSleepSeconds }}
+          livenessProbe:
+            # Answering at all. Every condition hypha can diagnose either exits the process itself
+            # or is something a restart would not fix, so this must not be pointed at /readyz.
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            # Includes a live remote reachability check, and reports not-ready for the whole
+            # shutdown, which is what takes this pod out of rotation while it can still serve what
+            # it holds.
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 10
+            failureThreshold: 3
+          startupProbe:
+            # A start that has to rebuild pending sets or restore a lost cache volume walks the
+            # remote namespace before it serves; liveness must not fire underneath that.
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 10
+            failureThreshold: 90
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/hypha
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+        - name: tmp
+          emptyDir: {}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

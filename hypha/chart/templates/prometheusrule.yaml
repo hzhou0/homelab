@@ -1,0 +1,174 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+{{- $rule := .Values.monitoring.prometheusRule }}
+{{- $value := "{{ $value }}" }}
+{{- range $name, $deployment := .Values.deployments }}
+{{- $ctx := dict "root" $ "deployment" $name }}
+{{- $fullname := include "hypha.fullname" $ctx }}
+{{- $sel := include "hypha.selector" $ctx }}
+{{- $pod := printf "%s-[0-9]+" $fullname }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "hypha.labels" $ctx | nindent 4 }}
+spec:
+  groups:
+    - name: {{ $fullname }}
+      rules:
+        - alert: HyphaDown
+          # One process is the whole deployment; there is nothing else serving this endpoint.
+          expr: up{ {{ $sel }} } == 0
+          for: 5m
+          labels:
+            severity: critical
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} is not being scraped"
+            description: "No Hypha process is serving {{ $deployment.hostname }}."
+
+        - alert: HyphaInvariantHalt
+          # Exit 86 is the deliberate invariant-violation status. Every restart after it exits the
+          # same way from the recorded marker, so this needs an operator, not a restart.
+          expr: kube_pod_container_status_last_terminated_exitcode{namespace="{{ $.Release.Namespace }}",container="hypha",pod=~"{{ $pod }}"} == 86
+          labels:
+            severity: critical
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} halted on an invariant violation"
+            description: "The deployment refuses to serve until the halt marker is cleared; read the process log for the violated invariant."
+
+        - alert: HyphaRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="{{ $.Release.Namespace }}",container="hypha",pod=~"{{ $pod }}"}[1h]) > 3
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} restarted {{ $value }} times in an hour"
+
+        - alert: HyphaS3ErrorsElevated
+          expr: |
+            sum(rate(hypha_s3_requests_total{ {{ $sel }},outcome="error"}[5m]))
+              / clamp_min(sum(rate(hypha_s3_requests_total{ {{ $sel }} }[5m])), 0.001)
+              > {{ $rule.errorRatio }}
+          for: 15m
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} is failing {{ $value }} of client requests"
+
+        - alert: HyphaMarkersOwed
+          # Flat zero in health: an owed marker is the cache refusing writes, and the queue's only
+          # bound.
+          expr: hypha_markers_owed{ {{ $sel }} } > 0
+          for: 10m
+          labels:
+            severity: critical
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} is still retrying {{ $value }} markers"
+
+        - alert: HyphaPendingSetNotDraining
+          expr: |
+            hypha_pending_markers{ {{ $sel }} } > {{ $rule.pendingMarkersFloor }}
+              and deriv(hypha_pending_markers{ {{ $sel }} }[30m]) >= 0
+          for: 30m
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} pending set is not shrinking ({{ $value }} keys)"
+            description: "Cached writes are acknowledged faster than the remote takes them; the unreconciled window is this many keys wide."
+
+        - alert: HyphaBackpressureThrottling
+          expr: rate(hypha_backpressure_throttled{ {{ $sel }} }[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} is refusing cached writes with 503 SlowDown"
+
+        - alert: HyphaRemoteUploadFailures
+          expr: |
+            sum(rate(hypha_remote_uploads_total{ {{ $sel }},outcome="error"}[10m]))
+              / clamp_min(sum(rate(hypha_remote_uploads_total{ {{ $sel }} }[10m])), 0.001)
+              > {{ $rule.uploadErrorRatio }}
+          for: 15m
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} reconcile is failing {{ $value }} of its uploads"
+
+        - alert: HyphaDirtyDrain
+          # The last drain overran its budget, so those buckets get a recovery scan on every start
+          # until a clean shutdown seals them.
+          expr: hypha_buckets_dirty_at_drain{ {{ $sel }} } > 0
+          for: 5m
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} left {{ $value }} buckets unsealed at the last drain"
+
+        - alert: HyphaStartedFromRebuild
+          expr: increase(hypha_startup_seconds_count{ {{ $sel }},path="rebuild"}[15m]) > 0
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} started on the rebuild path"
+            description: "The previous run did not seal its buckets, so this start re-derived pending sets rather than inheriting them."
+
+        - alert: HyphaCacheUsageUnknown
+          # The other two cache alerts compare gauges that this failure removes rather than moves,
+          # so without this one a cache that never evicts is the quietest state hypha has.
+          expr: absent(hypha_cache_capacity_bytes{ {{ $sel }} })
+          for: 15m
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} cannot measure its cache"
+            description: "GC sweeps debris but never evicts while usage is unavailable, so the cache only fills. Check the usage source."
+
+        - alert: HyphaCacheAboveHighWater
+          expr: |
+            hypha_cache_used_bytes{ {{ $sel }} }
+              > on(job, namespace) hypha_cache_water_mark_bytes{ {{ $sel }},mark="high"}
+          for: 30m
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} cache is above its high water mark"
+
+        - alert: HyphaCacheUndersized
+          # The top rung with the byte target still unmet is the one GC condition an operator has to
+          # act on: the scavenger has spent everything it has.
+          expr: hypha_gc_ladder_rung{ {{ $sel }} } >= 3
+          for: 1h
+          labels:
+            severity: critical
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} GC is at the top of the escalation ladder"
+            description: "Eviction cannot keep the cache under its water mark; the cache is too small for the working set."
+
+        - alert: HyphaCacheMissRateHigh
+          expr: |
+            sum(rate(hypha_cache_reads_total{ {{ $sel }},result="miss"}[30m]))
+              / clamp_min(sum(rate(hypha_cache_reads_total{ {{ $sel }} }[30m])), 0.001)
+              > {{ $rule.cacheMissRatio }}
+          for: 1h
+          labels:
+            severity: warning
+            deployment: {{ $name }}
+          annotations:
+            summary: "Hypha {{ $fullname }} serves {{ $value }} of reads from the remote"
+{{- end }}
+{{- end }}

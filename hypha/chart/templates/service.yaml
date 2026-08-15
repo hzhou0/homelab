@@ -1,0 +1,26 @@
+{{- range $name, $deployment := .Values.deployments }}
+{{- $ctx := dict "root" $ "deployment" $name }}
+---
+# Plain label selector — no Pod-UID or sentinel selector, because exclusivity is the StatefulSet's
+# to hold, not the Service's. Also the StatefulSet's governing service; nothing needs per-pod DNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hypha.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "hypha.labels" $ctx | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "hypha.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: s3
+      port: {{ $.Values.serving.port }}
+      targetPort: s3
+      protocol: TCP
+    - name: admin
+      port: {{ $.Values.serving.adminPort }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

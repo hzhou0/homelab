@@ -1,0 +1,161 @@
+# homelab-hypha values
+#
+# One release. Every entry in `deployments` gets its own Hypha process and its own StatefulSet,
+# Service, HTTPRoute, ConfigMap, dashboard and alerts, named `<release>-<key>`. Everything outside
+# that map is shared by all of them.
+
+# The two deployments the homelab runs. `mode` decides when a write is acknowledged: `cached` on the
+# cache commit, reconciling to the remote behind it; `durable` only after the remote commit.
+#
+# `bucketPrefix` sits ahead of the fixed role segment (`-d-`, `-m-`, `-r-`, `-g-`) on every backend
+# bucket its deployment touches, and is charged against S3's 63-byte bucket-name cap. **The prefixes
+# must differ**: that, and nothing else, is what keeps two deployments' buckets disjoint on a shared
+# remote account.
+deployments:
+  cached:
+    mode: cached
+    bucketPrefix: hypha
+    hostname: s3.internal.haustorium.net
+  durable:
+    mode: durable
+    bucketPrefix: hypha-direct
+    hostname: s3-direct.internal.haustorium.net
+
+image:
+  repository: ghcr.io/hzhou0/hypha
+  # Defaults to the chart's appVersion.
+  tag: "sha-f50e42a"
+  pullPolicy: IfNotPresent
+
+serving:
+  port: 8014
+  adminPort: 9014
+
+# One pre-created Secret holds every credential under fixed key names. The chart creates no Secret
+# and takes no literal key, so nothing sensitive reaches a values file or the release history.
+secretName: hypha
+
+# The durability tier. `region` is only how hypha's SDK signs — client buckets pass through
+# untouched.
+remote:
+  # The off-site S3 endpoint. The one value with no sensible default: install fails without it.
+  endpoint: "https://s3.us-west-4.idrivee2.com"
+  region: us-west-4
+
+# The cache tier, required in durable mode too, where it stays the namespace and ETag projection.
+# SeaweedFS runs with auth off, so what the Secret holds is signed with and ignored there — but a
+# cache that does check gets the same treatment as the remote.
+cache:
+  endpoint: http://homelab-seaweedfs-s3.seaweedfs:8333
+  region: us-east-1
+
+reconcile:
+  intervalMs: 5000
+  concurrency: 16
+  # Cached-mode admission gate on the pending set. Both at 0 (the default) means writes are
+  #  acknowledged, however, far behind the remote falls; set at least one for a deployment whose
+  # remote is slower than its clients.
+  backpressure:
+    maxPending: 0
+    maxAgeMs: 600000
+
+background:
+  concurrency: 4
+  queueDepth: 256
+
+volumeWatchIntervalMs: 30000
+
+gc:
+  intervalMs: 300000
+  minIntervalMs: 1000
+  concurrency: 4
+  maxConcurrency: 16
+  highWater: 0.85
+  lowWater: 0.70
+  probePages: 5
+  yieldFloor: 0.2
+  opportunisticEvictions: 64
+  # Without a usage source GC sweeps debris but never evicts bodies, and a cached deployment's
+  # cache only fills.
+  usage:
+    enabled: true
+    master: http://homelab-seaweedfs-master.seaweedfs:9333
+    garbageThreshold: 0.3
+  recency:
+    fillTarget: 100000
+    depth: 7
+    falsePositiveRate: 0.01
+
+# tracing-subscriber's EnvFilter. Request spans are emitted at info on span close.
+logLevel: info
+
+# Must cover the process's fixed drain budgets (15 s connections + 10 s obligations + 10 s actors)
+# plus preStopSleepSeconds; the chart refuses to render below that sum. Overrunning is safe but
+# costs the next start a recovery scan.
+terminationGracePeriodSeconds: 45
+# Time for the gateway to take this pod out of rotation before the process starts refusing. Uses
+# the native `sleep` preStop handler, so it needs Kubernetes 1.30+ and no shell in the image.
+preStopSleepSeconds: 5
+
+resources:
+  requests:
+    cpu: 1000m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+# Keep the single writer off the reclaimable spot node (node.kubernetes.io/capacity-type=spot):
+# losing it means losing the deployment until the Pod object is gone.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node.kubernetes.io/capacity-type
+              operator: NotIn
+              values: [spot]
+nodeSelector: {}
+tolerations: []
+
+# The shared Cilium Gateway each deployment's hostname is routed through. The hypha namespace must
+# also be in the cilium chart's gateway.backendNamespaces, or the route resolves to a backend the
+# gateway may not reach.
+gateway:
+  enabled: true
+  name: internal
+  namespace: cilium-gateway
+  # Disabled outright: S3 bodies are unbounded, so any request timeout is a size limit in disguise.
+  requestTimeout: 0s
+
+# Ingress allows for the S3 port, one CiliumNetworkPolicy per entry. Scoped by source namespace
+# only — a pod can self-apply any label, so labels are not a trust boundary.
+accessGrants:
+  fromNamespaces: []
+
+monitoring:
+  # The admin listener is unauthenticated, so its grant is a namespace allow of its own rather than
+  # part of the S3 grants above.
+  namespace: monitoring
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+  prometheusRule:
+    enabled: true
+    # Pending markers this far behind, and not shrinking, is a remote that cannot keep up rather
+    # than a burst passing through.
+    pendingMarkersFloor: 5000
+    # Share of client requests or remote uploads that may fail before it is a deployment problem.
+    errorRatio: 0.05
+    uploadErrorRatio: 0.1
+    # Cache misses this high for an hour means the working set does not fit.
+    cacheMissRatio: 0.5
+  dashboard:
+    enabled: true
+    # Read by the kube-prometheus-stack Grafana sidecar, which discovers ConfigMaps in every
+    # namespace (monitoring chart: grafana.sidecar.dashboards.searchNamespace=ALL).
+    label: grafana_dashboard
+    folder: Homelab
+
+podAnnotations: {}
+podLabels: {}

@@ -72,6 +72,12 @@ kube-prometheus-stack:
     # the grafana container is Go; the two k8s-sidecar (Python) containers ignore this.
     env:
       GOGC: "40"
+    sidecar:
+      dashboards:
+        # Same reasoning as the all-namespace ServiceMonitor discovery above: a chart ships its
+        # dashboard ConfigMap in its own namespace, and the default (this namespace only) leaves
+        # it undiscovered.
+        searchNamespace: ALL
     # Exposed via the shared Cilium Gateway, so the subchart's own Ingress is off.
     ingress:
       enabled: false

@@ -1,0 +1,25 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+{{- range $name, $deployment := .Values.deployments }}
+{{- $ctx := dict "root" $ "deployment" $name }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "hypha.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "hypha.labels" $ctx | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $.Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "hypha.selectorLabels" $ctx | nindent 6 }}
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: {{ $.Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ $.Values.monitoring.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- end }}

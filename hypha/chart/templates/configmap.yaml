@@ -1,0 +1,72 @@
+{{/*
+Kept a define so the pod annotation can checksum one deployment's config alone: a checksum over the
+whole rendered file restarts both deployments whenever either one's config moves, and a restart here
+costs a recovery scan.
+*/}}
+{{ define "hypha.config" -}}
+{{- $gc := .root.Values.gc -}}
+bucket_prefix = {{ required (printf "deployments.%s.bucketPrefix is required" .deployment) .config.bucketPrefix | quote }}
+mode = {{ required (printf "deployments.%s.mode is required" .deployment) .config.mode | quote }}
+volume_watch_interval_ms = {{ .root.Values.volumeWatchIntervalMs | int64 }}
+
+[serving]
+listen = "0.0.0.0:{{ .root.Values.serving.port }}"
+admin_listen = "0.0.0.0:{{ .root.Values.serving.adminPort }}"
+
+[remote]
+endpoint = {{ required "remote.endpoint is required" .root.Values.remote.endpoint | quote }}
+region = {{ .root.Values.remote.region | quote }}
+
+[cache]
+endpoint = {{ required "cache.endpoint is required" .root.Values.cache.endpoint | quote }}
+region = {{ .root.Values.cache.region | quote }}
+
+[reconcile]
+interval_ms = {{ .root.Values.reconcile.intervalMs | int64 }}
+concurrency = {{ .root.Values.reconcile.concurrency | int64 }}
+
+[reconcile.backpressure]
+max_pending = {{ .root.Values.reconcile.backpressure.maxPending | int64 }}
+max_age_ms = {{ .root.Values.reconcile.backpressure.maxAgeMs | int64 }}
+
+[background]
+concurrency = {{ .root.Values.background.concurrency | int64 }}
+queue_depth = {{ .root.Values.background.queueDepth | int64 }}
+
+[gc]
+interval_ms = {{ $gc.intervalMs | int64 }}
+min_interval_ms = {{ $gc.minIntervalMs | int64 }}
+concurrency = {{ $gc.concurrency | int64 }}
+max_concurrency = {{ $gc.maxConcurrency | int64 }}
+high_water = {{ include "hypha.float" $gc.highWater }}
+low_water = {{ include "hypha.float" $gc.lowWater }}
+probe_pages = {{ $gc.probePages | int64 }}
+yield_floor = {{ include "hypha.float" $gc.yieldFloor }}
+opportunistic_evictions = {{ $gc.opportunisticEvictions | int64 }}
+{{ if $gc.usage.enabled }}
+[gc.usage]
+kind = "seaweedfs"
+master = {{ required "gc.usage.master is required when gc.usage.enabled" $gc.usage.master | quote }}
+garbage_threshold = {{ include "hypha.float" $gc.usage.garbageThreshold }}
+{{ end }}
+[gc.recency]
+fill_target = {{ $gc.recency.fillTarget | int64 }}
+depth = {{ $gc.recency.depth | int64 }}
+false_positive_rate = {{ include "hypha.float" $gc.recency.falsePositiveRate }}
+{{- end }}
+
+{{- range $name, $deployment := .Values.deployments }}
+{{- $ctx := dict "root" $ "deployment" $name "config" $deployment }}
+---
+# Everything except credentials, which arrive as HYPHA_* environment variables and overlay this.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hypha.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "hypha.labels" $ctx | nindent 4 }}
+data:
+  hypha.toml: |
+    {{- include "hypha.config" $ctx | nindent 4 }}
+{{- end }}

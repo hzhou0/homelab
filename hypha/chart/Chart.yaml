@@ -1,0 +1,21 @@
+apiVersion: v2
+name: homelab-hypha
+description: >-
+  Hypha, the encrypting S3 gateway in front of the SeaweedFS cache (homelab-seaweedfs) and an
+  off-site remote. One write-capable process per deployment prefix, so the workload is a
+  single-replica StatefulSet: the controller creates no replacement until the old Pod object is
+  gone, which is what makes exclusivity a property of the workload rather than a claim the process
+  asserts about itself. Installed twice — cached (s3.internal.haustorium.net) and durable
+  (s3-direct.internal.haustorium.net), each with its own bucketPrefix. Foundational like
+  cilium/cert-manager: cluster-admin installs it into its own hypha namespace, not an app-*/tool-*
+  one.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - hypha
+  - s3
+  - object-storage
+  - encryption
+  - gateway
+  - homelab
