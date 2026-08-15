@@ -290,8 +290,10 @@ async fn a_shadow_reclaim_still_owed_at_drain_withholds_the_marker() {
 /// until competing traffic displaces it.
 #[tokio::test]
 async fn pressure_reclaims_a_cold_shadow_and_leaves_the_key_intact() {
+    // Capacity large enough that a two-part composite clears the rehydrate ceiling: a cache too
+    // small to be worth landing this object in would never grow the shadow this reclaims.
     let h = Harness::builder(Mode::Cached)
-        .with_usage(1_000_000)
+        .with_usage(200_000_000)
         .tune(|c| {
             c.gc.high_water = 0.86;
             c.gc.low_water = 0.85;

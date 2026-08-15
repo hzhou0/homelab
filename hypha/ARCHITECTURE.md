@@ -355,8 +355,11 @@ Surface limits:
   a native part, ack once the remote confirms.
 - **GET** — a local body serves from the cache. A tombstoned key (or a body lost to node failure)
   fetches the covering age chunks from the remote, authenticates, decrypts, and streams to the client;
-  cached mode also **rehydrates the body locally and bumps its recency position**. Durable mode never
-  rehydrates — the body would be tombstoned again immediately.
+  cached mode also **rehydrates the body locally and bumps its recency position**. A body worth more
+  than a share of the low-water mark is not landed: the eviction paying for it would take many keys
+  each serving more reads than it does. Its recency position is bumped anyway, so it lands the moment
+  it fits — the ceiling scales with the cache. Durable mode never rehydrates: the body would be
+  tombstoned again immediately.
 - **HEAD / LIST** — served from the cache while its sync marker is present, reading plaintext sizes and
   client ETags off facts twins for tombstoned keys and cached composites. Listing the remote instead
   requires a bounded per-entry trailer fan-out.
@@ -492,10 +495,13 @@ mark.
 - Under pressure it climbs a ladder: first shorten the pass interval, then raise concurrency, then
   relax the age threshold. Only one rung moves per pass, on that pass's evidence.
 
-**Usage source.** `internal` accounting (bytes hypha wrote) is backend-agnostic but blind to backend
-overhead and uncompacted deletions; it is the default and fallback. A backend-specific source can read
-real disk topology and trigger compaction. Without one, debris is still swept but bodies are never
-evicted.
+**Usage source.** Pressure is measured in physical bytes read from the backend's own disk topology,
+not in the live object sizes hypha wrote: dead bytes awaiting compaction are exactly what makes a
+cache fill with nobody writing to it, and the same source is what can be asked to compact them. A
+measurement is therefore backend-specific, and configuring one is optional. Without it — or whenever a
+sample fails — there is no target to evict against: debris is still swept, but bodies are never
+evicted and a cached deployment's cache only fills. A deployment with no source at all is warned about
+at boot; a source that silently stops parsing is not, which is what the usage gauges are for.
 
 ## Recovery and lifecycle
 

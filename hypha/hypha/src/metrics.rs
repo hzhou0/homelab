@@ -72,6 +72,11 @@ fn describe() {
         "hypha_gc_debris_total",
         "Debris items GC reclaimed, by class"
     );
+    describe_counter!(
+        "hypha_rehydrations_declined_total",
+        "Reads whose plaintext was left on the remote because the body is too large a share of \
+         the cache to be worth landing; each one is a permanent cache miss for that key"
+    );
     describe_histogram!("hypha_gc_pass_seconds", "Duration of one scavenger pass");
     describe_gauge!(
         "hypha_gc_ladder_rung",
@@ -150,6 +155,10 @@ pub(crate) fn gc_evicted(bytes: u64) {
 pub(crate) fn gc_pass(rung: usize, elapsed: Duration) {
     gauge!("hypha_gc_ladder_rung").set(rung as f64);
     histogram!("hypha_gc_pass_seconds").record(elapsed.as_secs_f64());
+}
+
+pub(crate) fn rehydration_declined() {
+    counter!("hypha_rehydrations_declined_total").increment(1);
 }
 
 pub(crate) fn cache_usage(used: u64, capacity: u64, low_water: f64, high_water: f64) {

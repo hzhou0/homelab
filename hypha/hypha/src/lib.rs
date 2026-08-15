@@ -117,8 +117,12 @@ pub async fn build_service(config: &Config) -> Result<(S3Service, Lifecycle, Buc
     // Spawned here rather than inside `Hypha` so the drain has a handle to join: the transitions it
     // runs hold K's write lock across a fetch, and one killed between landing a body and deleting its
     // twin leaves exactly the hybrid state orders every path to avoid.
-    let (background, background_actor) =
-        background::spawn(tier.clone(), config.background, shutdown.clone());
+    let (background, background_actor) = background::spawn(
+        tier.clone(),
+        config.background,
+        gc.rehydrate_ceiling(),
+        shutdown.clone(),
+    );
 
     let app = Hypha::new(
         tier,

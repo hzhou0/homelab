@@ -23,6 +23,9 @@ const CAPACITY: u64 = 1_000_000;
 const HIGH_WATER: f64 = 0.86;
 const LOW_WATER: f64 = 0.85;
 
+/// GC's share of the low-water mark, so the sizes below follow the marks this file chose.
+const REHYDRATE_SHARE: f64 = 0.10;
+
 /// Usage that puts a pass over the high-water mark, owing ~15 KB.
 const PRESSURED: f64 = 0.865;
 
@@ -581,6 +584,45 @@ async fn a_cache_wipe_restores_the_namespace_and_reads_rehydrate_off_it() {
         bodies[1],
         "a full wipe → restore → rehydrate → evict → rehydrate cycle must be lossless"
     );
+}
+
+/// Both sides on one harness, because the object's size is the only thing that may separate them: a
+/// smaller key rehydrating is what makes the larger one's tombstone the ceiling's doing and not a
+/// transition actor that stopped running.
+#[tokio::test]
+async fn a_body_over_the_rehydrate_ceiling_is_never_landed() {
+    let h = cached_with_usage().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+    let ceiling = (CAPACITY as f64 * LOW_WATER * REHYDRATE_SHARE) as usize;
+    let over = pattern_seeded(ceiling + 1, 1);
+    let under = pattern_seeded(ceiling / 2, 2);
+    put(&c, B, "over", &over).await;
+    put(&c, B, "under", &under).await;
+    until_durable(&h, "over").await;
+    until_durable(&h, "under").await;
+
+    h.usage().set_ratio(PRESSURED);
+    wait_until(15_000, "both bodies to be evicted", || async {
+        is_evicted(&h, "over").await && is_evicted(&h, "under").await
+    })
+    .await;
+
+    h.usage().set_ratio(RELAXED);
+    assert_eq!(
+        get_all(&c, B, "over").await,
+        over,
+        "a declined rehydrate must not cost the read its bytes"
+    );
+    assert_eq!(get_all(&c, B, "under").await, under);
+    wait_until(8_000, "the smaller body to rehydrate", || async {
+        !is_evicted(&h, "under").await
+    })
+    .await;
+    stays_false(700, "the oversized body was landed", || async {
+        !is_evicted(&h, "over").await
+    })
+    .await;
 }
 
 // ── the ladder, through the exposition ───────────────────────────────────────────────────────

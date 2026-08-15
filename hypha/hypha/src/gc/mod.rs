@@ -15,6 +15,7 @@ mod store;
 mod usage;
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,9 +43,40 @@ const TOUCH_QUEUE_DEPTH: usize = 1024;
 /// path, so one wake-up should take whatever a burst deposited.
 const TOUCH_BATCH: usize = 256;
 
+/// A tenant this large is a poor one whatever its temperature: the eviction paying for it takes many
+/// keys that each serve more reads than it does.
+const REHYDRATE_SHARE_OF_LOW_WATER: f64 = 0.10;
+
 #[derive(Clone)]
 pub(crate) struct Gc {
     tx: mpsc::Sender<String>,
+    ceiling: RehydrateCeiling,
+}
+
+/// Zero admits everything — no usage source, or no pass settled yet. An unmeasurable cache is not
+/// evidence of a small one, so the gate protects a known budget rather than guessing at one.
+#[derive(Clone, Default)]
+pub(crate) struct RehydrateCeiling(Arc<AtomicU64>);
+
+impl RehydrateCeiling {
+    pub(crate) fn admits(&self, plen: u64) -> bool {
+        match self.0.load(Ordering::Relaxed) {
+            0 => true,
+            ceiling => plen <= ceiling,
+        }
+    }
+
+    fn publish(&self, capacity: u64, low_water: f64) {
+        let ceiling = capacity as f64 * low_water * REHYDRATE_SHARE_OF_LOW_WATER;
+        self.0.store(ceiling as u64, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn measured(capacity: u64, low_water: f64) -> Self {
+        let ceiling = RehydrateCeiling::default();
+        ceiling.publish(capacity, low_water);
+        ceiling
+    }
 }
 
 /// The actor runs until the last [`Gc`] drops, i.e. with the service: every sender is a handle held
@@ -59,6 +91,7 @@ pub(crate) fn spawn(
     cfg: &config::Gc,
 ) -> (Gc, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(TOUCH_QUEUE_DEPTH);
+    let ceiling = RehydrateCeiling::default();
     let ring = RecencyRing::new(&cfg.recency);
     let depth = ring.depth();
     let source = cfg.usage.as_ref().map(usage::connect);
@@ -79,6 +112,7 @@ pub(crate) fn spawn(
             opportunistic_evictions: cfg.opportunistic_evictions,
             low_water: cfg.low_water,
             high_water: cfg.high_water,
+            ceiling: ceiling.clone(),
             source,
             tier,
             buckets,
@@ -88,7 +122,7 @@ pub(crate) fn spawn(
         }
         .run(),
     );
-    (Gc { tx }, task)
+    (Gc { tx, ceiling }, task)
 }
 
 /// Where a key's plaintext lives, and therefore what a touch is *about* — the one thing a caller has
@@ -120,6 +154,10 @@ impl Plaintext {
 }
 
 impl Gc {
+    pub(crate) fn rehydrate_ceiling(&self) -> RehydrateCeiling {
+        self.ceiling.clone()
+    }
+
     /// Record interest in a key. Every op that resolves or lands a single key calls this — the
     /// write path included, because a write is the strongest available statement of interest in a
     /// key and a read-only ring gets write-hot/read-cold keys exactly backwards.
@@ -160,6 +198,7 @@ struct GcActor {
     opportunistic_evictions: usize,
     low_water: f64,
     high_water: f64,
+    ceiling: RehydrateCeiling,
     source: Option<Arc<dyn UsageSource>>,
     rx: mpsc::Receiver<String>,
     /// Rotated slices on their way to GC's bucket. Tracked rather than detached so the drain can wait
@@ -349,6 +388,7 @@ impl GcActor {
                 self.low_water,
                 self.high_water,
             );
+            self.ceiling.publish(usage.after.capacity, self.low_water);
         }
         let Some(usage) = report.usage else {
             // No usage source, or the sample failed: the ladder has no evidence either way, and
@@ -724,6 +764,18 @@ impl Pass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unpublished_ceiling_admits_any_body() {
+        assert!(RehydrateCeiling::default().admits(u64::MAX));
+    }
+
+    #[test]
+    fn the_ceiling_is_a_share_of_the_low_water_mark() {
+        let ceiling = RehydrateCeiling::measured(1_000_000, 0.80);
+        assert!(ceiling.admits(80_000));
+        assert!(!ceiling.admits(80_001));
+    }
 
     /// The whole of what a caller has to get right, and it follows from the ETag alone.
     #[test]

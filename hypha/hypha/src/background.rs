@@ -17,6 +17,7 @@ use hypha_core::error::{Error, Result};
 use hypha_core::meta;
 
 use crate::codec;
+use crate::gc::RehydrateCeiling;
 use crate::tier::Tiering;
 
 pub(crate) enum Transition {
@@ -37,6 +38,12 @@ impl Transition {
             Transition::Rehydrate { bucket, key, .. } => registry_key(bucket, key),
         }
     }
+
+    fn plaintext_len(&self) -> u64 {
+        match self {
+            Transition::Rehydrate { plen, .. } => *plen,
+        }
+    }
 }
 
 /// Bucket names cannot contain `/`, so the join is unambiguous — and it costs one allocation per
@@ -53,13 +60,22 @@ type LiveTransitions = Arc<DashMap<String, CancellationToken>>;
 pub struct Background {
     tx: mpsc::Sender<(Transition, CancellationToken)>,
     live: LiveTransitions,
+    ceiling: RehydrateCeiling,
 }
 
 impl Background {
     /// Queue a transition, unless this key already has one. Never blocks and never fails visibly: a
     /// full queue (or an actor already gone at shutdown) drops the transition, which is the correct
     /// load response for work whose only value is saving a *future* read a remote fetch.
+    ///
+    /// An oversized body is declined here rather than after a permit and a whole-object fetch have
+    /// been spent on it. Recency is recorded when a read resolves, not when a body lands, so a
+    /// declined key stays ranked and rehydrates from a cache large enough to hold it.
     pub(crate) fn submit(&self, transition: Transition) {
+        if !self.ceiling.admits(transition.plaintext_len()) {
+            crate::metrics::rehydration_declined();
+            return;
+        }
         let registered = transition.registry_key();
         let token = CancellationToken::new();
         // Scoped so the shard guard is released before `remove` below can want it.
@@ -94,6 +110,7 @@ impl Background {
 pub(crate) fn spawn(
     tier: Tiering,
     cfg: config::Background,
+    ceiling: RehydrateCeiling,
     shutdown: CancellationToken,
 ) -> (Background, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(cfg.queue_depth.max(1));
@@ -107,7 +124,7 @@ pub(crate) fn spawn(
         shutdown,
     };
     let task = tokio::spawn(actor.run());
-    (Background { tx, live }, task)
+    (Background { tx, live, ceiling }, task)
 }
 
 struct TransitionActor {
@@ -308,22 +325,34 @@ mod tests {
     /// A handle whose actor never runs, so queued transitions stay queued and the registry is
     /// observable.
     fn handle(depth: usize) -> (Background, mpsc::Receiver<(Transition, CancellationToken)>) {
+        with_ceiling(depth, RehydrateCeiling::default())
+    }
+
+    fn with_ceiling(
+        depth: usize,
+        ceiling: RehydrateCeiling,
+    ) -> (Background, mpsc::Receiver<(Transition, CancellationToken)>) {
         let (tx, rx) = mpsc::channel(depth);
         (
             Background {
                 tx,
                 live: Arc::new(DashMap::new()),
+                ceiling,
             },
             rx,
         )
     }
 
     fn transition(key: &str) -> Transition {
+        sized(key, 0)
+    }
+
+    fn sized(key: &str, plen: u64) -> Transition {
         Transition::Rehydrate {
             bucket: "b".into(),
             key: key.into(),
             cetag: "e".into(),
-            plen: 0,
+            plen,
         }
     }
 
@@ -362,6 +391,22 @@ mod tests {
         assert!(
             token.is_cancelled(),
             "cancel must reach a still-queued transition"
+        );
+    }
+
+    /// A refusal must not outlive the measurement it was taken against, so it leaves the registry as
+    /// it found it.
+    #[tokio::test]
+    async fn a_body_over_the_ceiling_is_declined_and_leaves_no_registry_entry() {
+        let (bg, mut rx) = with_ceiling(8, RehydrateCeiling::measured(1_000_000, 0.80));
+        bg.submit(sized("huge", 80_001));
+        assert!(rx.try_recv().is_err(), "an oversized body must not queue");
+        assert!(!bg.is_live("b", "huge"));
+
+        bg.submit(sized("fits", 80_000));
+        assert!(
+            rx.try_recv().is_ok(),
+            "a body within the ceiling must queue"
         );
     }
 
