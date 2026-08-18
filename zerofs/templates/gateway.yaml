@@ -1,0 +1,169 @@
+{{- $root := . }}
+{{- range (include "zerofs.gatewayNodes" . | fromYamlArray) }}
+{{- $ctx := dict "root" $root "node" .name "role" .role }}
+{{- $fullname := include "zerofs.gateway.fullname" $ctx }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "zerofs.gateway.labels" $ctx | nindent 4 }}
+data:
+  zerofs.toml: |
+    {{- include "zerofs.gateway.config" $ctx | nindent 4 }}
+---
+# Per-node, not one Service across the pair: the CSI driver is given both addresses and probes for
+# the one that is leading, and replication ships to a named peer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "zerofs.gateway.labels" $ctx | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "zerofs.gateway.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: ninep
+      port: {{ $root.Values.gateway.ports.ninep }}
+      targetPort: ninep
+      protocol: TCP
+    - name: admin
+      port: {{ $root.Values.gateway.ports.admin }}
+      targetPort: admin
+      protocol: TCP
+    - name: repl
+      port: {{ $root.Values.gateway.ports.replication }}
+      targetPort: repl
+      protocol: TCP
+    - name: metrics
+      port: {{ $root.Values.gateway.ports.metrics }}
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "zerofs.gateway.labels" $ctx | nindent 4 }}
+spec:
+  # A StatefulSet because at most one process per node identity may hold the cache volume and the
+  # writer term: no replacement Pod is created until the old Pod object is gone, so a partitioned
+  # node's still-running process blocks its own successor rather than racing it.
+  replicas: 1
+  serviceName: {{ $fullname }}
+  selector:
+    matchLabels:
+      {{- include "zerofs.gateway.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "zerofs.gateway.selectorLabels" $ctx | nindent 8 }}
+        {{- with $root.Values.gateway.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include "zerofs.gateway.config" $ctx | sha256sum }}
+        {{- with $root.Values.gateway.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ $root.Values.gateway.terminationGracePeriodSeconds }}
+      containers:
+        - name: zerofs
+          image: "{{ $root.Values.gateway.image.repository }}:{{ $root.Values.gateway.image.tag | default $root.Chart.AppVersion }}"
+          imagePullPolicy: {{ $root.Values.gateway.image.pullPolicy }}
+          args: ["run", "-c", "/etc/zerofs/zerofs.toml"]
+          ports:
+            - name: ninep
+              containerPort: {{ $root.Values.gateway.ports.ninep }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ $root.Values.gateway.ports.admin }}
+              protocol: TCP
+            - name: repl
+              containerPort: {{ $root.Values.gateway.ports.replication }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ $root.Values.gateway.ports.metrics }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ $root.Values.gateway.logLevel | quote }}
+            {{- $secret := required "gateway.secretName is required: credentials are never chart values" $root.Values.gateway.secretName }}
+            {{- range $var, $key := dict
+                  "ZEROFS_PASSWORD" "encryptionPassword"
+                  "AWS_ACCESS_KEY_ID" "accessKeyId"
+                  "AWS_SECRET_ACCESS_KEY" "secretAccessKey" }}
+            - name: {{ $var }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ $key }}
+            {{- end }}
+          # The replication port, not 9P: a standby binds it before its role is resolved but binds
+          # 9P only once it takes over, so probing 9P would drop the standby out of its Service and
+          # cut off the ships it exists to receive.
+          readinessProbe:
+            tcpSocket:
+              port: repl
+            periodSeconds: 2
+            timeoutSeconds: 1
+          resources:
+            {{- toYaml $root.Values.gateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zerofs
+            - name: cache
+              mountPath: {{ $root.Values.gateway.cache.dir }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+      {{- with $root.Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- with $root.Values.gateway.affinity }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if $root.Values.gateway.antiAffinity }}
+        podAntiAffinity:
+          {{- if eq $root.Values.gateway.antiAffinity "required" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "zerofs.gateway.podSelectorLabels" $root | nindent 18 }}
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "zerofs.gateway.podSelectorLabels" $root | nindent 20 }}
+          {{- end }}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $root.Values.gateway.cache.volume.storageClassName }}
+        resources:
+          requests:
+            storage: {{ $root.Values.gateway.cache.volume.size }}
+{{- end }}

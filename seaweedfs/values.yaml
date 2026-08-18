@@ -59,6 +59,18 @@ seaweedfs:
           # vg-nvme on this node is 376.94Gi (topolvm_volumegroup_size_bytes); leave 200Gi free.
           size: 175Gi
           maxVolumes: 0
+    k3s-compute-1f70dc:
+      replicas: 1
+      nodeSelector: |
+        vg: nvme
+        kubernetes.io/hostname: k3s-compute-1f70dc
+      dataDirs:
+        - name: data1
+          type: persistentVolumeClaim
+          storageClass: topolvm-provisioner
+          # vg-nvme on this node is 376.94Gi (topolvm_volumegroup_size_bytes); leave 200Gi free.
+          size: 175Gi
+          maxVolumes: 0
 
   filer:
     enabled: true

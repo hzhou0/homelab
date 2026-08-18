@@ -150,9 +150,48 @@ HTTP:80 for `*.internal.haustorium.net`, `allowedRoutes.from: All`.
   proxy* and *`ingress` proxy → backends* — both using the reserved `ingress` identity that
   vanilla k8s `NetworkPolicy` cannot select. This chart ships two `CiliumClusterwideNetworkPolicy`s
   (`gateway-ingress-policy.yaml`): `allow-clients-to-gateway-ingress` (gated by `allowedCIDRs`)
-  and `allow-gateway-ingress-to-backends` (scoped to non-system namespaces via Exists + NotIn to
-  avoid sweeping in system pods like coredns).
+  and `allow-gateway-ingress-to-backends`, an **explicit allow-list of backend namespaces**
+  (`gateway.backendNamespaces`).
+- **A route into an unlisted namespace is dead.** The reverse hop is deliberately not granted
+  cluster-wide, so exposing a new namespace takes a human editing this chart's values and
+  upgrading the release — the workload's own manifests cannot grant it, and neither can the
+  namespace's generated ingress NetworkPolicy, whose `namespaceSelector` can never match the
+  reserved identity Envoy re-identifies proxied traffic as. It fails silently in the direction
+  that misleads: the `HTTPRoute` reports `Accepted` and `ResolvedRefs`, the Service has healthy
+  endpoints, and every request still returns **503**. Reaching the Service directly (a
+  port-forward, which bypasses the mesh) is the check that separates this from a broken app.
 - **TLS:** cert-manager `Certificate` for `*.internal.haustorium.net` via `letsencrypt-cloudflare`
   (from the `cert-manager` chart — install that first).
 - **L3 whitelist:** `gateway.allowedCIDRs` restricts the front door to known hosts before TLS
   or route processing; an empty list falls back to open (`world + cluster`).
+
+## The public Gateway
+
+A second `Gateway`, off unless `publicGateway.enabled`, is the only path from the internet to a
+cluster service. It is deliberately a separate object rather than WAN exposure switched on for the
+internal one, because the two differ in who may attach a route — and that is the whole boundary.
+
+- **Attachment is the gate, not the network.** Cilium proxies both Gateways through the same
+  per-node Envoy under one reserved `ingress` identity, and the proxy hop replaces the client
+  address, so no `CiliumNetworkPolicy` — CIDR, entity or otherwise — can tell public traffic from
+  internal once it leaves Envoy. The reverse-hop backend allow-list is therefore shared between the
+  two Gateways and separates nothing.
+- **What does separate them** is `allowedRoutes.namespaces.from: Same`: a route must live in the
+  public Gateway's own namespace, where the operator ServiceAccount holds no RoleBinding (its deploy
+  rights are generated only into `app-*`/`tool-*`) and cannot create a `ReferenceGrant` anywhere.
+  Publishing a service is a cluster-admin edit here, and nothing a workload writes for itself
+  reaches the front door. Each `publicGateway.routes` entry renders the route plus the
+  `ReferenceGrant` by which its backend namespace consents.
+- **The front door widens for both.** Admitting the internet on the shared `ingress` identity
+  admits it to the internal Gateway's listener as well, so the allow excepts private space and LAN
+  clients stay subject to `gateway.allowedCIDRs`. Separation on the destination side is the
+  firewall's, not Cilium's: nothing translates or routes to the internal Gateway. That is also why
+  the internal Gateway is left v4-only — a globally routable address would leave it one WAN rule
+  away from the internet, where today there is no address to route to at all. The public Gateway
+  instead pins one address of each family out of the bottom of the v6 prefix, and its exposure
+  annotation is what asks the firewall to admit the v6 half. Scoping the front-door allow by
+  listener port instead would hold only while a v4 port-forward is doing the remapping.
+- **DNS stays manual.** The public name is a registrar record aimed at the WAN address; nothing
+  here publishes it. `publicGateway.internalDnsNames` optionally spares LAN clients the hairpin via
+  Unbound, one name at a time — a wildcard there would shadow every name in the public zone,
+  including those that resolve outside the cluster.

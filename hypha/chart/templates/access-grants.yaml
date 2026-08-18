@@ -1,13 +1,15 @@
 {{- /*
-Ingress allows layered on the cluster-wide east-west default deny. Scoped by source NAMESPACE
-only — a pod can self-apply any label, so labels are not a trust boundary; the namespace is.
+Ingress allows layered on the cluster-wide east-west default deny.
+
+The S3 port is open to the whole cluster: it is SigV4-authenticated and already reachable from the
+LAN through the gateway, so a source fence in front of it restricts nothing an attacker has to pass.
+The admin listener is unauthenticated, so it keeps a real fence.
 
 The gateway's own reverse hop is NOT granted here: it is an allow-list held by the cilium chart
 (gateway.backendNamespaces), so a route into this namespace stays dead until it is listed there.
 */ -}}
 {{- range $name, $deployment := .Values.deployments }}
 {{- $ctx := dict "root" $ "deployment" $name }}
-{{- if $.Values.accessGrants.fromNamespaces }}
 ---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
@@ -21,19 +23,14 @@ spec:
     matchLabels:
       {{- include "hypha.selectorLabels" $ctx | nindent 6 }}
   ingress:
-    - fromEndpoints:
-        {{- range $ns := $.Values.accessGrants.fromNamespaces }}
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns }}
-        {{- end }}
+    - fromEntities:
+        - cluster
       toPorts:
         - ports:
             - port: {{ $.Values.serving.port | quote }}
               protocol: TCP
-{{- end }}
 {{- if $.Values.monitoring.namespace }}
 ---
-# The admin listener is unauthenticated (probes and metrics), so its reach is one namespace wide.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:

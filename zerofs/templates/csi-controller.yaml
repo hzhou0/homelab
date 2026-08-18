@@ -1,0 +1,58 @@
+{{- $ctx := dict "root" . "component" "controller" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "zerofs.csi.controller.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.csi.labels" $ctx | nindent 4 }}
+spec:
+  # The provisioner sidecar takes a lease, so extra replicas would idle rather than help.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "zerofs.csi.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "zerofs.csi.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "zerofs.csi.controller.fullname" . }}
+      enableServiceLinks: false
+      {{- with .Values.csi.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: zerofs-csi
+          image: "{{ .Values.csi.image.repository }}:{{ .Values.csi.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.csi.image.pullPolicy }}
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+          resources:
+            {{- toYaml .Values.csi.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-provisioner
+          image: {{ .Values.csi.provisionerImage }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election
+          resources:
+            {{- toYaml .Values.csi.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

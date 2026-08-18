@@ -1,10 +1,9 @@
-{{- if .Values.gateway.enabled }}
+{{- if or .Values.gateway.enabled .Values.publicGateway.enabled }}
 # Clients → `ingress` proxy L3 allow-list. A vanilla k8s NetworkPolicy cannot match the reserved
 # `ingress` identity, so this front-door allow is Cilium-native.
 #
 # `ingress` is deliberately NOT granted cluster-wide, so a route into a fenced namespace stays dead
 # until that namespace is listed as a backend.
-{{- if .Values.gateway.allowedCIDRs }}
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
@@ -17,28 +16,46 @@ spec:
     matchLabels:
       reserved:ingress: ""
   ingress:
+    {{- if .Values.gateway.enabled }}
+    {{- if .Values.gateway.allowedCIDRs }}
     - fromCIDR:
         {{- range .Values.gateway.allowedCIDRs }}
         - {{ . | quote }}
         {{- end }}
-{{- else }}
-apiVersion: cilium.io/v2
-kind: CiliumClusterwideNetworkPolicy
-metadata:
-  name: allow-clients-to-gateway-ingress
-  labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/part-of: homelab-cilium
-spec:
-  endpointSelector:
-    matchLabels:
-      reserved:ingress: ""
-  ingress:
+    {{- else }}
     - fromEntities:
         - world
         - cluster
+    {{- end }}
+    {{- end }}
+    {{- if .Values.publicGateway.enabled }}
+    # One `ingress` identity fronts both Gateways, so this admits the internet to either. What keeps
+    # it off the internal Gateway is that nothing translates or routes to that Gateway's address.
+    - fromCIDRSet:
+        # Private space is excepted so LAN clients stay subject to the allow-list above.
+        - cidr: "0.0.0.0/0"
+          except:
+            - "10.0.0.0/8"
+            - "172.16.0.0/12"
+            - "192.168.0.0/16"
+            - "127.0.0.0/8"
+            - "169.254.0.0/16"
+        - cidr: "::/0"
+          except:
+            - "fc00::/7"
+            - "fe80::/10"
+            - "::1/128"
+    {{- end }}
+{{- $backends := list }}
+{{- if .Values.gateway.enabled }}
+{{- $backends = .Values.gateway.backendNamespaces | default list }}
 {{- end }}
-{{- if .Values.gateway.backendNamespaces }}
+{{- if .Values.publicGateway.enabled }}
+{{- range $r := .Values.publicGateway.routes }}
+{{- $backends = append $backends $r.backend.namespace }}
+{{- end }}
+{{- end }}
+{{- with ($backends | uniq | sortAlpha) }}
 ---
 # Reverse hop: Envoy re-identifies proxied traffic as `reserved:ingress`, which a namespaceSelector
 # cannot match — so this hop needs a Cilium-native allow too. Additive; the east-west fence owns the deny.
@@ -47,7 +64,7 @@ kind: CiliumClusterwideNetworkPolicy
 metadata:
   name: allow-gateway-ingress-to-backends
   labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
     app.kubernetes.io/part-of: homelab-cilium
 spec:
   endpointSelector:
@@ -55,7 +72,7 @@ spec:
       - key: k8s:io.kubernetes.pod.namespace
         operator: In
         values:
-{{- range $ns := .Values.gateway.backendNamespaces }}
+{{- range $ns := . }}
           - {{ $ns | quote }}
 {{- end }}
   enableDefaultDeny:

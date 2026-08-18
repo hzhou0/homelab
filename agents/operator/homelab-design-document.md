@@ -16,9 +16,12 @@
 8. [Database Layer](#8-database-layer)
 9. [Backup & Disaster Recovery](#9-backup--disaster-recovery)
 10. [DNS & Privacy](#10-dns--privacy)
-11. [Security Considerations](#11-security-considerations)
-12. [Operational Procedures](#12-operational-procedures)
-13. [IP Address Plan](#13-ip-address-plan)
+11. [Cluster Governance](#11-cluster-governance)
+12. [Observability](#12-observability)
+13. [Remote Access](#13-remote-access)
+14. [Security Considerations](#14-security-considerations)
+15. [Operational Procedures](#15-operational-procedures)
+16. [IP Address Plan](#16-ip-address-plan)
 
 ---
 
@@ -43,6 +46,9 @@ The design prioritizes simplicity, minimal resource overhead, and strong backup/
 | Compute Nodes | Multiple N100 mini PCs (Alpine Linux) | k3s workers, SeaweedFS storage nodes |
 | Database Node | Dedicated mini PC | PostgreSQL, local path provisioner |
 | DAS Enclosure | TerraMaster D4-320 (USB 3.2 Gen2, 4-bay) | Database tablespaces via direct mount |
+
+The database node must boot from an internal NVMe: its bootstrap claims every `sd*` device for the
+ZFS pool and aborts if Alpine was installed onto one of them.
 
 ### 2.2 Topton M1 Port Assignments
 
@@ -86,6 +92,13 @@ Each physical interface on OPNsense has its own subnet. Network segregation is a
 | k3s Pods | 10.42.0.0/16 + ULA v6 | Internal to cluster (CNI managed) | N/A |
 | k3s Services | 10.43.0.0/16 + ULA v6 | Internal to cluster | N/A |
 | LB IP pool | 10.0.0.100–150 | LoadBalancer service IPs (Cilium LB IPAM + L2) | N/A |
+| LB IPv6 pool | /112 slice of the LAN /64 | LoadBalancer v6 addresses (Cilium LB IPAM, NDP) | N/A |
+
+IPv6 comes from a DHCPv6-PD /56 delegated to OPNsense; the LAN interface tracks a /64 from it and
+hands hosts a SLAAC GUA. Pod and service v6 space is ULA and deliberately unroutable — only a
+Service that opts into a v6 family gets a globally-routable address, and that address is reachable
+from the internet with no NAT in the way the moment it is assigned. The addressing plan and the
+CIDRs baked into the server's k3s install line live in `migration/DUAL-STACK-MIGRATION.md`.
 
 ### 3.3 OPNsense Interface Configuration
 
@@ -182,14 +195,14 @@ k3s is chosen for its single-binary design, minimal resource footprint, and clea
 
 | Node | Role | Storage |
 |------|------|---------|
-| `k3s-server` | Server + worker, control plane at 10.0.0.22 (DHCP reservation) | NVMe (OS 100GB, `vg-nvme` remainder) |
-| `k3s-compute-<6hex>` | Worker | NVMe (OS 100GB, `vg-nvme` remainder) |
-| `k3s-compute-spot` | Worker, reclaimable | none — root claims the whole disk |
+| `k3s-server` | Server + worker, control plane at 10.0.0.22 (DHCP reservation) | OS 100GB, `vg-nvme` on the remainder |
+| `k3s-compute-<6hex>` | Worker | OS 100GB, `vg-nvme` on the remainder |
+| `k3s-compute-spot-<6hex>` | Worker, reclaimable | none — root claims the whole disk |
 | `k3s-db` | Worker (tainted) | NVMe (OS) + D4-320 (4× HDD) |
 
 Compute roles are multi-instance and take a 6-char hash of the DMI product UUID in their hostname;
-singleton roles keep plain names. Worker addresses come from DHCP and are not fixed — only the
-control plane's is reserved. The spot node carries
+the server and database singletons keep plain names. Worker addresses come from DHCP and are not
+fixed — only the control plane's is reserved. Spot nodes carry
 `node.kubernetes.io/capacity-type=spot`, which every singleton workload uses as an anti-affinity
 exclusion.
 
@@ -210,7 +223,7 @@ server init and can only be changed by rebuilding the cluster.
 The database node is tainted to prevent non-database workloads from scheduling on it:
 
 ```bash
-kubectl taint nodes db workload=database:NoSchedule
+kubectl taint nodes k3s-db workload=database:NoSchedule
 ```
 
 Database pods include tolerations and node affinity:
@@ -237,6 +250,13 @@ Traffic flows through three layers:
 1. **Service mesh (east-west TCP)** — Cilium's sidecarless service mesh intercepts all TCP traffic between pods using per-node Envoy proxies and eBPF socket redirection. No sidecars are injected into pods. This provides L7 observability (via Hubble), traffic management, and a consistent mTLS-capable data plane for all in-cluster TCP communication.
 
 2. **North-south ingress** — The only externally accessible entry point for TCP is a shared `Gateway` object backed by a single LoadBalancer IP (assigned by Cilium LB IPAM, ARP-announced by Cilium L2). Traffic is routed by hostname via `HTTPRoute` objects. No TCP service is exposed via `type: LoadBalancer` directly — all inbound TCP must enter through the Gateway. UDP services that cannot traverse the Gateway each get their own dedicated LoadBalancer IP via `type: LoadBalancer`.
+
+   A second, optional `Gateway` on its own LoadBalancer IP is the one path in from the internet. It
+   differs from the shared internal Gateway in exactly one respect that matters: its listener admits
+   routes only from its own namespace, which no operator RoleBinding reaches. Both Gateways are
+   proxied by the same Envoy under one `reserved:ingress` identity, so no NetworkPolicy can separate
+   their traffic once it leaves the proxy — route attachment, not the network fence, is what decides
+   whether a service is public, and it is a cluster-admin edit to the `cilium` chart.
 
 3. **WAN exposure** — A custom OPNsense operator watches `Gateway` and `Service` objects for the
    `homelab.lab/*` annotations and creates/removes the corresponding WAN port forward rule via the
@@ -290,7 +310,8 @@ spec:
 **DNS** — A wildcard zone resolves to the Gateway's LoadBalancer IP, so any `HTTPRoute` hostname
 works without a per-service DNS entry. The Gateway carries `homelab.lab/hostname` for the internal
 wildcard, which the OPNsense operator turns into an Unbound override. It is internal-only: there is
-no `homelab.lab/expose` on it, and no public wildcard at a registrar. See section 13.4.
+no `homelab.lab/expose` on it, and no public wildcard at a registrar. The public Gateway is the
+exception, and its names are published at the registrar by hand. See section 16.4.
 
 UDP services are excluded from these wildcards; each retains an individual Unbound host override pointing to its own dedicated LoadBalancer IP.
 
@@ -369,16 +390,19 @@ Hypha's design — data path, conditional writes, encryption, tiering, and recov
 
 ### 7.3 Storage Node Disk Partitioning
 
-Each server/compute node's NVMe is partitioned during Alpine installation (`kube-node/10-provision.start`):
+Each server/compute node's install disk is partitioned during Alpine installation (`kube-node/10-provision.start`):
 
 | Partition | Size | Format | Purpose |
 |-----------|------|--------|---------|
-| nvme0n1p1 | 512MB | FAT32 (ESP) | EFI boot |
-| nvme0n1p2 | 100GB | ext4 | Alpine OS + k3s |
-| nvme0n1p3 | Remainder | LVM PV (raw) | `vg-nvme` — SeaweedFS via TopoLVM |
+| 1 | 512MB | FAT32 (ESP) | EFI boot |
+| 2 | 100GB | ext4 | Alpine OS + k3s |
+| 3 | Remainder | LVM PV (raw) | `vg-nvme` — SeaweedFS via TopoLVM |
 
-The `db` and `compute-spot` roles have no `p3` — root claims the whole disk — and provide no object
-storage.
+The install disk is the node's NVMe when it has one and `/dev/sda` otherwise; provisioning records
+the chosen disk and its LVM partition so the bootstrap doesn't re-derive them.
+
+The `db` and `compute-spot` roles have no third partition — root claims the whole disk — and provide
+no object storage.
 
 `vg-nvme` survives a k3s reinstall, and so do the logical volumes TopoLVM provisioned into it. Their
 `LogicalVolume` CRs do not, so after a cluster rebuild the old volumes linger as orphans that no
@@ -389,9 +413,12 @@ controller will reclaim and that silently starve new PVCs. Match `lvs` output ag
 
 Object storage is three foundational charts, all cluster-admin installed (not operator-deployed):
 
-- **`homelab-topolvm`** — CSI driver provisioning node-local logical volumes from the `vg-nvme` volume group (each storage node's `nvme0n1p3`, the ex-Ceph partition). Provides the `topolvm-provisioner` StorageClass; scoped to nodes labelled `vg=nvme` (replacing Ceph's `ceph-osd=true`).
-- **`homelab-seaweedfs`** — SeaweedFS as the hot cache tier: one volume server per storage node on `topolvm-provisioner` PVCs, replication off (no local redundancy).
-- **`hypha`** — the gateway, an encrypting S3 proxy whose cache is optional. It is deployed twice: a cached deployment (`s3.internal.haustorium.net`, via the shared Cilium Gateway, replacing `rook-ceph-rgw-s3-store`) fronting SeaweedFS as the default tier, and a cacheless deployment (`s3-direct.internal.haustorium.net`) that writes synchronously to the remote for clients that cannot tolerate loss (e.g. ZeroFS). Each deployment is scoped to its own remote namespace — a separate account/bucket, or a shared remote under a forced key prefix.
+- **`homelab-topolvm`** — CSI driver provisioning node-local logical volumes from the `vg-nvme` volume group. Provides the `topolvm-provisioner` StorageClass; scoped to nodes labelled `vg=nvme`, so it never starts where the volume group does not exist.
+- **`homelab-seaweedfs`** — SeaweedFS as the hot cache tier: one volume server per storage node on `topolvm-provisioner` PVCs, replication off (no local redundancy). Volume servers are declared per node rather than by replica count, because each one is pinned to its node's hostname and sized against that node's volume group.
+- **`hypha`** — the gateway, an encrypting S3 proxy, built in this repo (`hypha/`) and shipped as a container image from CI. One release runs two independent deployments, distinguished by when a write is acknowledged: a **cached** one (`s3.internal.haustorium.net`) that acks on the cache commit and reconciles to the remote behind it, and a **durable** one (`s3-direct.internal.haustorium.net`) that acks only after the remote commit, for clients that cannot tolerate loss. Durable mode still uses the cache — as the namespace and ETag projection — so both deployments depend on SeaweedFS. Their backend buckets are kept disjoint on a shared remote account by a per-deployment bucket prefix, which is the only thing separating them.
+
+Both are reachable only through the shared Cilium Gateway, so the L3 allow-list and TLS in front of
+every other internal service apply to S3 as well.
 
 Object bodies are encrypted client-side and continuously replicated to the remote for durability (local redundancy is off; names and metadata stay plaintext, as with standard S3 client-side encryption). The cache holds no unique state — on loss it is discarded and repopulates from the remote. The encryption scheme, conditional writes, tiering, and the mirror-vs-versioned-backup trade-off are all covered in [`hypha/ARCHITECTURE.md`](../../hypha/ARCHITECTURE.md).
 
@@ -408,7 +435,7 @@ Object bodies are encrypted client-side and continuously replicated to the remot
 ### 9.1 Design Principles
 
 - All backups are encrypted client-side before leaving the network. The backup provider sees only encrypted blobs.
-- Offsite copies go to an S3-compatible remote (e.g. Backblaze B2, ~$6/TB/month).
+- Offsite copies go to an S3-compatible remote (iDrive e2 today; the endpoint is a hypha value, and nothing else in the cluster knows the provider).
 - Replication is not used for local data protection. For object storage, hypha continuously replicates an encrypted copy to the remote; whether that copy is a plain mirror or a versioned backup is a remote-bucket configuration choice (see §7.4), not a property of hypha.
 - Encryption keys must be stored outside the cluster (password manager, printed in a safe). Losing them renders all backups unrecoverable.
 
@@ -420,13 +447,18 @@ Object storage has no separate backup job: Hypha continuously replicates an encr
 
 In the event of complete cluster loss, the rebuild order is:
 
-1. Install Alpine on all nodes (automated via custom ISO)
-2. Install k3s (server first, then agents)
-3. Deploy the cilium chart (service mesh + LB IPAM/L2 + ingress Gateway), cert-manager, and the custom OPNsense operator
-4. Deploy homelab-topolvm and homelab-seaweedfs, then hypha; the cache starts empty and repopulates from the remote on demand
-5. Reconfigure OPNsense port forwards (operator handles automatically)
+1. Install Alpine on all nodes and join k3s (both automated by the role ISOs; server first)
+2. Apply the Gateway API CRDs out-of-band, then install cert-manager (the ingress Gateway's wildcard cert must be issuable before the Gateway exists)
+3. Install the cilium chart — CNI, LB IPAM/L2, ingress Gateway, host firewall, WireGuard. Nodes are `NotReady` until this lands
+4. Install homelab-platform (Kyverno CRDs out-of-band first), then label/taint the nodes
+5. Install homelab-topolvm and homelab-seaweedfs, then hypha; the cache starts empty and repopulates from the remote on demand
+6. Install monitoring and the OPNsense operator; the operator re-creates the DNS overrides and WAN port forwards from the annotations already on the Gateway and Services
+7. Re-apply the operator agent's `app-*`/`tool-*` workloads from their manifests — nothing reconciles those back on its own
 
-Steps 1–4 should be scripted and stored in an external git repository for rapid rebuilds. Target recovery time: under 1 hour excluding data restore.
+The three Secrets no chart can regenerate (Cloudflare API token, OPNsense API credentials, WireGuard
+server key) must be restored from outside the cluster before the charts that consume them come up.
+
+Target recovery time: under 1 hour excluding data restore.
 
 ### 9.4 Offsite Architecture Diagram
 
@@ -529,28 +561,108 @@ Anonymized DNSCrypt provides equivalent privacy to ODoH with a larger relay ecos
 
 ---
 
-## 11. Security Considerations
+## 11. Cluster Governance
 
-### 11.1 Network Security
+### 11.1 Why the Cluster Is Governed by Admission Policy
+
+Day-to-day deployment is delegated to an autonomous (LLM) operator. Rather than reviewing what it
+submits, the cluster encodes its own architecture and standards as admission constraints: a manifest
+is either accepted — and therefore compliant by construction — or rejected with a machine-readable
+reason the operator can act on. The operator gets broad deploy power inside that region and no
+ability to move the region's boundary. The `homelab-platform` chart owns that surface, along with
+Kyverno itself.
+
+### 11.2 Two Tiers
+
+Workloads live in `app-*` namespaces (stateless applications) or `tool-*` namespaces (cluster
+tooling). The app tier is deliberately the narrower one: `Deployment` only, no persistent storage,
+Pod Security `restricted`, and resource requests/limits bounded by a per-runtime envelope selected
+by a required runtime label. The tool tier adds the stateful kinds and PVCs, runs at `baseline`, and
+is bounded by the namespace's generated `LimitRange` instead — at most one Helm release per tool
+namespace, so a namespace stays one identity.
+
+Creating a namespace in either tier auto-generates its guardrails (quota, limit range, default
+ingress policy, PSA labels, and the operator's deploy `RoleBinding`), reconciled against drift. The
+namespace must also carry provenance metadata, so every deployment records where it came from.
+
+### 11.3 What the Operator Cannot Do
+
+Confinement is RBAC-first: the operator's cluster role holds no namespaced write power at all; the
+rights it uses are bound into `app-*`/`tool-*` namespaces as they are generated. Admission policy
+then blocks the residue — creating non-tier namespaces, editing the constraints, touching network
+topology (Gateways, routes, network policy), or exposing a TCP service. Foundational components
+(CNI, CSI, cert-manager, storage, monitoring, the OPNsense operator) need cluster-scoped or
+privileged access and are installed by a human, each in its own non-tier namespace so this
+governance does not apply to them.
+
+The escalation path is a chart values change applied by a human — a new image on the allowlist, a
+wider runtime envelope, a larger quota. That keeps every widening of the region auditable in git.
+
+---
+
+## 12. Observability
+
+`monitoring` runs the kube-prometheus-stack (Prometheus Operator, Prometheus, Alertmanager, Grafana,
+node-exporter, kube-state-metrics), installed by cluster-admin because it owns cluster-scoped CRDs
+and needs cluster-wide discovery. Grafana is reached through the shared Gateway like any other
+internal service.
+
+Scraping works across a default-deny cluster because the generated per-namespace ingress policy
+admits the monitoring namespace by name — so a new governed namespace is scrapable with no
+per-namespace setup, while everything else stays fenced.
+
+Charts ship their own signals rather than centralizing them: hypha's chart carries its dashboards and
+alert rules, so the alerting surface for a component moves with the component. Hubble supplies the
+network half — per-flow metrics, DNS and HTTP metadata, and drop reasons straight from the eBPF
+datapath, with no application instrumentation.
+
+---
+
+## 13. Remote Access
+
+Off-LAN access is a WireGuard server hosted in the cluster (owned by the `cilium` chart, in its own
+namespace) on a dedicated UDP LoadBalancer IP, with the WAN forward reconciled by the OPNsense
+operator from the same annotations any other exposed UDP service uses. There is no public DNS record
+and no public wildcard: reaching an internal service from outside means bringing up the tunnel.
+
+The tunnel is not a general foothold on the LAN. The server masquerades peer traffic to its own pod
+IP, so Cilium sees the whole tunnel as a single endpoint, and that endpoint's egress is default-denied
+and re-opened only to the Gateway's backends and the LAN resolver. A peer therefore reaches exactly
+what the Gateway already fronts, plus DNS. Admin `kubectl` over the tunnel is a separate opt-in that
+must be enabled on both ends.
+
+The server's private key never enters Helm state — it is injected at runtime from a pre-created
+Secret, which is one of the three credentials a disaster rebuild must restore from outside the
+cluster.
+
+---
+
+## 14. Security Considerations
+
+### 14.1 Network Security
 
 - WiFi subnet is physically segregated from LAN via dedicated OPNsense port with firewall rules blocking cross-subnet traffic.
 - The Horaco unmanaged switch has no management interface, eliminating remote management attack surface. Physical access is the only concern.
 - All DNS traffic is encrypted via Anonymized DNSCrypt. Rogue DNS is prevented by port 53 NAT redirect.
-- OPNsense WAN blocks all unsolicited inbound traffic by default.
+- OPNsense WAN blocks all unsolicited inbound traffic by default. For IPv6 it is the only
+  network-level gate — a v6 LoadBalancer address is globally routable with no NAT in front of it.
+- The nodes themselves are locked down by a Cilium host-firewall policy: host ingress is default-deny,
+  re-allowing in-cluster identities, the admin hosts, and all UDP, so only TCP from `world` is
+  dropped. It enforces on wired NICs only.
 
-### 11.2 ISP / L1 Security
+### 14.2 ISP / L1 Security
 
 GPON upstream traffic is unencrypted at the optical layer per specification. XGS-PON adds AES encryption but downstream is broadcast to all subscribers on the same splitter. Known vulnerabilities include rogue ONT disruption (transmitting outside assigned time slots), potential eavesdropping via fibre trunk tapping, and weak PLOAM key exchange.
 
 Practical mitigation: encrypt all traffic at L3+ (HTTPS, WireGuard, TLS, encrypted DNS). The GPON/XGS-PON layer is not a security boundary — application-layer encryption is the real protection.
 
-### 11.3 Backup Security
+### 14.3 Backup Security
 
 - Hypha: object bodies encrypted client-side before they reach the remote (standard S3 client-side encryption; key names and metadata are not encrypted)
 - The offsite remote has no visibility into object contents (bodies are encrypted); it does see object names and sizes
 - Encryption keys stored outside the cluster infrastructure
 
-### 11.4 Kubernetes Security
+### 14.4 Kubernetes Security
 
 - **Namespaces are single-tenant.** Every namespace holds one app/tool/component, so the namespace
   *is* the workload's identity. NetworkPolicy grants are therefore scoped by source namespace, never
@@ -561,15 +673,19 @@ Practical mitigation: encrypt all traffic at L3+ (HTTPS, WireGuard, TLS, encrypt
   CCNP (so it holds even if Kyverno stops reconciling — fail closed); the platform
   `namespace-default-ingress` policy layers the same-namespace and scrape allows on top. East-west
   reachability past those requires an explicit grant.
+- Deployment authority is bounded by admission policy rather than by review (section 11), and the
+  autonomous operator cannot expose a TCP service or alter network topology at all
+- gVisor is available as a RuntimeClass for untrusted workloads; it is installed per node and
+  selected by a node label, so a pod asking for it schedules only where `runsc` exists
 - Database node is tainted — only authorized workloads schedule there
 - Storage nodes are labelled `vg=nvme` — TopoLVM's lvmd/node plugins are scoped by label
 - TopoLVM manages only the `vg-nvme` volume group, so it never claims unintended devices
 
 ---
 
-## 12. Operational Procedures
+## 15. Operational Procedures
 
-### 12.1 Node Provisioning
+### 15.1 Node Provisioning
 
 Nodes are provisioned from role-specific Alpine ISOs that self-install: boot one on bare metal and it
 partitions the disk, installs Alpine, joins the cluster, and sets up node-local storage without an
@@ -578,15 +694,19 @@ control-plane rebuild and is the same for every role — treat the ISOs as secre
 
 Neither provisioning phase can label or taint a node, since both need the API. Those are applied
 afterwards from a machine with a kubeconfig; `kube-node/nodes.md` lists which labels each role needs
-and what consumes them.
+and what consumes them. A freshly provisioned node stays `NotReady` until the `cilium` chart is
+installed — the bootstrap disables flannel and installs no CNI of its own.
 
-### 12.2 IP Address Management
+The second phase is one-shot and not re-runnable: it creates the volume group or ZFS pool assuming
+virgin storage. Rebuilding the k3s layer on a live node means running its k3s steps by hand.
+
+### 15.2 IP Address Management
 
 All infrastructure IPs are managed centrally in OPNsense via DHCP static mappings (**Services → DHCPv4 → LAN → Static Mappings**). Each mapping associates a MAC address with a fixed IP and hostname. Unbound automatically registers these hostnames for DNS resolution.
 
 Nodes use DHCP to receive their addresses. OPNsense boots fast on the Topton N100 and is ready to serve DHCP before compute nodes request an IP. In the unlikely event a node boots before OPNsense, the DHCP client retries every few seconds until it receives a response.
 
-### 12.3 k3s Upgrades
+### 15.3 k3s Upgrades
 
 1. Read release notes for API deprecations and breaking changes.
 2. Verify Cilium/SeaweedFS compatibility with the new version.
@@ -594,24 +714,26 @@ Nodes use DHCP to receive their addresses. OPNsense boots fast on the Topton N10
 4. Never skip minor versions (e.g., v1.32 → v1.33 → v1.34).
 5. Run `kubectl get nodes` to verify all nodes are Ready on the new version.
 
-### 12.4 Adding Storage
+### 15.4 Adding Storage
 
 To add a new compute node to the SeaweedFS/hypha pool:
 
-1. Provision the node with the standard Alpine ISO (includes the `vg-nvme` partition)
-2. Join the k3s cluster
-3. The bootstrap creates the volume group; label the node `vg=nvme` afterwards from a kubeconfig
-4. TopoLVM's lvmd/node plugins start on the node; add a SeaweedFS volume server (bump `volume.replicas`) to use the new capacity
+1. Provision the node with the compute Alpine ISO; it partitions, joins, and creates the volume group unattended
+2. Label the node `vg=nvme` from a kubeconfig, which starts TopoLVM's lvmd and node plugins there
+3. Add a volume-server entry for the new hostname to the seaweedfs values, sized against that node's volume group, and upgrade the release
 
-### 12.5 UPS Recommendations
+Volume servers are declared per node, not scaled by replica count: each is pinned to a hostname and
+sized independently, since the nodes' NVMe capacities differ.
+
+### 15.5 UPS Recommendations
 
 A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database node. These are the only stateful devices requiring graceful shutdown. Compute nodes are stateless and recover cleanly from hard power loss. Configure `apcupsd` or `nut` to trigger automatic shutdown when battery reaches low threshold.
 
 ---
 
-## 13. IP Address Plan
+## 16. IP Address Plan
 
-### 13.1 LAN (10.0.0.0/24)
+### 16.1 LAN (10.0.0.0/24)
 
 | Range | Assignment |
 |-------|------------|
@@ -625,14 +747,14 @@ A small UPS (~$60–80 CAD) is recommended for the OPNsense router and database 
 | 10.0.0.100–150 | Cilium LoadBalancer IP pool (LB IPAM + L2; .100 = shared Gateway) |
 | 10.0.0.200–250 | DHCP for other wired devices |
 
-### 13.2 WIFI (10.0.1.0/24)
+### 16.2 WIFI (10.0.1.0/24)
 
 | Range | Assignment |
 |-------|------------|
 | 10.0.1.1 | OPNsense WIFI gateway |
 | 10.0.1.100–200 | DHCP for wireless clients |
 
-### 13.3 Kubernetes Internal
+### 16.3 Kubernetes Internal
 
 | Range | Assignment |
 |-------|------------|
@@ -644,7 +766,7 @@ never routable. A Service gets a globally-routable v6 LoadBalancer address only 
 `ipFamilyPolicy` — and that address is reachable from the internet the moment it is assigned, gated
 solely by the OPNsense WAN firewall, with no NAT in the way as there is for v4.
 
-### 13.4 Service DNS
+### 16.4 Service DNS
 
 **Internal wildcard (Unbound host override, operator-managed):**
 
@@ -655,9 +777,10 @@ solely by the OPNsense WAN firewall, with no NAT in the way as there is for v4.
 
 TCP services need only an `HTTPRoute` with the desired hostname — no DNS entry. UDP services each
 require their own LoadBalancer IP and a dedicated Unbound override, which the operator creates from
-`homelab.lab/hostname`. Nothing is published in public DNS.
+`homelab.lab/hostname`. Nothing internal is published in public DNS; a name served by the public
+Gateway is a registrar record a human maintains, pointed at the WAN address like the VPN endpoint.
 
-### 13.5 Reserved Ranges for Future Subnets
+### 16.5 Reserved Ranges for Future Subnets
 
 | Range | Potential Use |
 |-------|--------------|

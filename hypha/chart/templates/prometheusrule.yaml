@@ -170,5 +170,6 @@ spec:
             deployment: {{ $name }}
           annotations:
             summary: "Hypha {{ $fullname }} serves {{ $value }} of reads from the remote"
+            description: "A nonzero hypha_rehydrations_declined_total means objects too large to cache at all, not a cache under pressure."
 {{- end }}
 {{- end }}

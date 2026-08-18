@@ -24,7 +24,7 @@ deployments:
 image:
   repository: ghcr.io/hzhou0/hypha
   # Defaults to the chart's appVersion.
-  tag: "sha-f50e42a"
+  tag: "sha-a131389"
   pullPolicy: IfNotPresent
 
 serving:
@@ -127,14 +127,8 @@ gateway:
   # Disabled outright: S3 bodies are unbounded, so any request timeout is a size limit in disguise.
   requestTimeout: 0s
 
-# Ingress allows for the S3 port, one CiliumNetworkPolicy per entry. Scoped by source namespace
-# only — a pod can self-apply any label, so labels are not a trust boundary.
-accessGrants:
-  fromNamespaces: []
-
 monitoring:
-  # The admin listener is unauthenticated, so its grant is a namespace allow of its own rather than
-  # part of the S3 grants above.
+  # The admin listener is unauthenticated, so unlike the S3 port it is fenced to one namespace.
   namespace: monitoring
   serviceMonitor:
     enabled: true

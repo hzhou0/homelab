@@ -73,7 +73,6 @@ Every tuning knob defaults to the process's own default; the ones normally set p
 | `remote.endpoint` | required, no default |
 | `cache.endpoint` | SeaweedFS S3 Service |
 | `gc.usage.master` | SeaweedFS master; without it GC sweeps debris but never evicts |
-| `accessGrants.fromNamespaces` | in-cluster S3 clients, by namespace |
 | `reconcile.backpressure.maxPending` / `maxAgeMs` | cap the unreconciled window; both `0` (off) by default |
 
 `terminationGracePeriodSeconds` must cover 15 s connections + 10 s obligations + 10 s actors +

@@ -10,7 +10,7 @@ chart). You cannot change them — you operate inside them.
 Read **`homelab-design-document.md`** (in this directory) for the architecture you operate
 within: the node topology (server / compute / database, taints and labels), networking
 (Cilium + Gateway API service mesh, Cilium LB IPAM + L2 for LoadBalancer IPs, `.lab` DNS, the
-OPNsense WAN-exposure operator), the storage model (Ceph/RGW S3, CloudNativePG), and the planned
+OPNsense WAN-exposure operator), the storage model (hypha S3 over SeaweedFS/TopoLVM), and the
 cluster tooling. It is the intent behind the constraints — consult it when deciding where and how
 something should run.
 
@@ -47,8 +47,7 @@ done inside the constraints, **stop and escalate** (see below) rather than forci
   into them; read cluster state (including the Kyverno policies and policy reports) for
   introspection.
 - You **cannot**: modify Kyverno policies, RBAC, or the generated namespace guardrails
-  (ResourceQuota/LimitRange/NetworkPolicy); write into protected namespaces
-  (`kube-system`, `kyverno`, `database`, `rook-ceph`, `tool-operator`, `kube-*`).
+  (ResourceQuota/LimitRange/NetworkPolicy); write anywhere outside `app-*`/`tool-*` namespaces.
 
 ## Always introspect before deploying
 
@@ -133,15 +132,27 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
 
 ## When to escalate (don't force it)
 
-Stop and tell the human operator — with the exact `homelab-platform` chart values change
-needed — when a task requires something only the platform chart can grant:
+Stop and tell the human operator — with the exact chart values change needed — when a task
+requires something only a foundational chart can grant:
 
 - **An image that isn't allowlisted** → request adding it to `imageAllowlist`.
 - **Resources outside a runtime's envelope** → request adjusting that `runtimeProfiles` entry.
 - **A disallowed kind / persistent storage in an app** → reconsider the design, or request it
   be treated as a `tool-*` deployment.
 - **A quota that's too small** → request a larger tier quota.
+- **A new namespace that serves traffic through the shared Gateway** → request it be added to
+  the `cilium` chart's `gateway.backendNamespaces`. Every first deployment into a fresh
+  namespace needs this, and nothing you can create substitutes for it.
+- **A service that must be reachable from the internet** → request a route on the public Gateway.
+  You cannot create one: it admits routes only from its own namespace, which you have no access to,
+  and every `HTTPRoute` you can write attaches to the internal Gateway alone.
 
-These are deliberate, auditable changes a human applies via `helm upgrade homelab-platform`.
-Your role is to deploy within the rules and surface the precise change when the rules need to
-move.
+These are deliberate, auditable changes a human applies via `helm upgrade`. Your role is to
+deploy within the rules and surface the precise change when the rules need to move.
+
+**The 503 that is not your bug.** Until that grant lands, a namespace's route is accepted and
+its traffic is dropped: `HTTPRoute` shows `Accepted` + `ResolvedRefs`, the Service has ready
+endpoints, the pods are healthy, and every request through the Gateway returns 503. Don't
+re-roll the Deployment chasing it. Confirm with `kubectl -n <ns> port-forward svc/<svc>` —
+that path bypasses the mesh, so a working response there means the workload is fine and the
+missing grant is the whole problem. Escalate at that point.

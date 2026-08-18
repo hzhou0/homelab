@@ -1,0 +1,41 @@
+{{- if .Values.csi.storageClass.enabled }}
+{{- $secretName := printf "%s-csi-admin" .Release.Name }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.csi.labels" (dict "root" . "component" "controller") | nindent 4 }}
+stringData:
+  adminEndpoint: {{ include "zerofs.adminEndpoints" . }}
+  volumesRoot: {{ .Values.csi.storageClass.volumesRoot }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.csi.storageClass.name }}
+  labels:
+    {{- include "zerofs.chartLabels" . | nindent 4 }}
+  {{- if .Values.csi.storageClass.default }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: csi.zerofs.net
+parameters:
+  # Both halves of the pair, in both parameters: the controller provisions against whichever answers
+  # as leader, and the mount re-routes to it after a failover without a remount.
+  adminEndpoint: {{ include "zerofs.adminEndpoints" . }}
+  gateway: {{ include "zerofs.ninepEndpoints" . }}
+  volumesRoot: {{ .Values.csi.storageClass.volumesRoot }}
+  # DeleteVolume is given no StorageClass parameters, only secrets.
+  csi.storage.k8s.io/provisioner-secret-name: {{ $secretName }}
+  csi.storage.k8s.io/provisioner-secret-namespace: {{ .Release.Namespace }}
+reclaimPolicy: {{ .Values.csi.storageClass.reclaimPolicy }}
+# A volume is a directory on a remote filesystem: there is no node-local capacity for the binding
+# to wait on, and any node can mount it.
+volumeBindingMode: Immediate
+# Requested capacity is recorded on the PV and never enforced; the gateway's max_size_gb is the
+# only real ceiling, and it covers the filesystem as a whole.
+allowVolumeExpansion: false
+{{- end }}

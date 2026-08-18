@@ -1,0 +1,19 @@
+apiVersion: v2
+name: homelab-zerofs
+description: >-
+  ZeroFS as a CSI driver: a leader/standby gateway pair holding one POSIX filesystem in an
+  S3 bucket, and the csi.zerofs.net driver that carves that filesystem into ReadWriteMany
+  volumes mounted over 9P. Complements topolvm, which hands out node-local block devices no
+  second node can reach. Foundational like cilium/cert-manager: cluster-admin installs it into
+  its own zerofs namespace, not an app-*/tool-* one, because the node plugin is a privileged
+  DaemonSet and the driver is cluster-scoped.
+type: application
+version: 0.1.0
+appVersion: "2.2.3"
+keywords:
+  - zerofs
+  - csi
+  - storage
+  - s3
+  - 9p
+  - homelab

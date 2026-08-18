@@ -104,9 +104,15 @@ loadBalancer:
   gatewayPool:
     name: gateway-pool
     ip: "10.0.0.100"
+  publicGatewayPool:
+    name: public-gateway-pool
+    ip: "10.0.0.99"
+    v6: "2001:569:5bc1:7f00:ffff::1"
+  # Starts above the gateway slice at the bottom of the prefix, which is pinned per Gateway.
   v6Pool:
     name: v6
-    cidr: "2001:569:5bc1:7f00:ffff::/112"
+    start: "2001:569:5bc1:7f00:ffff::100"
+    stop: "2001:569:5bc1:7f00:ffff::ffff"
   l2:
     name: lab-l2
     # Pin the announcer to the control-plane node: it must already be up for the cluster to function,
@@ -145,11 +151,45 @@ gateway:
     - hypha
     - monitoring
     - seaweedfs
+    - tool-filestash
     - tool-headlamp
 
   hubbleUI:
     enabled: true
     hostname: hubble.internal.haustorium.net
+
+# ---------------------------------------------------------------------------
+# Public (WAN-exposed) ingress Gateway
+# ---------------------------------------------------------------------------
+# Routes may attach only from this Gateway's own namespace, which no operator RoleBinding reaches:
+# publishing to the internet is a cluster-admin edit here, never a workload's own manifest.
+publicGateway:
+  enabled: true
+  name: public
+  namespace: cilium-gateway-public
+  ingressLabel: homelab.lab/ingress
+  gatewayClassName: cilium
+  hostname: "*.haustorium.net"
+
+  tlsSecretName: haustorium-wildcard-tls
+  issuerName: letsencrypt-cloudflare
+
+  expose: true
+  listenPort: 443
+
+  # Unbound overrides sparing LAN clients the WAN hairpin. Never a wildcard: it would shadow every
+  # name in the public zone, including those that resolve outside the cluster.
+  internalDnsNames: []
+
+  # Each entry renders a route here plus the ReferenceGrant its backend namespace must publish, and
+  # grants that namespace on the reverse hop.
+  routes: []
+    # - name: homepage
+    #   hostname: home.haustorium.net
+    #   backend:
+    #     namespace: app-homepage
+    #     name: homepage
+    #     port: 3000
 
 # ---------------------------------------------------------------------------
 # WireGuard remote-access tunnel

@@ -66,6 +66,7 @@ imageAllowlist:
   - ghcr.io/gethomepage/homepage:v1.13.2
   - ghcr.io/kyverno/policy-reporter:3.7.4
   - ghcr.io/kyverno/policy-reporter-ui:2.5.1
+  - docker.io/machines/filestash@sha256:75d123c3a4e50028c74daf9f2a7afe16d95c0b883abe5a974b81f057bdeb5808
 
   # --- applications (app-* tier) ---
   # - ghcr.io/<org>/<app>:<tag>

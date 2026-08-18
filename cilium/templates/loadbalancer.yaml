@@ -31,7 +31,28 @@ spec:
   serviceSelector:
     matchLabels:
       io.cilium.gateway/owning-gateway: {{ .Values.gateway.name | quote }}
-{{- with $lb.v6Pool.cidr }}
+{{- if .Values.publicGateway.enabled }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: {{ $lb.publicGatewayPool.name }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  blocks:
+    - start: {{ $lb.publicGatewayPool.ip | quote }}
+      stop: {{ $lb.publicGatewayPool.ip | quote }}
+    {{- with $lb.publicGatewayPool.v6 }}
+    - start: {{ . | quote }}
+      stop: {{ . | quote }}
+    {{- end }}
+  serviceSelector:
+    matchLabels:
+      io.cilium.gateway/owning-gateway: {{ .Values.publicGateway.name | quote }}
+{{- end }}
+{{- if $lb.v6Pool.start }}
 ---
 # Global unicast with no NAT in front of it: an address handed out here is internet-routable the
 # moment it is assigned, gated only by the OPNsense WAN firewall.
@@ -44,7 +65,8 @@ metadata:
     app.kubernetes.io/part-of: homelab-cilium
 spec:
   blocks:
-    - cidr: {{ . | quote }}
+    - start: {{ $lb.v6Pool.start | quote }}
+      stop: {{ $lb.v6Pool.stop | quote }}
   serviceSelector:
     matchExpressions:
       - key: io.cilium.gateway/owning-gateway

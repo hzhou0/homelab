@@ -7,6 +7,15 @@ set -e
 exec >>/var/log/bootstrap.log 2>&1
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+# dhcpcd backgrounds as soon as it configures any address, so the local service can start
+# before the DHCP lease and resolv.conf land and apk fails to resolve the mirror.
+i=0
+until apk update -q >/dev/null 2>&1; do
+  i=$((i + 1))
+  [ "$i" -lt 60 ] || { echo "ERROR: no usable network after 2 minutes" >&2; exit 1; }
+  sleep 2
+done
+
 apk add -q curl procps
 
 cat > /etc/sysctl.d/99-k3s.conf <<EOF
@@ -15,6 +24,11 @@ kernel.panic_on_oops=1
 vm.overcommit_memory=1
 EOF
 sysctl -p /etc/sysctl.d/99-k3s.conf
+
+# Volumes served over 9P are mounted by a userspace FUSE client: without the module there is
+# no /dev/fuse for the CSI node plugin to open, and its hostPath mount fails before it starts.
+modprobe fuse
+echo fuse >> /etc/modules
 
 mount --make-rshared /
 cat > /etc/local.d/00-rshared.start <<'EOF'
@@ -34,15 +48,16 @@ curl -sfL https://get.k3s.io | \
 
 rc-service k3s-agent restart
 
-# vg-nvme backs TopoLVM's node-local volumes. compute-spot shares this script but has no
-# p3 (root claims the whole disk, see 10-provision.start), so skip when the device isn't there.
-if [ -b /dev/nvme0n1p3 ]; then
+# vg-nvme backs TopoLVM's node-local volumes. compute-spot shares this script but gives
+# root the whole disk, so there is no third partition to claim.
+LVM_PART=$(cat /etc/node-lvm-part 2>/dev/null || true)
+if [ -n "$LVM_PART" ] && [ -b "$LVM_PART" ]; then
   apk add -q lvm2
-  pvcreate /dev/nvme0n1p3
-  vgcreate vg-nvme /dev/nvme0n1p3
+  pvcreate "$LVM_PART"
+  vgcreate vg-nvme "$LVM_PART"
 fi
 
 touch /etc/local.d/20-bootstrap.done
 echo "==> k3s compute bootstrap complete. Run from control plane:"
 echo "  kubectl label nodes $(hostname) gvisor=true"
-[ -b /dev/nvme0n1p3 ] && echo "  kubectl label nodes $(hostname) vg=nvme"
+[ -n "$LVM_PART" ] && echo "  kubectl label nodes $(hostname) vg=nvme"

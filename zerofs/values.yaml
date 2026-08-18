@@ -1,0 +1,140 @@
+# homelab-zerofs values
+
+gateway:
+  image:
+    repository: ghcr.io/barre/zerofs
+    tag: "2.2.3"
+    pullPolicy: IfNotPresent
+
+  ports:
+    ninep: 5564
+    admin: 7000
+    replication: 9000
+    metrics: 9091
+
+  # The filesystem every volume of this StorageClass is a directory in. One writer owns it, so a
+  # second gateway pair anywhere must be given a different url.
+  storage:
+    # `s3://bucket/prefix`. Install fails without it: there is no backend worth guessing.
+    url: "s3://zerofs/"
+    # Written verbatim as the backend's tiering header. Archive tiers make the filesystem
+    # unreadable — ZeroFS reads the manifest and SSTs continuously.
+    storageClass: ""
+
+  # Forwarded key-by-key to the object-store builder, each key prefixed `aws_`. Values must be
+  # strings, and misspellings are dropped silently rather than rejected.
+  aws:
+    endpoint: "https://s3.us-west-4.idrivee2.com"
+    region: us-west-4
+    allow_http: "false"
+    # ZeroFS fences writers with put-if-not-exists. A store that answers success instead of a
+    # precondition failure needs this Redis URL to arbitrate, or two nodes can both believe they lead.
+    # conditional_put: "redis://..."
+
+  # One pre-created Secret holds every credential under fixed key names, so nothing sensitive
+  # reaches a values file or the release history. Both nodes read the same one.
+  secretName: zerofs
+
+  cache:
+    dir: /data/cache
+    diskSizeGb: 40
+    volume:
+      storageClassName: topolvm-provisioner
+      size: 50Gi
+
+  filesystem:
+    # ENOSPC ceiling for the whole filesystem. CSI capacity requests are recorded on the PV and
+    # never enforced, so this is the only quota a volume can hit.
+    maxSizeGb: 100
+    compression: zstd-3
+
+  # Appended verbatim to the generated config. For the `[lsm]` and `[gc]` tuning tables, which have
+  # no reason to be modelled until a measurement asks for one.
+  extraConfig: ""
+
+  logLevel: info
+
+  # SIGTERM starts a real drain: servers quiesce, the open segment is sealed, and up to 256 MiB of
+  # buffered writes go to the remote. Being SIGKILLed through it costs the next start a recovery scan.
+  terminationGracePeriodSeconds: 120
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 3Gi
+
+  # Keep the pair off the reclaimable spot node and off each other's node: a standby that shares a
+  # host with its leader fails over nothing.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node.kubernetes.io/capacity-type
+                operator: NotIn
+                values: [spot]
+  antiAffinity: required
+  nodeSelector: {}
+  tolerations: []
+  podAnnotations: {}
+  podLabels: {}
+
+csi:
+  image:
+    repository: ghcr.io/barre/zerofs-csi
+    tag: "2.2.3"
+    pullPolicy: IfNotPresent
+
+  provisionerImage: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+  registrarImage: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
+  livenessProbeImage: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
+
+  # k3s keeps the kubelet's plugin and pod-volume trees here; the node plugin's mounts must be
+  # created under the same path the kubelet reads them from.
+  kubeletDir: /var/lib/kubelet
+
+  controller:
+    # A reclaim costs no data, only the lease and a pause in provisioning until it reschedules —
+    # but it is a singleton, and singletons stay off reclaimable capacity here.
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node.kubernetes.io/capacity-type
+                  operator: NotIn
+                  values: [spot]
+    nodeSelector: {}
+    tolerations: []
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+
+  node:
+    # Deliberately runs on spot too, unlike every other component here: it is the per-node mount
+    # agent, and a node without it starves any pod that claims a volume there.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 1Gi
+
+  storageClass:
+    enabled: true
+    name: zerofs
+    default: false
+    volumesRoot: /volumes
+    reclaimPolicy: Delete
+
+monitoring:
+  namespace: monitoring
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s

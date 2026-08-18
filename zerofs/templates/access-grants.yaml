@@ -1,0 +1,52 @@
+{{- /*
+Ingress allows layered on the cluster-wide east-west default deny.
+
+None of the three gateway ports is authenticated, so reachability is the whole trust boundary and
+each grant is as narrow as its client set allows. 9P namespaces by attach name only: any client that
+reaches it can attach to any volume's directory, or the filesystem root — which is why it is opened
+to the node plugins and nothing else, and why workloads never speak it themselves. The admin RPC
+runs every call as uid 0 and can delete any volume, so its one client is the controller.
+*/ -}}
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.chartLabels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "zerofs.gateway.podSelectorLabels" . | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            {{- include "zerofs.csi.selectorLabels" (dict "root" . "component" "node") | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: {{ .Values.gateway.ports.ninep | quote }}
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            {{- include "zerofs.csi.selectorLabels" (dict "root" . "component" "controller") | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: {{ .Values.gateway.ports.admin | quote }}
+              protocol: TCP
+    # Each half ships to the other, so the pair's own label set is both sides of this grant.
+    - fromEndpoints:
+        - matchLabels:
+            {{- include "zerofs.gateway.podSelectorLabels" . | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: {{ .Values.gateway.ports.replication | quote }}
+              protocol: TCP
+{{- if .Values.monitoring.namespace }}
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Values.monitoring.namespace }}
+      toPorts:
+        - ports:
+            - port: {{ .Values.gateway.ports.metrics | quote }}
+              protocol: TCP
+{{- end }}

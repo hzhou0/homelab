@@ -7,10 +7,26 @@ set -e
 exec >>/var/log/bootstrap.log 2>&1
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+# dhcpcd backgrounds as soon as it configures any address, so the local service can start
+# before the DHCP lease and resolv.conf land and apk fails to resolve the mirror.
+i=0
+until apk update -q >/dev/null 2>&1; do
+  i=$((i + 1))
+  [ "$i" -lt 60 ] || { echo "ERROR: no usable network after 2 minutes" >&2; exit 1; }
+  sleep 2
+done
+
 apk add zfs-lts
 modprobe zfs
 
-zpool create -f -o ashift=12 tablespaces raidz /dev/sda /dev/sdb /dev/sdc /dev/sdd
+POOL_DISKS="/dev/sda /dev/sdb /dev/sdc /dev/sdd"
+case " $POOL_DISKS " in
+  *" $(cat /etc/node-disk) "*)
+    echo "ERROR: Alpine was installed to a pool disk; the db node needs an NVMe root" >&2
+    exit 1
+    ;;
+esac
+zpool create -f -o ashift=12 tablespaces raidz $POOL_DISKS
 zfs set mountpoint=/mnt/tablespaces tablespaces
 
 rc-update add zfs-import boot
@@ -28,6 +44,11 @@ kernel.panic_on_oops=1
 vm.overcommit_memory=1
 EOF
 sysctl -p /etc/sysctl.d/99-k3s.conf
+
+# Volumes served over 9P are mounted by a userspace FUSE client: without the module there is
+# no /dev/fuse for the CSI node plugin to open, and its hostPath mount fails before it starts.
+modprobe fuse
+echo fuse >> /etc/modules
 
 mount --make-rshared /
 cat > /etc/local.d/00-rshared.start <<'EOF'

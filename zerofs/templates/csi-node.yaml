@@ -1,0 +1,101 @@
+{{- $ctx := dict "root" . "component" "node" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "zerofs.csi.node.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.csi.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "zerofs.csi.selectorLabels" $ctx | nindent 6 }}
+  # The FUSE clients are children of the plugin container, so restarting it breaks every published
+  # mount on that node. A rolling update would do that cluster-wide; OnDelete makes an upgrade a
+  # deliberate per-node operation, drained first.
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        {{- include "zerofs.csi.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "zerofs.csi.node.fullname" . }}
+      enableServiceLinks: false
+      priorityClassName: system-node-critical
+      # A pod with a volume can land anywhere its own tolerations allow, and it cannot start there
+      # unless the plugin is running too.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: zerofs-csi
+          image: "{{ .Values.csi.image.repository }}:{{ .Values.csi.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.csi.image.pullPolicy }}
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # Privileged, and the reason this chart is human-installed: the plugin opens /dev/fuse and
+          # mounts into the kubelet's tree.
+          securityContext:
+            privileged: true
+          ports:
+            - name: healthz
+              containerPort: 9808
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.csi.node.resources | nindent 12 }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            # Bidirectional: a mount made in this container's namespace has to propagate back to
+            # the host for the kubelet and the consuming pod to see it.
+            - name: kubelet-dir
+              mountPath: {{ .Values.csi.kubeletDir }}
+              mountPropagation: Bidirectional
+            - name: dev-fuse
+              mountPath: /dev/fuse
+        - name: node-driver-registrar
+          image: {{ .Values.csi.registrarImage }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.csi.kubeletDir }}/plugins/csi.zerofs.net/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: livenessprobe
+          image: {{ .Values.csi.livenessProbeImage }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port=9808
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: {{ .Values.csi.kubeletDir }}/plugins/csi.zerofs.net
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.csi.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: {{ .Values.csi.kubeletDir }}
+            type: Directory
+        - name: dev-fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice

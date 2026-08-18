@@ -7,12 +7,17 @@ and the post-join steps that need a `kubectl` against the control plane.
 
 ## How a node comes up
 
-`build.sh` bakes two scripts into every image's apkovl, which run in order from `/etc/local.d`:
+`build.sh` bakes two scripts into every image's apkovl. Only phase 1 sits in `/etc/local.d`; phase 2
+rides along as `/etc/bootstrap.start` and is moved into `local.d` on the installed root, so the ISO
+never runs both at once:
 
 | | Script | Runs | Does |
 |---|---|---|---|
-| Phase 1 | `10-provision.start` | from the ISO ramdisk | partitions `/dev/nvme0n1`, installs Alpine to disk, copies the role's phase-2 script into the installed root, reboots |
-| Phase 2 | `20-bootstrap-<role>.start` | from the installed root, once | installs k3s, sets up node-local storage, marks itself done |
+| Phase 1 | `10-provision.start` | from the ISO ramdisk | partitions the install disk, installs Alpine to disk, copies the role's phase-2 script into the installed root, reboots |
+| Phase 2 | `20-bootstrap.start` | from the installed root, once | installs k3s, sets up node-local storage, marks itself done |
+
+Phase 1 installs to the node's NVMe if it has one and to `/dev/sda` otherwise, and records the disk
+and its LVM partition in `/etc/node-disk` / `/etc/node-lvm-part` so phase 2 doesn't have to guess.
 
 Phase 2 is guarded by `/etc/local.d/20-bootstrap.done` and is **not** re-runnable — its `pvcreate` /
 `vgcreate` / `zpool create` steps assume virgin storage and abort under `set -e` against a volume
@@ -29,8 +34,8 @@ CNI arrives only when a cluster-admin installs the `cilium/` chart.
 
 | Role | Hostname | Disk layout | Storage |
 |---|---|---|---|
-| `k3s-server` | `k3s-server` | boot / root / `p3` | `vg-nvme` LVM VG on `p3`, backs TopoLVM |
-| `k3s-compute` | `k3s-compute-<6hex>` | boot / root / `p3` | `vg-nvme` LVM VG on `p3`, backs TopoLVM |
+| `k3s-server` | `k3s-server` | boot / root / third partition | `vg-nvme` LVM VG on the third partition, backs TopoLVM |
+| `k3s-compute` | `k3s-compute-<6hex>` | boot / root / third partition | `vg-nvme` LVM VG on the third partition, backs TopoLVM |
 | `k3s-compute-spot` | `k3s-compute-spot-<6hex>` | boot / root (whole disk) | none — reclaimable, holds no cluster data |
 | `k3s-db` | `k3s-db` | boot / root (whole disk) | ZFS `raidz` pool `tablespaces` over `sda`–`sdd`, mounted at `/mnt/tablespaces` |
 

@@ -16,7 +16,22 @@ exec >>/var/log/provision.log 2>&1
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 NODE_ROLE=$(cat /etc/node-role)
-DISK="/dev/nvme0n1"
+
+if [ -b /dev/nvme0n1 ]; then
+  DISK="/dev/nvme0n1"
+  PART="p"
+elif [ -b /dev/sda ]; then
+  DISK="/dev/sda"
+  PART=""
+else
+  echo "ERROR: neither /dev/nvme0n1 nor /dev/sda present" >&2
+  exit 1
+fi
+echo "==> installing to $DISK"
+
+BOOT_PART="${DISK}${PART}1"
+ROOT_PART="${DISK}${PART}2"
+LVM_PART="${DISK}${PART}3"
 
 # Installed from the on-ISO cache: parted/grub/etc. are the disk-setup tools;
 # dhcpcd brings the ramdisk online below. setup-disk lays down a minimal base and
@@ -86,18 +101,20 @@ esac
 partprobe "$DISK"
 mdev -s
 
-mkfs.vfat -F32 "${DISK}p1"
-mkfs.ext4 -q "${DISK}p2"
+mkfs.vfat -F32 "$BOOT_PART"
+mkfs.ext4 -q "$ROOT_PART"
 
-mount -t ext4 "${DISK}p2" /mnt
+mount -t ext4 "$ROOT_PART" /mnt
 mkdir -p /mnt/boot
-mount -t vfat "${DISK}p1" /mnt/boot
+mount -t vfat "$BOOT_PART" /mnt/boot
 
 USE_EFI=1 BOOTLOADER=grub setup-disk -m sys /mnt
 
 mkdir -p /mnt/etc/local.d
 cp /etc/k3s-token /mnt/etc/k3s-token
-cp "/etc/local.d/20-bootstrap-${NODE_ROLE}.start" /mnt/etc/local.d/20-bootstrap.start
+printf '%s\n' "$DISK" > /mnt/etc/node-disk
+[ -b "$LVM_PART" ] && printf '%s\n' "$LVM_PART" > /mnt/etc/node-lvm-part
+cp /etc/bootstrap.start /mnt/etc/local.d/20-bootstrap.start
 chmod +x /mnt/etc/local.d/20-bootstrap.start
 chroot /mnt rc-update add local default
 # setup-disk drops dhcpcd, so the installed root would boot loopback-only with no

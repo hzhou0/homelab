@@ -9,8 +9,10 @@ cp -r /work/overlays/"$PROFILE" "$OVERLAY"
 mkdir -p "$OVERLAY/etc/local.d"
 printf '%s' "$K3S_TOKEN" > "$OVERLAY/etc/k3s-token"
 cp /work/10-provision.start "$OVERLAY/etc/local.d/10-provision.start"
-cp /work/20-bootstrap-"$NODE_ROLE".start "$OVERLAY/etc/local.d/20-bootstrap-$NODE_ROLE.start"
-chmod +x "$OVERLAY/etc/local.d/"*.start
+# Phase 2 is staged outside local.d: on the ISO ramdisk the local service would run
+# it alongside phase 1, and the two race for the apk database lock.
+cp /work/20-bootstrap-"$NODE_ROLE".start "$OVERLAY/etc/bootstrap.start"
+chmod +x "$OVERLAY/etc/local.d/"*.start "$OVERLAY/etc/bootstrap.start"
 
 mkdir -p "$OVERLAY/etc/network"
 # All nodes use dhcpcd to DHCP whichever interface has a carrier, so

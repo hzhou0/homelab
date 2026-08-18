@@ -1,0 +1,117 @@
+{{- if .Values.publicGateway.enabled }}
+{{- $p := .Values.publicGateway }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $p.namespace }}
+  labels:
+    {{ $p.ingressLabel | default "homelab.lab/ingress" }}: "true"
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $p.name }}-tls
+  namespace: {{ $p.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  secretName: {{ $p.tlsSecretName }}
+  dnsNames:
+    - {{ $p.hostname | quote }}
+  issuerRef:
+    name: {{ $p.issuerName }}
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ $p.name }}
+  namespace: {{ $p.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+  annotations:
+    {{- with $p.internalDnsNames }}
+    homelab.lab/hostname: {{ join "," . | quote }}
+    {{- end }}
+    {{- if $p.expose }}
+    homelab.lab/expose: "true"
+    homelab.lab/protocol: "tcp"
+    homelab.lab/external-port: {{ $p.listenPort | quote }}
+    homelab.lab/internal-port: {{ $p.listenPort | quote }}
+    {{- end }}
+spec:
+  gatewayClassName: {{ $p.gatewayClassName | default "cilium" }}
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: {{ $p.listenPort }}
+      hostname: {{ $p.hostname | quote }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: {{ $p.tlsSecretName }}
+      # Same-namespace attachment is the whole public/internal split: no operator RoleBinding
+      # reaches this namespace, so nothing it deploys can bind itself to the WAN front door.
+      allowedRoutes:
+        namespaces:
+          from: Same
+{{- range $r := $p.routes }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $r.name }}
+  namespace: {{ $p.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  parentRefs:
+    - name: {{ $p.name }}
+      namespace: {{ $p.namespace }}
+  {{- with $r.hostname }}
+  hostnames:
+    - {{ . | quote }}
+  {{- end }}
+  rules:
+    - backendRefs:
+        - name: {{ $r.backend.name }}
+          namespace: {{ $r.backend.namespace }}
+          port: {{ $r.backend.port }}
+{{- end }}
+{{- $grants := dict }}
+{{- range $r := $p.routes }}
+{{- if ne $r.backend.namespace $p.namespace }}
+{{- $_ := set $grants $r.backend.namespace (append (index $grants $r.backend.namespace | default list) $r.backend.name) }}
+{{- end }}
+{{- end }}
+{{- range $ns, $names := $grants }}
+---
+# The backend namespace, not the route, is what consents to being published.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: {{ $p.name }}-gateway
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ $p.namespace }}
+  to:
+    {{- range $n := ($names | uniq | sortAlpha) }}
+    - group: ""
+      kind: Service
+      name: {{ $n | quote }}
+    {{- end }}
+{{- end }}
+{{- end }}
