@@ -733,8 +733,17 @@ impl Backend {
 
 /// Reverse `encoding-type=url` on a LIST-returned key. Keys are UTF-8; a stray non-UTF-8 sequence
 /// (which hypha never writes) degrades lossily rather than erroring a whole page.
+///
+/// **Form encoding, not path encoding**: the encoding S3 names here is
+/// `x-www-form-urlencoded`, so a space arrives as `+` and a literal `+` as `%2B` — hence the
+/// substitution before the percent decode, and hence that it is unambiguous. Percent-decoding alone
+/// hands back a key that addresses nothing: it is reported to the client under a name it cannot GET,
+/// and every internal operation keyed off the listing (the reconcile sweep above all) is aimed at an
+/// object that does not exist.
 fn url_decode(s: &str) -> String {
-    percent_decode_str(s).decode_utf8_lossy().into_owned()
+    percent_decode_str(&s.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 /// RFC 3986 unreserved bytes; everything else is percent-encoded per path segment (control bytes a

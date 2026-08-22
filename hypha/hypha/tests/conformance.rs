@@ -1294,6 +1294,35 @@ async fn list_objects() {
     assert_eq!(keys, vec!["a/2", "b/1"]);
 }
 
+/// A key is bytes, and LIST must hand back the bytes the client wrote. The backends answer hypha's
+/// `encoding-type=url` listing with form encoding, so a space arrives as `+` —
+/// decode that as a percent-escape only and every key carrying a space is reported to the client
+/// under a name it cannot GET, and addressed internally as a key that does not exist.
+#[tokio::test]
+async fn list_reports_keys_with_spaces_verbatim() {
+    let h = Harness::durable().await;
+    h.create_bucket(B).await;
+    let client = h.client();
+
+    let keys = [
+        "plain.txt",
+        "a file.txt",
+        "a dir/inner file.txt",
+        "a+file.txt",
+    ];
+    for k in keys {
+        put(&client, B, k, b"x").await;
+    }
+    let mut want: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    want.sort();
+    assert_eq!(list_keys(&client, B, None).await, want);
+    assert_eq!(
+        list_keys(&client, B, Some("a dir/")).await,
+        vec!["a dir/inner file.txt"],
+        "prefix filtering is on the client's bytes too"
+    );
+}
+
 /// LIST pagination under twin dilution. In durable mode every key is an eviction tombstone with a
 /// facts twin beside it, so a raw backend page is ~half client-visible: a page may return **fewer**
 /// than `MaxKeys` client keys (a short page — valid S3). Following the forwarded continuation token

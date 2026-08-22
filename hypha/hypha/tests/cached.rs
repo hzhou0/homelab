@@ -113,6 +113,37 @@ async fn cached_put_serves_from_cache_and_reconciles() {
     );
 }
 
+/// The reconcile sweep must be able to discharge a marker whose key contains a space. It reads the
+/// key back from a listing, and the backends form-encode listed keys — so a key mangled in the
+/// decode sends every step of the transition at a key that does not exist: the upload reads
+/// nothing, and the completion CAS declines against an absent marker. Both decline quietly, so the
+/// real marker stands, is listed again next pass, and its obligation can never be discharged —
+/// the pending set stops draining and backpressure eventually closes the tier to writes.
+#[tokio::test]
+async fn a_key_with_a_space_reconciles_and_clears_its_marker() {
+    let h = Harness::cached().await;
+    h.create_bucket(B).await;
+    let c = h.client();
+    let body = pattern(1024);
+
+    put(&c, B, "a file.txt", &body).await;
+    // A folder placeholder beside it: mainstream client behaviour (filestash, rclone, the console
+    // all PUT an empty body at a `/`-suffixed key), and the shape this was found in.
+    put(&c, B, "a folder/", b"").await;
+
+    wait_until(
+        15_000,
+        "reconcile uploads both keys and clears both markers",
+        || async {
+            remote_present(&h, B, "a file.txt").await
+                && !marker_present(&h, B, "a file.txt").await
+                && remote_present(&h, B, "a folder/").await
+                && !marker_present(&h, B, "a folder/").await
+        },
+    )
+    .await;
+}
+
 /// A marker backend failure cannot turn an already-committed cached PUT into a client error. The
 /// marker actor retains the obligation and retries it until the remote catches up.
 #[tokio::test]

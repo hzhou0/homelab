@@ -318,3 +318,54 @@ async fn remote_multipart_uploads_are_listed_in_key_order() {
     };
     assert_eq!(keys, sorted, "the remote must order uploads by key");
 }
+
+/// **`encoding-type=url` is form encoding, not path encoding.** Both backends answer a LIST with a
+/// space in the key's last segment as `+`, and a literal `+` as `%2B` — so `+` unambiguously decodes
+/// back to a space, and a plain percent-decode of a listed key silently corrupts every key carrying
+/// one. (They differ on the parent segments: SeaweedFS path-escapes those, MinIO form-escapes
+/// throughout. A form decode covers both; a percent decode covers neither.)
+///
+/// hypha lists with `encoding-type=url` everywhere — control bytes its own keyspace uses cannot
+/// survive the response XML otherwise — so this is the decoding contract the whole keyspace rests on.
+/// A key corrupted here addresses nothing: the reconcile sweep still counts the marker it listed,
+/// but every operation it then issues names a key that does not exist.
+#[tokio::test]
+async fn listed_keys_are_form_encoded_by_both_backends() {
+    let h = Harness::durable().await;
+    let raw = h.raw();
+    let bucket = probe_bucket(&h, &raw, "enc").await;
+
+    let keys = ["a b.txt", "a+b.txt", "d i r/f i le.txt"];
+    for key in keys {
+        put_raw(&raw, &bucket, key, b"x").await;
+    }
+    let listed = raw
+        .list_objects_v2()
+        .bucket(&bucket)
+        .encoding_type(aws_sdk_s3::types::EncodingType::Url)
+        .send()
+        .await
+        .expect("encoded list");
+    let encoded: Vec<&str> = listed.contents().iter().filter_map(|o| o.key()).collect();
+
+    let form_decode = |k: &str| {
+        percent_encoding::percent_decode_str(&k.replace('+', " "))
+            .decode_utf8()
+            .expect("a listed key is UTF-8")
+            .into_owned()
+    };
+    let mut decoded: Vec<String> = encoded.iter().map(|k| form_decode(k)).collect();
+    decoded.sort();
+    let mut want: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    want.sort();
+    assert_eq!(
+        decoded, want,
+        "a form decode recovers every key: {encoded:?}"
+    );
+    assert!(
+        encoded
+            .iter()
+            .any(|k| k.contains('+') && !k.contains("%2B")),
+        "a space really did come back as `+`: {encoded:?}"
+    );
+}
