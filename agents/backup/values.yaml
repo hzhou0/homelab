@@ -1,0 +1,49 @@
+# homelab-agent-backup values
+
+schedule: "12 12 * * *"
+
+destination:
+  bucket: agent-state
+  # The durable deployment, not the cached one: an acknowledged write there is already on the
+  # off-site remote, and local disk is exactly what this exists to survive losing.
+  endpoint: http://hypha-durable.hypha:8014
+  # SigV4 needs one. hypha passes client buckets through whatever it is.
+  region: us-east-1
+
+# Pre-created in the release namespace, holding `accessKeyId` and `secretAccessKey` for hypha's S3
+# API, so no credential reaches a values file or the release history.
+secretName: hypha-client
+
+capture:
+  # The tiers the agent may write to. Both the guardrails and its RBAC are keyed to these prefixes,
+  # so a namespace outside them is not the agent's to lose.
+  namespacePattern: "^(app|tool)-"
+
+  # Every namespaced kind the cluster serves is captured, discovered at run time rather than listed:
+  # the authoritative set of what the agent may create lives in the governance policies, and a copy
+  # of it here would be a copy that silently stops matching. These are excluded as derived — each is
+  # rebuilt by a controller from something else in the export, or records the old cluster rather than
+  # anything that was deployed.
+  excludedKinds:
+    - pods
+    - replicasets.apps
+    - controllerrevisions.apps
+    - podtemplates
+    - endpoints
+    - endpointslices.discovery.k8s.io
+    # One per running pod, written by the CNI to describe it. Restoring one would describe a pod
+    # that no longer exists.
+    - ciliumendpoints.cilium.io
+    - events
+    - events.events.k8s.io
+    - leases.coordination.k8s.io
+    - csistoragecapacities.storage.k8s.io
+    - policyreports.wgpolicyk8s.io
+    - ephemeralreports.reports.kyverno.io
+    - updaterequests.kyverno.io
+    # Served by an aggregated API that is down more readily than the rest, and holds no state.
+    - pods.metrics.k8s.io
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

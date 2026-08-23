@@ -1,0 +1,16 @@
+apiVersion: v2
+name: homelab-agent-backup
+description: >-
+  A nightly export of everything the operator agent has deployed into app-*/tool-* namespaces,
+  written to hypha's durable tier. Nothing in this repo reconciles those resources — the agent
+  creates them from a conversation — so the export is the only record they were ever asked for.
+  Installed by cluster-admin into its own agent-backup namespace, deliberately outside the tiers
+  the agent can write to, so a backup cannot be deleted by the mistake it exists to undo.
+type: application
+version: 0.1.0
+keywords:
+  - backup
+  - operator-agent
+  - hypha
+  - s3
+  - homelab

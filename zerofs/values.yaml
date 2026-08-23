@@ -130,7 +130,26 @@ csi:
     name: zerofs
     default: false
     volumesRoot: /volumes
-    reclaimPolicy: Delete
+    # A released claim must not take the directory with it: the volume handle is the only record of
+    # which directory held which workload, so reclaiming one is unrecoverable rather than merely rude.
+    reclaimPolicy: Retain
+
+# A PersistentVolume is the only record of which directory on the filesystem belongs to which
+# workload: the handle is stored nowhere else, so losing the API objects orphans data the gateway
+# still holds intact. This ships those bindings off-cluster so they can be reapplied against a
+# rebuilt one. The manifest is names, handles and sizes — no key material — which is why it is
+# written in the clear.
+bindingBackup:
+  enabled: true
+  schedule: "17 * * * *"
+
+  # The endpoint, region and credentials are the gateway's: the bindings belong at the same provider
+  # as the filesystem they describe, and only the destination within it is this backup's own.
+  bucket: zerofs-bindings
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 monitoring:
   namespace: monitoring

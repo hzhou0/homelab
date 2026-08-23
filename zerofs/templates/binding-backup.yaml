@@ -1,0 +1,142 @@
+{{- if .Values.bindingBackup.enabled }}
+{{- $b := .Values.bindingBackup }}
+{{- $name := include "zerofs.bindingBackup.fullname" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.bindingBackup.labels" . | nindent 4 }}
+data:
+  export-bindings.sh: |
+    #!/bin/sh
+    set -eu
+
+    # Claims are carried because nothing outside the cluster defines them, and a definition that did
+    # live in git would still be a request: the volume it binds is named only here.
+    claims="$(mktemp)"
+    manifest="$(mktemp)"
+    kubectl get pvc --all-namespaces -o json > "$claims"
+
+    kubectl get pv -o json | jq --slurpfile claims "$claims" '
+      (.items | map(select(.spec.csi.driver == "{{ include "zerofs.csi.driverName" . }}") | .metadata.name)) as $volumes
+      | .items = (
+          [ .items[] | select(.metadata.name | IN($volumes[])) ]
+          + [ $claims[0].items[] | select(.spec.volumeName | IN($volumes[])) ]
+        )
+    ' > "$manifest"
+
+    # An empty render means the query broke, not that every volume went away: publishing it would
+    # replace the last good copy with nothing.
+    if [ "$(jq '.items | length' "$manifest")" -eq 0 ]; then
+      echo "no PersistentVolume uses {{ include "zerofs.csi.driverName" . }}: refusing to publish an empty manifest" >&2
+      exit 1
+    fi
+
+    # A fixed ring of weekday slots, so history is bounded by overwriting rather than by deleting:
+    # this job never issues a delete, and a bad run costs one slot instead of the set. The floating
+    # key is what the restore script reaches for when it is not told otherwise.
+    for key in "bindings-weekday-$(date -u +%u).json" bindings-latest.json; do
+      aws s3 cp "$manifest" "s3://$BUCKET/$key" --endpoint-url "$ENDPOINT"
+    done
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.bindingBackup.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "zerofs.bindingBackup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "zerofs.bindingBackup.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.bindingBackup.labels" . | nindent 4 }}
+spec:
+  schedule: {{ $b.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "zerofs.bindingBackup.labels" . | nindent 12 }}
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: {{ $name }}
+          enableServiceLinks: false
+          {{- with $b.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $b.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $b.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: export-bindings
+              # Pinned rather than configurable: the script is written against the kubectl, jq and
+              # AWS CLI this image carries, and swapping it swaps the script's interpreter too.
+              image: alpine/k8s:1.36.2
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/export-bindings.sh"]
+              env:
+                - name: BUCKET
+                  value: {{ $b.bucket | quote }}
+                - name: ENDPOINT
+                  value: {{ .Values.gateway.aws.endpoint | quote }}
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.gateway.aws.region | quote }}
+                {{- include "zerofs.awsCredentialEnv" (dict "secret" .Values.gateway.secretName) | nindent 16 }}
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+          volumes:
+            - name: scripts
+              configMap:
+                name: {{ $name }}
+{{- end }}

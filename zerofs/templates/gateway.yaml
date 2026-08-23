@@ -98,16 +98,12 @@ spec:
             - name: RUST_LOG
               value: {{ $root.Values.gateway.logLevel | quote }}
             {{- $secret := required "gateway.secretName is required: credentials are never chart values" $root.Values.gateway.secretName }}
-            {{- range $var, $key := dict
-                  "ZEROFS_PASSWORD" "encryptionPassword"
-                  "AWS_ACCESS_KEY_ID" "accessKeyId"
-                  "AWS_SECRET_ACCESS_KEY" "secretAccessKey" }}
-            - name: {{ $var }}
+            {{- include "zerofs.awsCredentialEnv" (dict "secret" $secret) | nindent 12 }}
+            - name: ZEROFS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ $secret }}
-                  key: {{ $key }}
-            {{- end }}
+                  key: encryptionPassword
           # The replication port, not 9P: a standby binds it before its role is resolved but binds
           # 9P only once it takes over, so probing 9P would drop the standby out of its Service and
           # cut off the ships it exists to receive.

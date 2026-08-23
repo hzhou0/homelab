@@ -33,7 +33,7 @@ spec:
           imagePullPolicy: {{ .Values.csi.image.pullPolicy }}
           args:
             - --mode=node
-            - --endpoint=unix:///csi/csi.sock
+            - --endpoint=unix://{{ include "zerofs.csi.socketPath" . }}
           env:
             - name: NODE_ID
               valueFrom:
@@ -56,7 +56,7 @@ spec:
             {{- toYaml .Values.csi.node.resources | nindent 12 }}
           volumeMounts:
             - name: socket-dir
-              mountPath: /csi
+              mountPath: {{ include "zerofs.csi.socketDir" . }}
             # Bidirectional: a mount made in this container's namespace has to propagate back to
             # the host for the kubelet and the consuming pod to see it.
             - name: kubelet-dir
@@ -67,25 +67,25 @@ spec:
         - name: node-driver-registrar
           image: {{ .Values.csi.registrarImage }}
           args:
-            - --csi-address=/csi/csi.sock
-            - --kubelet-registration-path={{ .Values.csi.kubeletDir }}/plugins/csi.zerofs.net/csi.sock
+            - --csi-address={{ include "zerofs.csi.socketPath" . }}
+            - --kubelet-registration-path={{ include "zerofs.csi.pluginDir" . }}/{{ include "zerofs.csi.socketName" . }}
           volumeMounts:
             - name: socket-dir
-              mountPath: /csi
+              mountPath: {{ include "zerofs.csi.socketDir" . }}
             - name: registration-dir
               mountPath: /registration
         - name: livenessprobe
           image: {{ .Values.csi.livenessProbeImage }}
           args:
-            - --csi-address=/csi/csi.sock
+            - --csi-address={{ include "zerofs.csi.socketPath" . }}
             - --health-port=9808
           volumeMounts:
             - name: socket-dir
-              mountPath: /csi
+              mountPath: {{ include "zerofs.csi.socketDir" . }}
       volumes:
         - name: socket-dir
           hostPath:
-            path: {{ .Values.csi.kubeletDir }}/plugins/csi.zerofs.net
+            path: {{ include "zerofs.csi.pluginDir" . }}
             type: DirectoryOrCreate
         - name: registration-dir
           hostPath:

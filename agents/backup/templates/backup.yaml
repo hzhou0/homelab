@@ -1,0 +1,127 @@
+{{- $name := include "agentBackup.fullname" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentBackup.labels" . | nindent 4 }}
+data:
+  excluded-kinds: |
+{{- range .Values.capture.excludedKinds }}
+    {{ . }}
+{{- end }}
+  export-agent-state.sh: |
+    #!/bin/sh
+    set -eu
+
+    # Namespaces lead the list so they come back first, and they carry the provenance the tier
+    # policies demand — nothing else recreates them.
+    kinds="namespace,$(kubectl api-resources --namespaced --verbs=list -o name \
+      | grep -vxF -f /scripts/excluded-kinds | tr '\n' ',' | sed 's/,$//')"
+
+    state="$(mktemp)"
+    kubectl get "$kinds" --all-namespaces -o json | jq '
+      .items |= map(
+        # A namespace answers for itself; everything else answers for the one holding it.
+        select((.metadata.namespace // .metadata.name) | test("{{ .Values.capture.namespacePattern }}"))
+        # Tokens minted for a cluster that will not exist, and a ConfigMap pinning its CA.
+        | select(.type != "kubernetes.io/service-account-token")
+        | select(.metadata.name != "kube-root-ca.crt")
+        # The tier guardrails, stamped into every namespace on create and stamped again on the next
+        # one. Restoring them would fight the policy that owns them.
+        | select(.metadata.labels["generate.kyverno.io/policy-name"] == null)
+      )
+    ' > "$state"
+
+    # An empty render means the query broke, not that the agent deployed nothing: publishing it
+    # would replace the last good copy with nothing.
+    if [ "$(jq '.items | length' "$state")" -eq 0 ]; then
+      echo "no resources found in agent namespaces: refusing to publish an empty state" >&2
+      exit 1
+    fi
+
+    if ! aws s3api head-bucket --bucket "$BUCKET" --endpoint-url "$ENDPOINT" 2>/dev/null; then
+      aws s3api create-bucket --bucket "$BUCKET" --endpoint-url "$ENDPOINT"
+    fi
+
+    # A fixed ring of weekday slots, so history is bounded by overwriting rather than by deleting:
+    # this job never issues a delete, and a bad run costs one slot instead of the set. The floating
+    # key is what the restore script reaches for when it is not told otherwise.
+    for key in "agent-state-weekday-$(date -u +%u).json" agent-state-latest.json; do
+      aws s3 cp "$state" "s3://$BUCKET/$key" --endpoint-url "$ENDPOINT"
+    done
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentBackup.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "agentBackup.labels" . | nindent 12 }}
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: {{ $name }}
+          enableServiceLinks: false
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: export-agent-state
+              # Pinned rather than configurable: the script is written against the kubectl, jq and
+              # AWS CLI this image carries, and swapping it swaps the script's interpreter too.
+              image: alpine/k8s:1.36.2
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/export-agent-state.sh"]
+              env:
+                - name: BUCKET
+                  value: {{ .Values.destination.bucket | quote }}
+                - name: ENDPOINT
+                  value: {{ .Values.destination.endpoint | quote }}
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.destination.region | quote }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secretName }}
+                      key: accessKeyId
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.secretName }}
+                      key: secretAccessKey
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+          volumes:
+            - name: scripts
+              configMap:
+                name: {{ $name }}

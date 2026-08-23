@@ -21,7 +21,7 @@ metadata:
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
   {{- end }}
-provisioner: csi.zerofs.net
+provisioner: {{ include "zerofs.csi.driverName" . }}
 parameters:
   # Both halves of the pair, in both parameters: the controller provisions against whichever answers
   # as leader, and the mount re-routes to it after a failover without a remount.

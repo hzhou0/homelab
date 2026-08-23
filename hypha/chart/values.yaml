@@ -23,8 +23,7 @@ deployments:
 
 image:
   repository: ghcr.io/hzhou0/hypha
-  # Defaults to the chart's appVersion.
-  tag: "sha-a131389"
+  tag: "sha-e6901a5"
   pullPolicy: IfNotPresent
 
 serving:

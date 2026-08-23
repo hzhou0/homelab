@@ -37,22 +37,22 @@ spec:
           imagePullPolicy: {{ .Values.csi.image.pullPolicy }}
           args:
             - --mode=controller
-            - --endpoint=unix:///csi/csi.sock
+            - --endpoint=unix://{{ include "zerofs.csi.socketPath" . }}
           resources:
             {{- toYaml .Values.csi.controller.resources | nindent 12 }}
           volumeMounts:
             - name: socket-dir
-              mountPath: /csi
+              mountPath: {{ include "zerofs.csi.socketDir" . }}
         - name: csi-provisioner
           image: {{ .Values.csi.provisionerImage }}
           args:
-            - --csi-address=/csi/csi.sock
+            - --csi-address={{ include "zerofs.csi.socketPath" . }}
             - --leader-election
           resources:
             {{- toYaml .Values.csi.controller.resources | nindent 12 }}
           volumeMounts:
             - name: socket-dir
-              mountPath: /csi
+              mountPath: {{ include "zerofs.csi.socketDir" . }}
       volumes:
         - name: socket-dir
           emptyDir: {}

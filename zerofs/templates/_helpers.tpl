@@ -57,6 +57,30 @@ app.kubernetes.io/name: zerofs-gateway
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
+{{ define "zerofs.csi.driverName" -}}
+csi.zerofs.net
+{{- end }}
+
+{{ define "zerofs.csi.socketDir" -}}
+/csi
+{{- end }}
+
+{{ define "zerofs.csi.socketName" -}}
+csi.sock
+{{- end }}
+
+{{ define "zerofs.csi.socketPath" -}}
+{{ include "zerofs.csi.socketDir" . }}/{{ include "zerofs.csi.socketName" . }}
+{{- end }}
+
+{{/*
+The kubelet finds a plugin by driver name, so this path is a contract with it rather than a layout
+choice: the node plugin's socket and the registrar's advertised path must resolve to the same file.
+*/}}
+{{ define "zerofs.csi.pluginDir" -}}
+{{ .Values.csi.kubeletDir }}/plugins/{{ include "zerofs.csi.driverName" . }}
+{{- end }}
+
 {{ define "zerofs.csi.labels" -}}
 {{ include "zerofs.chartLabels" .root }}
 {{ include "zerofs.csi.selectorLabels" . }}
@@ -161,4 +185,31 @@ peers = [{{ join ", " $peers }}]
 
 {{ . }}
 {{- end }}
+{{- end }}
+
+{{ define "zerofs.bindingBackup.fullname" -}}
+{{ printf "%s-binding-backup" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{ define "zerofs.bindingBackup.labels" -}}
+{{ include "zerofs.chartLabels" . }}
+app.kubernetes.io/name: zerofs-binding-backup
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Takes `(dict "secret" <name>)`. Both readers of the object store authenticate the same way, from
+key names the pre-created Secret is required to use.
+*/}}
+{{ define "zerofs.awsCredentialEnv" -}}
+- name: AWS_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ .secret }}
+      key: accessKeyId
+- name: AWS_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ .secret }}
+      key: secretAccessKey
 {{- end }}
