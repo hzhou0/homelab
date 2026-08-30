@@ -1,0 +1,36 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: storage-class
+policies:
+  - ../../.rendered/homelab-platform/templates/constraints/storage-class.yaml
+resources:
+  - resources.yaml
+results:
+  - kind: PersistentVolumeClaim
+    policy: tier-storage-class
+    resources:
+      - pvc-zerofs-in-app
+    result: pass
+  - kind: PersistentVolumeClaim
+    policy: tier-storage-class
+    resources:
+      - pvc-topolvm-in-app
+      - pvc-unset-class-in-app
+    result: fail
+  - kind: PersistentVolumeClaim
+    policy: tier-storage-class
+    resources:
+      - pvc-topolvm-in-tool
+    result: fail
+  - kind: PersistentVolumeClaim
+    policy: tier-storage-class
+    resources:
+      - pvc-zerofs-in-tool
+    result: pass
+  # Ungoverned namespace: the foundational charts keep their node-local volumes
+  - kind: PersistentVolumeClaim
+    policy: tier-storage-class
+    resources:
+      - pvc-topolvm-in-seaweedfs
+    result: skip

@@ -1,0 +1,38 @@
+{{- if and .Values.policies.enabled .Values.storageClasses }}
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: tier-storage-class
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+  annotations:
+    policies.kyverno.io/title: Allowed StorageClasses (app-* / tool-*)
+    policies.kyverno.io/description: >-
+      Governed namespaces are throwaway, so their durable state may only sit on a shared remote
+      filesystem that outlives them and that any node can mount. Node-local classes are reserved
+      for the foundational charts a human installs.
+spec:
+  validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["persistentvolumeclaims"]
+  matchConditions:
+    - name: in-tier-namespace
+      expression: >-
+        {{ include "platform.inTierNamespace" . }}
+  validations:
+    # An absent storageClassName silently binds the cluster default, so naming one is required
+    # rather than merely checked.
+    - expression: >-
+        has(object.spec.storageClassName) &&
+        object.spec.storageClassName in {{ include "platform.storageClassList" . }}
+      message: >-
+        Claims in app-*/tool-* must name one of: {{ .Values.storageClasses | join ", " }}.
+        Node-local storage belongs in a human-installed foundational namespace.
+{{- end }}

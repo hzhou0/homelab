@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-zerofs-in-app
+  namespace: app-test
+spec:
+  storageClassName: zerofs
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-topolvm-in-app
+  namespace: app-test
+spec:
+  storageClassName: topolvm-provisioner
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# No storageClassName: the cluster default would bind, and it is not zerofs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-unset-class-in-app
+  namespace: app-test
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-topolvm-in-tool
+  namespace: tool-test
+spec:
+  storageClassName: topolvm-provisioner
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-zerofs-in-tool
+  namespace: tool-test
+spec:
+  storageClassName: zerofs
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-topolvm-in-seaweedfs
+  namespace: seaweedfs
+spec:
+  storageClassName: topolvm-provisioner
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
