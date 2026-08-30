@@ -104,6 +104,30 @@ Restoring assumes the directory survives, which a retaining reclaim policy guara
 release kept its name and namespace: the gateway addresses live in each volume's attributes, so
 either rename invalidates every exported binding at once.
 
+## Reclaiming a released volume
+
+The retaining reclaim policy is what makes a lost claim survivable, and it is also why a released
+volume is never cleaned up on its own: the directory outlives every object that named it, and the
+handle recording which one it was lives on the PersistentVolume alone. Deleting that object is
+therefore the one thing not to do — the bytes stay, indistinguishable from every other directory,
+and the filesystem quota keeps counting them.
+
+Reclaiming means asking the controller to remove the directory, because the admin RPC is reachable
+from nowhere else. Setting an already-released volume's policy to `Delete` is the whole operation:
+
+```sh
+kubectl patch pv "$pv" -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+```
+
+Nothing else follows it. A released volume is reclaimed as soon as its policy allows it, and the
+object is removed by the same pass that removes the directory, so a delete issued afterwards finds
+nothing left to delete. Only a volume still bound or still available needs one, and then it is the
+claim's departure that starts the reclaim.
+
+Confirm against the controller rather than the volume's disappearance, which a plain delete would
+produce just as readily: the driver logs a `DeleteVolume` naming the path. A failed one leaves the
+volume released and retrying, which is the safe outcome and points at the gateway.
+
 ## Operating limits
 
 - **The filesystem quota is the only ceiling.** It covers every volume at once, so a PVC's requested

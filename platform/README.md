@@ -10,8 +10,9 @@ themselves**.
 
 | | `app-*` namespaces | `tool-*` namespaces |
 |---|---|---|
-| Purpose | stateless application deployments | cluster tooling |
-| Workloads | `Deployment` only (no PVC, no bare Pods) | + StatefulSet/DaemonSet/Job/CronJob/PVC |
+| Purpose | application deployments | cluster tooling |
+| Workloads | `Deployment` only (no bare Pods) | + StatefulSet/DaemonSet/Job/CronJob |
+| Storage | claims on the shared-filesystem class only | same |
 | Pod Security | `restricted` | `baseline` |
 | Resources | per-runtime envelope (see below) | LimitRange defaults + ceiling |
 | Images | allowlist only | allowlist only |
@@ -31,6 +32,20 @@ same-namespace traffic, the monitoring scraper, and any namespace labelled `home
 skip the same infra exclude-list (`networkPolicy.excludeNamespaces`, which must match the CCNP's
 `eastWestDefaultDeny.excludeNamespaces`: kube-system/CoreDNS, cert-manager, kyverno, …). So a new
 deployment of any kind is default-deny east-west unless explicitly granted.
+
+## Storage
+
+Both tiers take the same allow-list, and it holds only the class whose volumes are directories on a
+shared remote filesystem. Governed namespaces are throwaway by design: a workload in one may be
+rebuilt or moved at any time, so its state has to outlive the namespace and be mountable from any
+node. Node-local classes are reserved for the foundational charts a human installs, which is where
+anything latency-bound gets codified instead. A claim naming no class at all is rejected rather than
+defaulted, since the cluster default is not on the list.
+
+The claim templates a controller carries — a StatefulSet's `volumeClaimTemplates`, a generic
+ephemeral volume's inline template — take the same list. The claims they generate would be caught on
+their own admission anyway, but only after the controller was accepted, which leaves a workload that
+never becomes ready instead of a refusal.
 
 ## Per-runtime resource ranges
 
@@ -82,7 +97,8 @@ ServiceAccount directly.
 | Concern | Mechanism |
 |---|---|
 | Allowed kinds per tier | `ValidatingPolicy` `allowed-kinds-{app,tool}` |
-| Stateless / no bare Pods | `ValidatingPolicy` `no-bare-pods` + `no-pvc-volumes-app` |
+| No bare Pods | `ValidatingPolicy` `no-bare-pods` |
+| Storage confined to a class | `ValidatingPolicy` `tier-storage-class` + `tier-claim-template-storage-class` |
 | Pod Security | native PSA labels (via `MutatingPolicy` `namespace-psa-labels`) + `harden-defaults` |
 | Image allowlist | `ValidatingPolicy` `image-allowlist` + ConfigMap |
 | App resource ranges | `ValidatingPolicy` `runtime-label` + `runtime-ranges` + ConfigMap |

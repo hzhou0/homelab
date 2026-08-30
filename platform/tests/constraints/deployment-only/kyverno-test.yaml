@@ -31,21 +31,43 @@ results:
       - pod-bare-outside
     result: skip
 
-  # no-pvc-volumes-app: Deployments with PVC volumes are rejected in app-*
+  # Mounting a claim by name is unconstrained here: the claim itself was gated at its own
+  # admission, so any that exists in a governed namespace is already on a permitted class.
   - kind: Deployment
-    policy: no-pvc-volumes-app
+    policy: tier-claim-template-storage-class
     resources:
       - deploy-with-pvc-in-app
-    result: fail
-  # Stateless Deployment in app-* is fine
-  - kind: Deployment
-    policy: no-pvc-volumes-app
-    resources:
       - deploy-stateless-in-app
-    result: pass
-  # Deployment with PVC in tool-* → matchCondition is app-* only → skip
-  - kind: Deployment
-    policy: no-pvc-volumes-app
-    resources:
+      - deploy-ephemeral-zerofs-in-app
       - deploy-with-pvc-in-tool
+    result: pass
+  - kind: Deployment
+    policy: tier-claim-template-storage-class
+    resources:
+      - deploy-ephemeral-topolvm-in-app
+      - deploy-ephemeral-unset-class-in-app
+    result: fail
+  # StatefulSets are a tool-* kind, and their volumeClaimTemplates take the same list
+  - kind: StatefulSet
+    policy: tier-claim-template-storage-class
+    resources:
+      - sts-zerofs-in-tool
+    result: pass
+  - kind: StatefulSet
+    policy: tier-claim-template-storage-class
+    resources:
+      - sts-topolvm-in-tool
+      - sts-unset-class-in-tool
+    result: fail
+  # CronJob pod specs nest one level deeper; the ephemeral check follows them there
+  - kind: CronJob
+    policy: tier-claim-template-storage-class
+    resources:
+      - cronjob-ephemeral-topolvm-in-tool
+    result: fail
+  # Ungoverned namespace → matchCondition false → skip
+  - kind: Deployment
+    policy: tier-claim-template-storage-class
+    resources:
+      - deploy-with-pvc-outside
     result: skip

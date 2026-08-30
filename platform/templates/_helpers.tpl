@@ -20,3 +20,15 @@ Glob match values for each tier's namespaces, e.g. "app-*".
 */}}
 {{- define "platform.appGlob" -}}{{ .Values.prefixes.app }}*{{- end -}}
 {{- define "platform.toolGlob" -}}{{ .Values.prefixes.tool }}*{{- end -}}
+
+{{/*
+CEL predicate matching a resource in either governed tier.
+*/}}
+{{- define "platform.inTierNamespace" -}}
+object.metadata.namespace.startsWith('{{ .Values.prefixes.app }}') || object.metadata.namespace.startsWith('{{ .Values.prefixes.tool }}')
+{{- end -}}
+
+{{/*
+CEL list literal of the StorageClasses a governed claim may name.
+*/}}
+{{- define "platform.storageClassList" -}}{{ .Values.storageClasses | toJson }}{{- end -}}

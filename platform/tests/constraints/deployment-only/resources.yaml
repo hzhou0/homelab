@@ -108,3 +108,212 @@ spec:
       containers:
         - name: app
           image: nginx:1.27
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-ephemeral-zerofs-in-app
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: { app: eph }
+  template:
+    metadata:
+      labels: { app: eph }
+    spec:
+      volumes:
+        - name: data
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                storageClassName: zerofs
+                accessModes: [ReadWriteMany]
+                resources:
+                  requests:
+                    storage: 1Gi
+      containers:
+        - name: app
+          image: busybox:1.36
+          volumeMounts:
+            - name: data
+              mountPath: /data
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-ephemeral-topolvm-in-app
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: { app: eph }
+  template:
+    metadata:
+      labels: { app: eph }
+    spec:
+      volumes:
+        - name: data
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                storageClassName: topolvm-provisioner
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: 1Gi
+      containers:
+        - name: app
+          image: busybox:1.36
+          volumeMounts:
+            - name: data
+              mountPath: /data
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-ephemeral-unset-class-in-app
+  namespace: app-test
+spec:
+  selector:
+    matchLabels: { app: eph }
+  template:
+    metadata:
+      labels: { app: eph }
+    spec:
+      volumes:
+        - name: data
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: 1Gi
+      containers:
+        - name: app
+          image: busybox:1.36
+          volumeMounts:
+            - name: data
+              mountPath: /data
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sts-zerofs-in-tool
+  namespace: tool-test
+spec:
+  serviceName: sts
+  selector:
+    matchLabels: { app: sts }
+  template:
+    metadata:
+      labels: { app: sts }
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: zerofs
+        accessModes: [ReadWriteMany]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sts-topolvm-in-tool
+  namespace: tool-test
+spec:
+  serviceName: sts
+  selector:
+    matchLabels: { app: sts }
+  template:
+    metadata:
+      labels: { app: sts }
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: topolvm-provisioner
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sts-unset-class-in-tool
+  namespace: tool-test
+spec:
+  serviceName: sts
+  selector:
+    matchLabels: { app: sts }
+  template:
+    metadata:
+      labels: { app: sts }
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cronjob-ephemeral-topolvm-in-tool
+  namespace: tool-test
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          volumes:
+            - name: data
+              ephemeral:
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: topolvm-provisioner
+                    accessModes: [ReadWriteOnce]
+                    resources:
+                      requests:
+                        storage: 1Gi
+          containers:
+            - name: app
+              image: busybox:1.36
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-with-pvc-outside
+  namespace: default
+spec:
+  selector:
+    matchLabels: { app: x }
+  template:
+    metadata:
+      labels: { app: x }
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: my-pvc
+      containers:
+        - name: app
+          image: busybox:1.36

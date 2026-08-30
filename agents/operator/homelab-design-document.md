@@ -574,12 +574,19 @@ Kyverno itself.
 
 ### 11.2 Two Tiers
 
-Workloads live in `app-*` namespaces (stateless applications) or `tool-*` namespaces (cluster
-tooling). The app tier is deliberately the narrower one: `Deployment` only, no persistent storage,
-Pod Security `restricted`, and resource requests/limits bounded by a per-runtime envelope selected
-by a required runtime label. The tool tier adds the stateful kinds and PVCs, runs at `baseline`, and
-is bounded by the namespace's generated `LimitRange` instead — at most one Helm release per tool
-namespace, so a namespace stays one identity.
+Workloads live in `app-*` namespaces (applications) or `tool-*` namespaces (cluster tooling). The
+app tier is deliberately the narrower one: `Deployment` only, Pod Security `restricted`, and
+resource requests/limits bounded by a per-runtime envelope selected by a required runtime label. The
+tool tier adds the stateful kinds, runs at `baseline`, and is bounded by the namespace's generated
+`LimitRange` instead — at most one Helm release per tool namespace, so a namespace stays one
+identity.
+
+Storage is the one guardrail the two tiers share unchanged: a claim in either may only name the
+shared remote filesystem. Both tiers are throwaway by construction — a governed namespace is
+something the operator agent creates, rebuilds, and discards — so state kept in one has to outlive
+it and be mountable from any node. Node-local volumes would tie a pod to the machine that provisioned
+it and lose the data with the namespace. Anything latency-bound enough to need them is by that fact
+not throwaway, and gets codified as a foundational chart a human installs instead.
 
 Creating a namespace in either tier auto-generates its guardrails (quota, limit range, default
 ingress policy, PSA labels, and the operator's deploy `RoleBinding`), reconciled against drift. The

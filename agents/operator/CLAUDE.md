@@ -62,11 +62,11 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
 
 ## Two tiers
 
-### `app-*` namespaces — stateless applications
+### `app-*` namespaces — applications
 - One namespace per app: `app-<name>`.
 - **Only** `Deployment` for workloads (plus `Service`, `ConfigMap`, `Secret`,
-  `ServiceAccount`, `HorizontalPodAutoscaler`, `PodDisruptionBudget`, `Ingress`/`HTTPRoute`).
-  No StatefulSet/DaemonSet/Job/CronJob, no PVC, no bare Pods, no persistent storage.
+  `ServiceAccount`, `HorizontalPodAutoscaler`, `PodDisruptionBudget`, `PersistentVolumeClaim`,
+  `Ingress`/`HTTPRoute`). No StatefulSet/DaemonSet/Job/CronJob, no bare Pods.
 - Every Deployment's **pod template** must carry the label `homelab.lab/runtime` set to the
   app's language (one of the `runtime-profiles` keys, e.g. `go`, `node`, `python`, `jvm`,
   `rust`, `static`).
@@ -79,7 +79,7 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
 
 ### `tool-*` namespaces — cluster tooling
 - One namespace per tool: `tool-<name>`.
-- Allowed kinds = the app set **plus** `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `PVC`.
+- Allowed kinds = the app set **plus** `StatefulSet`, `DaemonSet`, `Job`, `CronJob`.
 - **At most one Helm release (chart) per `tool-*` namespace.** Install each tool into its own
   namespace; a second chart in the same namespace is rejected.
 - Pod Security is **baseline** (slightly wider than app). Still no privileged/host access.
@@ -88,6 +88,14 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
 
 ### Both tiers
 - Every container image must be in the `image-allowlist` ConfigMap. Avoid `:latest`.
+- **Every claim must name `storageClassName: zerofs`** — leaving it unset is rejected, and no other
+  class is permitted in either tier. A `StatefulSet`'s `volumeClaimTemplates` and any generic
+  ephemeral volume's inline template take the same rule. Those volumes are directories on a shared
+  remote filesystem, so any node can mount one and a rescheduled pod keeps its data.
+- The size you request on a claim is a label, not a reservation: one quota covers the whole
+  filesystem, so a claim can only fail by exhausting it for everyone.
+- Node-local storage (`topolvm-provisioner`) is not available to you in either tier. A workload
+  that genuinely needs it has to be codified as a foundational chart by the human operator.
 - New namespaces are auto-governed (quota, limits, default NetworkPolicy, PSA labels) the
   instant you create them — you don't (and can't) create those yourself.
 - **Every namespace you create must carry provenance metadata** — the create is rejected
@@ -137,8 +145,9 @@ requires something only a foundational chart can grant:
 
 - **An image that isn't allowlisted** → request adding it to `imageAllowlist`.
 - **Resources outside a runtime's envelope** → request adjusting that `runtimeProfiles` entry.
-- **A disallowed kind / persistent storage in an app** → reconsider the design, or request it
-  be treated as a `tool-*` deployment.
+- **A disallowed kind** → reconsider the design, or request it be treated as a `tool-*` deployment.
+- **A workload that needs node-local storage** → it does not belong in either tier; request it be
+  codified as a foundational chart.
 - **A quota that's too small** → request a larger tier quota.
 - **A new namespace that serves traffic through the shared Gateway** → request it be added to
   the `cilium` chart's `gateway.backendNamespaces`. Every first deployment into a fresh

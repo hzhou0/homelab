@@ -143,6 +143,7 @@ gateway:
   allowedCIDRs:
     - 10.0.0.232/32
     - 10.0.1.140/32
+    - 10.0.1.148/32
 
   # Backends the gateway may reach on the reverse hop. A fenced namespace is unreachable from the
   # gateway until listed here.
@@ -153,6 +154,8 @@ gateway:
     - seaweedfs
     - tool-filestash
     - tool-headlamp
+    - app-memos
+    - app-navidrome
 
   hubbleUI:
     enabled: true

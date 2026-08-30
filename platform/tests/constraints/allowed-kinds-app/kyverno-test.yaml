@@ -23,11 +23,6 @@ results:
     resources:
       - job-in-app
     result: fail
-  - kind: PersistentVolumeClaim
-    policy: allowed-kinds-app
-    resources:
-      - pvc-in-app
-    result: fail
   # Same kinds in tool-* are not in scope for this policy (matchCondition is app-* only)
   - kind: StatefulSet
     policy: allowed-kinds-app

@@ -44,17 +44,6 @@ spec:
         - name: job
           image: busybox:1.36
 ---
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: pvc-in-app
-  namespace: app-test
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 1Gi
----
 # StatefulSet in a tool-* namespace — policy matchCondition is app-* only → skip
 apiVersion: apps/v1
 kind: StatefulSet

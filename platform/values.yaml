@@ -45,8 +45,8 @@ runtimeLabel: "homelab.lab/runtime"
 
 runtimeProfiles:
   static: { cpuMin: "10m",  cpuMax: "250m",  memMin: "16Mi",  memMax: "128Mi" }
-  go:     { cpuMin: "50m",  cpuMax: "500m",  memMin: "32Mi",  memMax: "1000Mi" }
-  rust:   { cpuMin: "50m",  cpuMax: "500m",  memMin: "32Mi",  memMax: "200Mi" }
+  go:     { cpuMin: "50m",  cpuMax: "2000m",  memMin: "32Mi",  memMax: "1000Mi" }
+  rust:   { cpuMin: "50m",  cpuMax: "2000m",  memMin: "32Mi",  memMax: "200Mi" }
   node:   { cpuMin: "100m", cpuMax: "1000m", memMin: "128Mi", memMax: "4000Mi" }
   python: { cpuMin: "100m", cpuMax: "1000m", memMin: "128Mi", memMax: "4000Mi" }
   jvm:    { cpuMin: "250m", cpuMax: "2000m", memMin: "256Mi", memMax: "1536Mi" }
@@ -67,9 +67,16 @@ imageAllowlist:
   - ghcr.io/kyverno/policy-reporter:3.7.4
   - ghcr.io/kyverno/policy-reporter-ui:2.5.1
   - docker.io/machines/filestash@sha256:75d123c3a4e50028c74daf9f2a7afe16d95c0b883abe5a974b81f057bdeb5808
+  - ghcr.io/usememos/memos:0.30.0
+  - ghcr.io/navidrome/navidrome:0.63.2
+  - docker.io/filebrowser/filebrowser@sha256:a469ea076d4a1b4b1d86a41d130f2f536cd9da996a2b1fb39c0d7635f9d89b9a
 
   # --- applications (app-* tier) ---
   # - ghcr.io/<org>/<app>:<tag>
+
+# The only StorageClasses a governed claim may name, in either tier. Empty forbids PVCs outright.
+# A claim naming none at all is rejected either way: the cluster default is not one of these.
+storageClasses: [zerofs]
 
 tiers:
   app:

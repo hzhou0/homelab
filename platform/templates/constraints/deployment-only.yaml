@@ -38,30 +38,54 @@ spec:
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
-  name: no-pvc-volumes-app
+  name: tier-claim-template-storage-class
   labels:
 {{ include "platform.labels" . | indent 4 }}
   annotations:
-    policies.kyverno.io/title: Stateless Deployments (app-*)
+    policies.kyverno.io/title: Inline claim templates (app-* / tool-*)
     policies.kyverno.io/description: >-
-      app-* Deployments must be stateless: no persistentVolumeClaim volumes.
+      Holds the claim templates a controller carries — a StatefulSet's volumeClaimTemplates and a
+      generic ephemeral volume's inline template — to the StorageClasses a standalone claim is held
+      to. The claims they generate are checked on their own admission, but only once the controller
+      exists, which turns a refusal into a workload that never becomes ready.
 spec:
   validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
   evaluation:
     background:
       enabled: false
+  autogen:
+    podControllers:
+      controllers: []
   matchConstraints:
     resourceRules:
       - apiGroups: ["apps"]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["deployments"]
+        resources: ["deployments", "statefulsets", "daemonsets"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs", "cronjobs"]
   matchConditions:
-    - name: in-app-namespace
-      expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.app }}')"
+    - name: in-tier-namespace
+      expression: >-
+        {{ include "platform.inTierNamespace" . }}
+  variables:
+    # Every matched kind but CronJob holds its pod spec at the same path.
+    - name: podSpec
+      expression: >-
+        has(object.spec.jobTemplate) ? object.spec.jobTemplate.spec.template.spec : object.spec.template.spec
   validations:
     - expression: >-
-        !has(object.spec.template.spec.volumes) ||
-        object.spec.template.spec.volumes.all(v, !has(v.persistentVolumeClaim))
-      message: "app-* Deployments must be stateless: persistentVolumeClaim volumes are not allowed (use emptyDir, or a tool-* namespace)."
+        !has(variables.podSpec.volumes) || variables.podSpec.volumes.all(v, !has(v.ephemeral) ||
+        (has(v.ephemeral.volumeClaimTemplate.spec.storageClassName) &&
+        v.ephemeral.volumeClaimTemplate.spec.storageClassName in {{ include "platform.storageClassList" . }}))
+      message: >-
+        Ephemeral volume claim templates must name one of: {{ .Values.storageClasses | join ", " }}.
+    - expression: >-
+        !has(object.spec.volumeClaimTemplates) || object.spec.volumeClaimTemplates.all(c,
+        has(c.spec.storageClassName) &&
+        c.spec.storageClassName in {{ include "platform.storageClassList" . }})
+      message: >-
+        volumeClaimTemplates must name one of: {{ .Values.storageClasses | join ", " }}.
 {{- end }}

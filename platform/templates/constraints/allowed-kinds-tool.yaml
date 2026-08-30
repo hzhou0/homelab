@@ -8,8 +8,9 @@ metadata:
   annotations:
     policies.kyverno.io/title: Allowed resource kinds (tool-*)
     policies.kyverno.io/description: >-
-      tool-* namespaces allow the app set plus StatefulSet, DaemonSet, Job,
-      CronJob and PVC. Raw ReplicaSets / ReplicationControllers stay disallowed.
+      tool-* namespaces allow the app set plus StatefulSet, DaemonSet, Job and
+      CronJob. Raw ReplicaSets / ReplicationControllers stay disallowed. Claims are
+      governed separately, on the same StorageClass allow-list both tiers share.
 spec:
   validationActions: [{{ .Values.policies.validationAction | default "Deny" }}]
   evaluation:
@@ -24,7 +25,11 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["replicationcontrollers"]
+        resources:
+          - "replicationcontrollers"
+{{- if not .Values.storageClasses }}
+          - "persistentvolumeclaims"
+{{- end }}
   matchConditions:
     - name: in-tool-namespace
       expression: "object.metadata.namespace.startsWith('{{ .Values.prefixes.tool }}')"
