@@ -1,0 +1,130 @@
+{{- $ctx := dict "root" $ "component" "proxy" }}
+{{- $fullname := include "neon.fullname" $ctx }}
+{{- if $.Values.proxy.tls.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  secretName: {{ $fullname }}-tls
+  dnsNames:
+    - {{ $.Values.proxy.tls.hostname }}
+  issuerRef:
+    name: {{ $.Values.proxy.tls.issuer }}
+    kind: {{ $.Values.proxy.tls.issuerKind }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ $.Values.proxy.replicas }}
+  selector:
+    matchLabels:
+      {{- include "neon.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "neon.selectorLabels" $ctx | nindent 8 }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      enableServiceLinks: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.proxy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: proxy
+          image: {{ include "neon.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/proxy
+          args:
+            # Authentication is answered by our control plane rather than by a redirect flow, and
+            # it happens before the wake, so a bad password never costs a cold start.
+            - --auth-backend=control-plane
+            - --auth-endpoint={{ include "neon.ctlURL" $ }}/proxy/v1
+            - --proxy=0.0.0.0:{{ $.Values.proxy.pgPort }}
+            - --mgmt=0.0.0.0:{{ $.Values.proxy.mgmtPort }}
+            - --http=0.0.0.0:{{ $.Values.proxy.httpPort }}
+            - --region={{ $.Values.availabilityZone }}
+            {{- if $.Values.proxy.tls.enabled }}
+            - --tls-key=/etc/neon/tls/tls.key
+            - --tls-cert=/etc/neon/tls/tls.crt
+            {{- end }}
+          ports:
+            - name: pg
+              containerPort: {{ $.Values.proxy.pgPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ $.Values.proxy.httpPort }}
+              protocol: TCP
+          {{- if $.Values.proxy.tls.enabled }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/neon/tls
+              readOnly: true
+          {{- end }}
+          resources:
+            {{- toYaml $.Values.proxy.resources | nindent 12 }}
+      {{- if $.Values.proxy.tls.enabled }}
+      # neon-ctl reads the deployment's own volumes to learn which secrets it depends on, so a
+      # renewal is noticed without anything naming the certificate twice.
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ $fullname }}-tls
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  # Clients speak the Postgres wire protocol, so this is an L4 address from Cilium LB IPAM rather
+  # than a route through the HTTP gateway.
+  type: LoadBalancer
+  {{- with $.Values.proxy.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  selector:
+    {{- include "neon.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-metrics
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" (dict "root" $ "component" "proxy-metrics") | nindent 4 }}
+spec:
+  selector:
+    {{- include "neon.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $.Values.proxy.httpPort }}
+      targetPort: http

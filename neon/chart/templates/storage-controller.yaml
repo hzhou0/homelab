@@ -1,0 +1,91 @@
+{{- $ctx := dict "root" $ "component" "storage-controller" }}
+{{- $fullname := include "neon.fullname" $ctx }}
+{{- $db := include "neon.fullname" (dict "root" $ "component" "controller-db") }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  # It owns generation numbers, and two of it issuing them concurrently is the corruption the
+  # numbers exist to prevent.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "neon.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "neon.selectorLabels" $ctx | nindent 8 }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      enableServiceLinks: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.storageController.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: storage-controller
+          image: {{ include "neon.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/storage_controller
+          args:
+            - --listen=0.0.0.0:{{ $.Values.storageController.port }}
+            # Permits running without auth, which is what makes the namespace the fence.
+            - --dev
+            - --control-plane-url={{ include "neon.ctlURL" $ }}
+            # Off by default, and with it off the controller never places a timeline on a
+            # safekeeper: no membership, no safekeeper GUC, and no notification to act on. A bare
+            # switch in this image, though upstream has since given it a value.
+            - --timelines-onto-safekeepers
+            - --timeline-safekeeper-count={{ $.Values.storageController.timelineSafekeeperCount }}
+          env:
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: controllerDbPassword
+            - name: DATABASE_URL
+              value: postgresql://{{ $.Values.controllerDb.user }}:$(DATABASE_PASSWORD)@{{ $db }}:{{ $.Values.controllerDb.port }}/{{ $.Values.controllerDb.database }}
+          ports:
+            - name: http
+              containerPort: {{ $.Values.storageController.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml $.Values.storageController.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "neon.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $.Values.storageController.port }}
+      targetPort: http

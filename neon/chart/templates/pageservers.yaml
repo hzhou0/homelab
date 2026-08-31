@@ -1,0 +1,148 @@
+{{- range $ps := .Values.pageservers }}
+{{- $ctx := dict "root" $ "component" (printf "pageserver-%v" $ps.id) }}
+{{- $fullname := include "neon.pageserverName" (dict "root" $ "id" $ps.id) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+data:
+  # remote_storage is an inline table rather than a section: a [remote_storage] header would land
+  # inside whichever table precedes it and the value would be silently ignored.
+  pageserver.toml: |
+    listen_pg_addr = '0.0.0.0:{{ $.Values.pageserver.pgPort }}'
+    listen_http_addr = '0.0.0.0:{{ $.Values.pageserver.httpPort }}'
+    pg_distrib_dir = '/usr/local/'
+    broker_endpoint = '{{ include "neon.brokerEndpoint" $ }}'
+    control_plane_api = '{{ include "neon.controllerURL" $ }}/upcall/v1/'
+    availability_zone = '{{ $.Values.availabilityZone }}'
+    remote_storage = {{ include "neon.remoteStorage" (dict "root" $ "prefix" $.Values.bucket.pageserverPrefix) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "neon.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: pg
+      port: {{ $.Values.pageserver.pgPort }}
+      targetPort: pg
+    - name: http
+      port: {{ $.Values.pageserver.httpPort }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  # One StatefulSet per pageserver rather than one with N replicas: the node id is permanent and
+  # keys generation numbers, so it must be stated rather than read off an ordinal that shifts.
+  replicas: 1
+  serviceName: {{ $fullname }}
+  selector:
+    matchLabels:
+      {{- include "neon.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "neon.selectorLabels" $ctx | nindent 8 }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ toYaml $.Values.bucket | sha256sum }}
+        {{- with $.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      enableServiceLinks: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ps.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # The config, identity and registration metadata have to sit inside the working directory,
+        # alongside the tenant data, so they are written into the volume rather than mounted over
+        # it. metadata.json is what the pageserver sends the controller to register itself; without
+        # an availability zone in it or in the config, registration fails.
+        - name: config
+          image: {{ include "neon.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              cp /config/pageserver.toml /data/.neon/pageserver.toml
+              printf 'id=%s\n' '{{ $ps.id }}' > /data/.neon/identity.toml
+              cat > /data/.neon/metadata.json <<'META'
+              {
+                "host": "{{ $fullname }}.{{ $.Release.Namespace }}.svc.cluster.local",
+                "port": {{ $.Values.pageserver.pgPort }},
+                "http_host": "{{ $fullname }}.{{ $.Release.Namespace }}.svc.cluster.local",
+                "http_port": {{ $.Values.pageserver.httpPort }},
+                "availability_zone_id": "{{ $.Values.availabilityZone }}"
+              }
+              META
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: data
+              mountPath: /data/.neon
+      containers:
+        - name: pageserver
+          image: {{ include "neon.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/pageserver
+          args:
+            - --workdir=/data/.neon
+          env:
+            {{- include "neon.bucketEnv" $ | nindent 12 }}
+          ports:
+            - name: pg
+              containerPort: {{ $.Values.pageserver.pgPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ $.Values.pageserver.httpPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /v1/status
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data/.neon
+          resources:
+            {{- toYaml $.Values.pageserver.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $.Values.pageserver.storageClass }}
+        resources:
+          requests:
+            storage: {{ $ps.size }}
+{{- end }}

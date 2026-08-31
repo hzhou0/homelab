@@ -5,3 +5,4 @@ agents/operator/*.kubeconfig
 **.tgz
 opnsense-operator/bin
 migration
+neon/ctl/bin

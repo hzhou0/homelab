@@ -1,0 +1,17 @@
+apiVersion: v2
+name: homelab-neon
+description: >-
+  Neon's storage layer — storage_broker, storage_controller and its Postgres, pageservers,
+  safekeepers — plus the proxy and neon-ctl, the control plane Neon does not ship. Renders only
+  what is true at deploy time: branches and computes are runtime objects neon-ctl owns, so nothing
+  here creates one. Foundational like cilium/cert-manager: cluster-admin installs it into its own
+  neon namespace, not an app-*/tool-* one.
+type: application
+version: 0.1.0
+appVersion: "8464"
+keywords:
+  - neon
+  - postgres
+  - branching
+  - storage
+  - homelab

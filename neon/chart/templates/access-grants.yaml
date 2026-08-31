@@ -1,0 +1,63 @@
+{{- /*
+Ingress allows layered on the cluster-wide east-west default deny.
+
+Components authenticate nothing between themselves — the storage controller runs with --dev — so
+the namespace boundary is the whole of the fence and it has to actually hold. One policy admits
+everything inside this namespace to everything else in it, which covers the storage mesh, the
+notification path, and the computes neon-ctl creates here at runtime; nothing enumerates ports,
+because a component added later would otherwise fail in a way that looks like a Neon bug.
+
+Client traffic arrives at the proxy from outside the cluster through a LoadBalancer address, which
+is not east-west and needs no grant. accessGrants is for in-cluster consumers.
+*/ -}}
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "neon.fullname" (dict "root" $ "component" "internal") }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.chartLabels" $ | nindent 4 }}
+spec:
+  endpointSelector: {}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+{{- if $.Values.monitoring.namespace }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "neon.fullname" (dict "root" $ "component" "metrics") }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.chartLabels" $ | nindent 4 }}
+spec:
+  endpointSelector: {}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $.Values.monitoring.namespace }}
+{{- end }}
+{{- range $namespace := $.Values.accessGrants }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "neon.fullname" (dict "root" $ "component" (printf "allow-%s" $namespace)) }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.chartLabels" $ | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "neon.selectorLabels" (dict "root" $ "component" "proxy") | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $namespace }}
+      toPorts:
+        - ports:
+            - port: {{ $.Values.proxy.pgPort | quote }}
+              protocol: TCP
+{{- end }}

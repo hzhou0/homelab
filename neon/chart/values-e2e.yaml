@@ -1,0 +1,87 @@
+# Overrides for a throwaway k3d cluster. Everything here is either absent from that cluster
+# (topolvm, zerofs, cert-manager, the Prometheus operator) or sized for a laptop.
+
+secretName: neon-e2e-credentials
+
+bucket:
+  endpoint: http://minio.minio:9000
+
+storageController:
+  # Below three the controller refuses outside --dev, which is exactly why this can run one.
+  timelineSafekeeperCount: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+
+controllerDb:
+  storageClass: local-path
+  size: 1Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+
+# Two, so a tenant has somewhere to migrate to: notify-attach is the only thing that proves the
+# hook path, and it fires on a move.
+pageservers:
+  - id: 1
+    size: 5Gi
+  - id: 2
+    size: 5Gi
+
+pageserver:
+  storageClass: local-path
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+
+safekeepers:
+  - id: 1
+
+safekeeper:
+  storageClass: local-path
+  size: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+proxy:
+  replicas: 1
+  # No cert-manager here. The proxy then has no SNI to read an endpoint from, so a client names it
+  # in the startup options instead — which is the path a client on a plain connection always takes.
+  tls:
+    enabled: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+
+ctl:
+  # Short enough that an idle compute is scaled down inside a test run rather than five minutes
+  # later. The suspender polls at a quarter of this.
+  suspendTimeout: 60s
+  image:
+    repository: neon-ctl
+    tag: e2e
+    # Imported into the cluster rather than pulled; there is no registry in this loop.
+    pullPolicy: Never
+  registry:
+    storageClass: local-path
+    size: 100Mi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+storageBroker:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+
+monitoring:
+  serviceMonitor:
+    enabled: false

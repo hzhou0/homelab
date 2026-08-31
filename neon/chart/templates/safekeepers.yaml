@@ -1,0 +1,105 @@
+{{- range $sk := .Values.safekeepers }}
+{{- $ctx := dict "root" $ "component" (printf "safekeeper-%v" $sk.id) }}
+{{- $fullname := include "neon.safekeeperName" (dict "root" $ "id" $sk.id) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "neon.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: pg
+      port: {{ $.Values.safekeeper.pgPort }}
+      targetPort: pg
+    - name: http
+      port: {{ $.Values.safekeeper.httpPort }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ $fullname }}
+  selector:
+    matchLabels:
+      {{- include "neon.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "neon.selectorLabels" $ctx | nindent 8 }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      enableServiceLinks: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $sk.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: safekeeper
+          image: {{ include "neon.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/safekeeper
+          args:
+            - --id={{ $sk.id }}
+            - --datadir=/data
+            - --listen-pg=0.0.0.0:{{ $.Values.safekeeper.pgPort }}
+            - --listen-http=0.0.0.0:{{ $.Values.safekeeper.httpPort }}
+            # What a compute is told to connect to. Without it the advertised address is the bind
+            # address, which is 0.0.0.0 and reaches nothing.
+            - --advertise-pg={{ $fullname }}.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.safekeeper.pgPort }}
+            - --broker-endpoint={{ include "neon.brokerEndpoint" $ }}
+            # The WAL retention horizon includes backup_lsn, and backup_lsn only advances when the
+            # offload task has somewhere to write. Without this, no segment is ever reclaimed and
+            # the volume fills until writes stall cluster-wide.
+            - --remote-storage={{ include "neon.remoteStorage" (dict "root" $ "prefix" $.Values.bucket.safekeeperPrefix) }}
+          env:
+            {{- include "neon.bucketEnv" $ | nindent 12 }}
+          ports:
+            - name: pg
+              containerPort: {{ $.Values.safekeeper.pgPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ $.Values.safekeeper.httpPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /v1/status
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml $.Values.safekeeper.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $.Values.safekeeper.storageClass }}
+        resources:
+          requests:
+            storage: {{ $.Values.safekeeper.size }}
+{{- end }}

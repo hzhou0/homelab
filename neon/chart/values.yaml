@@ -1,0 +1,238 @@
+image:
+  repository: neondatabase/neon
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# One pre-created Secret holds every credential under fixed key names. The chart creates no Secret
+# and takes no literal key, so nothing sensitive reaches a values file or the release history.
+#
+#   kubectl -n neon create secret generic neon-credentials \
+#     --from-literal=bucketAccessKey=... --from-literal=bucketSecretKey=... \
+#     --from-literal=controllerDbPassword=...
+secretName: neon-credentials
+
+# Neon forces path-style addressing whenever an endpoint is set. The bucket must already exist:
+# nothing here creates it, and neither Neon component creates one lazily.
+bucket:
+  name: neon
+  region: us-east-1
+  endpoint: http://hypha-durable.hypha:8014
+  pageserverPrefix: pageserver
+  safekeeperPrefix: safekeeper
+
+# Every component reports this as its availability zone. Registration fails outright without one,
+# and a single-site cluster has nothing truthful to say here.
+availabilityZone: homelab
+
+storageBroker:
+  port: 50051
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+storageController:
+  port: 8080
+  # Below three the controller refuses to run outside --dev, and a quorum of two has no majority
+  # that survives losing one member.
+  timelineSafekeeperCount: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  nodeSelector: {}
+
+# Holds pageserver generation numbers, which are what stop a stale writer being blessed. It must
+# survive node loss, so it goes to object storage rather than a node-local disk.
+controllerDb:
+  image: postgres:17-alpine
+  database: storage_controller
+  user: storage_controller
+  port: 5432
+  storageClass: zerofs
+  size: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  nodeSelector: {}
+
+# One StatefulSet per entry, so a node id is stated rather than inferred from an ordinal, and
+# placement is per instance. The id is permanent: it keys generation numbers in the controller's
+# database, and reusing one for a different machine reattaches its tenants.
+pageservers:
+  - id: 1
+    size: 400Gi
+    nodeSelector:
+      kubernetes.io/hostname: k3s-compute-272384
+  - id: 2
+    size: 80Gi
+    nodeSelector:
+      kubernetes.io/hostname: k3s-compute-cb3c65
+
+pageserver:
+  pgPort: 6400
+  httpPort: 9898
+  storageClass: topolvm-provisioner
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      memory: 8Gi
+
+# Un-offloaded WAL is the one tier with no other copy, so no two entries may share a node with
+# each other or with the pageserver that holds the layers they would be replayed into.
+safekeepers:
+  - id: 1
+    nodeSelector:
+      kubernetes.io/hostname: k3s-compute-cb3c65
+  - id: 2
+    nodeSelector:
+      kubernetes.io/hostname: k3s-compute-1f70dc
+  - id: 3
+    nodeSelector:
+      kubernetes.io/hostname: k3s-server
+
+safekeeper:
+  pgPort: 5454
+  httpPort: 7676
+  storageClass: topolvm-provisioner
+  size: 60Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      memory: 4Gi
+
+proxy:
+  # Ships in the storage image, so it costs no additional artifact.
+  pgPort: 4432
+  httpPort: 7001
+  mgmtPort: 7000
+  replicas: 2
+  # Cilium LB IPAM assigns and L2-announces this; leave empty to take whatever the pool offers.
+  loadBalancerIP: ""
+  # cert-manager writes the certificate here. neon-ctl restarts the deployment when it is renewed,
+  # because the proxy reads it once at startup and has no reload path.
+  tls:
+    enabled: true
+    issuer: letsencrypt
+    issuerKind: ClusterIssuer
+    hostname: pg.internal.haustorium.net
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  nodeSelector: {}
+
+ctl:
+  image:
+    repository: ghcr.io/hzhou0/neon-ctl
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  port: 8080
+  # A cold start is a basebackup, so this scales with working-set size.
+  wakeTimeout: 90s
+  # Zero never suspends.
+  suspendTimeout: 5m
+  # The registry file is memory-mapped and held under an exclusive lock, so it wants a local block
+  # device. That makes it the one piece of state here with no protection against losing its node.
+  registry:
+    storageClass: topolvm-provisioner
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+
+# What a branch may be created at. The storage layer records a version per timeline and serves any
+# of them at once, so this list is the whole statement of what this deployment can run; a branch
+# that names no version gets the newest present.
+computeImages:
+  16: neondatabase/compute-node-v16:8464
+  17: neondatabase/compute-node-v17:8464
+
+# The pod every compute is rendered from. ${COMPUTE_ID} and ${COMPUTE_IMAGE} are substituted per
+# compute; anything else is left as written, so a stale placeholder fails visibly rather than
+# becoming an empty flag. The ports named here are where neon-ctl reads them from.
+computePodTemplate:
+  metadata:
+    labels:
+      app.kubernetes.io/name: neon-compute
+  spec:
+    enableServiceLinks: false
+    terminationGracePeriodSeconds: 30
+    containers:
+      - name: compute
+        image: ${COMPUTE_IMAGE}
+        command:
+          - /usr/local/bin/compute_ctl
+        args:
+          # An absolute path: compute_ctl strips the "postgres" suffix and looks for pg_config
+          # beside it, so a bare name resolves to /pg_config and it dies before it reads a spec.
+          - --pgbin=/usr/local/bin/postgres
+          - --compute-id=${COMPUTE_ID}
+          - --control-plane-uri={{ include "neon.ctlURL" $ }}
+          - --pgdata=/var/db/pgdata
+          - --connstr=postgresql://cloud_admin@localhost:55433/postgres
+          - --external-http-port=3080
+          - --internal-http-port=3081
+          # Nothing here runs in a Neon VM, so the VM-specific paths have to stay off.
+          - --dev
+        ports:
+          - name: postgres
+            containerPort: 55433
+          - name: http
+            containerPort: 3080
+        # Without this the pod counts as ready the moment the container starts, and a wake hands
+        # the proxy an address minutes before Postgres will answer on it.
+        readinessProbe:
+          exec:
+            command: ["/usr/local/bin/pg_isready", "-q", "-p", "55433"]
+          periodSeconds: 2
+          failureThreshold: 90
+        volumeMounts:
+          - name: pgdata
+            mountPath: /var/db
+        resources:
+          requests:
+            cpu: 250m
+            memory: 1Gi
+          limits:
+            memory: 4Gi
+    volumes:
+      - name: pgdata
+        emptyDir:
+          sizeLimit: 20Gi
+
+# Safekeepers are posted to the controller by a hook job, which needs an HTTP client the storage
+# image does not carry.
+registrationImage: curlimages/curl:8.10.1
+
+# Namespaces granted reach to the proxy. Everything else is refused by the cluster-wide east-west
+# default deny.
+accessGrants: []
+
+monitoring:
+  namespace: monitoring
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+
+imagePullSecrets: []
+podLabels: {}
+podAnnotations: {}

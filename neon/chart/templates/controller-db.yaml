@@ -1,0 +1,92 @@
+{{- $ctx := dict "root" $ "component" "controller-db" }}
+{{- $fullname := include "neon.fullname" $ctx }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "neon.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: postgres
+      port: {{ $.Values.controllerDb.port }}
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ $fullname }}
+  selector:
+    matchLabels:
+      {{- include "neon.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "neon.selectorLabels" $ctx | nindent 8 }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      enableServiceLinks: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.controllerDb.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: {{ $.Values.controllerDb.image }}
+          env:
+            - name: POSTGRES_DB
+              value: {{ $.Values.controllerDb.database }}
+            - name: POSTGRES_USER
+              value: {{ $.Values.controllerDb.user }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: controllerDbPassword
+            # The mount root is the volume itself, and initdb refuses a directory it does not own.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: {{ $.Values.controllerDb.port }}
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ $.Values.controllerDb.user }}", "-d", "{{ $.Values.controllerDb.database }}"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            {{- toYaml $.Values.controllerDb.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $.Values.controllerDb.storageClass }}
+        resources:
+          requests:
+            storage: {{ $.Values.controllerDb.size }}

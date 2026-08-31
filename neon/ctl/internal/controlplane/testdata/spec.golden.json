@@ -1,0 +1,103 @@
+{
+  "format_version": 1,
+  "cluster": {
+    "cluster_id": "main",
+    "name": "main",
+    "roles": [
+      {
+        "name": "app",
+        "encrypted_password": "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy",
+        "options": null
+      }
+    ],
+    "databases": [
+      {
+        "name": "appdb",
+        "owner": "app",
+        "options": null
+      }
+    ],
+    "settings": [
+      {
+        "name": "listen_addresses",
+        "value": "0.0.0.0",
+        "vartype": "string"
+      },
+      {
+        "name": "shared_preload_libraries",
+        "value": "neon",
+        "vartype": "string"
+      },
+      {
+        "name": "fsync",
+        "value": "off",
+        "vartype": "bool"
+      },
+      {
+        "name": "wal_level",
+        "value": "logical",
+        "vartype": "enum"
+      },
+      {
+        "name": "wal_log_hints",
+        "value": "on",
+        "vartype": "bool"
+      },
+      {
+        "name": "hot_standby",
+        "value": "on",
+        "vartype": "bool"
+      },
+      {
+        "name": "max_wal_senders",
+        "value": "10",
+        "vartype": "integer"
+      },
+      {
+        "name": "max_replication_slots",
+        "value": "10",
+        "vartype": "integer"
+      },
+      {
+        "name": "max_connections",
+        "value": "100",
+        "vartype": "integer"
+      },
+      {
+        "name": "synchronous_standby_names",
+        "value": "walproposer",
+        "vartype": "string"
+      },
+      {
+        "name": "wal_sender_timeout",
+        "value": "0",
+        "vartype": "integer"
+      },
+      {
+        "name": "password_encryption",
+        "value": "scram-sha-256",
+        "vartype": "enum"
+      },
+      {
+        "name": "port",
+        "value": "55433",
+        "vartype": "integer"
+      }
+    ]
+  },
+  "skip_pg_catalog_updates": false,
+  "tenant_id": "1a2b3344556677881122334455667788",
+  "timeline_id": "aa223344556677881122334455667788",
+  "pageserver_connstring": "postgresql://no_user@ps-0.neon:6400",
+  "safekeepers_generation": 3,
+  "safekeeper_connstrings": [
+    "sk-0.neon:5454",
+    "sk-1.neon:5454",
+    "sk-2.neon:5454"
+  ],
+  "mode": "Primary",
+  "branch_id": "main",
+  "endpoint_id": "main",
+  "reconfigure_concurrency": 1,
+  "suspend_timeout_seconds": 60
+}

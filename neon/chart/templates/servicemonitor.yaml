@@ -1,0 +1,57 @@
+{{- if $.Values.monitoring.serviceMonitor.enabled }}
+{{- /*
+Every Neon binary serves /metrics on its HTTP listener, so one monitor per component tracks whatever
+the release actually renders rather than a fixed list.
+*/ -}}
+{{- /* neon-ctl is absent: it serves no /metrics. */ -}}
+{{- $targets := list (dict "component" "storage-controller" "port" "http") }}
+{{- range $ps := $.Values.pageservers }}
+{{- $targets = append $targets (dict "component" (printf "pageserver-%v" $ps.id) "port" "http") }}
+{{- end }}
+{{- range $sk := $.Values.safekeepers }}
+{{- $targets = append $targets (dict "component" (printf "safekeeper-%v" $sk.id) "port" "http") }}
+{{- end }}
+{{- range $target := $targets }}
+{{- $ctx := dict "root" $ "component" $target.component }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "neon.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $.Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "neon.selectorLabels" $ctx | nindent 6 }}
+  endpoints:
+    - port: {{ $target.port }}
+      path: /metrics
+      interval: {{ $.Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ $.Values.monitoring.serviceMonitor.scrapeTimeout }}
+{{- end }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "neon.fullname" (dict "root" $ "component" "proxy") }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" (dict "root" $ "component" "proxy") | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $.Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "neon.selectorLabels" (dict "root" $ "component" "proxy-metrics") | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ $.Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ $.Values.monitoring.serviceMonitor.scrapeTimeout }}
+{{- end }}

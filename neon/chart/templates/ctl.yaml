@@ -1,0 +1,181 @@
+{{- $ctx := dict "root" $ "component" "ctl" }}
+{{- $fullname := include "neon.fullname" $ctx }}
+{{- $proxy := include "neon.fullname" (dict "root" $ "component" "proxy") }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+# Namespaced deliberately: computes only ever exist beside it, so nothing here needs to reach
+# another namespace and a ClusterRole would grant what could never be used.
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only, and only to compare a mounted certificate's version against the one already stamped
+  # on the proxy's pod template.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}
+    namespace: {{ $.Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-compute-template
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+data:
+  # Rendered through the template engine so the value can name the control plane's own Service,
+  # which is release-derived. The ${...} placeholders are not Go template syntax and pass through
+  # untouched for neon-ctl to expand per compute.
+  pod.yaml: |
+    {{- tpl (toYaml $.Values.computePodTemplate) $ | nindent 4 }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-registry
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ $.Values.ctl.registry.storageClass }}
+  resources:
+    requests:
+      storage: {{ $.Values.ctl.registry.size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  # The registry file is held under an exclusive lock, so a second process cannot open it. A
+  # rolling update would start the replacement while the old one still holds the file.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "neon.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "neon.selectorLabels" $ctx | nindent 8 }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/compute-template: {{ tpl (toYaml $.Values.computePodTemplate) $ | sha256sum }}
+        {{- with $.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $fullname }}
+      enableServiceLinks: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.ctl.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: neon-ctl
+          image: "{{ $.Values.ctl.image.repository }}:{{ $.Values.ctl.image.tag }}"
+          imagePullPolicy: {{ $.Values.ctl.image.pullPolicy }}
+          args:
+            - --listen=0.0.0.0:{{ $.Values.ctl.port }}
+            - --storage-controller-url={{ include "neon.controllerURL" $ }}
+            - --compute-pod-template=/etc/neon-ctl/pod.yaml
+            - --compute-images={{ range $i, $version := keys $.Values.computeImages | sortAlpha }}{{ if $i }},{{ end }}{{ $version }}={{ get $.Values.computeImages $version }}{{ end }}
+            - --proxy-deployment={{ $proxy }}
+            - --wake-timeout={{ $.Values.ctl.wakeTimeout }}
+            - --suspend-timeout={{ $.Values.ctl.suspendTimeout }}
+          ports:
+            - name: http
+              containerPort: {{ $.Values.ctl.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: registry
+              mountPath: /var/lib/neon-ctl
+            - name: compute-template
+              mountPath: /etc/neon-ctl
+              readOnly: true
+          resources:
+            {{- toYaml $.Values.ctl.resources | nindent 12 }}
+      volumes:
+        - name: registry
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}-registry
+        - name: compute-template
+          configMap:
+            name: {{ $fullname }}-compute-template
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "neon.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $.Values.ctl.port }}
+      targetPort: http
