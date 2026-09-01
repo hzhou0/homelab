@@ -88,10 +88,8 @@ func (s *Server) renderSpec(ctx context.Context, instance *kube.Instance) (*neon
 	return spec, nil
 }
 
-// A compute needs more than the branch's own settings to run at all: without a port it listens on
-// 5432 while compute_ctl dials the one the pod template declares, and marks the compute failed.
-// The tenant, timeline, pageserver and safekeeper GUCs are not here — they ride the spec's own
-// fields, and naming them twice would let the two disagree.
+// Without a port here Postgres listens on 5432 while compute_ctl dials what the pod template
+// declares. The storage GUCs are absent deliberately: they ride the spec's own fields.
 func settingsFor(instance *kube.Instance, branch []registry.Setting) []neon.GenericOption {
 	settings := []neon.GenericOption{
 		{Name: "listen_addresses", Value: ptr("0.0.0.0"), VarType: "string"},

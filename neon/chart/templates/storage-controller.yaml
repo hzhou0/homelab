@@ -38,20 +38,29 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      initContainers:
+        {{- include "neon.authInit" (dict "root" $ "scopes" "admin,pageserverapi,safekeeperdata") | nindent 8 }}
       containers:
         - name: storage-controller
           image: {{ include "neon.image" $ }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          # Alone among the components it takes the key and the tokens as values rather than paths,
+          # so what the init container derived is read back here instead of being mounted.
           command:
-            - /usr/local/bin/storage_controller
+            - /bin/sh
+            - -ec
+            - |
+              export PUBLIC_KEY="$(cat {{ include "neon.authDir" (dict "root" $) }}/public.pem)"
+              export PAGESERVER_JWT_TOKEN="$(cat {{ include "neon.authDir" (dict "root" $) }}/pageserverapi.jwt)"
+              export SAFEKEEPER_JWT_TOKEN="$(cat {{ include "neon.authDir" (dict "root" $) }}/safekeeperdata.jwt)"
+              export CONTROL_PLANE_JWT_TOKEN="$(cat {{ include "neon.authDir" (dict "root" $) }}/admin.jwt)"
+              exec /usr/local/bin/storage_controller "$@"
+            - storage_controller
           args:
             - --listen=0.0.0.0:{{ $.Values.storageController.port }}
-            # Permits running without auth, which is what makes the namespace the fence.
-            - --dev
             - --control-plane-url={{ include "neon.ctlURL" $ }}
-            # Off by default, and with it off the controller never places a timeline on a
-            # safekeeper: no membership, no safekeeper GUC, and no notification to act on. A bare
-            # switch in this image, though upstream has since given it a value.
+            # Off by default, and with it off no timeline is ever placed on a safekeeper: no
+            # membership, no safekeeper GUC on a compute, and no notification to act on.
             - --timelines-onto-safekeepers
             - --timeline-safekeeper-count={{ $.Values.storageController.timelineSafekeeperCount }}
           env:
@@ -72,8 +81,12 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+          volumeMounts:
+            {{- include "neon.authVolumeMount" (dict "root" $) | nindent 12 }}
           resources:
             {{- toYaml $.Values.storageController.resources | nindent 12 }}
+      volumes:
+        {{- include "neon.authVolume" (dict "root" $) | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service

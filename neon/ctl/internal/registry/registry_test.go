@@ -101,9 +101,8 @@ func TestStaticModeSurvivesAWrite(t *testing.T) {
 	}
 }
 
-// A rewrite replaces the child rows rather than merging them: dropping a setting has to remove it.
 // A branch name reaches a Kubernetes object name, a proxy endpoint id and a path, so anything
-// that would be legal in only some of those has to be refused at the door.
+// legal in only some of those has to be refused at the door.
 func TestValidateName(t *testing.T) {
 	for _, name := range []string{"main", "feature-1", "a", "a1"} {
 		if err := ValidateName(name); err != nil {

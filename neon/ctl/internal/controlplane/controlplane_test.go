@@ -163,6 +163,9 @@ type fakeStorcon struct {
 	safekeeper []neon.SafekeeperDescribe
 	created    []neon.TimelineCreateRequest
 	status     int
+
+	timelineRefused bool
+	deletedTenants  []string
 }
 
 func newFakeStorcon(t *testing.T) *fakeStorcon {
@@ -217,9 +220,22 @@ func newFakeStorcon(t *testing.T) *fakeStorcon {
 			return
 		}
 		fake.mu.Lock()
-		fake.created = append(fake.created, request)
+		refused := fake.timelineRefused
+		if !refused {
+			fake.created = append(fake.created, request)
+		}
 		fake.mu.Unlock()
+		if refused {
+			http.Error(w, "no safekeepers", http.StatusInternalServerError)
+			return
+		}
 		fake.respond(w, map[string]string{})
+	})
+	mux.HandleFunc("DELETE /v1/tenant/{tenant}", func(w http.ResponseWriter, r *http.Request) {
+		fake.mu.Lock()
+		fake.deletedTenants = append(fake.deletedTenants, r.PathValue("tenant"))
+		fake.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]string{})
 	})
 	mux.HandleFunc("DELETE /v1/tenant/{tenant}/timeline/{timeline}", func(w http.ResponseWriter, r *http.Request) {
 		fake.respond(w, map[string]string{})
@@ -394,9 +410,8 @@ func unboundInstance() kube.Instance {
 
 var update = flag.Bool("update", false, "rewrite the golden spec")
 
-// The spec is Neon's internal format and changes across releases. Pinning the golden document
-// turns a shape change into a test failure at upgrade time rather than a compute that will not
-// start, which is the only cheap guard available without depending on Neon's own crate.
+// The spec is Neon's internal format and changes across releases. Pinning it turns a shape change
+// into a test failure at upgrade rather than a compute that will not start.
 func TestRenderSpecGolden(t *testing.T) {
 	storcon := newFakeStorcon(t)
 	store := newStore(t)
@@ -639,9 +654,8 @@ func TestNotifyAttachStatusContract(t *testing.T) {
 		}
 	})
 
-	// The notification carries node ids and addresses are resolved live, so pushing before the
-	// controller answers with the placement it announced would send a stale address and report
-	// success. Nothing would ever correct that.
+	// Addresses are resolved live, so pushing before the controller answers with the placement it
+	// announced would send a stale one and report success. Nothing would correct that.
 	t.Run("placement not yet visible is retryable", func(t *testing.T) {
 		storcon := newFakeStorcon(t)
 		store := newStore(t)
@@ -1256,5 +1270,54 @@ func TestForkKeepsTheAncestorsVersion(t *testing.T) {
 	}
 	if child.PgVersion != 16 {
 		t.Errorf("pg version = %d, want the ancestor's", child.PgVersion)
+	}
+}
+
+// Creating a branch is two controller calls and the second is the one that fails in practice. The
+// tenant from the first is then unreachable by any name, so it has to be taken back.
+func TestCreateBranchDeletesTheTenantItCannotUse(t *testing.T) {
+	storcon := newFakeStorcon(t)
+	storcon.timelineRefused = true
+	store := newStore(t)
+	server := newTestServer(t, storcon, store, newFakeRuntime(), nil)
+
+	response := do(t, server, http.MethodPost, "/api/branches", `{
+		"name":"main",
+		"roles":[{"name":"app","password":"hunter2"}]}`)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+
+	storcon.mu.Lock()
+	deleted := storcon.deletedTenants
+	storcon.mu.Unlock()
+	if len(deleted) != 1 {
+		t.Fatalf("deleted tenants = %v, want exactly the one just created", deleted)
+	}
+	if _, err := store.Get(context.Background(), "main"); !errors.Is(err, registry.ErrNotFound) {
+		t.Errorf("a failed branch was recorded anyway: %v", err)
+	}
+}
+
+// A tenant the caller named is not ours to delete: the failure says nothing about whatever else
+// already lives on it.
+func TestCreateBranchLeavesAnAdoptedTenantAlone(t *testing.T) {
+	storcon := newFakeStorcon(t)
+	storcon.timelineRefused = true
+	server := newTestServer(t, storcon, newStore(t), newFakeRuntime(), nil)
+
+	response := do(t, server, http.MethodPost, "/api/branches", `{
+		"name":"main",
+		"tenant_id":"aa7d0e4f02c00ce5e0a4c405b6850585",
+		"roles":[{"name":"app","password":"hunter2"}]}`)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+
+	storcon.mu.Lock()
+	deleted := storcon.deletedTenants
+	storcon.mu.Unlock()
+	if len(deleted) != 0 {
+		t.Errorf("deleted a tenant the caller supplied: %v", deleted)
 	}
 }

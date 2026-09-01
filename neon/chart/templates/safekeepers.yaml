@@ -7,8 +7,12 @@ kind: Service
 metadata:
   name: {{ $fullname }}
   namespace: {{ $.Release.Namespace }}
+  # neon-ctl registers safekeepers with the storage controller by reading these Services, so this
+  # object is the whole record: the id it is keyed by, and the zone it is spread across.
   labels:
     {{- include "neon.labels" $ctx | nindent 4 }}
+    neon.internal/safekeeper-id: {{ $sk.id | quote }}
+    neon.internal/availability-zone: {{ $sk.availabilityZone | default $fullname | quote }}
 spec:
   selector:
     {{- include "neon.selectorLabels" $ctx | nindent 4 }}
@@ -54,6 +58,8 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      initContainers:
+        {{- include "neon.authInit" (dict "root" $ "scopes" "safekeeperdata") | nindent 8 }}
       containers:
         - name: safekeeper
           image: {{ include "neon.image" $ }}
@@ -69,9 +75,13 @@ spec:
             # address, which is 0.0.0.0 and reaches nothing.
             - --advertise-pg={{ $fullname }}.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.safekeeper.pgPort }}
             - --broker-endpoint={{ include "neon.brokerEndpoint" $ }}
-            # The WAL retention horizon includes backup_lsn, and backup_lsn only advances when the
-            # offload task has somewhere to write. Without this, no segment is ever reclaimed and
-            # the volume fills until writes stall cluster-wide.
+            - --pg-auth-public-key-path={{ include "neon.authPublicKeyPath" (dict "root" $) }}
+            - --http-auth-public-key-path={{ include "neon.authPublicKeyPath" (dict "root" $) }}
+            # Presented to another safekeeper rather than validated: recovering a timeline from a
+            # peer reads that peer's HTTP API, which demands a token of its own.
+            - --auth-token-path={{ include "neon.authDir" (dict "root" $) }}/safekeeperdata.jwt
+            # The retention horizon includes backup_lsn, which advances only when the offload task
+            # has somewhere to write. Without this no segment is reclaimed and the volume fills.
             - --remote-storage={{ include "neon.remoteStorage" (dict "root" $ "prefix" $.Values.bucket.safekeeperPrefix) }}
           env:
             {{- include "neon.bucketEnv" $ | nindent 12 }}
@@ -91,8 +101,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- include "neon.authVolumeMount" (dict "root" $) | nindent 12 }}
           resources:
             {{- toYaml $.Values.safekeeper.resources | nindent 12 }}
+      volumes:
+        {{- include "neon.authVolume" (dict "root" $) | nindent 8 }}
   volumeClaimTemplates:
     - metadata:
         name: data

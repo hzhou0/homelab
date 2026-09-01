@@ -14,8 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
-// These tests run against a real apiserver rather than a mock client, because most of what this
-// package relies on is admission and validation the apiserver owns: immutable selectors, what a
+// A mock client asserts none of what this package actually relies on: immutable selectors, what a
 // label value may contain, and defaulting on write.
 var restConfig *rest.Config
 

@@ -286,9 +286,8 @@ type Store struct {
 
 var (
 	bucket = []byte("branches")
-	// Keyed state that is ours but is not a branch. The signing key lives here because a compute
-	// only trusts the key set it was served, so a restart that mints a new one can no longer
-	// reconfigure anything already running.
+	// A compute trusts only the key set it was served, so a restart that minted a new signing key
+	// could no longer reconfigure anything already running.
 	metaBucket = []byte("meta")
 )
 

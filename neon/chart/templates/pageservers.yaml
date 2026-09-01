@@ -19,6 +19,9 @@ data:
     broker_endpoint = '{{ include "neon.brokerEndpoint" $ }}'
     control_plane_api = '{{ include "neon.controllerURL" $ }}/upcall/v1/'
     availability_zone = '{{ $.Values.availabilityZone }}'
+    auth_validation_public_key_path = '{{ include "neon.authPublicKeyPath" (dict "root" $) }}'
+    pg_auth_type = 'NeonJWT'
+    http_auth_type = 'NeonJWT'
     remote_storage = {{ include "neon.remoteStorage" (dict "root" $ "prefix" $.Values.bucket.pageserverPrefix) }}
 ---
 apiVersion: v1
@@ -77,10 +80,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       initContainers:
-        # The config, identity and registration metadata have to sit inside the working directory,
-        # alongside the tenant data, so they are written into the volume rather than mounted over
-        # it. metadata.json is what the pageserver sends the controller to register itself; without
-        # an availability zone in it or in the config, registration fails.
+        {{- include "neon.authInit" (dict "root" $ "scopes" "generations_api,safekeeperdata") | nindent 8 }}
+        # Config, identity and registration metadata have to sit inside the working directory,
+        # alongside the tenant data, so they are written into the volume rather than mounted over it.
         - name: config
           image: {{ include "neon.image" $ }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
@@ -89,6 +91,9 @@ spec:
             - -ec
             - |
               cp /config/pageserver.toml /data/.neon/pageserver.toml
+              # Appended rather than templated: the config is a ConfigMap, and this is a
+              # credential. The controller rejects the generation upcalls without it.
+              printf "control_plane_api_token = '%s'\n" "$(cat {{ include "neon.authDir" (dict "root" $) }}/generations_api.jwt)" >> /data/.neon/pageserver.toml
               printf 'id=%s\n' '{{ $ps.id }}' > /data/.neon/identity.toml
               cat > /data/.neon/metadata.json <<'META'
               {
@@ -104,12 +109,20 @@ spec:
               mountPath: /config
             - name: data
               mountPath: /data/.neon
+            {{- include "neon.authVolumeMount" (dict "root" $) | nindent 12 }}
       containers:
         - name: pageserver
           image: {{ include "neon.image" $ }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          # The WAL receiver dials safekeepers over the Postgres protocol and takes its token from
+          # the environment, so the derived file is read back here rather than named as a path.
           command:
-            - /usr/local/bin/pageserver
+            - /bin/sh
+            - -ec
+            - |
+              export NEON_AUTH_TOKEN="$(cat {{ include "neon.authDir" (dict "root" $) }}/safekeeperdata.jwt)"
+              exec /usr/local/bin/pageserver "$@"
+            - pageserver
           args:
             - --workdir=/data/.neon
           env:
@@ -130,12 +143,14 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data/.neon
+            {{- include "neon.authVolumeMount" (dict "root" $) | nindent 12 }}
           resources:
             {{- toYaml $.Values.pageserver.resources | nindent 12 }}
       volumes:
         - name: config
           configMap:
             name: {{ $fullname }}
+        {{- include "neon.authVolume" (dict "root" $) | nindent 8 }}
   volumeClaimTemplates:
     - metadata:
         name: data

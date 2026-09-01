@@ -63,9 +63,8 @@ func TestSignedTokenMatchesNeonsShape(t *testing.T) {
 	}
 }
 
-// An admin token carries no tenant, and the field has to be absent rather than null: Neon's
-// deserialiser takes a missing tenant_id as None, and a scope without one is how blanket access
-// is expressed.
+// The tenant field has to be absent rather than null: Neon's deserialiser reads a missing one as
+// None, which is how blanket access is expressed.
 func TestAdminTokenOmitsTenant(t *testing.T) {
 	key, err := NewStorageKey([]byte(neonTestPrivateKey))
 	if err != nil {

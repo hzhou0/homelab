@@ -1,0 +1,121 @@
+# neon
+
+Postgres with compute and storage separated: data durable in hypha, computes disposable, branching
+available when wanted. Open-source Neon ships the storage layer and `compute_ctl` but deliberately
+not a control plane — that is the part Neon Inc. keeps — so this supplies it.
+
+`chart/` is the `homelab-neon` Helm chart and `chart/README.md` owns why it is shaped as it is.
+`ctl/` is `neon-ctl`, the control plane, and `ctl/README.md` owns the behaviour of that code. This
+file is the runbook.
+
+Foundational: cluster-admin installs it into the `neon` namespace, not an `app-*`/`tool-*` one, so
+the platform's admission constraints do not apply.
+
+## Prerequisites
+
+- A bucket on the durable hypha gateway. Nothing here creates one and neither Neon component
+  creates one lazily.
+- `topolvm-provisioner` for pageserver and safekeeper volumes, `zerofs` for the controller
+  database. The controller database holds generation numbers and must survive node loss: reset that
+  counter and a stale writer is blessed, which is silent corruption a dump cannot undo.
+- A node labelled for each pageserver and safekeeper in `values.yaml`. Placement is stated per
+  instance rather than scheduled, because the ids are permanent.
+
+## Install
+
+One Secret holds every credential. The chart creates none and takes no literal key, so nothing
+sensitive reaches a values file or the release history.
+
+```sh
+openssl genpkey -algorithm ed25519 -out auth.pem
+
+kubectl create namespace neon
+kubectl -n neon create secret generic neon-credentials \
+  --from-literal=bucketAccessKey=... \
+  --from-literal=bucketSecretKey=... \
+  --from-literal=controllerDbPassword=... \
+  --from-file=authPrivateKey=auth.pem
+
+helm install neon neon/chart -n neon
+```
+
+That key is the whole of the storage layer's authentication. Every public key and every token is a
+function of it, so each pod derives what it needs into an emptyDir before its main container
+starts. Rotating is replacing that one Secret value and restarting the deployments.
+
+## Bootstrap
+
+Nothing is created at install. A branch is a timeline plus a compute pointed at it, and both are
+runtime objects `neon-ctl` owns:
+
+```sh
+curl -X POST http://neon-ctl:8080/api/branches \
+  -H "Authorization: Bearer $(neon-ctl token --scope=admin)" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"main","roles":[{"name":"app","password":"..."}],
+       "databases":[{"name":"appdb","owner":"app"}],"start":true}'
+```
+
+Fork it with `{"name":"dev","parent":"main"}`. A fork inherits its ancestor's Postgres version and
+cannot differ.
+
+Clients connect through the proxy, naming the branch in the SNI hostname, or in the startup options
+when there is no TLS.
+
+## Verify
+
+Work down this list; each rung depends on the ones above it.
+
+1. Every pageserver appears under `GET /control/v1/node`, every safekeeper under
+   `GET /control/v1/safekeeper`, each in a **distinct** availability zone. A timeline cannot be
+   placed until both lists are populated, and the controller spreads members one per zone.
+2. Heartbeat rounds report nothing offline. A scope mismatch shows up here as a JWT error, and for
+   pageservers it shows only as `warming-up` — check the pageserver's own log too.
+3. Volumes bind on the expected classes and nodes; topolvm's advertised capacity drops as predicted.
+4. Both bucket prefixes receive writes. Watch hypha's metrics for 4xx — that is the real
+   compatibility test.
+5. **`backup_lsn` advances** past `timeline_start_lsn` on a safekeeper's `timeline_status`. This is
+   the check that proves WAL is actually being reclaimed; without it the volumes fill until writes
+   stall cluster-wide. Pair it with a standing alert on safekeeper volume use.
+6. A query succeeds from a granted namespace and is refused from an ungranted one.
+7. **Exercise the hooks.** Migrate a tenant to another pageserver and confirm `neon-ctl` resolves the
+   node id, rebuilds the spec, and reconfigures the compute *without* restarting it. A plain migrate
+   returns 200 without moving anything — the optimiser reverts a sub-optimal placement, so set the
+   tenant's scheduling policy to `Essential` and pass `override_scheduler` first. Then delete a
+   compute pod and confirm it returns correctly bound, which exercises the pull path.
+8. **Exercise the cold path.** Let a branch idle to zero, connect, and confirm the proxy wakes it.
+   Measure how long it takes.
+
+`ctl/e2e/cluster.sh` runs 1–8 against a throwaway k3d cluster with MinIO standing in for hypha. It
+never touches the current kubeconfig context.
+
+## Operating
+
+**Adding a safekeeper** is an entry in `values.yaml` and an upgrade. `neon-ctl` registers it from
+its Service within a minute; until then the controller has not heard of it and a timeline created in
+that window fails to place.
+
+**Removing one** needs its scheduling policy set through the controller first. Deleting the Service
+stops it being re-registered but does not retire the record.
+
+**Losing the controller database** loses generation numbers, which cannot be rebuilt by scanning.
+Restoring an old dump reintroduces a counter that has already been used. Placement re-converges on
+its own; safekeeper registration does too.
+
+**The registry is the one thing worth backing up.** It holds branch names and per-branch settings —
+small, and the only state in the system that object storage and the controller cannot reconstruct.
+Losing it loses names, not data. It is held under an exclusive file lock, which is why `neon-ctl`
+runs one replica with a `Recreate` rollout.
+
+**An upgrade means re-checking the compute spec.** It is Neon's internal format and changes across
+releases; a rendered spec is pinned as a golden document, so a shape change fails a test rather than
+producing a compute that will not start. Pin the storage and compute images to the same tag and read
+that diff on every bump.
+
+## Known limits
+
+- **The control plane is ours.** Small, but a bug means computes silently keep dialling a detached
+  pageserver. Rungs 7 and 8 are the guard.
+- **Durable mode is WAN-backed.** The painful paths are cold pageserver reads and WAL offload
+  throughput, and only one safekeeper is elected offloader at a time. Measure before trusting.
+- **hypha is a single writer.** Fine at this scale, a ceiling to remember.

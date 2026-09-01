@@ -76,10 +76,8 @@ func (r patchBranchRequest) patch() registry.Patch {
 	return patch
 }
 
-// resolvePgVersion turns a request into a version this deployment can actually start. It is
-// only ever asked for a root branch: a fork inherits its ancestor's and cannot differ.
-//
-// Unasked defaults to the newest image the deployment carries, so what can run is stated once.
+// Only ever asked for a root branch, since a fork inherits its ancestor's. Unasked takes the
+// newest image present, so the set of images is the whole statement of what can run.
 func (s *Server) resolvePgVersion(requested int) (int, error) {
 	available := s.computes.PgVersions()
 	if len(available) == 0 {
@@ -200,6 +198,11 @@ func (s *Server) createBranch(ctx context.Context, request createBranchRequest) 
 		}
 	}
 	if err := s.storcon.CreateTimeline(ctx, branch.TenantID, branch.TimelineCreateRequest()); err != nil {
+		if tenantIsNew {
+			if cleanup := s.storcon.DeleteTenant(ctx, branch.TenantID); cleanup != nil {
+				s.log.Error("deleting the tenant of a failed branch", "tenant", branch.TenantID, "error", cleanup)
+			}
+		}
 		return nil, withStatus(http.StatusBadGateway, fmt.Errorf("creating timeline: %w", err))
 	}
 	if err := s.registry.Put(ctx, branch); err != nil {

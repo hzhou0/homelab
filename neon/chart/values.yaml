@@ -3,12 +3,8 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
-# One pre-created Secret holds every credential under fixed key names. The chart creates no Secret
-# and takes no literal key, so nothing sensitive reaches a values file or the release history.
-#
-#   kubectl -n neon create secret generic neon-credentials \
-#     --from-literal=bucketAccessKey=... --from-literal=bucketSecretKey=... \
-#     --from-literal=controllerDbPassword=...
+# Pre-created, holding every credential under fixed key names. The chart creates no Secret and
+# takes no literal key, so nothing sensitive reaches a values file or the release history.
 secretName: neon-credentials
 
 # Neon forces path-style addressing whenever an endpoint is set. The bucket must already exist:
@@ -20,9 +16,9 @@ bucket:
   pageserverPrefix: pageserver
   safekeeperPrefix: safekeeper
 
-# Every component reports this as its availability zone. Registration fails outright without one,
-# and a single-site cluster has nothing truthful to say here.
-availabilityZone: homelab
+# Registration fails outright without one, and a single-site cluster has nothing truthful to say.
+# Safekeepers are the exception: the controller spreads a timeline one member per distinct zone.
+availabilityZone: neon
 
 storageBroker:
   port: 50051
@@ -63,9 +59,8 @@ controllerDb:
       memory: 1Gi
   nodeSelector: {}
 
-# One StatefulSet per entry, so a node id is stated rather than inferred from an ordinal, and
-# placement is per instance. The id is permanent: it keys generation numbers in the controller's
-# database, and reusing one for a different machine reattaches its tenants.
+# One StatefulSet per entry, so an id is stated rather than inferred from an ordinal. It is
+# permanent: it keys generation numbers, and reusing one for a different machine reattaches it.
 pageservers:
   - id: 1
     size: 400Gi
@@ -158,16 +153,14 @@ ctl:
       memory: 256Mi
   nodeSelector: {}
 
-# What a branch may be created at. The storage layer records a version per timeline and serves any
-# of them at once, so this list is the whole statement of what this deployment can run; a branch
-# that names no version gets the newest present.
+# The storage layer records a version per timeline and serves any of them at once, so this list is
+# the whole statement of what can run. A branch naming no version gets the newest present.
 computeImages:
   16: neondatabase/compute-node-v16:8464
   17: neondatabase/compute-node-v17:8464
 
-# The pod every compute is rendered from. ${COMPUTE_ID} and ${COMPUTE_IMAGE} are substituted per
-# compute; anything else is left as written, so a stale placeholder fails visibly rather than
-# becoming an empty flag. The ports named here are where neon-ctl reads them from.
+# The pod every compute is rendered from. Only ${COMPUTE_ID} and ${COMPUTE_IMAGE} are substituted;
+# anything else is left as written, so a stale placeholder fails visibly rather than emptying.
 computePodTemplate:
   metadata:
     labels:
@@ -197,11 +190,11 @@ computePodTemplate:
             containerPort: 55433
           - name: http
             containerPort: 3080
-        # Without this the pod counts as ready the moment the container starts, and a wake hands
-        # the proxy an address minutes before Postgres will answer on it.
+        # Without this the pod is ready the moment the container starts, and a wake hands the proxy
+        # an address minutes before Postgres answers. The role is named only to keep the log quiet.
         readinessProbe:
           exec:
-            command: ["/usr/local/bin/pg_isready", "-q", "-p", "55433"]
+            command: ["/usr/local/bin/pg_isready", "-q", "-p", "55433", "-U", "cloud_admin", "-d", "postgres"]
           periodSeconds: 2
           failureThreshold: 90
         volumeMounts:
@@ -217,10 +210,6 @@ computePodTemplate:
       - name: pgdata
         emptyDir:
           sizeLimit: 20Gi
-
-# Safekeepers are posted to the controller by a hook job, which needs an HTTP client the storage
-# image does not carry.
-registrationImage: curlimages/curl:8.10.1
 
 # Namespaces granted reach to the proxy. Everything else is refused by the cluster-wide east-west
 # default deny.

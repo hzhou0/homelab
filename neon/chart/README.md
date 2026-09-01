@@ -21,10 +21,17 @@ different machine reattaches its tenants. Reading it off a pod ordinal makes it 
 order, so it is stated instead. Per-instance placement falls out of the same decision.
 
 **Pageservers register themselves; safekeepers are registered for them.** A pageserver reads a
-metadata file beside its config at startup and sends it to the controller. Safekeepers have no
-equivalent, so a hook job posts them after install, and until every one of them is posted the
-controller cannot place a timeline for want of a quorum. Re-run it with `helm upgrade` if the
-controller's database is ever rebuilt.
+metadata file beside its config at startup and sends it to the controller. A safekeeper has no
+notion of the controller at all, and the controller has no way to discover one, so something has to
+assert that it exists — and until every one of them is asserted the controller cannot place a
+timeline for want of a quorum.
+
+That assertion is `neon-ctl` reading these Services rather than a job posting a list, which makes
+registration a fact that re-converges instead of an event that has to be re-run: a safekeeper added
+later, or a controller database rebuilt, heals on its own. The Service is the whole record — the
+id, the zone, the ports and the host it resolves to are all on it, so nothing is stated twice. The
+write is an upsert that leaves a scheduling policy set by hand alone, which is what makes repeating
+it safe.
 
 **Config lives inside the pageserver's working directory**, which is also where tenant data lives,
 so an init container writes it into the volume rather than mounting it over one.
@@ -44,12 +51,28 @@ and has no reload path, which is why `neon-ctl` restarts it when the secret it m
 
 ## The fence
 
-Components authenticate nothing between themselves — the controller runs `--dev` — so the namespace
-boundary is the entire fence, and the grant that admits the namespace to itself is what makes the
-storage mesh, the notification path and the runtime-created computes reachable. It names no ports,
-because a component added later would otherwise fail in a way that reads as a Neon bug. Client
-traffic arrives from outside the cluster and needs no east-west grant; `accessGrants` is for
+Two layers, because neither is sufficient alone.
+
+The namespace boundary comes first: one grant admits the namespace to itself, which is what makes
+the storage mesh, the notification path and the runtime-created computes reachable. It names no
+ports, because a component added later would otherwise fail in a way that reads as a Neon bug.
+Client traffic arrives from outside the cluster and needs no east-west grant; `accessGrants` is for
 in-cluster consumers of the proxy.
+
+Inside that boundary every storage call is authenticated with an EdDSA JWT, and the only thing
+stored is the private key. The public half and every token are functions of it, so each pod derives
+what it needs into an emptyDir before its main container starts, rather than being handed material
+minted somewhere else. Derivation is deterministic, so pods computing it independently agree without
+anything being generated, ordered, or kept in step — and rotating the deployment is replacing one
+Secret value.
+
+`neon-ctl` is the exception that needs the key itself rather than a derivative, because it is the
+only component that signs at runtime: its own token for the controller, a tenant-scoped one into
+every compute spec, and the signature it checks on inbound notifications.
+
+This is what allows the controller to run without `--dev`. That flag is not a mode: it suppresses a
+startup assertion, and the assertion it suppresses includes the requirement that a timeline gets
+three safekeepers. Running with it means a quorum of two would boot silently.
 
 ## Placement
 
@@ -60,14 +83,3 @@ the node with the most free space.
 
 Nothing here keeps a component off a reclaimable node. That belongs to the node, not to this chart:
 a node that can vanish should carry a taint.
-
-## Install
-
-Create the bucket on the durable gateway first — nothing here creates one, and neither Neon
-component creates one lazily. Then the credentials Secret named by `secretName`, holding
-`bucketAccessKey`, `bucketSecretKey` and `controllerDbPassword`; the chart creates no Secret and
-takes no literal key, so nothing sensitive reaches a values file or the release history.
-
-Pageservers appear under `GET /control/v1/node` on their own once running. Safekeepers appear under
-`GET /control/v1/safekeeper` once the hook job has run. A timeline cannot be created until both
-lists are populated.

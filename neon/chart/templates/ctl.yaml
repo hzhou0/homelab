@@ -25,8 +25,8 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Read-only, and only to compare a mounted certificate's version against the one already stamped
-  # on the proxy's pod template.
+  # Read-only: the only reason to see a Secret is to compare its version against the one already
+  # stamped on a pod template.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
@@ -55,9 +55,8 @@ metadata:
   labels:
     {{- include "neon.labels" $ctx | nindent 4 }}
 data:
-  # Rendered through the template engine so the value can name the control plane's own Service,
-  # which is release-derived. The ${...} placeholders are not Go template syntax and pass through
-  # untouched for neon-ctl to expand per compute.
+  # Rendered through the template engine so the value can name a Service whose host is derived
+  # from the release name.
   pod.yaml: |
     {{- tpl (toYaml $.Values.computePodTemplate) $ | nindent 4 }}
 ---
@@ -133,6 +132,10 @@ spec:
             - --proxy-deployment={{ $proxy }}
             - --wake-timeout={{ $.Values.ctl.wakeTimeout }}
             - --suspend-timeout={{ $.Values.ctl.suspendTimeout }}
+          env:
+            # The only component given the private half, because it is the only one that signs at
+            # runtime rather than validating.
+            {{- include "neon.secretEnv" (dict "root" $ "name" "NEON_CTL_AUTH_KEY" "key" "authPrivateKey") | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ $.Values.ctl.port }}

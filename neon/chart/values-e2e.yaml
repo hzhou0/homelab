@@ -7,8 +7,9 @@ bucket:
   endpoint: http://minio.minio:9000
 
 storageController:
-  # Below three the controller refuses outside --dev, which is exactly why this can run one.
-  timelineSafekeeperCount: 1
+  # No longer reducible: outside --dev the controller refuses fewer than three, so the throwaway
+  # cluster runs the same quorum the real one does.
+  timelineSafekeeperCount: 3
   resources:
     requests:
       cpu: 50m
@@ -39,6 +40,8 @@ pageserver:
 
 safekeepers:
   - id: 1
+  - id: 2
+  - id: 3
 
 safekeeper:
   storageClass: local-path

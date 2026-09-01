@@ -321,12 +321,8 @@ type TLSConfig struct {
 	CertPath string `json:"cert_path"`
 }
 
-// SigningKey authenticates this service to a compute. compute_ctl guards /configure, /status and
-// /terminate behind a token signed by a key whose public half it learns from the spec it is
-// served, so the two travel together and a compute trusts nothing it was not handed directly.
-//
-// Ed25519 because that is what compute_ctl validates unless a key announces RS256; there is no
-// ECDSA path.
+// compute_ctl learns this key's public half from the spec it is served, so the two travel together
+// and a compute trusts nothing it was not handed. Ed25519 because the only other path is RS256.
 type SigningKey struct {
 	private ed25519.PrivateKey
 	kid     string
@@ -486,6 +482,25 @@ func (c *StorageController) LocateTimeline(ctx context.Context, tenant TenantID,
 	return &located, c.do(ctx, http.MethodGet, path, nil, nil, &located)
 }
 
+// The whole record the controller keeps. Beyond the id it is reporting: the version is stored and
+// never read back, and the `active` field it documents as ignored.
+type SafekeeperUpsert struct {
+	ID                 NodeID `json:"id"`
+	RegionID           string `json:"region_id"`
+	Version            int64  `json:"version"`
+	Host               string `json:"host"`
+	Port               int32  `json:"port"`
+	HTTPPort           int32  `json:"http_port"`
+	AvailabilityZoneID string `json:"availability_zone_id"`
+}
+
+// Nothing in Neon does this for itself. Repeating it is free, and it leaves a scheduling policy
+// set by hand alone, which is what makes it safe on a timer.
+func (c *StorageController) UpsertSafekeeper(ctx context.Context, safekeeper SafekeeperUpsert) error {
+	path := fmt.Sprintf("/control/v1/safekeeper/%d", safekeeper.ID)
+	return c.do(ctx, http.MethodPost, path, nil, safekeeper, nil)
+}
+
 func (c *StorageController) CreateTenant(ctx context.Context, tenant TenantID) error {
 	return c.do(ctx, http.MethodPost, "/v1/tenant", nil, TenantCreateRequest{NewTenantID: tenant}, nil)
 }
@@ -493,6 +508,14 @@ func (c *StorageController) CreateTenant(ctx context.Context, tenant TenantID) e
 func (c *StorageController) CreateTimeline(ctx context.Context, tenant TenantID, req TimelineCreateRequest) error {
 	path := fmt.Sprintf("/v1/tenant/%s/timeline", tenant)
 	return c.do(ctx, http.MethodPost, path, nil, req, nil)
+}
+
+func (c *StorageController) DeleteTenant(ctx context.Context, tenant TenantID) error {
+	err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/v1/tenant/%s", tenant), nil, nil, nil)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
 }
 
 func (c *StorageController) DeleteTimeline(ctx context.Context, tenant TenantID, timeline TimelineID) error {
@@ -687,17 +710,27 @@ type SafekeeperInfo struct {
 	Hostname *string `json:"hostname"`
 }
 
-// Neon's storage components authenticate with EdDSA JWTs whose claims carry a scope and, for
-// tenant-scoped tokens, the tenant they are good for. The claims carry no expiry: a storage token
-// is valid until the key behind it changes.
+// EdDSA, and the claims carry no expiry: a storage token is valid until the key behind it
+// changes.
 type StorageScope string
 
 const (
-	ScopeTenant        StorageScope = "tenant"
-	ScopeAdmin         StorageScope = "admin"
-	ScopePageServerAPI StorageScope = "pageserverapi"
-	ScopeSafekeeperAPI StorageScope = "safekeeperdata"
+	ScopeTenant         StorageScope = "tenant"
+	ScopeAdmin          StorageScope = "admin"
+	ScopePageServerAPI  StorageScope = "pageserverapi"
+	ScopeSafekeeperAPI  StorageScope = "safekeeperdata"
+	ScopeGenerationsAPI StorageScope = "generations_api"
 )
+
+// Neon matches the scope exhaustively and answers an unknown one with the same 403 it gives a
+// forged token, so a misspelling is indistinguishable from an attack until someone reads a log.
+func (s StorageScope) valid() bool {
+	switch s {
+	case ScopeTenant, ScopeAdmin, ScopePageServerAPI, ScopeSafekeeperAPI, ScopeGenerationsAPI:
+		return true
+	}
+	return false
+}
 
 type StorageClaims struct {
 	TenantID *TenantID    `json:"tenant_id,omitempty"`
@@ -733,7 +766,20 @@ func (k *StorageKey) Verifier() *StorageVerifier {
 	return &StorageVerifier{public: k.private.Public().(ed25519.PublicKey)}
 }
 
+// PublicKeyPEM is the SPKI PEM the storage components validate against, derived rather than
+// carried alongside so the two can never be a mismatched pair.
+func (k *StorageKey) PublicKeyPEM() ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(k.private.Public())
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), nil
+}
+
 func (k *StorageKey) Token(claims StorageClaims) (string, error) {
+	if !claims.Scope.valid() {
+		return "", fmt.Errorf("neon: unknown storage scope %q", claims.Scope)
+	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
 		return "", err

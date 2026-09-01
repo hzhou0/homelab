@@ -39,10 +39,18 @@ up)
   k3d image import neon-ctl:e2e -c "$CLUSTER"
 
   k create namespace "$NAMESPACE" --dry-run=client -o yaml | k apply -f -
+
+  # One key, per run. Everything else each pod derives for itself, which is also what the real
+  # deployment does — without it the storage controller refuses to start outside --dev.
+  keys="$(mktemp -d)"
+  trap 'rm -rf "$keys"' EXIT
+  openssl genpkey -algorithm ed25519 -out "$keys/auth.pem" 2>/dev/null
+
   k -n "$NAMESPACE" create secret generic neon-e2e-credentials \
     --from-literal=bucketAccessKey=neon \
     --from-literal=bucketSecretKey=neonneon \
     --from-literal=controllerDbPassword=neonneon \
+    --from-file=authPrivateKey="$keys/auth.pem" \
     --dry-run=client -o yaml | k apply -f -
 
   helm --kube-context "$CONTEXT" upgrade --install neon "$CHART" \

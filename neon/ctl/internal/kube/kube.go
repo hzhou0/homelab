@@ -1,5 +1,5 @@
-// Package kube is everything this service does with the Kubernetes API: it runs computes and
-// restarts the proxy when its certificate is renewed.
+// Package kube is everything this service does with the Kubernetes API: it runs computes, restarts
+// the proxy for a renewed certificate, and registers safekeepers from the Services describing them.
 package kube
 
 import (
@@ -447,11 +447,8 @@ func merge(maps ...map[string]string) map[string]string {
 	return merged
 }
 
-// CertRoller exists because Neon's proxy reads its certificate once at startup and has no reload
-// path, so a renewal reaches it only through a restart.
-//
-// Which secrets matter is read from the deployment itself rather than configured: the volumes it
-// mounts are already the record of what it depends on.
+// Neon's proxy reads its certificate once at startup and has no reload path, so a renewal reaches
+// it only through a restart. Which secrets matter is read from the volumes it already mounts.
 type CertRoller struct {
 	client     kubernetes.Interface
 	namespace  string
@@ -490,9 +487,8 @@ func (c *CertRoller) Run(ctx context.Context) {
 	}
 }
 
-// roll stamps the versions of every secret the deployment mounts onto its pod template. Writing
-// versions rather than a timestamp makes the patch idempotent, so a tick with nothing renewed
-// restarts nothing.
+// Stamping versions rather than a timestamp makes the patch idempotent, so a tick with nothing
+// renewed restarts nothing.
 func (c *CertRoller) roll(ctx context.Context) error {
 	deployments := c.client.AppsV1().Deployments(c.namespace)
 	deployment, err := deployments.Get(ctx, c.deployment, metav1.GetOptions{})
@@ -551,3 +547,123 @@ func (c *CertRoller) roll(ctx context.Context) error {
 }
 
 func ptr[T any](value T) *T { return &value }
+
+// A safekeeper has no notion of the controller and the controller cannot discover one, so
+// something must assert it exists. Reading the cluster makes that a fact rather than an event.
+type SafekeeperRegistrar struct {
+	client    kubernetes.Interface
+	storcon   *neon.StorageController
+	namespace string
+	log       *slog.Logger
+}
+
+const (
+	labelSafekeeperID     = "neon.internal/safekeeper-id"
+	labelAvailabilityZone = "neon.internal/availability-zone"
+	labelAppVersion       = "app.kubernetes.io/version"
+
+	// Bounds how long a newly added safekeeper stays unusable, and no timeline can be created on
+	// one the controller has not heard of.
+	safekeeperPollInterval = 10 * time.Second
+
+	// What upstream records for a safekeeper it has not yet posted.
+	safekeeperVersionUnknown = 1
+
+	// Required by the upsert, then recorded and handed back unread. There is one deployment and
+	// one site, so there is nothing for a value here to vary with.
+	safekeeperRegion = "neon"
+)
+
+func NewSafekeeperRegistrar(client kubernetes.Interface, storcon *neon.StorageController, log *slog.Logger, namespace string) *SafekeeperRegistrar {
+	return &SafekeeperRegistrar{client: client, storcon: storcon, namespace: namespace, log: log}
+}
+
+func (r *SafekeeperRegistrar) Run(ctx context.Context) {
+	ticker := time.NewTicker(safekeeperPollInterval)
+	defer ticker.Stop()
+
+	for {
+		if err := r.register(ctx); err != nil && ctx.Err() == nil {
+			r.log.Error("registering safekeepers", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// One failure must not hide the others: a controller that rejects one record has nothing to say
+// about the rest, and the next tick retries them all anyway.
+func (r *SafekeeperRegistrar) register(ctx context.Context) error {
+	found, err := r.discover(ctx)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, safekeeper := range found {
+		if err := r.storcon.UpsertSafekeeper(ctx, safekeeper); err != nil {
+			failures = append(failures, fmt.Errorf("safekeeper %d: %w", safekeeper.ID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// Everything the controller wants is already on the Service, which is also what its host resolves
+// to. Restating it as configuration would be a second copy free to disagree with the first.
+func (r *SafekeeperRegistrar) discover(ctx context.Context) ([]neon.SafekeeperUpsert, error) {
+	services, err := r.client.CoreV1().Services(r.namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSafekeeperID})
+	if err != nil {
+		return nil, err
+	}
+
+	found := make([]neon.SafekeeperUpsert, 0, len(services.Items))
+	for i := range services.Items {
+		service := &services.Items[i]
+		id, err := strconv.ParseUint(service.Labels[labelSafekeeperID], 10, 64)
+		if err != nil || id == 0 {
+			r.log.Error("skipping a safekeeper service with an unusable id",
+				"service", service.Name, "id", service.Labels[labelSafekeeperID])
+			continue
+		}
+		pgPort, httpPort := servicePort(service, "pg"), servicePort(service, "http")
+		if pgPort == 0 || httpPort == 0 {
+			r.log.Error("skipping a safekeeper service missing a named port", "service", service.Name)
+			continue
+		}
+		zone := service.Labels[labelAvailabilityZone]
+		if zone == "" {
+			zone = service.Name
+		}
+		found = append(found, neon.SafekeeperUpsert{
+			ID:                 neon.NodeID(id),
+			RegionID:           safekeeperRegion,
+			Version:            safekeeperVersion(service.Labels[labelAppVersion]),
+			Host:               fmt.Sprintf("%s.%s.svc.cluster.local", service.Name, r.namespace),
+			Port:               pgPort,
+			HTTPPort:           httpPort,
+			AvailabilityZoneID: zone,
+		})
+	}
+	return found, nil
+}
+
+func servicePort(service *corev1.Service, name string) int32 {
+	for _, port := range service.Spec.Ports {
+		if port.Name == name {
+			return port.Port
+		}
+	}
+	return 0
+}
+
+// Neon builds this from the commit count on the release branch, which is what the image tag of a
+// released build already is.
+func safekeeperVersion(tag string) int64 {
+	version, err := strconv.ParseInt(tag, 10, 64)
+	if err != nil || version < 0 {
+		return safekeeperVersionUnknown
+	}
+	return version
+}

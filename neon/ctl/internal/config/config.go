@@ -27,9 +27,8 @@ type Config struct {
 	WakeTimeout    time.Duration
 	SuspendTimeout time.Duration
 
-	// AuthKey is the Ed25519 private key Neon's storage components validate against, as PKCS#8
-	// PEM. Empty leaves every storage call unauthenticated, which the controller permits only
-	// under --dev.
+	// PKCS#8 PEM. Empty leaves every storage call unauthenticated, which the controller permits
+	// only under --dev.
 	AuthKey string
 }
 

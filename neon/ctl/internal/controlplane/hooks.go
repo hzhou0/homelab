@@ -12,9 +12,8 @@ import (
 	"github.com/hzhou0/homelab/neon/ctl/internal/neon"
 )
 
-// Notifications are the one inbound path that changes what a running compute is told, so they are
-// the one worth authenticating. A rejected token is 403 deliberately: the controller never retries
-// it, and it never will succeed.
+// The one inbound path that changes what a running compute is told. A rejected token answers 403
+// deliberately: the controller never retries that, and it never would succeed.
 func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 	if s.storageAuth == nil {
 		return true

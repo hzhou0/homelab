@@ -9,9 +9,8 @@ import (
 	"testing"
 )
 
-// The exchange published in RFC 7677 section 3 is the only external check available for a
-// verifier: reproducing its client proof and server signature exercises the salted password, both
-// keys and the stored key together.
+// RFC 7677 section 3 is the only external check available: reproducing its proof and signature
+// exercises the salted password, both keys and the stored key together.
 func TestVerifierMatchesPublishedExchange(t *testing.T) {
 	const (
 		password    = "pencil"

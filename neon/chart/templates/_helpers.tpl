@@ -1,9 +1,6 @@
 {{/*
 Component helpers take `(dict "root" $ "component" <name>)`: one release holds every Neon
 component, so a name or a label set means nothing without saying which.
-
-Trimming convention: each define opens with `-}}` and closes with `{{-`, so an `nindent`ed body
-never contributes a whitespace-only line.
 */}}
 {{ define "neon.fullname" -}}
 {{ printf "%s-%s" .root.Release.Name .component | trunc 63 | trimSuffix "-" }}
@@ -56,8 +53,7 @@ the controller keys generations and placement on and it must not move when a lis
 {{- end }}
 
 {{/*
-The S3 credentials every storage component reads. Neon's remote storage reads the standard AWS
-variables rather than anything of its own.
+Neon's remote storage reads the standard AWS variables rather than anything of its own.
 */}}
 {{ define "neon.bucketEnv" -}}
 - name: AWS_ACCESS_KEY_ID
@@ -72,10 +68,51 @@ variables rather than anything of its own.
       key: bucketSecretKey
 {{- end }}
 
-{{/*
-A TOML inline table, which is what both the pageserver config and the safekeeper's
---remote-storage flag expect.
-*/}}
 {{ define "neon.remoteStorage" -}}
 {bucket_name = "{{ .root.Values.bucket.name }}", bucket_region = "{{ .root.Values.bucket.region }}", prefix_in_bucket = "{{ .prefix }}", endpoint = "{{ .root.Values.bucket.endpoint }}"}
+{{- end }}
+
+{{/*
+Everything a component authenticates with is a function of the private key, so it is derived where
+it is used rather than minted once and distributed. Deterministic, so no two pods can disagree.
+*/}}
+{{ define "neon.authInit" -}}
+- name: auth
+  image: "{{ .root.Values.ctl.image.repository }}:{{ .root.Values.ctl.image.tag }}"
+  imagePullPolicy: {{ .root.Values.ctl.image.pullPolicy }}
+  args:
+    - derive
+    - --dir={{ include "neon.authDir" . }}
+    - --scopes={{ .scopes }}
+  env:
+    {{- include "neon.secretEnv" (dict "root" .root "name" "NEON_CTL_AUTH_KEY" "key" "authPrivateKey") | nindent 4 }}
+  volumeMounts:
+    {{- include "neon.authVolumeMount" (dict "write" true) | nindent 4 }}
+{{- end }}
+
+{{ define "neon.authVolume" -}}
+- name: auth
+  emptyDir: {}
+{{- end }}
+
+{{ define "neon.authDir" -}}
+/etc/neon/auth
+{{- end }}
+
+{{ define "neon.authVolumeMount" -}}
+- name: auth
+  mountPath: /etc/neon/auth
+  readOnly: {{ not .write }}
+{{- end }}
+
+{{ define "neon.authPublicKeyPath" -}}
+{{ include "neon.authDir" . }}/public.pem
+{{- end }}
+
+{{ define "neon.secretEnv" -}}
+- name: {{ .name }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ .root.Values.secretName }}
+      key: {{ .key }}
 {{- end }}

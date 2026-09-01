@@ -2,16 +2,22 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sync"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/hzhou0/homelab/neon/ctl/internal/neon"
@@ -464,5 +470,169 @@ func TestCertRollerFindsSecretsThroughTheDeployment(t *testing.T) {
 	}
 	if want := "proxy-tls=" + renewed.ResourceVersion; stamp(t) != want {
 		t.Errorf("the renewed version did not reach the pod template, want %q", want)
+	}
+}
+
+func safekeeperService(name string, labels map[string]string, ports ...corev1.ServicePort) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		Spec:       corev1.ServiceSpec{Ports: ports},
+	}
+}
+
+func namedPorts() []corev1.ServicePort {
+	return []corev1.ServicePort{
+		{Name: "pg", Port: 5454, TargetPort: intstr.FromString("pg")},
+		{Name: "http", Port: 7676, TargetPort: intstr.FromString("http")},
+	}
+}
+
+// The Service is the whole record: what the controller is told about a safekeeper is derived from
+// it rather than restated anywhere, so this is the test that the derivation is right.
+func TestSafekeeperDiscoveryReadsTheService(t *testing.T) {
+	ctx := context.Background()
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := newNamespace(t, client)
+
+	for _, service := range []*corev1.Service{
+		safekeeperService("sk-1", map[string]string{
+			labelSafekeeperID: "1",
+			labelAppVersion:   "8464",
+		}, namedPorts()...),
+		safekeeperService("sk-2", map[string]string{
+			labelSafekeeperID:     "2",
+			labelAvailabilityZone: "rack-b",
+			labelAppVersion:       "8464",
+		}, namedPorts()...),
+		// Not a safekeeper: no id label, so the selector must not return it.
+		safekeeperService("proxy", map[string]string{"app.kubernetes.io/name": "neon"}, namedPorts()...),
+	} {
+		if _, err := client.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	registrar := NewSafekeeperRegistrar(client, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), namespace)
+	found, err := registrar.discover(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []neon.SafekeeperUpsert{
+		{
+			ID: 1, RegionID: safekeeperRegion, Version: 8464,
+			Host: "sk-1." + namespace + ".svc.cluster.local",
+			Port: 5454, HTTPPort: 7676,
+			// Unstated, so it is its own zone: the controller places one member per zone, and a
+			// shared one would cap every timeline at a single safekeeper.
+			AvailabilityZoneID: "sk-1",
+		},
+		{
+			ID: 2, RegionID: safekeeperRegion, Version: 8464,
+			Host: "sk-2." + namespace + ".svc.cluster.local",
+			Port: 5454, HTTPPort: 7676,
+			AvailabilityZoneID: "rack-b",
+		},
+	}
+	if !reflect.DeepEqual(found, want) {
+		t.Errorf("discovered\n %+v\nwant\n %+v", found, want)
+	}
+}
+
+// A malformed record is skipped rather than posted or fatal: the controller rejects it anyway, and
+// one bad Service must not stop the others being registered.
+func TestSafekeeperDiscoverySkipsUnusableServices(t *testing.T) {
+	ctx := context.Background()
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := newNamespace(t, client)
+
+	for _, service := range []*corev1.Service{
+		safekeeperService("sk-zero", map[string]string{labelSafekeeperID: "0"}, namedPorts()...),
+		safekeeperService("sk-words", map[string]string{labelSafekeeperID: "one"}, namedPorts()...),
+		safekeeperService("sk-unnamed-ports", map[string]string{labelSafekeeperID: "4"},
+			corev1.ServicePort{Name: "pg", Port: 5454, TargetPort: intstr.FromString("pg")}),
+		safekeeperService("sk-good", map[string]string{labelSafekeeperID: "5"}, namedPorts()...),
+	} {
+		if _, err := client.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	registrar := NewSafekeeperRegistrar(client, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), namespace)
+	found, err := registrar.discover(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || found[0].ID != 5 {
+		t.Fatalf("discovered %+v, want only safekeeper 5", found)
+	}
+	// No version label at all: upstream's sentinel for a record it has not posted before.
+	if found[0].Version != safekeeperVersionUnknown {
+		t.Errorf("version = %d, want %d", found[0].Version, safekeeperVersionUnknown)
+	}
+}
+
+// The controller answering one record badly says nothing about the rest, so every safekeeper is
+// attempted and the failure is reported rather than swallowed.
+func TestSafekeeperRegisterPostsEveryRecord(t *testing.T) {
+	ctx := context.Background()
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := newNamespace(t, client)
+
+	for _, id := range []string{"1", "2", "3"} {
+		service := safekeeperService("sk-"+id, map[string]string{labelSafekeeperID: id}, namedPorts()...)
+		if _, err := client.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var (
+		mu       sync.Mutex
+		received []neon.SafekeeperUpsert
+	)
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body neon.SafekeeperUpsert
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		received = append(received, body)
+		mu.Unlock()
+		if body.ID == 2 {
+			http.Error(w, "no", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer controller.Close()
+
+	storcon, err := neon.NewStorageController(controller.URL, "", controller.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrar := NewSafekeeperRegistrar(client, storcon, slog.New(slog.NewTextHandler(io.Discard, nil)), namespace)
+
+	if err := registrar.register(ctx); err == nil {
+		t.Fatal("a rejected record was reported as success")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 3 {
+		t.Fatalf("posted %d records, want all 3 attempted: %+v", len(received), received)
+	}
+	for i, sk := range received {
+		if sk.ID != neon.NodeID(i+1) || sk.Host != fmt.Sprintf("sk-%d.%s.svc.cluster.local", i+1, namespace) {
+			t.Errorf("record %d = %+v", i, sk)
+		}
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,10 +25,17 @@ import (
 )
 
 func main() {
-	// The chart hands pre-minted tokens to components that only ever validate them, so something
-	// has to mint those out of band. It is the same key and the same claims either way.
+	// Every component derives what it needs, so this mints nothing the deployment depends on. It
+	// is here for reaching the storage layer by hand.
 	if len(os.Args) > 1 && os.Args[1] == "token" {
 		if err := printToken(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "derive" {
+		if err := derive(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -100,6 +109,7 @@ func run() error {
 
 	go server.RunSuspender(ctx)
 	go kube.NewCertRoller(client, log, cfg.Namespace, cfg.ProxyDeployment).Run(ctx)
+	go kube.NewSafekeeperRegistrar(client, storcon, log, cfg.Namespace).Run(ctx)
 
 	serve := &http.Server{
 		Addr:              cfg.Listen,
@@ -121,9 +131,8 @@ func run() error {
 	return nil
 }
 
-// Supplied rather than generated: every storage component validates against its public half, so
-// the key has to exist before any of them start. Absent, nothing is signed and the storage layer
-// has to be running with auth off.
+// Supplied rather than generated: every storage component validates against its public half, so it
+// must exist before any of them start. Absent, the storage layer has to be running with auth off.
 func storageAuthKey(cfg *config.Config) (*neon.StorageKey, error) {
 	if cfg.AuthKey == "" {
 		return nil, nil
@@ -147,6 +156,46 @@ func signingKey(ctx context.Context, store *registry.Store) (*neon.SigningKey, e
 		}
 	}
 	return neon.NewSigningKey(seed)
+}
+
+// Writes the files itself because the image has no shell to redirect with, and writes them world
+// readable: the destination is a per-pod emptyDir, already inside one trust boundary.
+func derive(args []string) error {
+	flags := flag.NewFlagSet("neon-ctl derive", flag.ContinueOnError)
+	dir := flags.String("dir", "", "directory to write into")
+	scopes := flags.String("scopes", "", "comma-separated scopes to mint a token for, each written as <scope>.jwt")
+	keyPEM := flags.String("auth-key", os.Getenv("NEON_CTL_AUTH_KEY"), "ed25519 private key as PKCS#8 PEM")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *keyPEM == "" || *dir == "" {
+		return errors.New("auth-key and dir are required")
+	}
+
+	key, err := neon.NewStorageKey([]byte(*keyPEM))
+	if err != nil {
+		return err
+	}
+	public, err := key.PublicKeyPEM()
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(*dir, "public.pem"), public, 0o444); err != nil {
+		return err
+	}
+	for _, scope := range strings.Split(*scopes, ",") {
+		if scope = strings.TrimSpace(scope); scope == "" {
+			continue
+		}
+		token, err := key.Token(neon.StorageClaims{Scope: neon.StorageScope(scope)})
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(*dir, scope+".jwt"), []byte(token), 0o444); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func printToken(args []string) error {
