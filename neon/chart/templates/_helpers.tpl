@@ -116,3 +116,17 @@ it is used rather than minted once and distributed. Deterministic, so no two pod
       name: {{ .root.Values.secretName }}
       key: {{ .key }}
 {{- end }}
+
+{{/*
+Every component that runs one replica. An exclusion rather than a taint: the spot node exists to run
+disposable work, so only what cannot survive being reclaimed has to stay away from it.
+*/}}
+{{ define "neon.singletonAffinity" -}}
+nodeAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: node.kubernetes.io/capacity-type
+            operator: NotIn
+            values: [spot]
+{{- end }}

@@ -1,6 +1,6 @@
 image:
   repository: neondatabase/neon
-  tag: ""
+  tag: "8464"
   pullPolicy: IfNotPresent
 
 # Pre-created, holding every credential under fixed key names. The chart creates no Secret and
@@ -66,10 +66,6 @@ pageservers:
     size: 400Gi
     nodeSelector:
       kubernetes.io/hostname: k3s-compute-272384
-  - id: 2
-    size: 80Gi
-    nodeSelector:
-      kubernetes.io/hostname: k3s-compute-cb3c65
 
 pageserver:
   pgPort: 6400
@@ -113,13 +109,15 @@ proxy:
   httpPort: 7001
   mgmtPort: 7000
   replicas: 2
-  # Cilium LB IPAM assigns and L2-announces this; leave empty to take whatever the pool offers.
-  loadBalancerIP: ""
+  servicePort: 5432
+  # Who may reach the proxy through the gateway's TCP listener. That path skips the gateway's own
+  # Envoy, so its L3 allow-list does not cover this; a CIDR list here is the only narrowing there is.
+  allowFrom: world
   # cert-manager writes the certificate here. neon-ctl restarts the deployment when it is renewed,
   # because the proxy reads it once at startup and has no reload path.
   tls:
     enabled: true
-    issuer: letsencrypt
+    issuer: letsencrypt-cloudflare
     issuerKind: ClusterIssuer
     hostname: pg.internal.haustorium.net
   resources:
@@ -133,9 +131,12 @@ proxy:
 ctl:
   image:
     repository: ghcr.io/hzhou0/neon-ctl
-    tag: "0.1.0"
+    tag: "sha-709c9e2"
     pullPolicy: IfNotPresent
   port: 8080
+  # Publishes the branch API on the gateway. Empty leaves it reachable only from inside the
+  # namespace, which is enough if branches are only ever created by something in-cluster.
+  hostname: neon.internal.haustorium.net
   # A cold start is a basebackup, so this scales with working-set size.
   wakeTimeout: 90s
   # Zero never suspends.
@@ -211,12 +212,18 @@ computePodTemplate:
         emptyDir:
           sizeLimit: 20Gi
 
+# The shared gateway that forwards Postgres to the proxy. Its listener must name this namespace,
+# and the namespace must be one the gateway is allowed to reach on the return hop.
+gateway:
+  name: internal
+  namespace: cilium-gateway
+  sectionName: postgres
+
 # Namespaces granted reach to the proxy. Everything else is refused by the cluster-wide east-west
 # default deny.
 accessGrants: []
 
 monitoring:
-  namespace: monitoring
   serviceMonitor:
     enabled: true
     interval: 30s

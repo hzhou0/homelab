@@ -10,8 +10,12 @@ metadata:
     {{- include "neon.labels" $ctx | nindent 4 }}
 spec:
   secretName: {{ $fullname }}-tls
+  # Neon reads the subject CN, strips a `*.` prefix, and treats what remains as the suffix a branch
+  # name sits under. Without the CN it cannot tell a branch from the rest of the hostname.
+  commonName: "*.{{ $.Values.proxy.tls.hostname }}"
   dnsNames:
-    - {{ $.Values.proxy.tls.hostname }}
+    - "*.{{ $.Values.proxy.tls.hostname }}"
+    - {{ $.Values.proxy.tls.hostname | quote }}
   issuerRef:
     name: {{ $.Values.proxy.tls.issuer }}
     kind: {{ $.Values.proxy.tls.issuerKind }}
@@ -101,18 +105,33 @@ metadata:
   labels:
     {{- include "neon.labels" $ctx | nindent 4 }}
 spec:
-  # Clients speak the Postgres wire protocol, so this is an L4 address from Cilium LB IPAM rather
-  # than a route through the HTTP gateway.
-  type: LoadBalancer
-  {{- with $.Values.proxy.loadBalancerIP }}
-  loadBalancerIP: {{ . }}
-  {{- end }}
+  type: ClusterIP
   selector:
     {{- include "neon.selectorLabels" $ctx | nindent 4 }}
   ports:
     - name: pg
-      port: 5432
+      port: {{ $.Values.proxy.servicePort }}
       targetPort: pg
+---
+# The gateway forwards this port byte-for-byte rather than reading it: Postgres upgrades to TLS
+# mid-connection, so there is no ClientHello for an SNI router to match, and the proxy needs the
+# name anyway to pick a branch out of it.
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "neon.labels" $ctx | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ $.Values.gateway.name }}
+      namespace: {{ $.Values.gateway.namespace }}
+      sectionName: {{ $.Values.gateway.sectionName }}
+  rules:
+    - backendRefs:
+        - name: {{ $fullname }}
+          port: {{ $.Values.proxy.servicePort }}
 ---
 apiVersion: v1
 kind: Service

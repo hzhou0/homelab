@@ -12,8 +12,8 @@ import (
 	"github.com/hzhou0/homelab/neon/ctl/internal/neon"
 )
 
-// The one inbound path that changes what a running compute is told. A rejected token answers 403
-// deliberately: the controller never retries that, and it never would succeed.
+// A rejected token answers 403 deliberately: the storage controller never retries that status, and
+// a token that does not verify never would succeed.
 func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 	if s.storageAuth == nil {
 		return true
@@ -30,13 +30,22 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	// Admin only. Every compute holds a tenant-scoped token, and one of those must not be able to
-	// repoint the storage of every other compute.
+	// repoint the storage of every other compute or edit branches it does not own.
 	if claims.Scope != neon.ScopeAdmin {
 		s.log.Warn("rejected a notification", "scope", claims.Scope)
 		writeError(w, http.StatusForbidden, "token is not admin-scoped")
 		return false
 	}
 	return true
+}
+
+func (s *Server) adminOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(w, r) {
+			return
+		}
+		next(w, r)
+	}
 }
 
 // The controller never retries 400, 401 or 403, so a transient failure returned as one leaves a

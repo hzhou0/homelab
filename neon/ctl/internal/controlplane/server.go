@@ -76,13 +76,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"/wake_compute", s.handleWakeCompute)
 	mux.HandleFunc("GET "+base+"/endpoints/{endpoint}/jwks", s.handleEndpointJWKS)
 
-	mux.HandleFunc("GET /api/branches", s.handleListBranches)
-	mux.HandleFunc("POST /api/branches", s.handleCreateBranch)
-	mux.HandleFunc("GET /api/branches/{name}", s.handleGetBranch)
-	mux.HandleFunc("PATCH /api/branches/{name}", s.handlePatchBranch)
-	mux.HandleFunc("DELETE /api/branches/{name}", s.handleDeleteBranch)
-	mux.HandleFunc("POST /api/branches/{name}/start", s.handleStartBranch)
-	mux.HandleFunc("POST /api/branches/{name}/stop", s.handleStopBranch)
+	// The only routes reachable from outside the namespace, so they are the only ones that carry
+	// their own admission rather than resting on the network fence.
+	mux.HandleFunc("GET /api/branches", s.adminOnly(s.handleListBranches))
+	mux.HandleFunc("POST /api/branches", s.adminOnly(s.handleCreateBranch))
+	mux.HandleFunc("GET /api/branches/{name}", s.adminOnly(s.handleGetBranch))
+	mux.HandleFunc("PATCH /api/branches/{name}", s.adminOnly(s.handlePatchBranch))
+	mux.HandleFunc("DELETE /api/branches/{name}", s.adminOnly(s.handleDeleteBranch))
+	mux.HandleFunc("POST /api/branches/{name}/start", s.adminOnly(s.handleStartBranch))
+	mux.HandleFunc("POST /api/branches/{name}/stop", s.adminOnly(s.handleStopBranch))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

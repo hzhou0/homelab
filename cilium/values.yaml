@@ -133,6 +133,13 @@ gateway:
   gatewayClassName: cilium
   hostname: "*.internal.haustorium.net"
 
+  # Ports forwarded byte-for-byte to one namespace each, for protocols the HTTP listeners cannot
+  # carry. The hostname wildcard already answers for them at any depth, so they need no record.
+  tcpListeners:
+    - name: postgres
+      port: 5432
+      namespace: neon
+
   tlsSecretName: internal-haustorium-wildcard-tls
   issuerName: letsencrypt-cloudflare
 
@@ -151,6 +158,7 @@ gateway:
     - app-homepage
     - hypha
     - monitoring
+    - neon
     - seaweedfs
     - tool-filestash
     - tool-headlamp

@@ -1321,3 +1321,51 @@ func TestCreateBranchLeavesAnAdoptedTenantAlone(t *testing.T) {
 		t.Errorf("deleted a tenant the caller supplied: %v", deleted)
 	}
 }
+
+// The branch API is the only surface published outside the namespace, so it must refuse a caller
+// the network fence would otherwise have admitted.
+func TestBranchAPIRequiresAnAdminToken(t *testing.T) {
+	const privateKey = `-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEID/Drmc1AA6U/znNRWpF3zEGegOATQxfkdWxitcOMsIH
+-----END PRIVATE KEY-----
+`
+	storageKey, err := neon.NewStorageKey([]byte(privateKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newStore(t)
+	seedBranch(t, store)
+
+	server := newTestServer(t, newFakeStorcon(t), store, newFakeRuntime(), nil)
+	server.storageKey = storageKey
+	server.storageAuth = storageKey.Verifier()
+
+	if got := do(t, server, http.MethodGet, "/api/branches", "").Code; got != http.StatusForbidden {
+		t.Errorf("without a token: status = %d, want 403", got)
+	}
+
+	tenantToken, err := storageKey.Token(neon.StorageClaims{Scope: neon.ScopeTenant})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := doAuthed(t, server, http.MethodGet, "/api/branches", tenantToken).Code; got != http.StatusForbidden {
+		t.Errorf("with a tenant token: status = %d, want 403", got)
+	}
+
+	adminToken, err := storageKey.Token(neon.StorageClaims{Scope: neon.ScopeAdmin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := doAuthed(t, server, http.MethodGet, "/api/branches", adminToken).Code; got != http.StatusOK {
+		t.Errorf("with an admin token: status = %d, want 200", got)
+	}
+}
+
+func doAuthed(t *testing.T, server *Server, method, target, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(method, target, nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	return recorder
+}

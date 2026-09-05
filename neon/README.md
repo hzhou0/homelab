@@ -4,9 +4,7 @@ Postgres with compute and storage separated: data durable in hypha, computes dis
 available when wanted. Open-source Neon ships the storage layer and `compute_ctl` but deliberately
 not a control plane — that is the part Neon Inc. keeps — so this supplies it.
 
-`chart/` is the `homelab-neon` Helm chart and `chart/README.md` owns why it is shaped as it is.
-`ctl/` is `neon-ctl`, the control plane, and `ctl/README.md` owns the behaviour of that code. This
-file is the runbook.
+`chart/` is the `homelab-neon` Helm chart, `ctl/` is `neon-ctl`, the control plane.
 
 Foundational: cluster-admin installs it into the `neon` namespace, not an `app-*`/`tool-*` one, so
 the platform's admission constraints do not apply.
@@ -49,18 +47,30 @@ Nothing is created at install. A branch is a timeline plus a compute pointed at 
 runtime objects `neon-ctl` owns:
 
 ```sh
-curl -X POST http://neon-ctl:8080/api/branches \
-  -H "Authorization: Bearer $(neon-ctl token --scope=admin)" \
+curl -X POST https://neon.internal.haustorium.net/api/branches \
+  -H "Authorization: Bearer $(neon-ctl token --scope=admin --auth-key="$(cat auth.pem)")" \
   -H 'Content-Type: application/json' \
   -d '{"name":"main","roles":[{"name":"app","password":"..."}],
        "databases":[{"name":"appdb","owner":"app"}],"start":true}'
 ```
 
+That host is the only part of `neon-ctl` published on the gateway, and the branch routes are the
+only ones that check a token — the rest answer callers inside the namespace, and one of them serves
+role verifiers to the proxy.
+
 Fork it with `{"name":"dev","parent":"main"}`. A fork inherits its ancestor's Postgres version and
 cannot differ.
 
-Clients connect through the proxy, naming the branch in the SNI hostname, or in the startup options
-when there is no TLS.
+Clients connect to `<branch>.pg.internal.haustorium.net`, which the gateway's own DNS wildcard
+already answers — a DNS wildcard synthesises at any depth, unlike a TLS one, which matches a single
+label and is why the proxy's certificate has to be the wildcard one level below that suffix. The
+proxy takes the branch from the SNI name; a client that cannot send SNI names it in the startup
+options instead.
+
+Postgres is carried on the shared gateway's TCP listener rather than an address of its own. The
+gateway forwards the port without reading it, because the protocol upgrades to TLS mid-connection
+and so offers an SNI router nothing to match on the first byte — and the proxy needs the name
+anyway.
 
 ## Verify
 
@@ -91,21 +101,33 @@ never touches the current kubeconfig context.
 
 ## Operating
 
+**Placement is stated, not scheduled.** Pageservers and safekeepers name their node, because ids
+are permanent and a safekeeper that shares a failure domain with the pageserver its WAL replays into
+defeats the point of a quorum. The singletons instead exclude reclaimable capacity: the spot node
+exists to run disposable work, so a taint would push all of it off, and an exclusion keeps only what
+cannot survive a reclaim away. The proxy is exempt, having replicas and no state.
+
 **Adding a safekeeper** is an entry in `values.yaml` and an upgrade. `neon-ctl` registers it from
-its Service within a minute; until then the controller has not heard of it and a timeline created in
+its Service within 10 seconds; until then the controller has not heard of it and a timeline created in
 that window fails to place.
 
 **Removing one** needs its scheduling policy set through the controller first. Deleting the Service
 stops it being re-registered but does not retire the record.
 
-**Losing the controller database** loses generation numbers, which cannot be rebuilt by scanning.
-Restoring an old dump reintroduces a counter that has already been used. Placement re-converges on
-its own; safekeeper registration does too.
+**The controller database must not be lost.** It holds the generation numbers that fence a stale
+pageserver out of object storage, and losing them is the one failure here that corrupts data
+silently rather than stopping it. A backup does not rescue it: restoring an old dump re-issues
+generations already handed out, which is precisely what the fencing exists to prevent, and
+rebuilding them by scanning object storage is not a supported path. The requirement is that it
+survives, not that it can be restored — hence durable storage rather than a node-local volume. If it
+is rebuilt anyway, placement and safekeeper registration re-converge on their own; generations
+do not.
 
-**The registry is the one thing worth backing up.** It holds branch names and per-branch settings —
-small, and the only state in the system that object storage and the controller cannot reconstruct.
-Losing it loses names, not data. It is held under an exclusive file lock, which is why `neon-ctl`
-runs one replica with a `Recreate` rollout.
+**The registry is what to back up.** Branch names and per-branch settings — small, and the only
+state object storage and the controller cannot reconstruct between them. A stale copy is still
+useful, which is what makes this a backup problem rather than a durability one: losing it loses
+names, not data. It is held under an exclusive file lock, which is why `neon-ctl` runs one replica
+with a `Recreate` rollout.
 
 **An upgrade means re-checking the compute spec.** It is Neon's internal format and changes across
 releases; a rendered spec is pinned as a golden document, so a shape change fails a test rather than

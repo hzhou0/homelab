@@ -63,7 +63,7 @@ Neither phase can label or taint a node — those need the API. From the control
 |---|---|---|
 | `vg=nvme` | server, compute | TopoLVM's lvmd/node DaemonSets and SeaweedFS select on it. The server bootstrap applies this to itself; compute nodes need it applied manually. |
 | `gvisor=true` | every node running gVisor | `utils/gvisor-runtime.yaml`'s RuntimeClass `nodeSelector` |
-| `node.kubernetes.io/capacity-type=spot` | spot nodes **only** | Anti-affinity in `cilium`, `platform`, `cert-manager`, `monitoring`, `opnsense-operator` keeps singletons off reclaimable capacity |
+| `node.kubernetes.io/capacity-type=spot` | spot nodes **only** | Anti-affinity in `cilium`, `platform`, `cert-manager`, `monitoring`, `opnsense-operator`, `hypha`, `zerofs`, `neon` keeps singletons off reclaimable capacity |
 | `node-role=database` + taint `workload=database:NoSchedule` | db | Reserves the node for database workloads |
 
 `capacity-type` is the one that fails silently. It's an *exclusion*, so omitting it doesn't error —

@@ -63,4 +63,20 @@ spec:
       allowedRoutes:
         namespaces:
           from: All
+    {{- range $g.tcpListeners }}
+    # Raw TCP: a protocol whose own TLS is not a ClientHello on the first byte cannot be routed by
+    # SNI. This bypasses Envoy entirely and is forwarded to the backend Service, so neither the L3
+    # allow-list above nor the backend grant applies — the backend admits its own clients.
+    - name: {{ .name }}
+      protocol: TCP
+      port: {{ .port }}
+      allowedRoutes:
+        # No `kinds` here: naming one makes every route that does not name a sectionName get tested
+        # against this listener, and the HTTP routes on this gateway do not name one.
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace }}
+    {{- end }}
 {{- end }}
