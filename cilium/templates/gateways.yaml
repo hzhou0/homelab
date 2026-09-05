@@ -1,72 +1,82 @@
-{{- if .Values.gateway.enabled }}
-{{- $g := .Values.gateway }}
+{{- range $name, $g := .Values.gateways }}
+{{- if $g.enabled }}
+---
 # The ingress label is what the generated per-namespace NetworkPolicies match to admit this gateway.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: {{ $g.namespace }}
   labels:
-    {{ $g.ingressLabel | default "homelab.lab/ingress" }}: "true"
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    {{ $.Values.ingressLabel | default "homelab.lab/ingress" }}: "true"
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
     app.kubernetes.io/part-of: homelab-cilium
 ---
 # Until the ACME order completes the Gateway stays un-programmed for HTTPS — expected on first install.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: {{ $g.name }}-tls
+  name: {{ $name }}-tls
   namespace: {{ $g.namespace }}
   labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
     app.kubernetes.io/part-of: homelab-cilium
 spec:
-  secretName: {{ $g.tlsSecretName }}
+  secretName: {{ $g.tls.secretName }}
   dnsNames:
     - {{ $g.hostname | quote }}
   issuerRef:
-    name: {{ $g.issuerName }}
+    name: {{ $g.tls.issuerName }}
     kind: ClusterIssuer
     group: cert-manager.io
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: {{ $g.name }}
+  name: {{ $name }}
   namespace: {{ $g.namespace }}
   labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
     app.kubernetes.io/part-of: homelab-cilium
   annotations:
-    homelab.lab/hostname: {{ $g.hostname | quote }}
+    {{- with $g.dnsNames }}
+    homelab.lab/hostname: {{ join "," . | quote }}
+    {{- end }}
     {{- if $g.expose }}
     homelab.lab/expose: "true"
+    homelab.lab/protocol: "tcp"
+    homelab.lab/external-port: {{ $g.listenPort | quote }}
+    homelab.lab/internal-port: {{ $g.listenPort | quote }}
     {{- end }}
 spec:
-  gatewayClassName: {{ $g.gatewayClassName | default "cilium" }}
+  gatewayClassName: {{ $g.className | default "cilium" }}
   listeners:
+    # Same-namespace attachment is the whole model: no RoleBinding reaches a gateway namespace, so
+    # nothing a workload deploys can publish itself on any gateway.
     - name: https
       protocol: HTTPS
-      port: 443
+      port: {{ $g.listenPort }}
       hostname: {{ $g.hostname | quote }}
       tls:
         mode: Terminate
         certificateRefs:
           - kind: Secret
-            name: {{ $g.tlsSecretName }}
+            name: {{ $g.tls.secretName }}
       allowedRoutes:
         namespaces:
-          from: All
+          from: Same
+    {{- with $g.plaintextPort }}
     - name: http
       protocol: HTTP
-      port: 80
+      port: {{ . }}
       hostname: {{ $g.hostname | quote }}
       allowedRoutes:
         namespaces:
-          from: All
+          from: Same
+    {{- end }}
     {{- range $g.tcpListeners }}
     # Raw TCP: a protocol whose own TLS is not a ClientHello on the first byte cannot be routed by
     # SNI. This bypasses Envoy entirely and is forwarded to the backend Service, so neither the L3
-    # allow-list above nor the backend grant applies — the backend admits its own clients.
+    # allow-list nor the backend grant applies — the backend admits its own clients.
     - name: {{ .name }}
       protocol: TCP
       port: {{ .port }}
@@ -79,4 +89,5 @@ spec:
             matchLabels:
               kubernetes.io/metadata.name: {{ .namespace }}
     {{- end }}
+{{- end }}
 {{- end }}
