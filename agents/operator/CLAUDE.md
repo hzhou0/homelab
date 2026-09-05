@@ -23,8 +23,8 @@ task touches that component:
 - `references/cilium.md` — the `cilium` chart: CNI + service mesh (Gateway API), the single
   shared ingress Gateway for `*.internal.haustorium.net`, and the LoadBalancer stack (Cilium LB
   IPAM + L2 announcements — what assigns and announces LoadBalancer IPs; MetalLB was replaced).
-  Read this to attach an app to the shared Gateway via `HTTPRoute`, or when a UDP service needs
-  its own LoadBalancer IP.
+  Read this before requesting that an app be published, or when a UDP service needs its own
+  LoadBalancer IP.
 - `references/cert-manager.md` — TLS certificate issuance (Let's Encrypt via Cloudflare DNS-01).
   Read this when a deployment needs an HTTPS cert (the shared Gateway already terminates the
   wildcard `*.internal.haustorium.net`).
@@ -65,8 +65,8 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
 ### `app-*` namespaces — applications
 - One namespace per app: `app-<name>`.
 - **Only** `Deployment` for workloads (plus `Service`, `ConfigMap`, `Secret`,
-  `ServiceAccount`, `HorizontalPodAutoscaler`, `PodDisruptionBudget`, `PersistentVolumeClaim`,
-  `Ingress`/`HTTPRoute`). No StatefulSet/DaemonSet/Job/CronJob, no bare Pods.
+  `ServiceAccount`, `HorizontalPodAutoscaler`, `PodDisruptionBudget`, `PersistentVolumeClaim`).
+  No StatefulSet/DaemonSet/Job/CronJob, no bare Pods, and no routes of any kind.
 - Every Deployment's **pod template** must carry the label `homelab.lab/runtime` set to the
   app's language (one of the `runtime-profiles` keys, e.g. `go`, `node`, `python`, `jvm`,
   `rust`, `static`).
@@ -149,19 +149,17 @@ requires something only a foundational chart can grant:
 - **A workload that needs node-local storage** → it does not belong in either tier; request it be
   codified as a foundational chart.
 - **A quota that's too small** → request a larger tier quota.
-- **A new namespace that serves traffic through the shared Gateway** → request it be added to
-  the `cilium` chart's `gateway.backendNamespaces`. Every first deployment into a fresh
-  namespace needs this, and nothing you can create substitutes for it.
-- **A service that must be reachable from the internet** → request a route on the public Gateway.
-  You cannot create one: it admits routes only from its own namespace, which you have no access to,
-  and every `HTTPRoute` you can write attaches to the internal Gateway alone.
+- **Anything that must serve traffic** → request a route in the `cilium` chart. That one entry is
+  also what unfences the namespace to the Gateway, so there is nothing else to ask for. You cannot
+  publish anything yourself: every Gateway admits routes only from its own namespace, which you have
+  no access to, and route kinds are refused to you outright.
 
 These are deliberate, auditable changes a human applies via `helm upgrade`. Your role is to
 deploy within the rules and surface the precise change when the rules need to move.
 
-**The 503 that is not your bug.** Until that grant lands, a namespace's route is accepted and
-its traffic is dropped: `HTTPRoute` shows `Accepted` + `ResolvedRefs`, the Service has ready
-endpoints, the pods are healthy, and every request through the Gateway returns 503. Don't
-re-roll the Deployment chasing it. Confirm with `kubectl -n <ns> port-forward svc/<svc>` —
-that path bypasses the mesh, so a working response there means the workload is fine and the
-missing grant is the whole problem. Escalate at that point.
+**The 503 that is not your bug.** Until that grant lands, a route is accepted and its traffic is
+dropped: the route shows `Accepted` + `ResolvedRefs`, the Service has ready endpoints, the pods are
+healthy, and every request through the Gateway returns 503. Don't re-roll the Deployment chasing it.
+Confirm with `kubectl -n <ns> port-forward svc/<svc>` — that path bypasses the mesh, so a working
+response there means the workload is fine and the missing grant is the whole problem. Escalate at
+that point.

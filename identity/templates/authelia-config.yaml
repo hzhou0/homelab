@@ -1,0 +1,72 @@
+{{- $ctx := dict "root" $ "component" "authelia" }}
+{{- $fullname := include "identity.fullname" $ctx }}
+{{- $redis := include "identity.fullname" (dict "root" $ "component" "redis") }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+data:
+  configuration.yml: |
+    theme: 'dark'
+    server:
+      address: 'tcp://0.0.0.0:{{ include "identity.portalPort" $ }}'
+      # Its own healthcheck writes a file next to the binary, which a read-only root filesystem
+      # refuses; the probe here is the kubelet's.
+      disable_healthcheck: true
+      endpoints:
+        authz:
+          ext-authz:
+            implementation: 'ExtAuthz'
+            # Only the last strategy answers a request that authenticated nowhere, so this order
+            # is what gives a browser the portal and a script a challenge.
+            authn_strategies:
+              - name: 'HeaderAuthorization'
+                schemes: ['Basic', 'Bearer']
+              - name: 'CookieSession'
+    log:
+      level: 'info'
+      format: 'json'
+    telemetry:
+      metrics:
+        enabled: true
+        address: 'tcp://0.0.0.0:{{ include "identity.metricsPort" $ }}'
+    authentication_backend:
+      password_reset:
+        disable: true
+      refresh_interval: '5m'
+      ldap:
+        implementation: 'lldap'
+        address: '{{ include "identity.ldapURL" $ }}'
+        base_dn: '{{ $.Values.lldap.baseDN }}'
+        user: 'uid=admin,ou=people,{{ $.Values.lldap.baseDN }}'
+    access_control:
+      default_policy: '{{ $.Values.authelia.accessControl.defaultPolicy }}'
+      rules:
+        {{- toYaml $.Values.authelia.accessControl.rules | nindent 8 }}
+    session:
+      name: 'authelia_session'
+      same_site: 'lax'
+      expiration: '{{ $.Values.authelia.session.expiration }}'
+      inactivity: '{{ $.Values.authelia.session.inactivity }}'
+      remember_me: '{{ $.Values.authelia.session.rememberMe }}'
+      cookies:
+        - domain: '{{ $.Values.domain }}'
+          authelia_url: 'https://{{ include "identity.portalHost" $ }}'
+      redis:
+        host: '{{ $redis }}'
+        port: {{ include "identity.redisPort" $ }}
+    regulation:
+      max_retries: 3
+      find_time: '2m'
+      ban_time: '5m'
+    storage:
+      local:
+        path: '/data/db.sqlite3'
+    # Required to be configured and deliberately never used: nothing here sends mail, and every
+    # flow that would is either disabled or unreachable.
+    notifier:
+      filesystem:
+        filename: '/data/notification.txt'

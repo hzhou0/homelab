@@ -33,6 +33,9 @@ minor conformance-tests against; a mismatch surfaces as Gateways never reconcili
 install error. TCPRoute/UDPRoute are opt-in — Cilium disables L4 routing entirely when those CRDs
 are absent, and will not accept a Gateway that mixes them with HTTP/GRPC/TLS routes.
 
+The **experimental** channel is required, because the `ExternalAuth` HTTPRoute filter the ingress
+uses for centralized auth exists only there.
+
 `kubeProxyReplacement` requires k3s to run without its own kube-proxy, and Cilium must be pointed at
 a routable API server address rather than the loopback one k3s's kubeconfig carries, or agent nodes
 can't reach it.
@@ -72,9 +75,8 @@ so a node on wifi is not subject to the lockdown.
 
 ## Hubble (observability)
 
-`hubble.enabled` + `relay` + `ui` are on. The UI is exposed through the shared Gateway at
-`hubble.internal.haustorium.net` (see `hubble-ui-route.yaml` + `gateway.hubbleUI` in
-`values.yaml`), gated by the gateway's `allowedCIDRs`.
+`hubble.enabled` + `relay` + `ui` are on. The UI is published like anything else — an entry in a
+gateway's route list, behind the same authorization filter and the same L3 allow-list.
 
 ## WireGuard remote-access tunnel
 
@@ -148,48 +150,58 @@ HTTP:80 for `*.internal.haustorium.net`, `allowedRoutes.from: All`.
   proxy* and *`ingress` proxy → backends* — both using the reserved `ingress` identity that
   vanilla k8s `NetworkPolicy` cannot select. This chart ships two `CiliumClusterwideNetworkPolicy`s
   (`gateway-ingress-policy.yaml`): `allow-clients-to-gateway-ingress` (gated by `allowedCIDRs`)
-  and `allow-gateway-ingress-to-backends`, an **explicit allow-list of backend namespaces**
-  (`gateway.backendNamespaces`).
-- **A route into an unlisted namespace is dead.** The reverse hop is deliberately not granted
-  cluster-wide, so exposing a new namespace takes a human editing this chart's values and
-  upgrading the release — the workload's own manifests cannot grant it, and neither can the
-  namespace's generated ingress NetworkPolicy, whose `namespaceSelector` can never match the
-  reserved identity Envoy re-identifies proxied traffic as. It fails silently in the direction
+  and `allow-gateway-ingress-to-backends`, whose namespaces are **derived from what the gateways
+  serve** — every route's backend plus every TCP listener's target.
+- **A namespace nothing routes to is unreachable.** The reverse hop is deliberately not granted
+  cluster-wide, and because it is derived, it cannot drift from the route list or outlive it. A
+  workload's own manifests cannot grant it, and neither can the namespace's generated ingress
+  NetworkPolicy, whose `namespaceSelector` can never match the reserved identity Envoy
+  re-identifies proxied traffic as. It fails silently in the direction
   that misleads: the `HTTPRoute` reports `Accepted` and `ResolvedRefs`, the Service has healthy
   endpoints, and every request still returns **503**. Reaching the Service directly (a
   port-forward, which bypasses the mesh) is the check that separates this from a broken app.
+- **Every route lives here.** Both Gateways admit routes only from their own namespace, so nothing
+  a workload deploys can publish itself, and the route list in this chart's values is the whole of
+  what the cluster serves. Each entry also renders the backend namespace's consent to being routed
+  to, so publishing and being published to are one edit rather than two that can disagree.
+- **Authorization is a filter on the route, not a proxy in the path.** The Gateway API
+  `ExternalAuth` filter compiles to an Envoy `ext_authz` call, so a route names an authorization
+  service and Envoy asks it before proxying. It is attached to every route rendered here unless the
+  entry opts out, which is what makes an unauthenticated route a visible decision rather than an
+  omission — no admission rule enforces it, because nothing else can write a route.
 - **TLS:** cert-manager `Certificate` for `*.internal.haustorium.net` via `letsencrypt-cloudflare`
   (from the `cert-manager` chart — install that first).
-- **L3 whitelist:** `gateway.allowedCIDRs` restricts the front door to known hosts before TLS
-  or route processing; an empty list falls back to open (`world + cluster`).
+- **L3 whitelist:** each gateway's `allowedCIDRs` restricts the front door to known hosts before
+  TLS or route processing; an empty list falls back to open (`world + cluster`).
 
-## The public Gateway
+## Gateways
 
-A second `Gateway`, off unless `publicGateway.enabled`, is the only path from the internet to a
-cluster service. It is deliberately a separate object rather than WAN exposure switched on for the
-internal one, because the two differ in who may attach a route — and that is the whole boundary.
+`gateways` is a map, and every entry has the same shape: a namespace of its own, a hostname, a
+pinned address, an L3 allow-list, and the routes it serves. What separates the public one from the
+internal one is which addresses reach it and what its route list contains — not a different set of
+knobs.
 
-- **Attachment is the gate, not the network.** Cilium proxies both Gateways through the same
+- **Attachment is the gate, not the network.** Cilium proxies every Gateway through the same
   per-node Envoy under one reserved `ingress` identity, and the proxy hop replaces the client
-  address, so no `CiliumNetworkPolicy` — CIDR, entity or otherwise — can tell public traffic from
-  internal once it leaves Envoy. The reverse-hop backend allow-list is therefore shared between the
-  two Gateways and separates nothing.
-- **What does separate them** is `allowedRoutes.namespaces.from: Same`: a route must live in the
-  public Gateway's own namespace, where the operator ServiceAccount holds no RoleBinding (its deploy
-  rights are generated only into `app-*`/`tool-*`) and cannot create a `ReferenceGrant` anywhere.
-  Publishing a service is a cluster-admin edit here, and nothing a workload writes for itself
-  reaches the front door. Each `publicGateway.routes` entry renders the route plus the
-  `ReferenceGrant` by which its backend namespace consents.
-- **The front door widens for both.** Admitting the internet on the shared `ingress` identity
-  admits it to the internal Gateway's listener as well, so the allow excepts private space and LAN
-  clients stay subject to `gateway.allowedCIDRs`. Separation on the destination side is the
-  firewall's, not Cilium's: nothing translates or routes to the internal Gateway. That is also why
-  the internal Gateway is left v4-only — a globally routable address would leave it one WAN rule
-  away from the internet, where today there is no address to route to at all. The public Gateway
-  instead pins one address of each family out of the bottom of the v6 prefix, and its exposure
-  annotation is what asks the firewall to admit the v6 half. Scoping the front-door allow by
-  listener port instead would hold only while a v4 port-forward is doing the remapping.
-- **DNS stays manual.** The public name is a registrar record aimed at the WAN address; nothing
-  here publishes it. `publicGateway.internalDnsNames` optionally spares LAN clients the hairpin via
-  Unbound, one name at a time — a wildcard there would shadow every name in the public zone,
+  address, so no `CiliumNetworkPolicy` — CIDR, entity or otherwise — can tell one Gateway's traffic
+  from another's once it leaves Envoy. The reverse-hop backend allow is therefore shared between
+  them and separates nothing.
+- **What does separate them** is `allowedRoutes.namespaces.from: Same` on every listener: a route
+  must live in its Gateway's own namespace, where the operator ServiceAccount holds no RoleBinding
+  (its deploy rights are generated only into `app-*`/`tool-*`) and cannot create a `ReferenceGrant`
+  anywhere. Publishing anything is a cluster-admin edit here, and nothing a workload writes for
+  itself reaches any front door. Each route entry renders the route, the `ReferenceGrant` by which
+  its backend namespace consents, and the authorization filter — unless the entry opts out.
+- **The front door widens for everyone.** Admitting the internet on the shared `ingress` identity
+  admits it to every listener, so the public entry's allow excepts private space and LAN clients
+  stay subject to the internal entry's list. Separation on the destination side is the firewall's,
+  not Cilium's: nothing translates or routes to the internal address. That is also why the internal
+  Gateway is left v4-only — a globally routable address would leave it one WAN rule away from the
+  internet, where today there is no address to route to at all. The public one instead pins an
+  address of each family out of the bottom of the v6 prefix, and its exposure annotation is what
+  asks the firewall to admit the v6 half. Scoping the front-door allow by listener port instead
+  would hold only while a v4 port-forward is doing the remapping.
+- **DNS stays manual for the public zone.** Its name is a registrar record aimed at the WAN
+  address; nothing here publishes it. A gateway's `dnsNames` become Unbound overrides — a wildcard
+  is right for the internal zone and wrong for the public one, where it would shadow every name
   including those that resolve outside the cluster.

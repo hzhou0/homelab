@@ -21,11 +21,12 @@ spec:
       enabled: false
   matchConstraints:
     resourceRules:
-      # HTTPRoute/GRPCRoute are deliberately NOT listed — those are the sanctioned attach path.
+      # Routes included: the shared Gateways accept attachment only from their own namespace, so
+      # publishing is an edit to the cilium chart and never a workload's own manifest.
       - apiGroups: ["gateway.networking.k8s.io"]
         apiVersions: ["v1", "v1alpha2", "v1beta1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["gateways", "gatewayclasses", "tcproutes"]
+        resources: ["gateways", "gatewayclasses", "tcproutes", "httproutes", "grpcroutes"]
       - apiGroups: ["cilium.io"]
         apiVersions: ["v2", "v2alpha1"]
         operations: ["CREATE", "UPDATE", "DELETE"]

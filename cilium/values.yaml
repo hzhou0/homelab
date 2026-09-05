@@ -99,15 +99,6 @@ loadBalancer:
     name: v4
     start: "10.0.0.101"
     stop: "10.0.0.150"
-  # The gateway Service has no endpoints (Envoy is fronted by Cilium's BPF), so it needs a
-  # dedicated single-IP pool.
-  gatewayPool:
-    name: gateway-pool
-    ip: "10.0.0.100"
-  publicGatewayPool:
-    name: public-gateway-pool
-    ip: "10.0.0.99"
-    v6: "2001:569:5bc1:7f00:ffff::1"
   # Starts above the gateway slice at the bottom of the prefix, which is pinned per Gateway.
   v6Pool:
     name: v6
@@ -123,84 +114,138 @@ loadBalancer:
     interfaces: []
 
 # ---------------------------------------------------------------------------
-# Single shared ingress Gateway
+# Ingress Gateways
 # ---------------------------------------------------------------------------
-gateway:
+# One entry per Gateway, every entry the same shape. Each admits routes only from its own namespace,
+# so its route list is the whole of what it serves and publishing anything is an edit here.
+ingressLabel: homelab.lab/ingress
+
+# The authorization service a route's filter asks before proxying. Every gateway namespace is
+# granted a reference to it; a route opts out per entry.
+externalAuth:
   enabled: true
-  name: internal
-  namespace: cilium-gateway
-  ingressLabel: homelab.lab/ingress
-  gatewayClassName: cilium
-  hostname: "*.internal.haustorium.net"
+  namespace: identity
+  service: identity-authelia
+  port: 9091
 
-  # Ports forwarded byte-for-byte to one namespace each, for protocols the HTTP listeners cannot
-  # carry. The hostname wildcard already answers for them at any depth, so they need no record.
-  tcpListeners:
-    - name: postgres
-      port: 5432
-      namespace: neon
-
-  tlsSecretName: internal-haustorium-wildcard-tls
-  issuerName: letsencrypt-cloudflare
-
-  expose: false
-
-  # L3 ingress allow-list: only these source IPs may reach the gateway's Envoy front door.
-  # An empty list falls back to world + cluster (open). Use /32 for single hosts.
-  allowedCIDRs:
-    - 10.0.0.232/32
-    - 10.0.1.140/32
-    - 10.0.1.148/32
-
-  # Backends the gateway may reach on the reverse hop. A fenced namespace is unreachable from the
-  # gateway until listed here.
-  backendNamespaces:
-    - app-homepage
-    - hypha
-    - monitoring
-    - neon
-    - seaweedfs
-    - tool-filestash
-    - tool-headlamp
-    - app-memos
-    - app-navidrome
-
-  hubbleUI:
+gateways:
+  internal:
     enabled: true
-    hostname: hubble.internal.haustorium.net
+    namespace: cilium-gateway
+    className: cilium
+    hostname: "*.internal.haustorium.net"
+    listenPort: 443
+    # A plaintext listener beside the TLS one. Empty serves HTTPS only.
+    plaintextPort: 80
+    tls:
+      secretName: internal-haustorium-wildcard-tls
+      issuerName: letsencrypt-cloudflare
+    # The Gateway Service has no endpoints (Envoy is fronted by Cilium's BPF), so it needs its own
+    # single-IP pool rather than a slice of the general one.
+    address:
+      poolName: gateway-pool
+      ip: "10.0.0.100"
+      v6: ""
+    # Turned into overrides on the LAN resolver. A wildcard answers for every route below at once.
+    dnsNames: ["*.internal.haustorium.net"]
+    # No WAN forward: this address answers on the LAN only.
+    expose: false
+    # Who may reach the front door, as CIDRs with optional exceptions. Empty admits world + cluster.
+    allowedCIDRs:
+      - cidr: 10.0.0.232/32
+      - cidr: 10.0.1.140/32
+      - cidr: 10.0.1.148/32
+    # Ports forwarded byte-for-byte to one namespace each, for protocols the HTTP listeners cannot
+    # carry. The hostname wildcard already answers for them at any depth, so they need no record.
+    tcpListeners:
+      - name: postgres
+        port: 5432
+        namespace: neon
+    routes:
+      - name: homepage
+        hostname: home.internal.haustorium.net
+        backend: {namespace: app-homepage, name: homepage, port: 80}
+      - name: memos
+        hostname: memos.internal.haustorium.net
+        backend: {namespace: app-memos, name: memos, port: 80}
+      - name: navidrome
+        hostname: navidrome.internal.haustorium.net
+        backend: {namespace: app-navidrome, name: navidrome, port: 80}
+      - name: filebrowser
+        hostname: music-files.internal.haustorium.net
+        backend: {namespace: app-navidrome, name: filebrowser, port: 80}
+      - name: hypha-cached
+        hostname: s3.internal.haustorium.net
+        backend: {namespace: hypha, name: hypha-cached, port: 8014}
+        externalAuth: false
+        # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
+        requestTimeout: 0s
+      - name: hypha-durable
+        hostname: s3-direct.internal.haustorium.net
+        backend: {namespace: hypha, name: hypha-durable, port: 8014}
+        externalAuth: false
+        # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
+        requestTimeout: 0s
+      - name: identity-authelia
+        hostname: auth.internal.haustorium.net
+        backend: {namespace: identity, name: identity-authelia, port: 9091}
+        externalAuth: false
+      - name: identity-lldap
+        hostname: users.internal.haustorium.net
+        backend: {namespace: identity, name: identity-lldap, port: 17170}
+      - name: hubble-ui
+        hostname: hubble.internal.haustorium.net
+        backend: {namespace: kube-system, name: hubble-ui, port: 80}
+      - name: policy-reporter-ui
+        hostname: kyverno.internal.haustorium.net
+        backend: {namespace: kyverno, name: policy-reporter-ui, port: 8080}
+      - name: grafana
+        hostname: grafana.internal.haustorium.net
+        backend: {namespace: monitoring, name: homelab-monitoring-grafana, port: 80}
+      - name: prometheus
+        hostname: prometheus.internal.haustorium.net
+        backend: {namespace: monitoring, name: homelab-monitoring-kube-pr-prometheus, port: 9090}
+      - name: seaweedfs-master
+        hostname: seaweedfs.internal.haustorium.net
+        backend: {namespace: seaweedfs, name: homelab-seaweedfs-master, port: 9333}
+      - name: seaweedfs-filer
+        hostname: seaweedfs-filer.internal.haustorium.net
+        backend: {namespace: seaweedfs, name: homelab-seaweedfs-filer, port: 8888}
+      - name: filestash
+        hostname: files.internal.haustorium.net
+        backend: {namespace: tool-filestash, name: filestash, port: 80}
+      - name: headlamp
+        hostname: headlamp.internal.haustorium.net
+        backend: {namespace: tool-headlamp, name: headlamp, port: 80}
 
-# ---------------------------------------------------------------------------
-# Public (WAN-exposed) ingress Gateway
-# ---------------------------------------------------------------------------
-# Routes may attach only from this Gateway's own namespace, which no operator RoleBinding reaches:
-# publishing to the internet is a cluster-admin edit here, never a workload's own manifest.
-publicGateway:
-  enabled: true
-  name: public
-  namespace: cilium-gateway-public
-  ingressLabel: homelab.lab/ingress
-  gatewayClassName: cilium
-  hostname: "*.haustorium.net"
-
-  tlsSecretName: haustorium-wildcard-tls
-  issuerName: letsencrypt-cloudflare
-
-  expose: true
-  listenPort: 443
-
-  # Unbound overrides sparing LAN clients the WAN hairpin. Never a wildcard: it would shadow every
-  # name in the public zone, including those that resolve outside the cluster.
-  internalDnsNames: []
-
-  # Each entry renders a route here plus the ReferenceGrant its backend namespace must publish, and
-  # grants that namespace on the reverse hop.
-  routes: []
-    # - name: homepage
-    #   hostname: home.haustorium.net
-    #   backend:
-    #     namespace: app-homepage
-    #     name: homepage
-    #     port: 3000
+  # The authorization service a published route sends its subrequest to. Every namespace that may
+  # hold a route is granted a reference to it.
+  public:
+    enabled: true
+    namespace: cilium-gateway-public
+    className: cilium
+    hostname: "*.haustorium.net"
+    listenPort: 443
+    plaintextPort: ""
+    tls:
+      secretName: haustorium-wildcard-tls
+      issuerName: letsencrypt-cloudflare
+    address:
+      poolName: public-gateway-pool
+      ip: "10.0.0.99"
+      v6: "2001:569:5bc1:7f00:ffff::1"
+    # Never a wildcard: it would shadow every name in the public zone, including those that resolve
+    # outside the cluster.
+    dnsNames: []
+    expose: true
+    allowedCIDRs:
+      # Private space is excepted so LAN clients stay subject to the internal gateway's list.
+      - cidr: "0.0.0.0/0"
+        except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"]
+      - cidr: "::/0"
+        except: ["fc00::/7", "fe80::/10", "::1/128"]
+    tcpListeners: []
+    routes: []
 
 # ---------------------------------------------------------------------------
 # WireGuard remote-access tunnel

@@ -9,7 +9,8 @@ SeaweedFS cache (`homelab-seaweedfs`) and an age-encrypted copy on an off-site S
 ## Deployments
 
 One release. Each entry in `deployments` (`chart/values.yaml`) gets its own process, StatefulSet,
-Service, HTTPRoute, ConfigMap, dashboard and alerts, named `<release>-<key>`. **The prefixes must
+Service, ConfigMap, dashboard and alerts, named `<release>-<key>`; its route is in the `cilium`
+chart, published unauthenticated because SigV4 authenticates the caller already. **The prefixes must
 differ** — that is what keeps the deployments' backend buckets disjoint on a shared account.
 
 | Key | Resources | `mode` | `bucketPrefix` | Hostname | Acks on |
@@ -24,7 +25,7 @@ never mix.
 
 - Kubernetes 1.30+ (the `preStop` `sleep` handler).
 - The Secret below, created before install.
-- `hypha` in the cilium chart's `gateway.backendNamespaces`.
+- A route for each deployment in the cilium chart, which is also what makes the namespace reachable.
 - `hypha` in the seaweedfs chart's `accessGrants` for the S3, master and volume ports.
 
 ## Secrets

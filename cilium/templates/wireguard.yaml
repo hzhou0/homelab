@@ -178,19 +178,13 @@ spec:
     egress: true
     ingress: false
   egress:
-    {{- if .Values.gateway.backendNamespaces }}
+    {{- with (splitList "," (include "cilium.gatewayBackends" .) | compact) }}
+    # A peer sits where a LAN admin sits, so it reaches what the gateways serve and nothing else.
     - toEndpoints:
-        {{- range $ns := .Values.gateway.backendNamespaces }}
+        {{- range $ns := . }}
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns | quote }}
         {{- end }}
-    {{- end }}
-    {{- if .Values.gateway.hubbleUI.enabled }}
-    # Scope to the hubble-ui pods, not all of kube-system.
-    - toEndpoints:
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: kube-system
-            k8s:k8s-app: hubble-ui
     {{- end }}
     - toCIDR:
         - {{ printf "%s/32" $wg.lanDNS | quote }}

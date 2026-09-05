@@ -251,12 +251,12 @@ Traffic flows through three layers:
 
 2. **North-south ingress** — The only externally accessible entry point for TCP is a shared `Gateway` object backed by a single LoadBalancer IP (assigned by Cilium LB IPAM, ARP-announced by Cilium L2). Traffic is routed by hostname via `HTTPRoute` objects. No TCP service is exposed via `type: LoadBalancer` directly — all inbound TCP must enter through the Gateway. UDP services that cannot traverse the Gateway each get their own dedicated LoadBalancer IP via `type: LoadBalancer`.
 
-   A second, optional `Gateway` on its own LoadBalancer IP is the one path in from the internet. It
-   differs from the shared internal Gateway in exactly one respect that matters: its listener admits
-   routes only from its own namespace, which no operator RoleBinding reaches. Both Gateways are
-   proxied by the same Envoy under one `reserved:ingress` identity, so no NetworkPolicy can separate
-   their traffic once it leaves the proxy — route attachment, not the network fence, is what decides
-   whether a service is public, and it is a cluster-admin edit to the `cilium` chart.
+   A second, optional `Gateway` on its own LoadBalancer IP is the one path in from the internet.
+   Both admit routes only from their own namespace, which no operator RoleBinding reaches, so every
+   route on either lives in the `cilium` chart. Both are proxied by the same Envoy under one
+   `reserved:ingress` identity, so no NetworkPolicy can separate their traffic once it leaves the
+   proxy — route attachment, not the network fence, is what decides whether a service is reachable
+   at all, and it is a cluster-admin edit.
 
 3. **WAN exposure** — A custom OPNsense operator watches `Gateway` and `Service` objects for the
    `homelab.lab/*` annotations and creates/removes the corresponding WAN port forward rule via the
@@ -267,26 +267,9 @@ Traffic flows through three layers:
 
 This follows the same annotation-driven pattern as the AWS Load Balancer Controller in EKS.
 
-**HTTP/HTTPS (shared gateway):**
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: grafana
-spec:
-  parentRefs:
-  - name: internal
-    namespace: cilium-gateway
-  hostnames: ["grafana.internal.haustorium.net"]
-  rules:
-  - backendRefs:
-    - name: grafana
-      port: 3000
-```
-
-The Gateway itself is owned by the `cilium` chart and already annotated — an `HTTPRoute` attaching to
-it needs no annotations of its own.
+**HTTP/HTTPS (shared gateway):** a workload publishes nothing itself. The route, the backend
+namespace's consent to being routed to, and the authorization filter in front of it are one entry in
+the `cilium` chart's route list, so what the cluster serves can be read off a single file.
 
 **UDP (dedicated IP):**
 

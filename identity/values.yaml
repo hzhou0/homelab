@@ -1,0 +1,72 @@
+# homelab-identity values
+
+# The cookie domain, and so the set of hosts one session covers. Deliberately wider than the
+# gateway below: a session is a person, not a route into the cluster.
+domain: haustorium.net
+
+# The zone the portal and the directory are published under. The routes themselves are in the
+# cilium chart; Authelia still has to know the URL a browser reaches it at.
+publishedDomain: internal.haustorium.net
+
+# Created by hand before install, so nothing sensitive reaches the release history.
+secretName: identity-credentials
+
+monitoring:
+  namespace: monitoring
+
+lldap:
+  image:
+    repository: ghcr.io/lldap/lldap
+    tag: "v0.6.3-alpine"
+    pullPolicy: IfNotPresent
+  baseDN: dc=haustorium,dc=net
+  storage:
+    storageClass: topolvm-provisioner
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+
+redis:
+  image:
+    repository: redis
+    tag: "8.10.1-alpine"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 192Mi
+  nodeSelector: {}
+
+authelia:
+  image:
+    repository: ghcr.io/authelia/authelia
+    tag: "4.39.22"
+    pullPolicy: IfNotPresent
+  storage:
+    storageClass: topolvm-provisioner
+    size: 1Gi
+  session:
+    expiration: 12h
+    inactivity: 1h
+    rememberMe: 1M
+  # A second factor cannot be enrolled without a way to send someone a one-time code, so asking for
+  # one would lock every account out of everything. A rule here narrows the default for a named host.
+  accessControl:
+    defaultPolicy: one_factor
+    rules: []
+      # - domain: s3.internal.haustorium.net
+      #   policy: bypass
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  nodeSelector: {}

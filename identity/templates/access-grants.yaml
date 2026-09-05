@@ -1,0 +1,67 @@
+{{- /*
+Ingress allows layered on the cluster-wide east-west default deny. The gateway's own hop is not
+among them: reaching this namespace at all is granted where every other backend's is.
+*/ -}}
+{{- $authelia := dict "root" $ "component" "authelia" }}
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-{{ include "identity.fullname" (dict "root" $ "component" "lldap") }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" (dict "root" $ "component" "lldap") | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "identity.selectorLabels" (dict "root" $ "component" "lldap") | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            {{- include "identity.selectorLabels" $authelia | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: {{ include "identity.ldapPort" $ | quote }}
+              protocol: TCP
+---
+# A session store reachable without a password is fenced by this and nothing else.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-{{ include "identity.fullname" (dict "root" $ "component" "redis") }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" (dict "root" $ "component" "redis") | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "identity.selectorLabels" (dict "root" $ "component" "redis") | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            {{- include "identity.selectorLabels" $authelia | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: {{ include "identity.redisPort" $ | quote }}
+              protocol: TCP
+{{- with $.Values.monitoring.namespace }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-{{ include "identity.fullname" $authelia }}-metrics
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $authelia | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "identity.selectorLabels" $authelia | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ . }}
+      toPorts:
+        - ports:
+            - port: {{ include "identity.metricsPort" $ | quote }}
+              protocol: TCP
+{{- end }}

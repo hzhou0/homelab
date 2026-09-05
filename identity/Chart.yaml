@@ -1,0 +1,18 @@
+apiVersion: v2
+name: homelab-identity
+description: >-
+  The cluster's front door: Authelia as the policy decision point behind every published route,
+  lldap as the directory it reads, and a standalone Redis holding sessions. Applications receive
+  an already-authenticated identity in request headers and never see a credential. Foundational
+  like cilium/cert-manager — cluster-admin installs it into its own identity namespace, not an
+  app-*/tool-* one.
+type: application
+version: 0.1.0
+appVersion: "4.39.22"
+keywords:
+  - authelia
+  - lldap
+  - ldap
+  - authentication
+  - gateway
+  - homelab

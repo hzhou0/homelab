@@ -1,0 +1,119 @@
+{{- $ctx := dict "root" $ "component" "authelia" }}
+{{- $fullname := include "identity.fullname" $ctx }}
+{{- $redis := include "identity.fullname" (dict "root" $ "component" "redis") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "identity.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ include "identity.portalPort" $ }}
+      targetPort: http
+    - name: metrics
+      port: {{ include "identity.metricsPort" $ }}
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+spec:
+  # One, permanently: Authelia's own storage is SQLite on a ReadWriteOnce volume, which a second
+  # replica would either fail to mount or corrupt.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "identity.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "identity.labels" $ctx | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/authelia-config.yaml") $ | sha256sum }}
+    spec:
+      enableServiceLinks: false
+      {{- with $.Values.authelia.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: authelia
+          image: "{{ $.Values.authelia.image.repository }}:{{ $.Values.authelia.image.tag }}"
+          imagePullPolicy: {{ $.Values.authelia.image.pullPolicy }}
+          # The equals form is routed to a branch of the image's entrypoint that execs the
+          # arguments as a command; only the separated form reaches the binary.
+          args: ["--config", "/config/configuration.yml"]
+          env:
+            - name: AUTHELIA_SESSION_SECRET_FILE
+              value: /secrets/autheliaSessionSecret
+            - name: AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE
+              value: /secrets/autheliaStorageEncryptionKey
+            - name: AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD_FILE
+              value: /secrets/lldapAdminPassword
+          ports:
+            - name: http
+              containerPort: {{ include "identity.portalPort" $ }}
+            - name: metrics
+              containerPort: {{ include "identity.metricsPort" $ }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $.Values.authelia.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+        - name: secrets
+          secret:
+            secretName: {{ $.Values.secretName }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ $.Values.authelia.storage.storageClass }}
+  resources:
+    requests:
+      storage: {{ $.Values.authelia.storage.size }}

@@ -1,0 +1,16 @@
+{{- with .Values.monitoring.namespace }}
+{{- $ctx := dict "root" $ "component" "authelia" }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "identity.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "identity.selectorLabels" $ctx | nindent 6 }}
+  endpoints:
+    - port: metrics
+{{- end }}

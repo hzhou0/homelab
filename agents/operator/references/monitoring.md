@@ -4,8 +4,8 @@
 
 Prometheus + Grafana for the homelab, **installed by cluster-admin** into `monitoring`. Wraps the
 upstream prometheus-community **kube-prometheus-stack** (Prometheus Operator, Prometheus,
-Alertmanager, Grafana, node-exporter, kube-state-metrics) and ships an **HTTPRoute** that exposes
-Grafana through the shared Cilium ingress Gateway at `grafana.internal.haustorium.net`.
+Alertmanager, Grafana, node-exporter, kube-state-metrics). Grafana and Prometheus are published
+through the shared Cilium ingress Gateway, by routes that live in the `cilium` chart.
 
 ## Why its own chart
 
@@ -14,17 +14,17 @@ Foundational, same rationale as `cilium/` and `cert-manager/`: it owns cluster-s
 every namespace. The autonomous operator can't install it, so it lives in its own `monitoring`
 namespace rather than an `app-*`/`tool-*` one.
 
-## Grafana exposure
+## Exposure
 
-The HTTPRoute attaches to the `internal` Gateway in `cilium-gateway` (matching `gateway.name` /
-`gateway.namespace` here with the `homelab-cilium` chart). TLS is terminated by the gateway's
-wildcard cert and access is bounded by the gateway's L3 allow-list (`gateway.allowedCIDRs` over
-there). Grafana's own Ingress is disabled in favour of the Gateway API.
+This chart publishes nothing. TLS is terminated by the gateway's wildcard cert, access is bounded by
+the gateway's L3 allow-list, and who may reach Grafana is decided by the authorization filter the
+route carries — all of it in the `cilium` chart. Grafana's own Ingress is disabled in favour of the
+Gateway API.
 
 This `monitoring` namespace is itself default-deny ingress (the cilium `east-west-default-deny` CCNP
 fences every namespace, not just `app-*`/`tool-*`). Gateway traffic to Grafana/Prometheus flows
-because `monitoring` is in the gateway's `backendNamespaces` allow-list (cilium chart), which re-opens
-the `ingress` identity to this namespace — the gateway can only reach namespaces that host a route.
+because routes for them exist in the cilium chart, and that chart re-opens the `ingress` identity to
+exactly the namespaces its routes name.
 
 ## Scraping governed namespaces
 

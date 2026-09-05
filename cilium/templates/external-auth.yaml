@@ -1,0 +1,39 @@
+{{- if .Values.externalAuth.enabled }}
+{{- $sources := list }}
+{{- range $name, $g := .Values.gateways }}
+{{- if $g.enabled }}
+{{- $sources = append $sources $g.namespace }}
+{{- end }}
+{{- end }}
+{{- $sources = $sources | uniq | sortAlpha }}
+# Created here because the grant cannot exist before it. What runs inside is installed separately.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.externalAuth.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+---
+# A route's authorization backend is a cross-namespace reference like any other, refused until the
+# referent consents. Only a gateway's own namespace holds routes, so only those are named.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: external-auth
+  namespace: {{ .Values.externalAuth.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  from:
+{{- range $ns := $sources }}
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ $ns | quote }}
+{{- end }}
+  to:
+    - group: ""
+      kind: Service
+      name: {{ .Values.externalAuth.service | quote }}
+{{- end }}

@@ -95,20 +95,6 @@ seaweedfs:
 
 # Gateway-routed UIs. The filer UI browses object *contents* (plaintext); the raw S3/volume
 # ports stay unrouted.
-gateway:
-  enabled: true
-  name: internal
-  namespace: cilium-gateway
-  routes:
-    - name: seaweedfs-master
-      hostname: seaweedfs.internal.haustorium.net
-      serviceName: homelab-seaweedfs-master
-      servicePort: 9333
-    - name: seaweedfs-filer
-      hostname: seaweedfs-filer.internal.haustorium.net
-      serviceName: homelab-seaweedfs-filer
-      servicePort: 8888
-
 # Cross-namespace allow grants for the plaintext surfaces (one CiliumNetworkPolicy each, see
 # templates/access-grants.yaml). hypha is the only client today: S3 for data, master + volume
 # status APIs for its optional `seaweedfs` cache-usage source. The filer stays internal-only.

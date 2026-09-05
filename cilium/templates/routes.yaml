@@ -1,0 +1,63 @@
+{{- range $name, $g := .Values.gateways }}
+{{- if $g.enabled }}
+{{- range $r := $g.routes }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $r.name }}
+  namespace: {{ $g.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  parentRefs:
+    - name: {{ $name }}
+      namespace: {{ $g.namespace }}
+  hostnames:
+    - {{ $r.hostname | quote }}
+  rules:
+    - {{- with $r.requestTimeout }}
+      timeouts:
+        request: {{ . | quote }}
+      {{- end }}
+      backendRefs:
+        - name: {{ $r.backend.name }}
+          namespace: {{ $r.backend.namespace }}
+          port: {{ $r.backend.port }}
+      {{- if and $.Values.externalAuth.enabled (ne $r.externalAuth false) }}
+      filters:
+        {{- include "cilium.externalAuth" $ | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- $grants := dict }}
+{{- range $r := $g.routes }}
+{{- if ne $r.backend.namespace $g.namespace }}
+{{- $_ := set $grants $r.backend.namespace (append (index $grants $r.backend.namespace | default list) $r.backend.name) }}
+{{- end }}
+{{- end }}
+{{- range $ns, $names := $grants }}
+---
+# The backend namespace, not the route, is what consents to being published.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: {{ $name }}-gateway
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ $g.namespace }}
+  to:
+    {{- range $n := ($names | uniq | sortAlpha) }}
+    - group: ""
+      kind: Service
+      name: {{ $n | quote }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

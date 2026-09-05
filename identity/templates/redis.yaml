@@ -1,0 +1,78 @@
+{{- $ctx := dict "root" $ "component" "redis" }}
+{{- $fullname := include "identity.fullname" $ctx }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "identity.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: redis
+      port: {{ include "identity.redisPort" $ }}
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "identity.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "identity.labels" $ctx | nindent 8 }}
+    spec:
+      enableServiceLinks: false
+      {{- with $.Values.redis.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: "{{ $.Values.redis.image.repository }}:{{ $.Values.redis.image.tag }}"
+          imagePullPolicy: {{ $.Values.redis.image.pullPolicy }}
+          args:
+            - --port
+            - {{ include "identity.redisPort" $ | quote }}
+            # Nothing here survives a restart by design, so both persistence paths are off rather
+            # than merely unconfigured.
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - 128mb
+            # Evicting a session logs one person out; refusing a write stops everyone logging in.
+            - --maxmemory-policy
+            - volatile-lru
+          ports:
+            - name: redis
+              containerPort: {{ include "identity.redisPort" $ }}
+          readinessProbe:
+            exec:
+              command: [redis-cli, -p, {{ include "identity.redisPort" $ | quote }}, ping]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $.Values.redis.resources | nindent 12 }}

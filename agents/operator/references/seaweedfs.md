@@ -51,11 +51,11 @@ unauthenticated** bytes, so access is gated entirely at the network layer:
   namespace is (its pods are gated by RBAC). A grant matches nothing until its namespace exists, so
   restrict that namespace to the intended consumer. hypha is the only client today: S3 for data, and
   the master/volume status APIs for its optional `seaweedfs` cache-usage source.
-- The **master UI** (`:9333`) and **filer UI** (`:8888`) are additionally reachable through the shared
-  Cilium Gateway, bounded by the gateway's L3 admin allow-list, for inspection (this requires
-  `seaweedfs` in the gateway's `backendNamespaces`, since the fence blocks the gateway from unlisted
-  namespaces). The filer UI browses object contents (plaintext), so it exposes cache data to the admin
-  hosts — the raw S3 and volume ports stay unrouted.
+- The **master UI** (`:9333`) and **filer UI** (`:8888`) are additionally reachable through the
+  shared Cilium Gateway, bounded by its L3 admin allow-list and by the login its routes require, for
+  inspection. Both routes live in the cilium chart, which is also what unfences this namespace to the
+  gateway. The filer UI browses object contents (plaintext), so it exposes cache data to whoever
+  those two gates admit — the raw S3 and volume ports stay unrouted.
 
 ## Install
 

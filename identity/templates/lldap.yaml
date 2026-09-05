@@ -1,0 +1,115 @@
+{{- $ctx := dict "root" $ "component" "lldap" }}
+{{- $fullname := include "identity.fullname" $ctx }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "identity.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: ldap
+      port: {{ include "identity.ldapPort" $ }}
+      targetPort: ldap
+    - name: http
+      port: {{ include "identity.directoryPort" $ }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "identity.labels" $ctx | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "identity.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "identity.labels" $ctx | nindent 8 }}
+    spec:
+      enableServiceLinks: false
+      {{- with $.Values.lldap.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: lldap
+          image: "{{ $.Values.lldap.image.repository }}:{{ $.Values.lldap.image.tag }}"
+          imagePullPolicy: {{ $.Values.lldap.image.pullPolicy }}
+          # Bypasses the image's entrypoint, which chowns its own files and drops privileges with
+          # gosu, and so cannot run as an unprivileged user. Every setting here comes from the env.
+          command: ["/app/lldap", "run"]
+          env:
+            - name: LLDAP_LDAP_BASE_DN
+              value: {{ $.Values.lldap.baseDN | quote }}
+            - name: LLDAP_LDAP_USER_DN
+              value: "admin"
+            - name: LLDAP_LDAP_PORT
+              value: {{ include "identity.ldapPort" $ | quote }}
+            - name: LLDAP_HTTP_PORT
+              value: {{ include "identity.directoryPort" $ | quote }}
+            - name: LLDAP_HTTP_URL
+              value: https://{{ include "identity.directoryHost" $ }}
+            - name: LLDAP_DATABASE_URL
+              value: sqlite:///data/users.db?mode=rwc
+            - name: LLDAP_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: lldapJwtSecret
+            # Seeds the private key every password hash is derived from: changing it invalidates
+            # every stored credential.
+            - name: LLDAP_KEY_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: lldapKeySeed
+            - name: LLDAP_LDAP_USER_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: lldapAdminPassword
+          ports:
+            - name: ldap
+              containerPort: {{ include "identity.ldapPort" $ }}
+            - name: http
+              containerPort: {{ include "identity.directoryPort" $ }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $.Values.lldap.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ $.Values.lldap.storage.storageClass }}
+        resources:
+          requests:
+            storage: {{ $.Values.lldap.storage.size }}

@@ -109,6 +109,7 @@ ServiceAccount directly.
 | Constraint immutability | operator `ClusterRole` omits kyverno/RBAC/quota writes + `protect-constraints` |
 | Operator confined to tiers | `homelab-operator-deploy` bound per-namespace by `namespace-governance` + `restrict-operator-namespaces` |
 | Operator can't alter network topology | `ValidatingPolicy` `operator-no-network-topology` + deploy `ClusterRole` omits `ingresses`/gateways |
+| Operator can't publish | routes of every kind refused by the same policy; the Gateways admit routes only from their own namespace |
 | Operator can't expose TCP services | `ValidatingPolicy` `operator-no-service-exposure` (ClusterIP/ExternalName + UDP-only LB only) |
 
 ## Notes

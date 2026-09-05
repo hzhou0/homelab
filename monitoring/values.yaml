@@ -93,25 +93,3 @@ kube-prometheus-stack:
         org_role: Admin
       auth:
         disable_login_form: true
-
-gateway:
-  enabled: true
-  # Must match gateway.name / gateway.namespace in the homelab-cilium chart.
-  name: internal
-  namespace: cilium-gateway
-  hostname: grafana.internal.haustorium.net
-  # Grafana Service created by the subchart: <release>-grafana on port 80. Default assumes the
-  # release is named `homelab-monitoring`.
-  serviceName: homelab-monitoring-grafana
-  servicePort: 80
-
-# Prometheus has no built-in auth.
-prometheusGateway:
-  enabled: true
-  name: internal
-  namespace: cilium-gateway
-  hostname: prometheus.internal.haustorium.net
-  # Service created by the kube-prometheus-stack subchart: <release>-kube-pr-prometheus on the
-  # "http-web" port. Default assumes the release is named `homelab-monitoring`.
-  serviceName: homelab-monitoring-kube-pr-prometheus
-  servicePort: 9090

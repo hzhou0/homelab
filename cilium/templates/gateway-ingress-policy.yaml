@@ -1,9 +1,16 @@
-{{- if or .Values.gateway.enabled .Values.publicGateway.enabled }}
+{{- $enabled := dict }}
+{{- range $name, $g := .Values.gateways }}
+{{- if $g.enabled }}
+{{- $_ := set $enabled $name $g }}
+{{- end }}
+{{- end }}
+{{- if $enabled }}
 # Clients → `ingress` proxy L3 allow-list. A vanilla k8s NetworkPolicy cannot match the reserved
 # `ingress` identity, so this front-door allow is Cilium-native.
 #
-# `ingress` is deliberately NOT granted cluster-wide, so a route into a fenced namespace stays dead
-# until that namespace is listed as a backend.
+# One `ingress` identity fronts every Gateway, so these rules cannot be told apart once traffic
+# leaves the proxy: what admits the internet to the public Gateway admits it to any other. What
+# keeps it off the rest is that nothing translates or routes to their addresses.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
@@ -16,11 +23,17 @@ spec:
     matchLabels:
       reserved:ingress: ""
   ingress:
-    {{- if .Values.gateway.enabled }}
-    {{- if .Values.gateway.allowedCIDRs }}
-    - fromCIDR:
-        {{- range .Values.gateway.allowedCIDRs }}
-        - {{ . | quote }}
+    {{- range $name, $g := $enabled }}
+    {{- if $g.allowedCIDRs }}
+    - fromCIDRSet:
+        {{- range $c := $g.allowedCIDRs }}
+        - cidr: {{ $c.cidr | quote }}
+          {{- with $c.except }}
+          except:
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- end }}
         {{- end }}
     {{- else }}
     - fromEntities:
@@ -28,37 +41,11 @@ spec:
         - cluster
     {{- end }}
     {{- end }}
-    {{- if .Values.publicGateway.enabled }}
-    # One `ingress` identity fronts both Gateways, so this admits the internet to either. What keeps
-    # it off the internal Gateway is that nothing translates or routes to that Gateway's address.
-    - fromCIDRSet:
-        # Private space is excepted so LAN clients stay subject to the allow-list above.
-        - cidr: "0.0.0.0/0"
-          except:
-            - "10.0.0.0/8"
-            - "172.16.0.0/12"
-            - "192.168.0.0/16"
-            - "127.0.0.0/8"
-            - "169.254.0.0/16"
-        - cidr: "::/0"
-          except:
-            - "fc00::/7"
-            - "fe80::/10"
-            - "::1/128"
-    {{- end }}
-{{- $backends := list }}
-{{- if .Values.gateway.enabled }}
-{{- $backends = .Values.gateway.backendNamespaces | default list }}
-{{- end }}
-{{- if .Values.publicGateway.enabled }}
-{{- range $r := .Values.publicGateway.routes }}
-{{- $backends = append $backends $r.backend.namespace }}
-{{- end }}
-{{- end }}
-{{- with ($backends | uniq | sortAlpha) }}
+{{- with (splitList "," (include "cilium.gatewayBackends" .) | compact) }}
 ---
 # Reverse hop: Envoy re-identifies proxied traffic as `reserved:ingress`, which a namespaceSelector
-# cannot match — so this hop needs a Cilium-native allow too. Additive; the east-west fence owns the deny.
+# cannot match — so this hop needs a Cilium-native allow too. Additive; the east-west fence owns the
+# deny. Derived from the routes, so a namespace is reachable exactly as long as something serves it.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:

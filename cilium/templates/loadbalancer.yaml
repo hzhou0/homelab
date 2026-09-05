@@ -15,42 +15,29 @@ spec:
     matchExpressions:
       - key: io.cilium.gateway/owning-gateway
         operator: DoesNotExist
+{{- range $name, $g := $.Values.gateways }}
+{{- if $g.enabled }}
 ---
 apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
-  name: {{ $lb.gatewayPool.name }}
+  name: {{ $g.address.poolName }}
   labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
     app.kubernetes.io/part-of: homelab-cilium
 spec:
   # start==stop single-IP range instead of a /32 cidr (allowFirstLastIPs can't drop it).
   blocks:
-    - start: {{ $lb.gatewayPool.ip | quote }}
-      stop: {{ $lb.gatewayPool.ip | quote }}
-  serviceSelector:
-    matchLabels:
-      io.cilium.gateway/owning-gateway: {{ .Values.gateway.name | quote }}
-{{- if .Values.publicGateway.enabled }}
----
-apiVersion: cilium.io/v2
-kind: CiliumLoadBalancerIPPool
-metadata:
-  name: {{ $lb.publicGatewayPool.name }}
-  labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/part-of: homelab-cilium
-spec:
-  blocks:
-    - start: {{ $lb.publicGatewayPool.ip | quote }}
-      stop: {{ $lb.publicGatewayPool.ip | quote }}
-    {{- with $lb.publicGatewayPool.v6 }}
+    - start: {{ $g.address.ip | quote }}
+      stop: {{ $g.address.ip | quote }}
+    {{- with $g.address.v6 }}
     - start: {{ . | quote }}
       stop: {{ . | quote }}
     {{- end }}
   serviceSelector:
     matchLabels:
-      io.cilium.gateway/owning-gateway: {{ .Values.publicGateway.name | quote }}
+      io.cilium.gateway/owning-gateway: {{ $name | quote }}
+{{- end }}
 {{- end }}
 {{- if $lb.v6Pool.start }}
 ---

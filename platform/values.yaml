@@ -152,9 +152,4 @@ policy-reporter:
     affinity:
       nodeAffinity: *avoidSpot
     httproute:
-      enabled: true
-      parentRefs:
-        - name: internal
-          namespace: cilium-gateway
-      hostnames:
-        - kyverno.internal.haustorium.net
+      enabled: false

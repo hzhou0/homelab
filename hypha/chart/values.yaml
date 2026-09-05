@@ -116,16 +116,6 @@ affinity:
 nodeSelector: {}
 tolerations: []
 
-# The shared Cilium Gateway each deployment's hostname is routed through. The hypha namespace must
-# also be in the cilium chart's gateway.backendNamespaces, or the route resolves to a backend the
-# gateway may not reach.
-gateway:
-  enabled: true
-  name: internal
-  namespace: cilium-gateway
-  # Disabled outright: S3 bodies are unbounded, so any request timeout is a size limit in disguise.
-  requestTimeout: 0s
-
 monitoring:
   # The admin listener is unauthenticated, so unlike the S3 port it is fenced to one namespace.
   namespace: monitoring
