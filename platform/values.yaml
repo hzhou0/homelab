@@ -70,6 +70,7 @@ imageAllowlist:
   - ghcr.io/usememos/memos:0.31.0-rc.1
   - ghcr.io/navidrome/navidrome:0.63.2
   - docker.io/filebrowser/filebrowser@sha256:a469ea076d4a1b4b1d86a41d130f2f536cd9da996a2b1fb39c0d7635f9d89b9a
+  - docker.io/library/python@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a
 
   # --- applications (app-* tier) ---
   # - ghcr.io/<org>/<app>:<tag>

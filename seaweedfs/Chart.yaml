@@ -10,7 +10,7 @@ description: >-
   into its own seaweedfs namespace, not an app-*/tool-* one.
 type: application
 version: 0.1.0
-appVersion: "4.37"
+appVersion: "4.45"
 keywords:
   - seaweedfs
   - s3
@@ -19,6 +19,6 @@ keywords:
   - homelab
 dependencies:
   - name: seaweedfs
-    version: "4.37.0"
+    version: "4.45.0"
     repository: https://seaweedfs.github.io/seaweedfs/helm
     condition: seaweedfs.enabled

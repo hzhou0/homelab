@@ -108,6 +108,28 @@ it creates a second writer, which corrupts cross-object state in ways recovery d
    ```
 3. Remove the taint before the node rejoins.
 
+## Runbook: cache maintenance
+
+The cache namespace is authoritative, so hypha reads its absence as loss rather than as an outage: a
+missing sync marker or a `NoSuchBucket` from a live bucket records a halt marker and exits the
+process, and every restart re-exits until an operator resolves it. That is the intended trade — the
+alternative is answering a client with an absence the cache cannot vouch for, which is indisputable
+and wrong. A backend that is merely unreachable is retried instead, but one that is *up and
+answering absent* — a gateway whose metadata store is gone, say — is indistinguishable from the real
+loss, and is treated as one.
+
+So the cache never goes down under a running hypha. Drain first, in this order:
+
+```sh
+kubectl -n hypha scale sts --all --replicas=0
+# take the store down, bring it back, wait for it to be healthy
+kubectl -n hypha scale sts --all --replicas=1
+```
+
+An unplanned store outage trips the same halt. There the marker is evidence rather than an artifact
+of ordering: read the violation it records — the reserved control-byte key in the deployment's
+remote bucket — before deciding to clear it.
+
 ## Runbook: alerts
 
 | Alert | Means | Do |

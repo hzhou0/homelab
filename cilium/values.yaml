@@ -157,61 +157,99 @@ gateways:
         port: 5432
         namespace: neon
     routes:
-      - name: homepage
-        hostname: home.internal.haustorium.net
-        backend: {namespace: app-homepage, name: homepage, port: 80}
-      - name: memos
-        hostname: memos.internal.haustorium.net
-        backend: {namespace: app-memos, name: memos, port: 80}
-      - name: navidrome
-        hostname: navidrome.internal.haustorium.net
-        backend: {namespace: app-navidrome, name: navidrome, port: 80}
-      - name: filebrowser
-        hostname: music-files.internal.haustorium.net
-        backend: {namespace: app-navidrome, name: filebrowser, port: 80}
-      - name: hypha-cached
-        hostname: s3.internal.haustorium.net
-        backend: {namespace: hypha, name: hypha-cached, port: 8014}
-        externalAuth: false
-        # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
-        requestTimeout: 0s
-      - name: hypha-durable
-        hostname: s3-direct.internal.haustorium.net
-        backend: {namespace: hypha, name: hypha-durable, port: 8014}
-        externalAuth: false
-        # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
-        requestTimeout: 0s
-      - name: identity-authelia
-        hostname: auth.internal.haustorium.net
-        backend: {namespace: identity, name: identity-authelia, port: 9091}
-        externalAuth: false
-      - name: identity-lldap
-        hostname: users.internal.haustorium.net
-        backend: {namespace: identity, name: identity-lldap, port: 17170}
-      - name: hubble-ui
-        hostname: hubble.internal.haustorium.net
-        backend: {namespace: kube-system, name: hubble-ui, port: 80}
-      - name: policy-reporter-ui
-        hostname: kyverno.internal.haustorium.net
-        backend: {namespace: kyverno, name: policy-reporter-ui, port: 8080}
-      - name: grafana
-        hostname: grafana.internal.haustorium.net
-        backend: {namespace: monitoring, name: homelab-monitoring-grafana, port: 80}
-      - name: prometheus
-        hostname: prometheus.internal.haustorium.net
-        backend: {namespace: monitoring, name: homelab-monitoring-kube-pr-prometheus, port: 9090}
-      - name: seaweedfs-master
-        hostname: seaweedfs.internal.haustorium.net
-        backend: {namespace: seaweedfs, name: homelab-seaweedfs-master, port: 9333}
-      - name: seaweedfs-filer
-        hostname: seaweedfs-filer.internal.haustorium.net
-        backend: {namespace: seaweedfs, name: homelab-seaweedfs-filer, port: 8888}
-      - name: filestash
-        hostname: files.internal.haustorium.net
-        backend: {namespace: tool-filestash, name: filestash, port: 80}
-      - name: headlamp
-        hostname: headlamp.internal.haustorium.net
-        backend: {namespace: tool-headlamp, name: headlamp, port: 80}
+      home.internal.haustorium.net:
+        /:
+          namespace: app-homepage
+          name: homepage
+          port: 80
+      memos.internal.haustorium.net:
+        /:
+          namespace: app-memos
+          name: memos
+          port: 80
+      navidrome.internal.haustorium.net:
+        /:
+          namespace: app-navidrome
+          name: navidrome
+          port: 80
+      music-files.internal.haustorium.net:
+        /:
+          namespace: app-navidrome
+          name: filebrowser
+          port: 80
+      s3.internal.haustorium.net:
+        /:
+          namespace: hypha
+          name: hypha-cached
+          port: 8014
+          externalAuth: false
+          # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
+          requestTimeout: 0s
+      s3-direct.internal.haustorium.net:
+        /:
+          namespace: hypha
+          name: hypha-durable
+          port: 8014
+          externalAuth: false
+          # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
+          requestTimeout: 0s
+      auth.internal.haustorium.net:
+        /:
+          namespace: identity
+          name: identity-authelia
+          port: 9091
+          externalAuth: false
+      users.internal.haustorium.net:
+        /:
+          namespace: identity
+          name: identity-lldap
+          port: 17170
+      hubble.internal.haustorium.net:
+        /:
+          namespace: kube-system
+          name: hubble-ui
+          port: 80
+      kyverno.internal.haustorium.net:
+        /:
+          namespace: kyverno
+          name: policy-reporter-ui
+          port: 8080
+      grafana.internal.haustorium.net:
+        /:
+          namespace: monitoring
+          name: homelab-monitoring-grafana
+          port: 80
+      prometheus.internal.haustorium.net:
+        /:
+          namespace: monitoring
+          name: homelab-monitoring-kube-pr-prometheus
+          port: 9090
+      seaweedfs.internal.haustorium.net:
+        /:
+          namespace: seaweedfs
+          name: homelab-seaweedfs-master
+          port: 9333
+      seaweedfs-filer.internal.haustorium.net:
+        /:
+          namespace: seaweedfs
+          name: homelab-seaweedfs-filer
+          port: 8888
+      files.internal.haustorium.net:
+        # Its session endpoint is served by a helper that supplies the identity the application has
+        # no way to read for itself.
+        /api/session/auth/:
+          namespace: tool-filestash
+          name: filestash
+          port: 8080
+        /:
+          namespace: tool-filestash
+          name: filestash
+          port: 80
+      headlamp.internal.haustorium.net:
+        /:
+          namespace: tool-headlamp
+          name: headlamp
+          port: 80
 
   # The authorization service a published route sends its subrequest to. Every namespace that may
   # hold a route is granted a reference to it.
@@ -234,7 +272,7 @@ gateways:
     dnsNames: []
     expose: true
     tcpListeners: []
-    routes: []
+    routes: {}
 
 # ---------------------------------------------------------------------------
 # WireGuard remote-access tunnel

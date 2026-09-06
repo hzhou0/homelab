@@ -1,11 +1,15 @@
 {{- range $name, $g := .Values.gateways }}
 {{- if $g.enabled }}
-{{- range $r := $g.routes }}
+{{- $named := dict }}
+{{- range $host, $paths := $g.routes }}
+{{- $route := first (splitList "." $host) }}
+{{- with index $named $route }}{{ fail (printf "gateway %s: %s and %s both reduce to route %s" $name . $host $route) }}{{ end }}
+{{- $_ := set $named $route $host }}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
-  name: {{ $r.name }}
+  name: {{ $route }}
   namespace: {{ $g.namespace }}
   labels:
     app.kubernetes.io/managed-by: {{ $.Release.Service }}
@@ -15,17 +19,22 @@ spec:
     - name: {{ $name }}
       namespace: {{ $g.namespace }}
   hostnames:
-    - {{ $r.hostname | quote }}
+    - {{ $host | quote }}
   rules:
-    - {{- with $r.requestTimeout }}
+{{- range $prefix, $path := $paths }}
+    - {{- with $path.requestTimeout }}
       timeouts:
         request: {{ . | quote }}
       {{- end }}
+      matches:
+        - path:
+            type: PathPrefix
+            value: {{ $prefix | quote }}
       backendRefs:
-        - name: {{ $r.backend.name }}
-          namespace: {{ $r.backend.namespace }}
-          port: {{ $r.backend.port }}
-      {{- if and $.Values.externalAuth.enabled (ne $r.externalAuth false) }}
+        - name: {{ $path.name }}
+          namespace: {{ $path.namespace }}
+          port: {{ $path.port }}
+      {{- if and $.Values.externalAuth.enabled (ne $path.externalAuth false) }}
       filters:
         {{- include "cilium.externalAuth" $ | nindent 8 }}
         # A credential here is the authorizer's. Header mutations run after the filter chain, so it
@@ -36,10 +45,13 @@ spec:
               - Authorization
       {{- end }}
 {{- end }}
+{{- end }}
 {{- $grants := dict }}
-{{- range $r := $g.routes }}
-{{- if ne $r.backend.namespace $g.namespace }}
-{{- $_ := set $grants $r.backend.namespace (append (index $grants $r.backend.namespace | default list) $r.backend.name) }}
+{{- range $host, $paths := $g.routes }}
+{{- range $prefix, $path := $paths }}
+{{- if ne $path.namespace $g.namespace }}
+{{- $_ := set $grants $path.namespace (append (index $grants $path.namespace | default list) $path.name) }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- range $ns, $names := $grants }}
