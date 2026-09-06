@@ -21,8 +21,8 @@ lldap:
     pullPolicy: IfNotPresent
   baseDN: dc=haustorium,dc=net
   storage:
-    storageClass: topolvm-provisioner
-    size: 1Gi
+    storageClass: zerofs
+    size: 5Gi
   resources:
     requests:
       cpu: 25m
@@ -50,8 +50,8 @@ authelia:
     tag: "4.39.22"
     pullPolicy: IfNotPresent
   storage:
-    storageClass: topolvm-provisioner
-    size: 1Gi
+    storageClass: zerofs
+    size: 5Gi
   session:
     expiration: 12h
     inactivity: 1h
@@ -60,21 +60,42 @@ authelia:
   # against a directory bind per request for clients that hold no session.
   basicAuthCacheLifespan: 5m
 
-  # A second factor cannot be enrolled without a way to send someone a one-time code, so asking for
-  # one would lock every account out of everything. A rule here narrows the default for a named host.
+  # Nothing here can send a one-time code, so a second factor cannot be enrolled and asking for one
+  # would lock every account out of everything. Every policy below is therefore one_factor or deny.
   accessControl:
-    defaultPolicy: one_factor
-    rules: []
-      # - domain: s3.internal.haustorium.net
-      #   policy: bypass
+    # A published route reaches nobody until it is named below, so forgetting one fails closed.
+    defaultPolicy: deny
+    rules:
+      # Every published route is listed, so the set can be diffed against what is published.
+      - domain:
+          - home.internal.haustorium.net
+          - memos.internal.haustorium.net
+          - navidrome.internal.haustorium.net
+          - music-files.internal.haustorium.net
+          - files.internal.haustorium.net
+          - users.internal.haustorium.net
+          - grafana.internal.haustorium.net
+          - prometheus.internal.haustorium.net
+          - hubble.internal.haustorium.net
+          - kyverno.internal.haustorium.net
+        policy: one_factor
+
+      # Reachable from here is a change to the cluster or to what stores its data, so these are the
+      # ones an account is separately trusted with. The group is directory data, created by hand.
+      - domain:
+          - headlamp.internal.haustorium.net
+          - seaweedfs.internal.haustorium.net
+          - seaweedfs-filer.internal.haustorium.net
+        subject: ['group:admins']
+        policy: one_factor
 
   # An application that speaks OpenID Connect gets a real session of its own rather than trusting a
   # header, so it is preferred wherever an application supports it.
   oidc:
     enabled: true
     # The digest is not a credential — it is what the plaintext is checked against, and the
-    # plaintext belongs wherever the client runs. Every client is one_factor for the same reason
-    # the default policy is.
+    # plaintext belongs wherever the client runs. A client's policy is its own: the rules above
+    # gate the route, not the token exchange.
     clients:
       - id: memos
         name: Memos

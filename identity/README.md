@@ -40,6 +40,7 @@ kubectl -n identity create secret generic identity-credentials \
   --from-file=oidc.yml
 
 helm install identity identity -n identity
+helm upgrade identity identity -n identity
 ```
 
 The last two are needed only with OpenID Connect enabled; without it the first five are the whole
@@ -62,16 +63,22 @@ no one in it. That account is what the portal is first logged into, and what cre
 There is no signup: the administrator creates every account in the directory, and a person's
 password is the whole of what the directory holds about them.
 
-**A second factor is not available, and the default policy says so.** A factor is not directory
+**A second factor is not available, and every rule says so.** A factor is not directory
 data — TOTP secrets and passkeys live in Authelia's own storage — and Authelia will not let one be
 registered from a merely password-authenticated session, on the reasoning that whoever steals a
 password could otherwise enrol their own and hold the account forever. Its way out is a one-time
 code sent to the person, which needs something that can send mail. Without that, nobody can obtain
 a factor, so requiring one would make every route unreachable rather than more secure.
 
-Configuring a sender is what lifts this, and the default policy is then the only line that changes.
-Until then the password and the network fence in front of the gateway are the boundary, and a
-single route can still be raised on its own.
+Configuring a sender is what lifts this, and each rule's policy is then what changes. Until then the
+password and the network fence in front of the gateway are the boundary, and a single route can
+still be raised on its own.
+
+**Nothing is reachable that is not named.** The default is to deny, so a route published without a
+rule is unreachable rather than open to the whole directory, and adding one is part of publishing
+rather than something to remember afterwards. A rule carries a group only where an account is
+separately trusted; elsewhere any account in the directory suffices, because the fence in front of
+the gateway is what decides who reaches the names at all.
 
 ## The parts that are load-bearing
 
@@ -105,8 +112,10 @@ API, which is not in this path at all.
 
 **Redis is deliberately shallow.** No volume, no persistence, no Sentinel: its worst case is that
 everyone logs in again, and machinery costing more to run than what it protects is worth is the
-wrong trade. The other two datasets are node-local for the same reason — logging in must not depend
-on the object-storage stack an operator would be trying to diagnose.
+wrong trade. The other two datasets are the opposite trade and sit on network storage: pinned to a
+node, they make one machine's loss an outage of every published route at once. What they must not
+depend on is the cluster's own object stack — an operator diagnosing it has to log in first — and the
+filesystem under them is backed from outside the cluster, which is what keeps that true.
 
 **Authelia is a single replica**, and not configurably so. Its own storage is SQLite on a
 ReadWriteOnce volume, which a second replica would either fail to mount or corrupt; running more is

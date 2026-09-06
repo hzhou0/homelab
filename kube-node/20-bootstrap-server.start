@@ -74,6 +74,8 @@ LVM_PART=$(cat /etc/node-lvm-part)
 apk add -q lvm2
 pvcreate "$LVM_PART"
 vgcreate vg-nvme "$LVM_PART"
+# vgcreate activates for this boot only, and an inactive VG has no device nodes to mount.
+rc-update add lvm boot
 
 kubectl label nodes k3s-server vg=nvme
 
