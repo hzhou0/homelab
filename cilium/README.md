@@ -95,9 +95,6 @@ The tunnel is confined to **the Gateway's backend services and the LAN DNS only*
   routes to — *not* `reserved:ingress` — so the fence re-allows the Gateway's backend namespaces
   (mirroring `allow-gateway-ingress-to-backends`) plus the hubble-ui pods, and `lanDNS:53`. A
   `toEntities:ingress` rule would be a no-op: it never matches that enforcement point.
-- `allow-wireguard-to-gateway-ingress` grants the tunnel the Gateway front door **by identity**
-  rather than via `gateway.allowedCIDRs` — masquerade hides the peer CIDR from a `fromCIDR`
-  match, so this is the "similar access" that a CIDR entry would give an on-LAN host.
 - `allow-world-to-wireguard` re-opens the inbound handshake (the namespace is otherwise fenced by
   east-west-default-deny). Peer→server replies flow statefully, so peers must set
   `PersistentKeepalive`.
@@ -146,12 +143,11 @@ HTTP:80 for `*.internal.haustorium.net`, `allowedRoutes.from: All`.
 
 - **DNS:** `homelab.lab/hostname: "*.internal.haustorium.net"` → opnsense-operator creates a
   wildcard Unbound override at `10.0.0.100`. No `homelab.lab/expose` → internal-only.
-- **NetworkPolicy:** Cilium enforces Gateway traffic at two boundaries — *clients → `ingress`
-  proxy* and *`ingress` proxy → backends* — both using the reserved `ingress` identity that
-  vanilla k8s `NetworkPolicy` cannot select. This chart ships two `CiliumClusterwideNetworkPolicy`s
-  (`gateway-ingress-policy.yaml`): `allow-clients-to-gateway-ingress` (gated by `allowedCIDRs`)
-  and `allow-gateway-ingress-to-backends`, whose namespaces are **derived from what the gateways
-  serve** — every route's backend plus every TCP listener's target.
+- **NetworkPolicy:** the hop that still needs one is *`ingress` proxy → backends*, using the
+  reserved `ingress` identity that a vanilla k8s `NetworkPolicy` cannot select.
+  `allow-gateway-ingress-to-backends` (`gateway-ingress-policy.yaml`) carries the namespaces
+  **derived from what the gateways serve** — every route's backend plus every TCP listener's
+  target. The other direction, clients → proxy, has no policy at all: see below.
 - **A namespace nothing routes to is unreachable.** The reverse hop is deliberately not granted
   cluster-wide, and because it is derived, it cannot drift from the route list or outlive it. A
   workload's own manifests cannot grant it, and neither can the namespace's generated ingress
@@ -171,8 +167,12 @@ HTTP:80 for `*.internal.haustorium.net`, `allowedRoutes.from: All`.
   omission — no admission rule enforces it, because nothing else can write a route.
 - **TLS:** cert-manager `Certificate` for `*.internal.haustorium.net` via `letsencrypt-cloudflare`
   (from the `cert-manager` chart — install that first).
-- **L3 whitelist:** each gateway's `allowedCIDRs` restricts the front door to known hosts before
-  TLS or route processing; an empty list falls back to open (`world + cluster`).
+- **The front door is open, and the routes are the fence.** There is no source allow-list, because
+  a useful one cannot be written here: a single `ingress` identity fronts every Gateway, so a rule
+  restricting a source restricts it to all of them at once. Only the router in front can tell the
+  Gateways apart, by their addresses, and only for the traffic it routes — a host on the internal
+  Gateway's own subnet reaches it over L2. So every route authenticates instead, and the cluster's
+  own OpenID Connect clients can reach the issuer at the public URL they are required to use.
 
 ## Gateways
 

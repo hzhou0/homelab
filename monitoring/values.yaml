@@ -85,11 +85,18 @@ kube-prometheus-stack:
     grafana.ini:
       server:
         root_url: "https://grafana.internal.haustorium.net"
-      # No Grafana login: every visitor is an anonymous Admin and the login form is hidden. Safe
-      # only because reachability is restricted at the network edge, not by Grafana auth — drop
-      # this block to restore the normal login.
-      auth.anonymous:
-        enabled: true
-        org_role: Admin
       auth:
+        # The gateway has already decided who this is: no local form, and nothing to sign out of
+        # here — the session belongs to the portal.
         disable_login_form: true
+        signout_redirect_url: "https://auth.internal.haustorium.net/logout"
+      auth.proxy:
+        enabled: true
+        header_name: Remote-User
+        header_property: username
+        auto_sign_up: true
+        # Without these an account is named by its login and nothing else.
+        headers: "Name:Remote-Name Email:Remote-Email Groups:Remote-Groups"
+        # The header is trustworthy only because the route is the only way in, which is a property
+        # of the gateway rather than of Grafana.
+        enable_login_token: false

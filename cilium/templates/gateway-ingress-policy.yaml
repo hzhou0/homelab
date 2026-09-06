@@ -5,42 +5,9 @@
 {{- end }}
 {{- end }}
 {{- if $enabled }}
-# Clients → `ingress` proxy L3 allow-list. A vanilla k8s NetworkPolicy cannot match the reserved
-# `ingress` identity, so this front-door allow is Cilium-native.
-#
-# One `ingress` identity fronts every Gateway, so these rules cannot be told apart once traffic
-# leaves the proxy: what admits the internet to the public Gateway admits it to any other. What
-# keeps it off the rest is that nothing translates or routes to their addresses.
-apiVersion: cilium.io/v2
-kind: CiliumClusterwideNetworkPolicy
-metadata:
-  name: allow-clients-to-gateway-ingress
-  labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/part-of: homelab-cilium
-spec:
-  endpointSelector:
-    matchLabels:
-      reserved:ingress: ""
-  ingress:
-    {{- range $name, $g := $enabled }}
-    {{- if $g.allowedCIDRs }}
-    - fromCIDRSet:
-        {{- range $c := $g.allowedCIDRs }}
-        - cidr: {{ $c.cidr | quote }}
-          {{- with $c.except }}
-          except:
-            {{- range . }}
-            - {{ . | quote }}
-            {{- end }}
-          {{- end }}
-        {{- end }}
-    {{- else }}
-    - fromEntities:
-        - world
-        - cluster
-    {{- end }}
-    {{- end }}
+# Nothing restricts who may reach a Gateway's front door. One `ingress` identity fronts them all, so
+# a source rule could never mean "this Gateway" — and the only thing that can tell them apart by
+# address is the router in front, for the traffic it routes. Each route authenticates instead.
 {{- with (splitList "," (include "cilium.gatewayBackends" .) | compact) }}
 ---
 # Reverse hop: Envoy re-identifies proxied traffic as `reserved:ingress`, which a namespaceSelector

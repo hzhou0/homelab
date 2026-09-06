@@ -20,16 +20,39 @@ chart publishes nothing and decides nothing about who reaches what; it answers t
 
 Install cilium first. Namespace is managed there along with grants to make it visible to all namespaces.
 
+For OpenID Connect, generate the issuer's signing key first. It is a file rather than a literal
+because it is the one setting no environment variable can carry — those address configuration by
+name, and a signing key lives in a list, which has no name to address. Authelia accepts `--config`
+more than once, so it arrives as a second configuration file:
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out issuer.pem
+{ printf 'identity_providers:\n  oidc:\n    jwks:\n      - key: |\n'
+  sed 's/^/          /' issuer.pem; } > oidc.yml
+```
+
 ```sh
 kubectl -n identity create secret generic identity-credentials \
   --from-literal=lldapJwtSecret=...     --from-literal=lldapKeySeed=... \
   --from-literal=lldapAdminPassword=... --from-literal=autheliaSessionSecret=... \
-  --from-literal=autheliaStorageEncryptionKey=...
+  --from-literal=autheliaStorageEncryptionKey=... \
+  --from-literal=autheliaOidcHmacSecret=... \
+  --from-file=oidc.yml
 
 helm install identity identity -n identity
 ```
 
-Nothing sensitive goes on the command line beyond the Secret; the rest is `values.yaml`.
+The last two are needed only with OpenID Connect enabled; without it the first five are the whole
+Secret. Nothing sensitive goes on the command line beyond this, and `issuer.pem` and `oidc.yml` can
+be deleted afterwards — the Secret is the only copy that matters.
+
+Each client also needs a secret, and what goes in `values.yaml` is only its digest — the plaintext
+belongs wherever the client runs. Generate a pair with the image itself, which needs no install:
+
+```sh
+docker run --rm --network none ghcr.io/authelia/authelia:4.39.22 \
+  authelia crypto hash generate pbkdf2 --variant sha512 --random
+```
 
 ## Bootstrap
 

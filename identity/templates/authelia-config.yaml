@@ -25,6 +25,9 @@ data:
             authn_strategies:
               - name: 'HeaderAuthorization'
                 schemes: ['Basic', 'Bearer']
+                # Without it every request is a fresh bind, and a client that polls is a client that
+                # binds on a timer.
+                scheme_basic_cache_lifespan: '{{ $.Values.authelia.basicAuthCacheLifespan }}'
               - name: 'CookieSession'
     log:
       level: 'info'
@@ -42,6 +45,25 @@ data:
         address: '{{ include "identity.ldapURL" $ }}'
         base_dn: '{{ $.Values.lldap.baseDN }}'
         user: 'uid=admin,ou=people,{{ $.Values.lldap.baseDN }}'
+{{- with $.Values.authelia.oidc }}
+{{- if .enabled }}
+    identity_providers:
+      oidc:
+        # The signing key is the one thing that cannot arrive as an environment secret: nothing can
+        # address a list entry, so it is a second configuration file mounted from the Secret.
+        clients:
+          {{- range .clients }}
+          - client_id: '{{ .id }}'
+            client_name: '{{ .name }}'
+            client_secret: '{{ required (printf "authelia.oidc.clients[%s].secretDigest is required" .id) .secretDigest }}'
+            authorization_policy: 'one_factor'
+            redirect_uris:
+              {{- range .redirectURIs }}
+              - '{{ . }}'
+              {{- end }}
+          {{- end }}
+{{- end }}
+{{- end }}
     access_control:
       default_policy: '{{ $.Values.authelia.accessControl.defaultPolicy }}'
       rules:

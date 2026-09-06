@@ -204,25 +204,4 @@ spec:
             - port: {{ $wg.apiServer.port | quote }}
               protocol: TCP
     {{- end }}
----
-# The gateway front door, granted by identity rather than source CIDR: masquerade hides the peer
-# CIDR, so a fromCIDR match would never fire.
-apiVersion: cilium.io/v2
-kind: CiliumClusterwideNetworkPolicy
-metadata:
-  name: allow-wireguard-to-gateway-ingress
-  labels:
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/part-of: homelab-cilium
-spec:
-  endpointSelector:
-    matchLabels:
-      reserved:ingress: ""
-  enableDefaultDeny:
-    ingress: false
-  ingress:
-    - fromEndpoints:
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $wg.namespace }}
-            app.kubernetes.io/name: wireguard
 {{- end }}

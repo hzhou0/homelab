@@ -60,7 +60,14 @@ spec:
           imagePullPolicy: {{ $.Values.authelia.image.pullPolicy }}
           # The equals form is routed to a branch of the image's entrypoint that execs the
           # arguments as a command; only the separated form reaches the binary.
-          args: ["--config", "/config/configuration.yml"]
+          args:
+            - "--config"
+            - "/config/configuration.yml"
+            {{- if $.Values.authelia.oidc.enabled }}
+            # Carries only the issuer signing key, which no environment variable can address.
+            - "--config"
+            - "/secrets/oidc.yml"
+            {{- end }}
           env:
             - name: AUTHELIA_SESSION_SECRET_FILE
               value: /secrets/autheliaSessionSecret
@@ -68,6 +75,10 @@ spec:
               value: /secrets/autheliaStorageEncryptionKey
             - name: AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD_FILE
               value: /secrets/lldapAdminPassword
+            {{- if $.Values.authelia.oidc.enabled }}
+            - name: AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET_FILE
+              value: /secrets/autheliaOidcHmacSecret
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ include "identity.portalPort" $ }}

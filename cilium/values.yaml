@@ -150,11 +150,6 @@ gateways:
     dnsNames: ["*.internal.haustorium.net"]
     # No WAN forward: this address answers on the LAN only.
     expose: false
-    # Who may reach the front door, as CIDRs with optional exceptions. Empty admits world + cluster.
-    allowedCIDRs:
-      - cidr: 10.0.0.232/32
-      - cidr: 10.0.1.140/32
-      - cidr: 10.0.1.148/32
     # Ports forwarded byte-for-byte to one namespace each, for protocols the HTTP listeners cannot
     # carry. The hostname wildcard already answers for them at any depth, so they need no record.
     tcpListeners:
@@ -238,12 +233,6 @@ gateways:
     # outside the cluster.
     dnsNames: []
     expose: true
-    allowedCIDRs:
-      # Private space is excepted so LAN clients stay subject to the internal gateway's list.
-      - cidr: "0.0.0.0/0"
-        except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"]
-      - cidr: "::/0"
-        except: ["fc00::/7", "fe80::/10", "::1/128"]
     tcpListeners: []
     routes: []
 

@@ -56,6 +56,10 @@ authelia:
     expiration: 12h
     inactivity: 1h
     rememberMe: 1M
+  # How long a verified password stays good for. It bounds how stale a revoked credential can be,
+  # against a directory bind per request for clients that hold no session.
+  basicAuthCacheLifespan: 5m
+
   # A second factor cannot be enrolled without a way to send someone a one-time code, so asking for
   # one would lock every account out of everything. A rule here narrows the default for a named host.
   accessControl:
@@ -63,6 +67,27 @@ authelia:
     rules: []
       # - domain: s3.internal.haustorium.net
       #   policy: bypass
+
+  # An application that speaks OpenID Connect gets a real session of its own rather than trusting a
+  # header, so it is preferred wherever an application supports it.
+  oidc:
+    enabled: true
+    # The digest is not a credential — it is what the plaintext is checked against, and the
+    # plaintext belongs wherever the client runs. Every client is one_factor for the same reason
+    # the default policy is.
+    clients:
+      - id: memos
+        name: Memos
+        secretDigest: "$pbkdf2-sha512$310000$SNoRqt2qeOBhxC07JEl5lw$o0cDoZDQlBVQgcjo4IWldjXvxUB30xjlc7yXv1HULfhDDMSB9Xo/euha9zydoUqWmShcChtcW2.bg.yANCjNsg"
+        redirectURIs:
+          - https://memos.internal.haustorium.net/auth/callback
+      # Only a login page until the API server trusts this issuer and the deployment stops using
+      # its own ServiceAccount: until then every visitor has the same access whoever they are.
+      - id: headlamp
+        name: Headlamp
+        secretDigest: "$pbkdf2-sha512$310000$xSiVF9mL83f/aWsuB20gpA$L2WhvQ4d2l710OOdzUmy99DLF/DpBWXRq9TH845dJxuC/HlqkBZplgqtEwSYDgcuU.EoGSoT7d7iwML/6mGGTw"
+        redirectURIs:
+          - https://headlamp.internal.haustorium.net/oidc-callback
   resources:
     requests:
       cpu: 50m

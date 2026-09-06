@@ -28,6 +28,12 @@ spec:
       {{- if and $.Values.externalAuth.enabled (ne $r.externalAuth false) }}
       filters:
         {{- include "cilium.externalAuth" $ | nindent 8 }}
+        # A credential here is the authorizer's. Header mutations run after the filter chain, so it
+        # is read there and gone before the backend sees the request.
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove:
+              - Authorization
       {{- end }}
 {{- end }}
 {{- $grants := dict }}

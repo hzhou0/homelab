@@ -17,6 +17,9 @@ the empty default copies every header the authorizer returned, including one a c
         - accept
         - cookie
         - proxy-authorization
+        # A client that cannot hold a session sends a password on every request instead, and this is
+        # where it is checked. Only the basic scheme is claimed, so a bearer token passes through.
+        - authorization
         # Absent this, the portal infers the scheme from its own plain-HTTP subrequest and sends the
         # browser back to an http:// address after login.
         - x-forwarded-proto

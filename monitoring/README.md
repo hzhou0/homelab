@@ -49,6 +49,7 @@ Defaults to the upstream `prom-operator`. Override out of git via
 ```sh
 helm dependency build monitoring
 helm install homelab-monitoring monitoring -n monitoring --create-namespace
+helm upgrade homelab-monitoring monitoring -n monitoring
 ```
 
 The release name `homelab-monitoring` is assumed by `gateway.serviceName`
