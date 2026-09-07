@@ -13,7 +13,7 @@ import (
 // The proxy has no branch concept: an endpoint it cannot resolve, for whatever reason, must read
 // as absent rather than as an outage, or it retries a name that will never exist.
 func (s *Server) endpointBranch(ctx context.Context, w http.ResponseWriter, endpoint string) *registry.Branch {
-	branch, err := s.registry.Get(ctx, endpoint)
+	branch, err := s.registry.Endpoint(ctx, endpoint)
 	switch {
 	case err == nil:
 		return branch
@@ -82,7 +82,7 @@ func (s *Server) handleWakeCompute(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, wakeCompute{
 		Address: instance.PgAddress,
 		Aux: metricsAuxInfo{
-			EndpointID: branch.Name,
+			EndpointID: branch.EndpointID,
 			ProjectID:  branch.TenantID.String(),
 			BranchID:   branch.TimelineID.String(),
 			ComputeID:  instance.ID,

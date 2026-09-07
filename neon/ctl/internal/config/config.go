@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hzhou0/homelab/neon/ctl/internal/secret"
 )
 
 type Config struct {
@@ -30,6 +33,21 @@ type Config struct {
 	// PKCS#8 PEM. Empty leaves every storage call unauthenticated, which the controller permits
 	// only under --dev.
 	AuthKey string
+
+	IdentityUserHeader    string
+	IdentityDisplayHeader string
+	IdentityGroupsHeader  string
+
+	// The one identifier that may see every project.
+	AdminUser string
+
+	// The domain endpoint ids are shown under. Display only — the proxy takes the suffix it
+	// actually routes on from its own certificate.
+	EndpointSuffix string
+
+	// Seals the passwords the registry keeps, and its absence is what stops it keeping any: a
+	// password is otherwise only ever a verifier, which cannot be read back.
+	PasswordKey []byte
 }
 
 func Load(args []string) (*Config, error) {
@@ -37,6 +55,22 @@ func Load(args []string) (*Config, error) {
 	flags := flag.NewFlagSet("neon-ctl", flag.ContinueOnError)
 
 	flags.StringVar(&cfg.Listen, "listen", env("NEON_CTL_LISTEN", ":8080"), "address to serve on")
+
+	flags.StringVar(&cfg.IdentityUserHeader, "identity-user-header", env("NEON_CTL_IDENTITY_USER_HEADER", ""),
+		"request header carrying a stable directory identifier for the user, not a login name")
+	flags.StringVar(&cfg.IdentityDisplayHeader, "identity-display-header", env("NEON_CTL_IDENTITY_DISPLAY_HEADER", ""),
+		"request header carrying the user's human-readable name, shown but never acted on")
+	flags.StringVar(&cfg.IdentityGroupsHeader, "identity-groups-header", env("NEON_CTL_IDENTITY_GROUPS_HEADER", ""),
+		"request header carrying the user's groups, comma separated")
+	flags.StringVar(&cfg.AdminUser, "admin-user", env("NEON_CTL_ADMIN_USER", ""),
+		"directory identifier of the one user who may see every project")
+
+	flags.StringVar(&cfg.EndpointSuffix, "endpoint-suffix", env("NEON_CTL_ENDPOINT_SUFFIX", ""),
+		"domain endpoint ids are shown under, so the page can print a connectable host")
+
+	var passwordKey string
+	flags.StringVar(&passwordKey, "password-key", env("NEON_CTL_PASSWORD_KEY", ""),
+		"base64 32-byte key that seals stored passwords; unset keeps no password, only its verifier")
 
 	flags.StringVar(&cfg.StorageControllerURL, "storage-controller-url", env("NEON_CTL_STORAGE_CONTROLLER_URL", ""), "base url of the storage controller")
 	flags.StringVar(&cfg.StorageControllerToken, "storage-controller-token", env("NEON_CTL_STORAGE_CONTROLLER_TOKEN", ""), "bearer token for the storage controller")
@@ -60,6 +94,9 @@ func Load(args []string) (*Config, error) {
 	if cfg.ComputeImages, err = parseImages(images); err != nil {
 		return nil, err
 	}
+	if cfg.PasswordKey, err = parsePasswordKey(passwordKey); err != nil {
+		return nil, err
+	}
 	return cfg, cfg.validate()
 }
 
@@ -77,6 +114,9 @@ func (c *Config) validate() error {
 	if len(c.ComputeImages) == 0 {
 		problems = append(problems, errors.New("compute-images is required"))
 	}
+	if c.IdentityUserHeader == "" {
+		problems = append(problems, errors.New("identity-user-header is required"))
+	}
 	return errors.Join(problems...)
 }
 
@@ -91,6 +131,22 @@ func inClusterNamespace() string {
 		return ""
 	}
 	return strings.TrimSpace(string(namespace))
+}
+
+// Refused rather than stretched: a passphrase would put every stored password behind whatever
+// somebody typed, and a wrong-length key is far more likely a mistake than an intention.
+func parsePasswordKey(value string) ([]byte, error) {
+	if value == "" {
+		return nil, nil
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
+	if err != nil {
+		return nil, fmt.Errorf("password-key is not base64: %w", err)
+	}
+	if len(key) != secret.KeySize {
+		return nil, fmt.Errorf("password-key is %d bytes, want %d", len(key), secret.KeySize)
+	}
+	return key, nil
 }
 
 func parseImages(value string) (map[int]string, error) {

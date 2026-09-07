@@ -75,6 +75,18 @@ spec:
               value: /secrets/autheliaStorageEncryptionKey
             - name: AUTHELIA_AUTHENTICATION_BACKEND_LDAP_PASSWORD_FILE
               value: /secrets/lldapAdminPassword
+            - name: AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE
+              value: /secrets/smtpPassword
+            - name: AUTHELIA_NOTIFIER_SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: smtpUsername
+            - name: AUTHELIA_NOTIFIER_SMTP_SENDER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: smtpSender
             {{- if $.Values.authelia.oidc.enabled }}
             - name: AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET_FILE
               value: /secrets/autheliaOidcHmacSecret

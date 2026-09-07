@@ -134,10 +134,22 @@ spec:
             - --proxy-deployment={{ $proxy }}
             - --wake-timeout={{ $.Values.ctl.wakeTimeout }}
             - --suspend-timeout={{ $.Values.ctl.suspendTimeout }}
+            - --identity-user-header={{ $.Values.ctl.identity.userHeader }}
+            - --identity-display-header={{ $.Values.ctl.identity.displayHeader }}
+            - --identity-groups-header={{ $.Values.ctl.identity.groupsHeader }}
+            {{- with $.Values.ctl.adminUser }}
+            - --admin-user={{ . }}
+            {{- end }}
+            {{- with $.Values.proxy.tls.hostname }}
+            - --endpoint-suffix={{ . }}
+            {{- end }}
           env:
             # The only component given the private half, because it is the only one that signs at
             # runtime rather than validating.
             {{- include "neon.secretEnv" (dict "root" $ "name" "NEON_CTL_AUTH_KEY" "key" "authPrivateKey") | nindent 12 }}
+            # Optional, and its absence is the feature being off: without it a role keeps a
+            # verifier and no password, so one can be set and shown but never read back.
+            {{- include "neon.secretEnv" (dict "root" $ "name" "NEON_CTL_PASSWORD_KEY" "key" "passwordKey" "optional" true) | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ $.Values.ctl.port }}
@@ -184,29 +196,3 @@ spec:
     - name: http
       port: {{ $.Values.ctl.port }}
       targetPort: http
-{{- with $.Values.ctl.hostname }}
----
-# Only the branch API is published. The hooks and the proxy's auth endpoint answer callers inside
-# the namespace, and one of them serves role verifiers.
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: {{ $fullname }}
-  namespace: {{ $.Release.Namespace }}
-  labels:
-    {{- include "neon.labels" $ctx | nindent 4 }}
-spec:
-  parentRefs:
-    - name: {{ $.Values.gateway.name }}
-      namespace: {{ $.Values.gateway.namespace }}
-  hostnames:
-    - {{ . | quote }}
-  rules:
-    - matches:
-        - path:
-            type: PathPrefix
-            value: /api/branches
-      backendRefs:
-        - name: {{ $fullname }}
-          port: {{ $.Values.ctl.port }}
-{{- end }}

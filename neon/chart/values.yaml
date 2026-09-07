@@ -134,17 +134,23 @@ ctl:
     tag: "sha-709c9e2"
     pullPolicy: IfNotPresent
   port: 8080
-  # Publishes the branch API on the gateway. Empty leaves it reachable only from inside the
-  # namespace, which is enough if branches are only ever created by something in-cluster.
-  hostname: neon.internal.haustorium.net
+  # Set by the authenticating proxy in front, and believed without question — nothing here may be
+  # reachable except through it. Whatever the user header carries is what owns a project.
+  identity:
+    userHeader: Remote-User
+    displayHeader: Remote-Name
+    groupsHeader: Remote-Groups
+  # The one identifier that may see every project, as the user header would carry it. Empty means
+  # nobody.
+  adminUser: ""
   # A cold start is a basebackup, so this scales with working-set size.
   wakeTimeout: 90s
   # Zero never suspends.
   suspendTimeout: 5m
-  # The registry file is memory-mapped and held under an exclusive lock, so it wants a local block
-  # device. That makes it the one piece of state here with no protection against losing its node.
+  # Every project, branch and role is here and nowhere else — losing it strands tenants and
+  # timelines that still exist — so it is placed where it survives the node it was written on.
   registry:
-    storageClass: topolvm-provisioner
+    storageClass: zerofs
     size: 1Gi
   resources:
     requests:

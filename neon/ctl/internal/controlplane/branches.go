@@ -27,7 +27,6 @@ type createBranchRequest struct {
 	Parent    string  `json:"parent,omitempty"`
 	ParentLSN *string `json:"parent_lsn,omitempty"`
 
-	TenantID  string `json:"tenant_id,omitempty"`
 	PgVersion int    `json:"pg_version,omitempty"`
 	Mode      string `json:"mode,omitempty"`
 
@@ -38,8 +37,16 @@ type createBranchRequest struct {
 	Start bool `json:"start,omitempty"`
 }
 
-func (r createBranchRequest) spec() (registry.Spec, error) {
+// Every path from a request to a role passes through here, so sealing is asked for by the type
+// rather than remembered at each caller.
+type sealer func(role, password string) (string, error)
+
+func (r createBranchRequest) spec(seal sealer) (registry.Spec, error) {
 	mode, err := neon.ParseComputeMode(r.Mode)
+	if err != nil {
+		return registry.Spec{}, err
+	}
+	roles, err := roleSpecs(r.Roles, seal)
 	if err != nil {
 		return registry.Spec{}, err
 	}
@@ -47,7 +54,7 @@ func (r createBranchRequest) spec() (registry.Spec, error) {
 	spec := registry.Spec{
 		Name:      r.Name,
 		Mode:      mode,
-		Roles:     roleSpecs(r.Roles),
+		Roles:     roles,
 		Databases: r.Databases,
 		Settings:  r.Settings,
 	}
@@ -67,13 +74,16 @@ type patchBranchRequest struct {
 	Settings  *[]registry.Setting  `json:"settings,omitempty"`
 }
 
-func (r patchBranchRequest) patch() registry.Patch {
+func (r patchBranchRequest) patch(seal sealer) (registry.Patch, error) {
 	patch := registry.Patch{Databases: r.Databases, Settings: r.Settings}
 	if r.Roles != nil {
-		specs := roleSpecs(*r.Roles)
+		specs, err := roleSpecs(*r.Roles, seal)
+		if err != nil {
+			return registry.Patch{}, err
+		}
 		patch.Roles = &specs
 	}
-	return patch
+	return patch, nil
 }
 
 // Only ever asked for a root branch, since a fork inherits its ancestor's. Unasked takes the
@@ -94,12 +104,22 @@ func (s *Server) resolvePgVersion(requested int) (int, error) {
 	return 0, fmt.Errorf("no compute image for postgres %d; this deployment can run %v", requested, available)
 }
 
-func roleSpecs(requested []roleRequest) []registry.RoleSpec {
+func roleSpecs(requested []roleRequest, seal sealer) ([]registry.RoleSpec, error) {
 	specs := make([]registry.RoleSpec, 0, len(requested))
 	for _, role := range requested {
-		specs = append(specs, registry.RoleSpec{Name: role.Name, Password: role.Password, Verifier: role.Verifier})
+		spec := registry.RoleSpec{Name: role.Name, Password: role.Password, Verifier: role.Verifier}
+		// A verifier wins over a password, so sealing one that will not be used would keep a
+		// password the role does not have.
+		if role.Password != "" && role.Verifier == "" {
+			sealed, err := seal(role.Name, role.Password)
+			if err != nil {
+				return nil, err
+			}
+			spec.Secret = sealed
+		}
+		specs = append(specs, spec)
 	}
-	return specs
+	return specs, nil
 }
 
 type computeView struct {
@@ -111,6 +131,8 @@ type computeView struct {
 
 type branchView struct {
 	Name       string  `json:"name"`
+	ProjectID  string  `json:"project_id"`
+	EndpointID string  `json:"endpoint_id"`
 	TenantID   string  `json:"tenant_id"`
 	TimelineID string  `json:"timeline_id"`
 	Parent     string  `json:"parent,omitempty"`
@@ -130,9 +152,13 @@ type branchView struct {
 }
 
 func (s *Server) handleListBranches(w http.ResponseWriter, r *http.Request) {
-	branches, err := s.registry.List(r.Context())
+	_, project := s.scope(w, r)
+	if project == nil {
+		return
+	}
+	branches, err := s.registry.Branches(r.Context(), project.ID)
 	if err != nil {
-		s.log.Error("listing branches", "error", err)
+		s.log.Error("listing branches", "project", project.ID, "error", err)
 		writeError(w, http.StatusServiceUnavailable, "registry unavailable")
 		return
 	}
@@ -152,13 +178,17 @@ func (s *Server) handleGetBranch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
+	_, project := s.scope(w, r)
+	if project == nil {
+		return
+	}
 	var request createBranchRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		writeError(w, http.StatusBadRequest, "malformed request body")
 		return
 	}
 
-	branch, err := s.createBranch(r.Context(), request)
+	branch, err := s.createBranch(r.Context(), project, request)
 	if err != nil {
 		s.log.Error("creating branch", "branch", request.Name, "error", err)
 		writeError(w, statusOf(err), err.Error())
@@ -174,80 +204,56 @@ func (s *Server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 }
 
 // The branch is fully built and validated before the first controller call, so a rejected request
-// cannot leave a tenant behind.
-func (s *Server) createBranch(ctx context.Context, request createBranchRequest) (*registry.Branch, error) {
-	spec, err := request.spec()
+// cannot leave a timeline behind. The tenant is the project's and already exists.
+func (s *Server) createBranch(ctx context.Context, project *registry.Project, request createBranchRequest) (*registry.Branch, error) {
+	spec, err := request.spec(s.seal)
 	if err != nil {
 		return nil, withStatus(http.StatusBadRequest, err)
 	}
 
-	if _, err := s.registry.Get(ctx, spec.Name); err == nil {
-		return nil, withStatus(http.StatusConflict, fmt.Errorf("branch %q already exists", spec.Name))
-	} else if !errors.Is(err, registry.ErrNotFound) && !errors.Is(err, registry.ErrInvalidName) {
-		return nil, withStatus(http.StatusServiceUnavailable, err)
-	}
-
-	branch, tenantIsNew, err := s.buildBranch(ctx, request, spec)
+	branch, err := s.buildBranch(ctx, project, request, spec)
 	if err != nil {
 		return nil, err
 	}
 
-	if tenantIsNew {
-		if err := s.storcon.CreateTenant(ctx, branch.TenantID); err != nil {
-			return nil, withStatus(http.StatusBadGateway, fmt.Errorf("creating tenant: %w", err))
-		}
-	}
 	if err := s.storcon.CreateTimeline(ctx, branch.TenantID, branch.TimelineCreateRequest()); err != nil {
-		if tenantIsNew {
-			if cleanup := s.storcon.DeleteTenant(ctx, branch.TenantID); cleanup != nil {
-				s.log.Error("deleting the tenant of a failed branch", "tenant", branch.TenantID, "error", cleanup)
-			}
-		}
 		return nil, withStatus(http.StatusBadGateway, fmt.Errorf("creating timeline: %w", err))
 	}
-	if err := s.registry.Put(ctx, branch); err != nil {
-		// The timeline outlives the failed registry write. It stays enumerable from the
-		// controller, so nothing is lost but the name.
+	// Create rather than Put: the name is claimed in the same transaction it is checked in, so two
+	// callers racing for it cannot both believe they won.
+	if err := s.registry.Create(ctx, branch); err != nil {
+		if cleanup := s.storcon.DeleteTimeline(ctx, branch.TenantID, branch.TimelineID); cleanup != nil {
+			s.log.Error("deleting the timeline of a failed branch", "timeline", branch.TimelineID, "error", cleanup)
+		}
+		if errors.Is(err, registry.ErrNameTaken) {
+			return nil, withStatus(http.StatusConflict, err)
+		}
 		return nil, withStatus(http.StatusServiceUnavailable, fmt.Errorf("recording branch: %w", err))
 	}
 	return branch, nil
 }
 
-// buildBranch answers one question: which tenant. A fresh id is minted locally so that the branch
-// can be validated before anything is created.
-func (s *Server) buildBranch(ctx context.Context, request createBranchRequest, spec registry.Spec) (*registry.Branch, bool, error) {
+// buildBranch answers one question: root or fork. Both take their tenant from the project, so a
+// branch can never be created outside the isolation boundary its project owns.
+func (s *Server) buildBranch(ctx context.Context, project *registry.Project, request createBranchRequest, spec registry.Spec) (*registry.Branch, error) {
 	if request.Parent != "" {
-		parent, err := s.registry.Get(ctx, request.Parent)
+		parent, err := s.registry.Branch(ctx, project.ID, request.Parent)
 		if err != nil {
 			if isNotFound(err) || errors.Is(err, registry.ErrInvalidName) {
-				return nil, false, withStatus(http.StatusBadRequest, fmt.Errorf("parent branch %q does not exist", request.Parent))
+				return nil, withStatus(http.StatusBadRequest, fmt.Errorf("parent branch %q does not exist", request.Parent))
 			}
-			return nil, false, withStatus(http.StatusServiceUnavailable, err)
+			return nil, withStatus(http.StatusServiceUnavailable, err)
 		}
-		branch, err := parent.Fork(spec)
-		return branch, false, withStatus(http.StatusBadRequest, err)
-	}
-
-	var (
-		tenant neon.TenantID
-		err    error
-	)
-	tenantIsNew := request.TenantID == ""
-	if tenantIsNew {
-		tenant, err = neon.NewTenantID()
-	} else {
-		tenant, err = neon.ParseTenantID(request.TenantID)
-	}
-	if err != nil {
-		return nil, false, withStatus(http.StatusBadRequest, err)
+		branch, err := parent.Fork(spec, project)
+		return branch, withStatus(http.StatusBadRequest, err)
 	}
 
 	pgVersion, err := s.resolvePgVersion(request.PgVersion)
 	if err != nil {
-		return nil, false, withStatus(http.StatusBadRequest, err)
+		return nil, withStatus(http.StatusBadRequest, err)
 	}
-	branch, err := registry.New(spec, pgVersion, tenant)
-	return branch, tenantIsNew, withStatus(http.StatusBadRequest, err)
+	branch, err := registry.New(spec, pgVersion, project)
+	return branch, withStatus(http.StatusBadRequest, err)
 }
 
 func (s *Server) handlePatchBranch(w http.ResponseWriter, r *http.Request) {
@@ -260,7 +266,12 @@ func (s *Server) handlePatchBranch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "malformed request body")
 		return
 	}
-	if err := branch.Apply(request.patch()); err != nil {
+	patch, err := request.patch(s.seal)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := branch.Apply(patch); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -270,22 +281,74 @@ func (s *Server) handlePatchBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A running compute keeps its old catalog until it is told; the spec endpoint alone would not
-	// reach it until its next restart.
-	if instance, err := s.computes.Get(r.Context(), branch.Name); err == nil && instance.Running() {
-		spec, err := s.renderSpec(r.Context(), instance)
-		if err == nil {
-			var client *neon.ComputeCtl
-			if client, err = s.computeClient(instance); err == nil {
-				err = client.Configure(r.Context(), spec)
-			}
-		}
-		if err != nil {
-			s.log.Error("applying branch change to a running compute", "branch", branch.Name, "error", err)
-		}
+	if err := s.reconfigureBranch(r.Context(), branch); err != nil {
+		s.log.Error("applying branch change to a running compute", "branch", branch.Name, "error", err)
 	}
 
 	writeJSON(w, http.StatusOK, s.view(r.Context(), branch))
+}
+
+// A running compute keeps its old catalog until it is told; the spec endpoint alone would not
+// reach it until its next restart.
+func (s *Server) reconfigureBranch(ctx context.Context, branch *registry.Branch) error {
+	instance, err := s.computes.Get(ctx, branch.EndpointID)
+	if err != nil || !instance.Running() {
+		return nil
+	}
+	return s.configure(ctx, instance)
+}
+
+// A drop is performed by the compute and by nothing else, so the branch is woken for it. Recording
+// the removal without it would leave the object in Postgres holding data that nothing can reach.
+func (s *Server) dropFromCatalog(ctx context.Context, branch *registry.Branch, delta neon.DeltaOp) error {
+	instance, err := s.ensureRunning(ctx, branch)
+	if err != nil {
+		return withStatus(http.StatusServiceUnavailable, fmt.Errorf("waking the branch to drop %s: %w", delta.Name, err))
+	}
+	return s.configure(ctx, instance, delta)
+}
+
+func (s *Server) configure(ctx context.Context, instance *kube.Instance, deltas ...neon.DeltaOp) error {
+	spec, err := s.renderSpec(ctx, instance)
+	if err != nil {
+		return err
+	}
+	spec.DeltaOperations = deltas
+	client, err := s.computeClient(instance)
+	if err != nil {
+		return err
+	}
+	return client.Configure(ctx, spec)
+}
+
+type revealedPassword struct {
+	Role     string `json:"role"`
+	Password string `json:"password"`
+}
+
+// Mirrors what the page does, because everything the page does is a request somebody could have
+// made by hand. A deployment that keeps no passwords refuses rather than pretending to have none.
+func (s *Server) handleRevealPassword(w http.ResponseWriter, r *http.Request) {
+	branch := s.namedBranch(w, r)
+	if branch == nil {
+		return
+	}
+	if s.secrets == nil {
+		writeError(w, http.StatusPreconditionFailed, "this deployment keeps no passwords")
+		return
+	}
+	role, found := branch.Role(r.PathValue("role"))
+	if !found {
+		writeError(w, http.StatusNotFound, "role not found")
+		return
+	}
+	password, ok := s.reveal(&role)
+	if !ok {
+		writeError(w, http.StatusNotFound, "no password was kept for this role")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, revealedPassword{Role: role.Name, Password: password})
 }
 
 func (s *Server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
@@ -293,24 +356,27 @@ func (s *Server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 	if branch == nil {
 		return
 	}
-	name := branch.Name
-
-	if err := s.computes.Delete(r.Context(), name); err != nil {
-		s.log.Error("deleting compute", "branch", name, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "cannot remove compute")
-		return
-	}
-	if err := s.storcon.DeleteTimeline(r.Context(), branch.TenantID, branch.TimelineID); err != nil {
-		s.log.Error("deleting timeline", "branch", name, "error", err)
-		writeError(w, http.StatusBadGateway, "cannot remove timeline")
-		return
-	}
-	if err := s.registry.Delete(r.Context(), name); err != nil && !errors.Is(err, registry.ErrNotFound) {
-		s.log.Error("removing branch from registry", "branch", name, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "registry unavailable")
+	if err := s.deleteBranch(r.Context(), branch); err != nil {
+		s.log.Error("deleting branch", "branch", branch.Name, "error", err)
+		writeError(w, statusOf(err), err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// The compute goes first: a timeline deleted under a running compute would leave it serving pages
+// that no longer have a backing store.
+func (s *Server) deleteBranch(ctx context.Context, branch *registry.Branch) error {
+	if err := s.computes.Delete(ctx, branch.EndpointID); err != nil {
+		return withStatus(http.StatusServiceUnavailable, fmt.Errorf("removing compute: %w", err))
+	}
+	if err := s.storcon.DeleteTimeline(ctx, branch.TenantID, branch.TimelineID); err != nil {
+		return withStatus(http.StatusBadGateway, fmt.Errorf("removing timeline: %w", err))
+	}
+	if err := s.registry.Delete(ctx, branch.ProjectID, branch.Name); err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return withStatus(http.StatusServiceUnavailable, fmt.Errorf("removing branch: %w", err))
+	}
+	return nil
 }
 
 func (s *Server) handleStartBranch(w http.ResponseWriter, r *http.Request) {
@@ -331,25 +397,37 @@ func (s *Server) handleStopBranch(w http.ResponseWriter, r *http.Request) {
 	if branch == nil {
 		return
 	}
-	instance, err := s.computes.Get(r.Context(), branch.Name)
-	if errors.Is(err, kube.ErrNotFound) {
-		writeJSON(w, http.StatusOK, s.view(r.Context(), branch))
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "cannot resolve compute")
-		return
-	}
-	if err := s.suspend(r.Context(), instance); err != nil {
+	if err := s.stopBranch(r.Context(), branch); err != nil {
 		s.log.Error("stopping branch", "branch", branch.Name, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "cannot stop compute")
+		writeError(w, statusOf(err), err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, s.view(r.Context(), branch))
 }
 
+// A branch with no compute is already stopped, which is not an error to ask for again.
+func (s *Server) stopBranch(ctx context.Context, branch *registry.Branch) error {
+	instance, err := s.computes.Get(ctx, branch.EndpointID)
+	if errors.Is(err, kube.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return withStatus(http.StatusServiceUnavailable, fmt.Errorf("resolving compute: %w", err))
+	}
+	if err := s.suspend(ctx, instance); err != nil {
+		return withStatus(http.StatusServiceUnavailable, fmt.Errorf("stopping compute: %w", err))
+	}
+	return nil
+}
+
+// Every branch route resolves through its project, so a caller who may not see the project never
+// reaches the branch — including to learn whether it exists.
 func (s *Server) namedBranch(w http.ResponseWriter, r *http.Request) *registry.Branch {
-	branch, err := s.registry.Get(r.Context(), r.PathValue("name"))
+	_, project := s.scope(w, r)
+	if project == nil {
+		return nil
+	}
+	branch, err := s.registry.Branch(r.Context(), project.ID, r.PathValue("name"))
 	switch {
 	case err == nil:
 		return branch
@@ -369,6 +447,8 @@ func (s *Server) namedBranch(w http.ResponseWriter, r *http.Request) *registry.B
 func (s *Server) view(ctx context.Context, branch *registry.Branch) branchView {
 	view := branchView{
 		Name:       branch.Name,
+		ProjectID:  branch.ProjectID,
+		EndpointID: branch.EndpointID,
 		TenantID:   branch.TenantID.String(),
 		TimelineID: branch.TimelineID.String(),
 		Parent:     branch.Parent,
@@ -389,7 +469,7 @@ func (s *Server) view(ctx context.Context, branch *registry.Branch) branchView {
 		view.Roles = append(view.Roles, role.Name)
 	}
 
-	instance, err := s.computes.Get(ctx, branch.Name)
+	instance, err := s.computes.Get(ctx, branch.EndpointID)
 	if err != nil {
 		return view
 	}

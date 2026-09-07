@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/hzhou0/homelab/neon/ctl/internal/controlplane/ui"
 	"github.com/hzhou0/homelab/neon/ctl/internal/kube"
 	"github.com/hzhou0/homelab/neon/ctl/internal/neon"
 	"github.com/hzhou0/homelab/neon/ctl/internal/registry"
+	"github.com/hzhou0/homelab/neon/ctl/internal/secret"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -29,6 +31,16 @@ type Options struct {
 	// SuspendTimeout is reported to compute_ctl and drives its idle metrics; the decision to
 	// scale to zero is made here. Zero never suspends.
 	SuspendTimeout time.Duration
+
+	// EndpointSuffix is what an endpoint id is shown under, purely so the page can print a
+	// connectable host. Nothing routes on it; the proxy takes the suffix from its certificate.
+	EndpointSuffix string
+
+	// Passwords seals the passwords the registry keeps. Nil keeps none: a role is then only a
+	// verifier, and a password exists for exactly as long as the answer that set it.
+	Passwords *secret.Box
+
+	Identity IdentityOptions
 }
 
 type Server struct {
@@ -37,6 +49,10 @@ type Server struct {
 	computes kube.Runtime
 	log      *slog.Logger
 	opts     Options
+	identity IdentityOptions
+
+	// Absent unless a key was configured, which is what decides whether a password is kept at all.
+	secrets *secret.Box
 
 	key           *neon.SigningKey
 	storageKey    *neon.StorageKey
@@ -54,6 +70,8 @@ func New(storcon *neon.StorageController, store *registry.Store, computes kube.R
 		key:        key,
 		storageKey: storageKey,
 		opts:       opts,
+		identity:   opts.Identity,
+		secrets:    opts.Passwords,
 	}
 	if storageKey != nil {
 		server.storageAuth = storageKey.Verifier()
@@ -76,15 +94,43 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"/wake_compute", s.handleWakeCompute)
 	mux.HandleFunc("GET "+base+"/endpoints/{endpoint}/jwks", s.handleEndpointJWKS)
 
-	// The only routes reachable from outside the namespace, so they are the only ones that carry
-	// their own admission rather than resting on the network fence.
-	mux.HandleFunc("GET /api/branches", s.adminOnly(s.handleListBranches))
-	mux.HandleFunc("POST /api/branches", s.adminOnly(s.handleCreateBranch))
-	mux.HandleFunc("GET /api/branches/{name}", s.adminOnly(s.handleGetBranch))
-	mux.HandleFunc("PATCH /api/branches/{name}", s.adminOnly(s.handlePatchBranch))
-	mux.HandleFunc("DELETE /api/branches/{name}", s.adminOnly(s.handleDeleteBranch))
-	mux.HandleFunc("POST /api/branches/{name}/start", s.adminOnly(s.handleStartBranch))
-	mux.HandleFunc("POST /api/branches/{name}/stop", s.adminOnly(s.handleStopBranch))
+	// Everything below is scoped to the caller's identity, which an authenticating proxy in front
+	// supplies. Nothing here authenticates anyone itself.
+	mux.HandleFunc("GET /api/projects", s.handleListProjects)
+	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
+	mux.HandleFunc("GET /api/projects/{project}", s.handleGetProject)
+	mux.HandleFunc("PATCH /api/projects/{project}", s.handlePatchProject)
+	mux.HandleFunc("DELETE /api/projects/{project}", s.handleDeleteProject)
+
+	mux.HandleFunc("GET /api/projects/{project}/branches", s.handleListBranches)
+	mux.HandleFunc("POST /api/projects/{project}/branches", s.handleCreateBranch)
+	mux.HandleFunc("GET /api/projects/{project}/branches/{name}", s.handleGetBranch)
+	mux.HandleFunc("PATCH /api/projects/{project}/branches/{name}", s.handlePatchBranch)
+	mux.HandleFunc("DELETE /api/projects/{project}/branches/{name}", s.handleDeleteBranch)
+	mux.HandleFunc("POST /api/projects/{project}/branches/{name}/start", s.handleStartBranch)
+	mux.HandleFunc("POST /api/projects/{project}/branches/{name}/stop", s.handleStopBranch)
+	mux.HandleFunc("GET /api/projects/{project}/branches/{name}/roles/{role}/password", s.handleRevealPassword)
+
+	mux.Handle("GET /ui/assets/", http.StripPrefix("/ui/", ui.Assets()))
+	mux.HandleFunc("GET /{$}", s.handleUIProjects)
+	mux.HandleFunc("GET /ui/projects", s.handleUIProjectsFragment)
+	mux.HandleFunc("POST /ui/projects", s.handleUICreateProject)
+	mux.HandleFunc("GET /ui/projects/{project}", s.handleUIProject)
+	mux.HandleFunc("PATCH /ui/projects/{project}", s.handleUIGrant)
+	mux.HandleFunc("DELETE /ui/projects/{project}", s.handleUIDeleteProject)
+	mux.HandleFunc("GET /ui/projects/{project}/branches", s.handleUIBranches)
+	mux.HandleFunc("GET /ui/projects/{project}/branches/{name}", s.handleUIBranchPage)
+	mux.HandleFunc("GET /ui/projects/{project}/branches/{name}/detail", s.handleUIBranchFragment)
+	mux.HandleFunc("POST /ui/projects/{project}/branches", s.handleUICreateBranch)
+	mux.HandleFunc("DELETE /ui/projects/{project}/branches/{name}", s.handleUIDeleteBranch)
+	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/start", s.handleUIStartBranch)
+	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/stop", s.handleUIStopBranch)
+	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/roles", s.handleUIAddRole)
+	mux.HandleFunc("GET /ui/projects/{project}/branches/{name}/roles/{role}/password", s.handleUIRevealPassword)
+	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/roles/{role}/password", s.handleUIResetPassword)
+	mux.HandleFunc("DELETE /ui/projects/{project}/branches/{name}/roles/{role}", s.handleUIDeleteRole)
+	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/databases", s.handleUIAddDatabase)
+	mux.HandleFunc("DELETE /ui/projects/{project}/branches/{name}/databases/{database}", s.handleUIDeleteDatabase)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -184,7 +230,7 @@ const readinessPoll = time.Second
 // A cold start is slow enough that a burst of connections arrives while it is in progress, so they
 // share one attempt rather than each racing an update of the same object.
 func (s *Server) ensureRunning(ctx context.Context, branch *registry.Branch) (*kube.Instance, error) {
-	instance, err, _ := s.waking.Do(branch.Name, func() (any, error) {
+	instance, err, _ := s.waking.Do(branch.EndpointID, func() (any, error) {
 		return s.wake(ctx, branch)
 	})
 	if err != nil {
@@ -195,7 +241,7 @@ func (s *Server) ensureRunning(ctx context.Context, branch *registry.Branch) (*k
 
 func (s *Server) wake(ctx context.Context, branch *registry.Branch) (*kube.Instance, error) {
 	instance, err := s.computes.Ensure(ctx, kube.Binding{
-		ID:         branch.Name,
+		ID:         branch.EndpointID,
 		TenantID:   branch.TenantID,
 		TimelineID: branch.TimelineID,
 		Mode:       branch.Mode,
@@ -218,7 +264,7 @@ func (s *Server) wake(ctx context.Context, branch *registry.Branch) (*kube.Insta
 		case <-time.After(readinessPoll):
 		}
 
-		instance, err = s.computes.Get(ctx, branch.Name)
+		instance, err = s.computes.Get(ctx, branch.EndpointID)
 		if err != nil {
 			return nil, err
 		}
@@ -232,6 +278,7 @@ func (s *Server) wake(ctx context.Context, branch *registry.Branch) (*kube.Insta
 // the safekeepers — but a clean shutdown restarts faster and reports the LSN it stopped at.
 func (s *Server) suspend(ctx context.Context, instance *kube.Instance) error {
 	if instance.Running() {
+		s.rememberCatalog(ctx, instance)
 		client, err := s.computeClient(instance)
 		if err == nil {
 			_, err = client.Terminate(ctx, neon.TerminateFast)
@@ -242,6 +289,37 @@ func (s *Server) suspend(ctx context.Context, instance *kube.Instance) error {
 		}
 	}
 	return s.computes.Scale(ctx, instance.ID, 0)
+}
+
+// The last moment the compute can be asked what it has is the moment before it is taken down, and
+// the names are kept for one purpose: a page that cannot ask can still offer the connection string
+// that starts it again. Failing is fine — nothing downstream is worse than a page with no snapshot.
+func (s *Server) rememberCatalog(ctx context.Context, instance *kube.Instance) {
+	branch, err := s.registry.Endpoint(ctx, instance.ID)
+	if err != nil {
+		return
+	}
+	client, err := s.computeClient(instance)
+	if err != nil {
+		return
+	}
+	catalog, err := client.Catalog(ctx)
+	if err != nil {
+		s.log.Warn("cannot read a catalog before suspending", "compute", instance.ID, "error", err)
+		return
+	}
+
+	seen := registry.LastSeen{At: time.Now().UTC()}
+	for _, role := range catalog.Roles {
+		seen.Roles = append(seen.Roles, role.Name)
+	}
+	for _, database := range catalog.Databases {
+		seen.Databases = append(seen.Databases, database.Name)
+	}
+	branch.LastSeen = &seen
+	if err := s.registry.Put(ctx, branch); err != nil {
+		s.log.Error("recording a catalog before suspending", "branch", branch.Name, "error", err)
+	}
 }
 
 func isNotFound(err error) bool {

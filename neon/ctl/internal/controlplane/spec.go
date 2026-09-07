@@ -57,7 +57,7 @@ func (s *Server) renderSpec(ctx context.Context, instance *kube.Instance) (*neon
 		spec.SafekeepersGeneration = &generation
 	}
 
-	branch, err := s.registry.Get(ctx, instance.ID)
+	branch, err := s.registry.Endpoint(ctx, instance.ID)
 	if err != nil {
 		// The catalog lives in the timeline, so a spec with none mutates nothing and the compute
 		// still boots. This is what keeps a registry outage off the recovery path.

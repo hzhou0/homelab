@@ -23,6 +23,32 @@ import (
 	"github.com/hzhou0/homelab/neon/ctl/internal/scram"
 )
 
+// Every test runs inside one project, because after multitenancy there is no such thing as a
+// branch outside one.
+const (
+	testProjectName = "acme"
+	testProjectID   = "pr-test-project-aaaaaaaa"
+	testEndpointID  = "ep-test-branch-aaaaaaaa"
+)
+
+// Fixed rather than generated, so a route in a test can name the project literally.
+func seedProject(t *testing.T, store *registry.Store) *registry.Project {
+	t.Helper()
+	now := time.Now().UTC()
+	project := &registry.Project{
+		ID:        testProjectID,
+		Name:      testProjectName,
+		TenantID:  mustTenant(t),
+		Owner:     "tester",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := store.CreateProject(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	return project
+}
+
 func newStore(t *testing.T) *registry.Store {
 	t.Helper()
 	store, err := registry.Open(filepath.Join(t.TempDir(), "registry.db"))
@@ -30,6 +56,7 @@ func newStore(t *testing.T) *registry.Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
+	seedProject(t, store)
 	return store
 }
 
@@ -164,8 +191,9 @@ type fakeStorcon struct {
 	created    []neon.TimelineCreateRequest
 	status     int
 
-	timelineRefused bool
-	deletedTenants  []string
+	timelineRefused  bool
+	deletedTenants   []string
+	deletedTimelines []string
 }
 
 func newFakeStorcon(t *testing.T) *fakeStorcon {
@@ -238,6 +266,9 @@ func newFakeStorcon(t *testing.T) *fakeStorcon {
 		writeJSON(w, http.StatusOK, map[string]string{})
 	})
 	mux.HandleFunc("DELETE /v1/tenant/{tenant}/timeline/{timeline}", func(w http.ResponseWriter, r *http.Request) {
+		fake.mu.Lock()
+		fake.deletedTimelines = append(fake.deletedTimelines, r.PathValue("timeline"))
+		fake.mu.Unlock()
 		fake.respond(w, map[string]string{})
 	})
 
@@ -276,6 +307,10 @@ type fakeCompute struct {
 	status        neon.ComputeStatus
 	lastActive    *time.Time
 	terminated    bool
+	catalog       neon.CatalogObjects
+	// Kept as it arrived: decoding into the same types that encoded it would agree with any
+	// spelling, including one compute_ctl does not read.
+	bodies [][]byte
 }
 
 func newFakeCompute(t *testing.T) *fakeCompute {
@@ -297,7 +332,13 @@ func newFakeCompute(t *testing.T) *fakeCompute {
 			return
 		}
 		fake.configured = append(fake.configured, *config.Spec)
+		fake.bodies = append(fake.bodies, body)
 		writeJSON(w, http.StatusOK, map[string]string{})
+	})
+	mux.HandleFunc("GET /dbs_and_roles", func(w http.ResponseWriter, r *http.Request) {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		writeJSON(w, http.StatusOK, fake.catalog)
 	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		fake.mu.Lock()
@@ -320,6 +361,15 @@ func newFakeCompute(t *testing.T) *fakeCompute {
 	return fake
 }
 
+func (f *fakeCompute) lastBody() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.bodies) == 0 {
+		return ""
+	}
+	return string(f.bodies[len(f.bodies)-1])
+}
+
 func (f *fakeCompute) specs() []neon.ComputeSpec {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -339,6 +389,7 @@ func newTestServer(t *testing.T, storcon *fakeStorcon, store *registry.Store, ru
 	server := New(storcon.client(t), store, runtime, key, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{
 		WakeTimeout:    2 * time.Second,
 		SuspendTimeout: time.Minute,
+		Identity:       IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "tester"},
 	})
 	if computes != nil {
 		server.computeClient = func(instance *kube.Instance) (*neon.ComputeCtl, error) {
@@ -352,6 +403,8 @@ func seedBranch(t *testing.T, store *registry.Store) *registry.Branch {
 	t.Helper()
 	branch := &registry.Branch{
 		Name:       "main",
+		ProjectID:  testProjectID,
+		EndpointID: testEndpointID,
 		TenantID:   mustTenant(t),
 		TimelineID: mustTimeline(t),
 		PgVersion:  17,
@@ -370,13 +423,13 @@ func seedCompute(t *testing.T, runtime *fakeRuntime, running bool) kube.Instance
 	t.Helper()
 	instance := kube.Instance{
 		Binding: kube.Binding{
-			ID:         "main",
+			ID:         testEndpointID,
 			TenantID:   mustTenant(t),
 			TimelineID: mustTimeline(t),
 			Mode:       neon.ComputeMode{Kind: neon.ModePrimary},
 		},
-		ControlURL: "http://compute-main.neon:3080",
-		PgAddress:  "compute-main.neon:55433",
+		ControlURL: "http://compute-" + testEndpointID + ".neon:3080",
+		PgAddress:  "compute-" + testEndpointID + ".neon:55433",
 	}
 	if running {
 		instance.Replicas = 1
@@ -393,6 +446,7 @@ func do(t *testing.T, server *Server, method, target string, body string) *httpt
 		reader = strings.NewReader(body)
 	}
 	request := httptest.NewRequest(method, target, reader)
+	request.Header.Set("Remote-User", "tester")
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
 	return recorder
@@ -518,7 +572,7 @@ func TestSpecEndpointStatuses(t *testing.T) {
 	server := newTestServer(t, storcon, store, runtime, nil)
 
 	t.Run("attached", func(t *testing.T) {
-		response := do(t, server, http.MethodGet, "/compute/api/v2/computes/main/spec", "")
+		response := do(t, server, http.MethodGet, "/compute/api/v2/computes/"+testEndpointID+"/spec", "")
 		if response.Code != http.StatusOK {
 			t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 		}
@@ -561,7 +615,7 @@ func TestSpecEndpointStatuses(t *testing.T) {
 			storcon.mu.Unlock()
 		}()
 
-		response := do(t, server, http.MethodGet, "/compute/api/v2/computes/main/spec", "")
+		response := do(t, server, http.MethodGet, "/compute/api/v2/computes/"+testEndpointID+"/spec", "")
 		if response.Code != http.StatusServiceUnavailable {
 			t.Errorf("status = %d, want 503", response.Code)
 		}
@@ -793,7 +847,7 @@ func TestEndpointAccessControl(t *testing.T) {
 	server := newTestServer(t, storcon, store, newFakeRuntime(), nil)
 
 	t.Run("returns the role secret", func(t *testing.T) {
-		response := do(t, server, http.MethodGet, "/proxy/v1/get_endpoint_access_control?endpointish=main&role=app", "")
+		response := do(t, server, http.MethodGet, "/proxy/v1/get_endpoint_access_control?endpointish="+testEndpointID+"&role=app", "")
 		if response.Code != http.StatusOK {
 			t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 		}
@@ -816,7 +870,7 @@ func TestEndpointAccessControl(t *testing.T) {
 		reason string
 	}{
 		{"unknown endpoint", "/proxy/v1/get_endpoint_access_control?endpointish=absent&role=app", reasonEndpointNotFound},
-		{"unknown role", "/proxy/v1/get_endpoint_access_control?endpointish=main&role=nobody", reasonRoleNotFound},
+		{"unknown role", "/proxy/v1/get_endpoint_access_control?endpointish=" + testEndpointID + "&role=nobody", reasonRoleNotFound},
 		{"unusable endpoint name", "/proxy/v1/get_endpoint_access_control?endpointish=../etc&role=app", reasonEndpointNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -851,7 +905,7 @@ func TestWakeComputeStartsASuspendedBranch(t *testing.T) {
 	seedCompute(t, runtime, false)
 	server := newTestServer(t, storcon, store, runtime, nil)
 
-	response := do(t, server, http.MethodGet, "/proxy/v1/wake_compute?endpointish=main", "")
+	response := do(t, server, http.MethodGet, "/proxy/v1/wake_compute?endpointish="+testEndpointID, "")
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
@@ -869,18 +923,18 @@ func TestWakeComputeStartsASuspendedBranch(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Address != "compute-main.neon:55433" {
+	if body.Address != "compute-"+testEndpointID+".neon:55433" {
 		t.Errorf("address = %q", body.Address)
 	}
 	// A null server name is what tells the proxy to reach the compute without TLS.
 	if body.ServerName != nil {
 		t.Errorf("server_name = %v, want null", *body.ServerName)
 	}
-	if body.Aux.EndpointID != "main" || body.Aux.ProjectID != tenantHex || body.Aux.BranchID != timelineHex {
+	if body.Aux.EndpointID != testEndpointID || body.Aux.ProjectID != tenantHex || body.Aux.BranchID != timelineHex {
 		t.Errorf("aux = %+v", body.Aux)
 	}
 
-	instance, err := runtime.Get(context.Background(), "main")
+	instance, err := runtime.Get(context.Background(), testEndpointID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,7 +952,7 @@ func TestWakeComputeGivesUpWhenTheComputeStaysDown(t *testing.T) {
 	seedCompute(t, runtime, false)
 	server := newTestServer(t, storcon, store, runtime, nil)
 
-	response := do(t, server, http.MethodGet, "/proxy/v1/wake_compute?endpointish=main", "")
+	response := do(t, server, http.MethodGet, "/proxy/v1/wake_compute?endpointish="+testEndpointID, "")
 	if response.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", response.Code)
 	}
@@ -908,7 +962,7 @@ func TestEndpointJWKSIsEmpty(t *testing.T) {
 	storcon := newFakeStorcon(t)
 	server := newTestServer(t, storcon, newStore(t), newFakeRuntime(), nil)
 
-	response := do(t, server, http.MethodGet, "/proxy/v1/endpoints/main/jwks", "")
+	response := do(t, server, http.MethodGet, "/proxy/v1/endpoints/"+testEndpointID+"/jwks", "")
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d", response.Code)
 	}
@@ -939,7 +993,7 @@ func TestConcurrentWakesShareOneAttempt(t *testing.T) {
 		waiting.Add(1)
 		go func() {
 			defer waiting.Done()
-			do(t, server, http.MethodGet, "/proxy/v1/wake_compute?endpointish=main", "")
+			do(t, server, http.MethodGet, "/proxy/v1/wake_compute?endpointish="+testEndpointID, "")
 		}()
 	}
 	waiting.Wait()
@@ -966,7 +1020,7 @@ func TestCreateBranchStoresAVerifierNotAPassword(t *testing.T) {
 	store := newStore(t)
 	server := newTestServer(t, storcon, store, newFakeRuntime(), nil)
 
-	response := do(t, server, http.MethodPost, "/api/branches", `{
+	response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches", `{
 		"name":"main",
 		"roles":[{"name":"app","password":"hunter2"}],
 		"databases":[{"name":"appdb","owner":"app"}]}`)
@@ -974,7 +1028,7 @@ func TestCreateBranchStoresAVerifierNotAPassword(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
 
-	branch, err := store.Get(context.Background(), "main")
+	branch, err := store.Branch(context.Background(), testProjectID, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -983,6 +1037,10 @@ func TestCreateBranchStoresAVerifierNotAPassword(t *testing.T) {
 	}
 	if !scram.IsVerifier(branch.Roles[0].Verifier) {
 		t.Errorf("stored secret is not a verifier: %q", branch.Roles[0].Verifier)
+	}
+	// No key was configured, so the password itself was not kept in any form.
+	if branch.Roles[0].Secret != "" {
+		t.Error("a password was kept by a deployment that has nowhere to keep one")
 	}
 	if branch.TenantID.IsZero() || branch.TimelineID.IsZero() {
 		t.Errorf("branch was recorded without ids: %+v", branch)
@@ -1012,7 +1070,7 @@ func TestCreateBranchValidatesInput(t *testing.T) {
 		{"unusable mode", `{"name":"main","mode":"Sideways","roles":[{"name":"a","password":"b"}]}`, http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			response := do(t, server, http.MethodPost, "/api/branches", tc.body)
+			response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches", tc.body)
 			if response.Code != tc.want {
 				t.Errorf("status = %d, want %d: %s", response.Code, tc.want, response.Body)
 			}
@@ -1026,7 +1084,7 @@ func TestCreateBranchRejectsADuplicate(t *testing.T) {
 	seedBranch(t, store)
 	server := newTestServer(t, storcon, store, newFakeRuntime(), nil)
 
-	response := do(t, server, http.MethodPost, "/api/branches", `{"name":"main","roles":[{"name":"a","password":"b"}]}`)
+	response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches", `{"name":"main","roles":[{"name":"a","password":"b"}]}`)
 	if response.Code != http.StatusConflict {
 		t.Errorf("status = %d, want 409", response.Code)
 	}
@@ -1040,13 +1098,13 @@ func TestForkAsksTheControllerForABranch(t *testing.T) {
 	parent := seedBranch(t, store)
 	server := newTestServer(t, storcon, store, newFakeRuntime(), nil)
 
-	response := do(t, server, http.MethodPost, "/api/branches",
+	response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches",
 		`{"name":"feature","parent":"main","parent_lsn":"16/B374D848"}`)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
 
-	child, err := store.Get(context.Background(), "feature")
+	child, err := store.Branch(context.Background(), testProjectID, "feature")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1077,7 +1135,7 @@ func TestPatchBranchReconfiguresARunningCompute(t *testing.T) {
 	computes := newFakeCompute(t)
 	server := newTestServer(t, storcon, store, runtime, computes)
 
-	response := do(t, server, http.MethodPatch, "/api/branches/main",
+	response := do(t, server, http.MethodPatch, "/api/projects/"+testProjectID+"/branches/main",
 		`{"settings":[{"name":"work_mem","value":"64MB","vartype":"string"}]}`)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
@@ -1106,14 +1164,14 @@ func TestDeleteBranchRemovesComputeAndEntry(t *testing.T) {
 	seedCompute(t, runtime, true)
 	server := newTestServer(t, storcon, store, runtime, nil)
 
-	response := do(t, server, http.MethodDelete, "/api/branches/main", "")
+	response := do(t, server, http.MethodDelete, "/api/projects/"+testProjectID+"/branches/main", "")
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
-	if _, err := store.Get(context.Background(), "main"); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := store.Branch(context.Background(), testProjectID, "main"); !errors.Is(err, registry.ErrNotFound) {
 		t.Errorf("branch survived deletion: %v", err)
 	}
-	if _, err := runtime.Get(context.Background(), "main"); err == nil {
+	if _, err := runtime.Get(context.Background(), testEndpointID); err == nil {
 		t.Error("compute survived deletion")
 	}
 }
@@ -1128,14 +1186,14 @@ func TestBranchViewReportsLiveComputeState(t *testing.T) {
 	computes.lastActive = &active
 	server := newTestServer(t, storcon, store, runtime, computes)
 
-	response := do(t, server, http.MethodGet, "/api/branches/main", "")
+	response := do(t, server, http.MethodGet, "/api/projects/"+testProjectID+"/branches/main", "")
 	view := decodeBranch(t, response.Body.Bytes())
 	if view.Compute.Status != "absent" {
 		t.Errorf("status with no compute = %q", view.Compute.Status)
 	}
 
 	seedCompute(t, runtime, true)
-	response = do(t, server, http.MethodGet, "/api/branches/main", "")
+	response = do(t, server, http.MethodGet, "/api/projects/"+testProjectID+"/branches/main", "")
 	view = decodeBranch(t, response.Body.Bytes())
 	if view.Compute.Status != "running" || view.Compute.LastActive == nil {
 		t.Errorf("view = %+v", view.Compute)
@@ -1151,18 +1209,18 @@ func TestStartAndStopBranch(t *testing.T) {
 	computes := newFakeCompute(t)
 	server := newTestServer(t, storcon, store, runtime, computes)
 
-	if response := do(t, server, http.MethodPost, "/api/branches/main/start", ""); response.Code != http.StatusOK {
+	if response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches/main/start", ""); response.Code != http.StatusOK {
 		t.Fatalf("start status = %d, body = %s", response.Code, response.Body)
 	}
-	instance, err := runtime.Get(context.Background(), "main")
+	instance, err := runtime.Get(context.Background(), testEndpointID)
 	if err != nil || !instance.Running() {
 		t.Fatalf("compute after start = %+v, %v", instance, err)
 	}
 
-	if response := do(t, server, http.MethodPost, "/api/branches/main/stop", ""); response.Code != http.StatusOK {
+	if response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches/main/stop", ""); response.Code != http.StatusOK {
 		t.Fatalf("stop status = %d", response.Code)
 	}
-	instance, err = runtime.Get(context.Background(), "main")
+	instance, err = runtime.Get(context.Background(), testEndpointID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1179,16 +1237,16 @@ func TestUnknownBranchIsNotFound(t *testing.T) {
 	storcon := newFakeStorcon(t)
 	server := newTestServer(t, storcon, newStore(t), newFakeRuntime(), nil)
 
-	for _, target := range []string{"/api/branches/absent", "/api/branches/absent/start", "/api/branches/absent/stop"} {
+	for _, target := range []string{"/api/projects/" + testProjectID + "/branches/absent", "/api/projects/" + testProjectID + "/branches/absent/start", "/api/projects/" + testProjectID + "/branches/absent/stop"} {
 		method := http.MethodGet
-		if target != "/api/branches/absent" {
+		if target != "/api/projects/"+testProjectID+"/branches/absent" {
 			method = http.MethodPost
 		}
 		if response := do(t, server, method, target, ""); response.Code != http.StatusNotFound {
 			t.Errorf("%s %s = %d, want 404", method, target, response.Code)
 		}
 	}
-	if response := do(t, server, http.MethodGet, "/api/branches/NotALegalName", ""); response.Code != http.StatusBadRequest {
+	if response := do(t, server, http.MethodGet, "/api/projects/"+testProjectID+"/branches/NotALegalName", ""); response.Code != http.StatusBadRequest {
 		t.Errorf("status for an unusable name = %d, want 400", response.Code)
 	}
 }
@@ -1217,10 +1275,10 @@ func TestCreateBranchChoosesAmongAvailableVersions(t *testing.T) {
 		return fmt.Sprintf(`{"name":%q,"pg_version":%d,"roles":[{"name":"app","password":"x"}]}`, name, version)
 	}
 
-	if response := do(t, server, http.MethodPost, "/api/branches", body("older", 16)); response.Code != http.StatusCreated {
+	if response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches", body("older", 16)); response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
-	older, err := store.Get(context.Background(), "older")
+	older, err := store.Branch(context.Background(), testProjectID, "older")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1230,17 +1288,17 @@ func TestCreateBranchChoosesAmongAvailableVersions(t *testing.T) {
 
 	// Unavailable versions are refused where the branch is created, not later as a pod that
 	// cannot start.
-	response := do(t, server, http.MethodPost, "/api/branches", body("ancient", 13))
+	response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches", body("ancient", 13))
 	if response.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", response.Code)
 	}
 
 	// Saying nothing takes the configured default.
-	if response := do(t, server, http.MethodPost, "/api/branches",
+	if response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches",
 		`{"name":"plain","roles":[{"name":"app","password":"x"}]}`); response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
-	plain, err := store.Get(context.Background(), "plain")
+	plain, err := store.Branch(context.Background(), testProjectID, "plain")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1255,16 +1313,16 @@ func TestForkKeepsTheAncestorsVersion(t *testing.T) {
 	store := newStore(t)
 	server := newTestServer(t, storcon, store, newFakeRuntime(), nil)
 
-	if response := do(t, server, http.MethodPost, "/api/branches",
+	if response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches",
 		`{"name":"older","pg_version":16,"roles":[{"name":"app","password":"x"}]}`); response.Code != http.StatusCreated {
 		t.Fatal(response.Body)
 	}
-	if response := do(t, server, http.MethodPost, "/api/branches",
+	if response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches",
 		`{"name":"child","parent":"older","pg_version":17}`); response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
 
-	child, err := store.Get(context.Background(), "child")
+	child, err := store.Branch(context.Background(), testProjectID, "child")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1273,99 +1331,306 @@ func TestForkKeepsTheAncestorsVersion(t *testing.T) {
 	}
 }
 
-// Creating a branch is two controller calls and the second is the one that fails in practice. The
-// tenant from the first is then unreachable by any name, so it has to be taken back.
-func TestCreateBranchDeletesTheTenantItCannotUse(t *testing.T) {
+// A branch that cannot be recorded must not leave its timeline behind: nothing would ever name it
+// again, and only the controller would still know it exists.
+func TestCreateBranchDeletesTheTimelineItCannotRecord(t *testing.T) {
+	storcon := newFakeStorcon(t)
+	store := newStore(t)
+	server := newTestServer(t, storcon, store, newFakeRuntime(), nil)
+
+	// Claim the name first, so the create reaches the registry and is refused by it.
+	seedBranch(t, store)
+
+	response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches", `{
+		"name":"main",
+		"roles":[{"name":"app","password":"hunter2"}]}`)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	storcon.mu.Lock()
+	deleted := storcon.deletedTimelines
+	storcon.mu.Unlock()
+	if len(deleted) != 1 {
+		t.Errorf("deleted timelines = %v, want the one just created", deleted)
+	}
+}
+
+// The tenant belongs to the project, so a branch failing must never take it: every other branch in
+// the project is on it.
+func TestCreateBranchNeverDeletesTheProjectsTenant(t *testing.T) {
 	storcon := newFakeStorcon(t)
 	storcon.timelineRefused = true
 	store := newStore(t)
 	server := newTestServer(t, storcon, store, newFakeRuntime(), nil)
 
-	response := do(t, server, http.MethodPost, "/api/branches", `{
+	response := do(t, server, http.MethodPost, "/api/projects/"+testProjectID+"/branches", `{
 		"name":"main",
 		"roles":[{"name":"app","password":"hunter2"}]}`)
 	if response.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
-
-	storcon.mu.Lock()
-	deleted := storcon.deletedTenants
-	storcon.mu.Unlock()
-	if len(deleted) != 1 {
-		t.Fatalf("deleted tenants = %v, want exactly the one just created", deleted)
-	}
-	if _, err := store.Get(context.Background(), "main"); !errors.Is(err, registry.ErrNotFound) {
-		t.Errorf("a failed branch was recorded anyway: %v", err)
-	}
-}
-
-// A tenant the caller named is not ours to delete: the failure says nothing about whatever else
-// already lives on it.
-func TestCreateBranchLeavesAnAdoptedTenantAlone(t *testing.T) {
-	storcon := newFakeStorcon(t)
-	storcon.timelineRefused = true
-	server := newTestServer(t, storcon, newStore(t), newFakeRuntime(), nil)
-
-	response := do(t, server, http.MethodPost, "/api/branches", `{
-		"name":"main",
-		"tenant_id":"aa7d0e4f02c00ce5e0a4c405b6850585",
-		"roles":[{"name":"app","password":"hunter2"}]}`)
-	if response.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
-	}
-
 	storcon.mu.Lock()
 	deleted := storcon.deletedTenants
 	storcon.mu.Unlock()
 	if len(deleted) != 0 {
-		t.Errorf("deleted a tenant the caller supplied: %v", deleted)
+		t.Errorf("a failed branch deleted its project's tenant: %v", deleted)
+	}
+	if _, err := store.Branch(context.Background(), testProjectID, "main"); !errors.Is(err, registry.ErrNotFound) {
+		t.Errorf("a failed branch was recorded anyway: %v", err)
 	}
 }
 
-// The branch API is the only surface published outside the namespace, so it must refuse a caller
-// the network fence would otherwise have admitted.
-func TestBranchAPIRequiresAnAdminToken(t *testing.T) {
-	const privateKey = `-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEID/Drmc1AA6U/znNRWpF3zEGegOATQxfkdWxitcOMsIH
------END PRIVATE KEY-----
-`
-	storageKey, err := neon.NewStorageKey([]byte(privateKey))
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := newStore(t)
-	seedBranch(t, store)
-
-	server := newTestServer(t, newFakeStorcon(t), store, newFakeRuntime(), nil)
-	server.storageKey = storageKey
-	server.storageAuth = storageKey.Verifier()
-
-	if got := do(t, server, http.MethodGet, "/api/branches", "").Code; got != http.StatusForbidden {
-		t.Errorf("without a token: status = %d, want 403", got)
-	}
-
-	tenantToken, err := storageKey.Token(neon.StorageClaims{Scope: neon.ScopeTenant})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := doAuthed(t, server, http.MethodGet, "/api/branches", tenantToken).Code; got != http.StatusForbidden {
-		t.Errorf("with a tenant token: status = %d, want 403", got)
-	}
-
-	adminToken, err := storageKey.Token(neon.StorageClaims{Scope: neon.ScopeAdmin})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := doAuthed(t, server, http.MethodGet, "/api/branches", adminToken).Code; got != http.StatusOK {
-		t.Errorf("with an admin token: status = %d, want 200", got)
-	}
-}
-
-func doAuthed(t *testing.T, server *Server, method, target, token string) *httptest.ResponseRecorder {
+// identityServer runs the way a deployment behind an authenticating proxy does: headers are
+// believed, and there is no single owner to fall back on.
+func identityServer(t *testing.T, store *registry.Store) *Server {
 	t.Helper()
-	request := httptest.NewRequest(method, target, nil)
-	request.Header.Set("Authorization", "Bearer "+token)
+	server := newTestServer(t, newFakeStorcon(t), store, newFakeRuntime(), nil)
+	server.identity = IdentityOptions{
+		UserHeader:    "Remote-User",
+		DisplayHeader: "Remote-Name",
+		GroupsHeader:  "Remote-Groups",
+		Admin:         "root",
+	}
+	return server
+}
+
+func doAs(t *testing.T, server *Server, method, target, user, groups, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	request := httptest.NewRequest(method, target, reader)
+	if user != "" {
+		request.Header.Set("Remote-User", user)
+	}
+	if groups != "" {
+		request.Header.Set("Remote-Groups", groups)
+	}
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
 	return recorder
+}
+
+// Without a proxy in front there is no identity, and a request carrying none is refused rather
+// than treated as anonymous.
+func TestUnidentifiedRequestIsRefused(t *testing.T) {
+	server := identityServer(t, newStore(t))
+	for _, target := range []string{"/api/projects", "/api/projects/" + testProjectID + "", "/api/projects/" + testProjectID + "/branches"} {
+		if got := doAs(t, server, http.MethodGet, target, "", "", "").Code; got != http.StatusUnauthorized {
+			t.Errorf("GET %s = %d, want 401", target, got)
+		}
+	}
+}
+
+// The whole point of the model: one tenant's branches are not another's to see, and the answer
+// does not even admit the project exists.
+func TestProjectsAreInvisibleToOtherPeople(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	server := identityServer(t, store)
+
+	stranger := doAs(t, server, http.MethodGet, "/api/projects", "mallory", "outsiders", "")
+	if stranger.Code != http.StatusOK {
+		t.Fatalf("status = %d", stranger.Code)
+	}
+	if !strings.Contains(stranger.Body.String(), `"projects":[]`) {
+		t.Errorf("a stranger was shown projects: %s", stranger.Body)
+	}
+
+	for _, target := range []string{"/api/projects/" + testProjectID + "", "/api/projects/" + testProjectID + "/branches", "/api/projects/" + testProjectID + "/branches/main"} {
+		if got := doAs(t, server, http.MethodGet, target, "mallory", "outsiders", "").Code; got != http.StatusNotFound {
+			t.Errorf("GET %s as a stranger = %d, want 404", target, got)
+		}
+	}
+	// Refusal must not depend on the branch being absent, so the owner sees the same routes work.
+	for _, target := range []string{"/api/projects/" + testProjectID + "", "/api/projects/" + testProjectID + "/branches", "/api/projects/" + testProjectID + "/branches/main"} {
+		if got := doAs(t, server, http.MethodGet, target, "tester", "", "").Code; got != http.StatusOK {
+			t.Errorf("GET %s as the owner = %d, want 200", target, got)
+		}
+	}
+}
+
+func TestGroupGrantAndAdministrator(t *testing.T) {
+	store := newStore(t)
+	project, err := registry.NewProject("shared", "someone", []string{"platform"}, mustTenant(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateProject(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	server := identityServer(t, store)
+	shared := "/api/projects/" + project.ID
+
+	if got := doAs(t, server, http.MethodGet, shared, "carol", "platform", "").Code; got != http.StatusOK {
+		t.Errorf("a member of a granted group = %d, want 200", got)
+	}
+	if got := doAs(t, server, http.MethodGet, shared, "carol", "other", "").Code; got != http.StatusNotFound {
+		t.Errorf("a non-member = %d, want 404", got)
+	}
+	if got := doAs(t, server, http.MethodGet, shared, "root", "", "").Code; got != http.StatusOK {
+		t.Errorf("the administrator = %d, want 200", got)
+	}
+}
+
+// Creating a project for somebody else is an admin act; otherwise anyone could hand one to a
+// person who never asked for it.
+func TestOnlyAnAdminCreatesAProjectForSomeoneElse(t *testing.T) {
+	server := identityServer(t, newStore(t))
+
+	body := `{"name":"handed","owner":"victim"}`
+	if got := doAs(t, server, http.MethodPost, "/api/projects", "mallory", "", body).Code; got != http.StatusForbidden {
+		t.Errorf("a non-admin naming another owner = %d, want 403", got)
+	}
+	if got := doAs(t, server, http.MethodPost, "/api/projects", "root", "", body).Code; got != http.StatusCreated {
+		t.Errorf("an admin naming another owner = %d, want 201", got)
+	}
+}
+
+// Ownership keys off the stable identifier, never the display name. An account destroyed and
+// remade takes a new identifier, and must not inherit what the old one owned.
+func TestOwnershipFollowsTheStableIdentifierNotTheName(t *testing.T) {
+	store := newStore(t)
+	project, err := registry.NewProject("owned", "uuid-original", nil, mustTenant(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateProject(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	server := identityServer(t, store)
+
+	request := func(user, display string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/projects/"+project.ID, nil)
+		req.Header.Set("Remote-User", user)
+		req.Header.Set("Remote-Name", display)
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, req)
+		return recorder.Code
+	}
+
+	if got := request("uuid-original", "Henry"); got != http.StatusOK {
+		t.Errorf("the owner = %d, want 200", got)
+	}
+	// Same human name, new directory identifier: a recreated account, and a different principal.
+	if got := request("uuid-recreated", "Henry"); got != http.StatusNotFound {
+		t.Errorf("a recreated account with the same display name = %d, want 404", got)
+	}
+	// The display name is not consulted at all, so its absence changes nothing.
+	if got := request("uuid-original", ""); got != http.StatusOK {
+		t.Errorf("the owner without a display name = %d, want 200", got)
+	}
+}
+
+// Access can only be given away by someone who has it, so a grant naming a group the caller is
+// not in is refused the same way naming another owner is.
+func TestGrantsAreLimitedToGroupsTheCallerHolds(t *testing.T) {
+	server := identityServer(t, newStore(t))
+
+	foreign := doAs(t, server, http.MethodPost, "/api/projects", "mallory", "",
+		`{"name":"grabbed","groups":["platform"]}`)
+	if foreign.Code != http.StatusForbidden {
+		t.Errorf("granting a group the caller is not in = %d, want 403", foreign.Code)
+	}
+	if seen := doAs(t, server, http.MethodGet, "/api/projects", "carol", "platform", ""); strings.Contains(seen.Body.String(), "grabbed") {
+		t.Errorf("the refused project reached a stranger's listing: %s", seen.Body)
+	}
+
+	held := doAs(t, server, http.MethodPost, "/api/projects", "mallory", "platform",
+		`{"name":"shared","groups":["platform"]}`)
+	if held.Code != http.StatusCreated {
+		t.Errorf("granting a group the caller holds = %d, want 201: %s", held.Code, held.Body)
+	}
+
+	// The administrator is the one account that can grant on behalf of a team it is not in.
+	asAdmin := doAs(t, server, http.MethodPost, "/api/projects", "root", "",
+		`{"name":"onbehalf","groups":["platform"]}`)
+	if asAdmin.Code != http.StatusCreated {
+		t.Errorf("the administrator granting a group = %d, want 201: %s", asAdmin.Code, asAdmin.Body)
+	}
+}
+
+func TestPatchProjectGrants(t *testing.T) {
+	store := newStore(t)
+	server := identityServer(t, store)
+
+	created := doAs(t, server, http.MethodPost, "/api/projects", "henry", "platform", `{"name":"team"}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", created.Code, created.Body)
+	}
+	var project struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &project); err != nil {
+		t.Fatal(err)
+	}
+	team := "/api/projects/" + project.ID
+
+	if got := doAs(t, server, http.MethodPatch, team, "henry", "platform",
+		`{"groups":["platform"]}`); got.Code != http.StatusOK {
+		t.Errorf("the owner granting a group they hold = %d, want 200: %s", got.Code, got.Body)
+	}
+	if got := doAs(t, server, http.MethodGet, team, "carol", "platform", ""); got.Code != http.StatusOK {
+		t.Errorf("the newly granted group cannot reach it = %d", got.Code)
+	}
+
+	if got := doAs(t, server, http.MethodPatch, team, "henry", "platform",
+		`{"groups":["finance"]}`); got.Code != http.StatusForbidden {
+		t.Errorf("granting a group the owner does not hold = %d, want 403", got.Code)
+	}
+
+	// A member may use the project but not decide who else may.
+	if got := doAs(t, server, http.MethodPatch, team, "carol", "platform",
+		`{"groups":[]}`); got.Code != http.StatusForbidden {
+		t.Errorf("a group member re-granting = %d, want 403", got.Code)
+	}
+	if got := doAs(t, server, http.MethodPatch, team, "henry", "platform",
+		`{"owner":"someone-else"}`); got.Code != http.StatusForbidden {
+		t.Errorf("the owner handing the project away = %d, want 403", got.Code)
+	}
+	if got := doAs(t, server, http.MethodPatch, team, "root", "",
+		`{"owner":"someone-else"}`); got.Code != http.StatusOK {
+		t.Errorf("the administrator handing the project on = %d, want 200: %s", got.Code, got.Body)
+	}
+
+	// A stranger still learns nothing, including that the project exists.
+	if got := doAs(t, server, http.MethodPatch, team, "mallory", "",
+		`{"groups":[]}`); got.Code != http.StatusNotFound {
+		t.Errorf("a stranger = %d, want 404", got.Code)
+	}
+}
+
+// A project name belongs to its owner. Two people may each have one called the same thing, and
+// neither can see the other's.
+func TestTwoOwnersMayShareAProjectName(t *testing.T) {
+	server := identityServer(t, newStore(t))
+
+	id := func(user string) string {
+		t.Helper()
+		created := doAs(t, server, http.MethodPost, "/api/projects", user, "", `{"name":"app"}`)
+		if created.Code != http.StatusCreated {
+			t.Fatalf("%s creating app = %d: %s", user, created.Code, created.Body)
+		}
+		var project struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(created.Body.Bytes(), &project); err != nil {
+			t.Fatal(err)
+		}
+		return project.ID
+	}
+
+	henry, carol := id("henry"), id("carol")
+	if henry == carol {
+		t.Fatal("both owners were given the same project")
+	}
+
+	// Neither can reach the other's, and the same owner cannot take the name twice.
+	if got := doAs(t, server, http.MethodGet, "/api/projects/"+carol, "henry", "", "").Code; got != http.StatusNotFound {
+		t.Errorf("reaching another owner's project of the same name = %d, want 404", got)
+	}
+	if got := doAs(t, server, http.MethodPost, "/api/projects", "henry", "", `{"name":"app"}`).Code; got != http.StatusConflict {
+		t.Errorf("one owner reusing their own name = %d, want 409", got)
+	}
 }

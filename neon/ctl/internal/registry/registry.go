@@ -3,6 +3,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,10 @@ import (
 var (
 	ErrNotFound    = errors.New("registry: branch not found")
 	ErrInvalidName = errors.New("registry: invalid branch name")
+	ErrNameTaken   = errors.New("registry: branch name already used in this project")
+	// Never expected: an endpoint id carries enough entropy that a repeat is not a real outcome.
+	// It is checked anyway because the alternative is silently overwriting somebody else's branch.
+	ErrEndpointTaken = errors.New("registry: endpoint id already in use")
 )
 
 // A branch name reaches Kubernetes object names and a proxy endpoint id, so the narrowest of
@@ -35,7 +40,13 @@ func ValidateName(name string) error {
 // A Branch is a timeline plus the facts about it that only we hold: its name, its credentials and
 // its settings. The tags are the stored shape, so renaming a field here does not orphan a branch.
 type Branch struct {
-	Name       string          `json:"name"`
+	Name      string `json:"name"`
+	ProjectID string `json:"project_id"`
+
+	// What the proxy resolves out of the SNI name. Opaque and immutable: renaming a branch must
+	// not invalidate a connection string, and a name is only unique inside its project anyway.
+	EndpointID string `json:"endpoint_id"`
+
 	TenantID   neon.TenantID   `json:"tenant_id"`
 	TimelineID neon.TimelineID `json:"timeline_id"`
 
@@ -51,6 +62,8 @@ type Branch struct {
 	Databases []Database `json:"databases,omitempty"`
 	Settings  []Setting  `json:"settings,omitempty"`
 
+	LastSeen *LastSeen `json:"last_seen,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -60,6 +73,19 @@ type Branch struct {
 type Role struct {
 	Name     string `json:"name"`
 	Verifier string `json:"verifier"`
+
+	// Secret is the password the verifier was derived from, sealed. Empty is the normal state:
+	// nothing here needs it, and it exists only so a person can be shown it more than once.
+	Secret string `json:"secret,omitempty"`
+}
+
+// LastSeen is the names the compute had when it was last shut down. It is not a catalog and is
+// never shown as one: a page with nothing to ask still has to offer a connection string, and a
+// connection is what starts the compute back up.
+type LastSeen struct {
+	At        time.Time `json:"at"`
+	Roles     []string  `json:"roles"`
+	Databases []string  `json:"databases"`
 }
 
 type Database struct {
@@ -91,23 +117,29 @@ type RoleSpec struct {
 	Name     string
 	Password string
 	Verifier string
+
+	// Sealed elsewhere: this package holds no key and never reads what it stores here.
+	Secret string
 }
 
-// New creates a root branch. Both trailing arguments are facts the caller holds and this package
-// cannot invent; a branch recording a Postgres version its image does not run would not start.
-func New(spec Spec, pgVersion int, tenant neon.TenantID) (*Branch, error) {
-	if tenant.IsZero() {
-		return nil, errors.New("registry: a root branch needs a tenant")
+// New creates a root branch inside a project. The Postgres version is a fact the caller holds and
+// this package cannot invent; a branch recording a version its image does not run would not start.
+func New(spec Spec, pgVersion int, project *Project) (*Branch, error) {
+	if project == nil {
+		return nil, errors.New("registry: a branch needs a project")
 	}
 	if pgVersion == 0 {
 		return nil, errors.New("registry: a root branch needs the compute's postgres version")
 	}
-	return build(spec, pgVersion, tenant, nil)
+	return build(spec, pgVersion, project, nil)
 }
 
 // Fork derives a child. A timeline can only be branched inside its own tenant, and the catalog
 // comes with the timeline, so both are inherited unless the spec says otherwise.
-func (b *Branch) Fork(spec Spec) (*Branch, error) {
+func (b *Branch) Fork(spec Spec, project *Project) (*Branch, error) {
+	if project == nil || project.ID != b.ProjectID {
+		return nil, errors.New("registry: a fork belongs to its ancestor's project")
+	}
 	if len(spec.Roles) == 0 {
 		spec.Roles = b.roleSpecs()
 	}
@@ -119,11 +151,16 @@ func (b *Branch) Fork(spec Spec) (*Branch, error) {
 	}
 	// Neon's branching code always inherits the ancestor's version, which is why a fork is told
 	// nothing about it.
-	return build(spec, b.PgVersion, b.TenantID, b)
+	return build(spec, b.PgVersion, project, b)
 }
 
-func build(spec Spec, pgVersion int, tenant neon.TenantID, parent *Branch) (*Branch, error) {
+func build(spec Spec, pgVersion int, project *Project, parent *Branch) (*Branch, error) {
 	if err := ValidateName(spec.Name); err != nil {
+		return nil, err
+	}
+
+	endpoint, err := NewEndpointID()
+	if err != nil {
 		return nil, err
 	}
 
@@ -145,7 +182,9 @@ func build(spec Spec, pgVersion int, tenant neon.TenantID, parent *Branch) (*Bra
 	now := time.Now().UTC()
 	branch := &Branch{
 		Name:       spec.Name,
-		TenantID:   tenant,
+		ProjectID:  project.ID,
+		EndpointID: endpoint,
+		TenantID:   project.TenantID,
 		TimelineID: timeline,
 		PgVersion:  pgVersion,
 		Mode:       mode,
@@ -202,17 +241,33 @@ func (b *Branch) Validate() error {
 	if err := ValidateName(b.Name); err != nil {
 		return err
 	}
+	if err := ValidateName(b.ProjectID); err != nil {
+		return err
+	}
+	if err := ValidateName(b.EndpointID); err != nil {
+		return err
+	}
 	if b.TenantID.IsZero() {
 		return errors.New("registry: a branch needs a tenant")
 	}
 	if len(b.Roles) == 0 {
 		return errors.New("registry: a branch needs at least one role to be reachable")
 	}
+	// A name repeated here reaches the compute as two entries for one object, which it cannot
+	// provision and reports as a failure to start.
 	owners := map[string]bool{}
 	for _, role := range b.Roles {
+		if owners[role.Name] {
+			return fmt.Errorf("registry: role %q is named twice", role.Name)
+		}
 		owners[role.Name] = true
 	}
+	named := map[string]bool{}
 	for _, database := range b.Databases {
+		if named[database.Name] {
+			return fmt.Errorf("registry: database %q is named twice", database.Name)
+		}
+		named[database.Name] = true
 		if !owners[database.Owner] {
 			return fmt.Errorf("registry: database %q is owned by %q, which is not a role on this branch", database.Name, database.Owner)
 		}
@@ -249,7 +304,7 @@ func (b *Branch) Role(name string) (Role, bool) {
 func (b *Branch) roleSpecs() []RoleSpec {
 	specs := make([]RoleSpec, 0, len(b.Roles))
 	for _, role := range b.Roles {
-		specs = append(specs, RoleSpec{Name: role.Name, Verifier: role.Verifier})
+		specs = append(specs, RoleSpec{Name: role.Name, Verifier: role.Verifier, Secret: role.Secret})
 	}
 	return specs
 }
@@ -264,13 +319,13 @@ func resolveRoles(specs []RoleSpec) ([]Role, error) {
 			if !scram.IsVerifier(spec.Verifier) {
 				return nil, fmt.Errorf("registry: role %q: verifier is not a SCRAM-SHA-256 secret", spec.Name)
 			}
-			roles = append(roles, Role{Name: spec.Name, Verifier: spec.Verifier})
+			roles = append(roles, Role{Name: spec.Name, Verifier: spec.Verifier, Secret: spec.Secret})
 		case spec.Password != "":
 			verifier, err := scram.Verifier(spec.Password)
 			if err != nil {
 				return nil, err
 			}
-			roles = append(roles, Role{Name: spec.Name, Verifier: verifier})
+			roles = append(roles, Role{Name: spec.Name, Verifier: verifier, Secret: spec.Secret})
 		default:
 			return nil, fmt.Errorf("registry: role %q needs a password or a verifier", spec.Name)
 		}
@@ -278,8 +333,8 @@ func resolveRoles(specs []RoleSpec) ([]Role, error) {
 	return roles, nil
 }
 
-// Store is the branch registry: one bucket, one branch per key, each written and read whole.
-// Nothing here queries inside a branch, so a key-value file is the whole of what is needed.
+// Store holds projects and branches. Branches are keyed by endpoint id rather than by name,
+// because a name is only unique inside its project and the proxy resolves the endpoint alone.
 type Store struct {
 	db *bbolt.DB
 }
@@ -299,7 +354,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("registry: opening %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, name := range [][]byte{bucket, metaBucket} {
+		for _, name := range [][]byte{bucket, metaBucket, projectBucket, projectNameBucket, endpointBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -333,34 +388,82 @@ func (s *Store) PutMeta(ctx context.Context, name string, value []byte) error {
 	})
 }
 
-func (s *Store) Get(ctx context.Context, name string) (*Branch, error) {
+// Endpoint is the proxy's lookup: an SNI label and nothing else.
+func (s *Store) Endpoint(ctx context.Context, endpoint string) (*Branch, error) {
+	if err := ValidateName(endpoint); err != nil {
+		return nil, err
+	}
+	var branch *Branch
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		decoded, err := readBranch(tx, endpoint)
+		branch = decoded
+		return err
+	})
+	return branch, err
+}
+
+func readBranch(tx *bbolt.Tx, endpoint string) (*Branch, error) {
+	stored := tx.Bucket(bucket).Get([]byte(endpoint))
+	if stored == nil {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, endpoint)
+	}
+	var branch Branch
+	if err := json.Unmarshal(stored, &branch); err != nil {
+		return nil, fmt.Errorf("registry: branch %s: %w", endpoint, err)
+	}
+	return &branch, nil
+}
+
+func (s *Store) Branch(ctx context.Context, projectID, name string) (*Branch, error) {
+	if err := ValidateName(projectID); err != nil {
+		return nil, err
+	}
 	if err := ValidateName(name); err != nil {
 		return nil, err
 	}
 	var branch *Branch
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		stored := tx.Bucket(bucket).Get([]byte(name))
-		if stored == nil {
-			return fmt.Errorf("%w: %s", ErrNotFound, name)
+		endpoint := tx.Bucket(endpointBucket).Get(endpointKey(projectID, name))
+		if endpoint == nil {
+			return fmt.Errorf("%w: %s/%s", ErrNotFound, projectID, name)
 		}
-		var decoded Branch
-		if err := json.Unmarshal(stored, &decoded); err != nil {
-			return fmt.Errorf("registry: branch %s: %w", name, err)
-		}
-		branch = &decoded
-		return nil
+		decoded, err := readBranch(tx, string(endpoint))
+		branch = decoded
+		return err
 	})
 	return branch, err
 }
 
-// Branch names sort bytewise the same way they sort lexically, so the walk is already ordered.
-func (s *Store) List(ctx context.Context) ([]Branch, error) {
+// Branches walks the index rather than the branches themselves, so a project's members come back
+// ordered by name and no other project's rows are touched.
+func (s *Store) Branches(ctx context.Context, projectID string) ([]Branch, error) {
+	if err := ValidateName(projectID); err != nil {
+		return nil, err
+	}
 	var branches []Branch
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucket).ForEach(func(name, stored []byte) error {
+		prefix := endpointKey(projectID, "")
+		cursor := tx.Bucket(endpointBucket).Cursor()
+		for key, endpoint := cursor.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, endpoint = cursor.Next() {
+			branch, err := readBranch(tx, string(endpoint))
+			if err != nil {
+				return err
+			}
+			branches = append(branches, *branch)
+		}
+		return nil
+	})
+	return branches, err
+}
+
+// AllBranches is for work that spans projects, such as suspending idle computes.
+func (s *Store) AllBranches(ctx context.Context) ([]Branch, error) {
+	var branches []Branch
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucket).ForEach(func(key, stored []byte) error {
 			var branch Branch
 			if err := json.Unmarshal(stored, &branch); err != nil {
-				return fmt.Errorf("registry: branch %s: %w", name, err)
+				return fmt.Errorf("registry: branch %s: %w", key, err)
 			}
 			branches = append(branches, branch)
 			return nil
@@ -369,29 +472,55 @@ func (s *Store) List(ctx context.Context) ([]Branch, error) {
 	return branches, err
 }
 
+// Create refuses to overwrite. Both checks and the write share one transaction, so two callers
+// racing to claim the same name cannot both succeed.
+func (s *Store) Create(ctx context.Context, branch *Branch) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		if tx.Bucket(bucket).Get([]byte(branch.EndpointID)) != nil {
+			return fmt.Errorf("%w: %s", ErrEndpointTaken, branch.EndpointID)
+		}
+		if tx.Bucket(endpointBucket).Get(endpointKey(branch.ProjectID, branch.Name)) != nil {
+			return fmt.Errorf("%w: %s/%s", ErrNameTaken, branch.ProjectID, branch.Name)
+		}
+		return putBranch(tx, branch)
+	})
+}
+
+// Put overwrites, and is for a branch that already exists.
 func (s *Store) Put(ctx context.Context, branch *Branch) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return putBranch(tx, branch)
+	})
+}
+
+func putBranch(tx *bbolt.Tx, branch *Branch) error {
 	encoded, err := json.Marshal(branch)
 	if err != nil {
 		return fmt.Errorf("registry: writing %s: %w", branch.Name, err)
 	}
-	err = s.db.Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucket).Put([]byte(branch.Name), encoded)
-	})
-	if err != nil {
+	if err := tx.Bucket(bucket).Put([]byte(branch.EndpointID), encoded); err != nil {
 		return fmt.Errorf("registry: writing %s: %w", branch.Name, err)
 	}
-	return nil
+	return tx.Bucket(endpointBucket).Put(endpointKey(branch.ProjectID, branch.Name), []byte(branch.EndpointID))
 }
 
-func (s *Store) Delete(ctx context.Context, name string) error {
+func (s *Store) Delete(ctx context.Context, projectID, name string) error {
+	if err := ValidateName(projectID); err != nil {
+		return err
+	}
 	if err := ValidateName(name); err != nil {
 		return err
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		branches := tx.Bucket(bucket)
-		if branches.Get([]byte(name)) == nil {
-			return fmt.Errorf("%w: %s", ErrNotFound, name)
+		index := tx.Bucket(endpointBucket)
+		key := endpointKey(projectID, name)
+		endpoint := index.Get(key)
+		if endpoint == nil {
+			return fmt.Errorf("%w: %s/%s", ErrNotFound, projectID, name)
 		}
-		return branches.Delete([]byte(name))
+		if err := tx.Bucket(bucket).Delete(endpoint); err != nil {
+			return err
+		}
+		return index.Delete(key)
 	})
 }

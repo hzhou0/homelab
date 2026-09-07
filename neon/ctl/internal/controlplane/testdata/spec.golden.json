@@ -1,8 +1,8 @@
 {
   "format_version": 1,
   "cluster": {
-    "cluster_id": "main",
-    "name": "main",
+    "cluster_id": "ep-test-branch-aaaaaaaa",
+    "name": "ep-test-branch-aaaaaaaa",
     "roles": [
       {
         "name": "app",
@@ -96,8 +96,8 @@
     "sk-2.neon:5454"
   ],
   "mode": "Primary",
-  "branch_id": "main",
-  "endpoint_id": "main",
+  "branch_id": "ep-test-branch-aaaaaaaa",
+  "endpoint_id": "ep-test-branch-aaaaaaaa",
   "reconfigure_concurrency": 1,
   "suspend_timeout_seconds": 60
 }

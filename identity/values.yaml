@@ -56,17 +56,23 @@ authelia:
     expiration: 12h
     inactivity: 1h
     rememberMe: 1M
+  # Gmail rewrites any other From to the authenticated account, so the sender and the username are
+  # one value; both arrive from the Secret.
+  notifier:
+    disableStartupCheck: false
+    smtp:
+      address: 'submissions://smtp.gmail.com:465'
+
   # How long a verified password stays good for. It bounds how stale a revoked credential can be,
   # against a directory bind per request for clients that hold no session.
   basicAuthCacheLifespan: 5m
 
-  # Nothing here can send a one-time code, so a second factor cannot be enrolled and asking for one
-  # would lock every account out of everything. Every policy below is therefore one_factor or deny.
+  # A rule that asks for a second factor locks out every client presenting a password, since basic
+  # auth satisfies one factor and only one.
   accessControl:
     # A published route reaches nobody until it is named below, so forgetting one fails closed.
     defaultPolicy: deny
     rules:
-      # Every published route is listed, so the set can be diffed against what is published.
       - domain:
           - home.internal.haustorium.net
           - memos.internal.haustorium.net
@@ -87,12 +93,16 @@ authelia:
           - seaweedfs.internal.haustorium.net
           - seaweedfs-filer.internal.haustorium.net
         subject: ['group:admins']
-        policy: one_factor
+        policy: two_factor
 
   # An application that speaks OpenID Connect gets a real session of its own rather than trusting a
   # header, so it is preferred wherever an application supports it.
   oidc:
     enabled: true
+    # A claim not named here is served from userinfo, which the Kubernetes API server never calls.
+    claimsPolicies:
+      kubernetes:
+        id_token: ['groups', 'preferred_username']
     # The digest is not a credential — it is what the plaintext is checked against, and the
     # plaintext belongs wherever the client runs. A client's policy is its own: the rules above
     # gate the route, not the token exchange.
@@ -102,13 +112,18 @@ authelia:
         secretDigest: "$pbkdf2-sha512$310000$SNoRqt2qeOBhxC07JEl5lw$o0cDoZDQlBVQgcjo4IWldjXvxUB30xjlc7yXv1HULfhDDMSB9Xo/euha9zydoUqWmShcChtcW2.bg.yANCjNsg"
         redirectURIs:
           - https://memos.internal.haustorium.net/auth/callback
-      # Only a login page until the API server trusts this issuer and the deployment stops using
-      # its own ServiceAccount: until then every visitor has the same access whoever they are.
       - id: headlamp
         name: Headlamp
         secretDigest: "$pbkdf2-sha512$310000$xSiVF9mL83f/aWsuB20gpA$L2WhvQ4d2l710OOdzUmy99DLF/DpBWXRq9TH845dJxuC/HlqkBZplgqtEwSYDgcuU.EoGSoT7d7iwML/6mGGTw"
         redirectURIs:
           - https://headlamp.internal.haustorium.net/oidc-callback
+        claimsPolicy: kubernetes
+        # Its session outlives the ID token only with a refresh token, which offline_access grants.
+        scopes: ['openid', 'profile', 'email', 'groups', 'offline_access']
+        # offline_access is refused unless the code flow it depends on is spelled out.
+        responseTypes: ['code']
+        grantTypes: ['authorization_code', 'refresh_token']
+        consentMode: implicit
   resources:
     requests:
       cpu: 50m

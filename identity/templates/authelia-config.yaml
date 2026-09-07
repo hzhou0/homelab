@@ -51,12 +51,40 @@ data:
       oidc:
         # The signing key is the one thing that cannot arrive as an environment secret: nothing can
         # address a list entry, so it is a second configuration file mounted from the Secret.
+        {{- with .claimsPolicies }}
+        claims_policies:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         clients:
           {{- range .clients }}
           - client_id: '{{ .id }}'
             client_name: '{{ .name }}'
             client_secret: '{{ required (printf "authelia.oidc.clients[%s].secretDigest is required" .id) .secretDigest }}'
             authorization_policy: 'one_factor'
+            {{- with .claimsPolicy }}
+            claims_policy: '{{ . }}'
+            {{- end }}
+            {{- with .consentMode }}
+            consent_mode: '{{ . }}'
+            {{- end }}
+            {{- with .scopes }}
+            scopes:
+              {{- range . }}
+              - '{{ . }}'
+              {{- end }}
+            {{- end }}
+            {{- with .responseTypes }}
+            response_types:
+              {{- range . }}
+              - '{{ . }}'
+              {{- end }}
+            {{- end }}
+            {{- with .grantTypes }}
+            grant_types:
+              {{- range . }}
+              - '{{ . }}'
+              {{- end }}
+            {{- end }}
             redirect_uris:
               {{- range .redirectURIs }}
               - '{{ . }}'
@@ -87,8 +115,9 @@ data:
     storage:
       local:
         path: '/data/db.sqlite3'
-    # Required to be configured and deliberately never used: nothing here sends mail, and every
-    # flow that would is either disabled or unreachable.
+    # The sender, username and password are environment secrets; naming them here would put the
+    # account in the release history.
     notifier:
-      filesystem:
-        filename: '/data/notification.txt'
+      disable_startup_check: {{ $.Values.authelia.notifier.disableStartupCheck }}
+      smtp:
+        address: '{{ $.Values.authelia.notifier.smtp.address }}'

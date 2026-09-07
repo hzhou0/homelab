@@ -215,7 +215,24 @@ type ComputeSpec struct {
 
 	ReconfigureConcurrency int   `json:"reconfigure_concurrency"`
 	SuspendTimeoutSeconds  int64 `json:"suspend_timeout_seconds"`
+
+	// Carried only by the one request that performs the change, never by a rendered catalog: a
+	// list can say what should exist and cannot say that something should stop existing.
+	DeltaOperations []DeltaOp `json:"delta_operations,omitempty"`
 }
+
+// DeltaOp drops or renames an object the catalog no longer mentions. compute_ctl guards each with
+// IF EXISTS, so one delivered twice is not an error.
+type DeltaOp struct {
+	Action  string  `json:"action"`
+	Name    string  `json:"name"`
+	NewName *string `json:"new_name,omitempty"`
+}
+
+const (
+	DeleteRole     = "delete_role"
+	DeleteDatabase = "delete_db"
+)
 
 type Cluster struct {
 	ClusterID *string `json:"cluster_id"`
@@ -667,6 +684,18 @@ func (c *ComputeCtl) Status(ctx context.Context) (*ComputeStatusResponse, error)
 func (c *ComputeCtl) Configure(ctx context.Context, spec *ComputeSpec) error {
 	config := ComputeConfig{Spec: spec, ComputeCtlConfig: c.key.ComputeCtlConfig()}
 	return c.do(ctx, http.MethodPost, "/configure", nil, config, nil)
+}
+
+// CatalogObjects is what the compute actually has, read from its own catalogs rather than from the
+// spec it was given, which is the only way to see what was made without asking this service.
+type CatalogObjects struct {
+	Roles     []Role     `json:"roles"`
+	Databases []Database `json:"databases"`
+}
+
+func (c *ComputeCtl) Catalog(ctx context.Context) (*CatalogObjects, error) {
+	var catalog CatalogObjects
+	return &catalog, c.do(ctx, http.MethodGet, "/dbs_and_roles", nil, nil, &catalog)
 }
 
 func (c *ComputeCtl) Terminate(ctx context.Context, mode TerminateMode) (*LSN, error) {

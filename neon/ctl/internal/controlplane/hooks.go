@@ -39,15 +39,6 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-func (s *Server) adminOnly(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.authorized(w, r) {
-			return
-		}
-		next(w, r)
-	}
-}
-
 // The controller never retries 400, 401 or 403, so a transient failure returned as one leaves a
 // tenant mis-notified until something else kicks a reconcile. Only an unparseable body earns one.
 func (s *Server) handleNotifyAttach(w http.ResponseWriter, r *http.Request) {

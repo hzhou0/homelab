@@ -12,6 +12,7 @@ func minimal() []string {
 		"--namespace=neon",
 		"--compute-pod-template=/etc/neon-ctl/pod.yaml",
 		"--compute-images=17=neondatabase/compute-node-v17:8464",
+		"--identity-user-header=Remote-User",
 	}
 }
 
@@ -41,6 +42,7 @@ func TestEnvironmentSuppliesDefaults(t *testing.T) {
 	t.Setenv("NEON_CTL_COMPUTE_POD_TEMPLATE", "/etc/neon-ctl/pod.yaml")
 	t.Setenv("NEON_CTL_COMPUTE_IMAGES", "17=neondatabase/compute-node-v17:8464")
 	t.Setenv("NEON_CTL_SUSPEND_TIMEOUT", "30m")
+	t.Setenv("NEON_CTL_IDENTITY_USER_HEADER", "Remote-User")
 
 	cfg, err := Load(nil)
 	if err != nil {
@@ -83,5 +85,42 @@ func TestComputeImagesMustBeParsable(t *testing.T) {
 		if _, err := Load(append(minimal(), "--compute-images="+images)); err == nil {
 			t.Errorf("compute-images=%q was accepted", images)
 		}
+	}
+}
+
+// The identity header is required, because there is no other way for this service to learn who is
+// calling and no default that would be safe to assume.
+func TestIdentityHeaderIsRequired(t *testing.T) {
+	bare := []string{
+		"--storage-controller-url=http://storage-controller.neon:8080",
+		"--namespace=neon",
+		"--compute-pod-template=/etc/neon-ctl/pod.yaml",
+		"--compute-images=17=neondatabase/compute-node-v17:8464",
+	}
+	if _, err := Load(bare); err == nil || !strings.Contains(err.Error(), "identity-user-header") {
+		t.Errorf("no identity header = %v, want a refusal", err)
+	}
+}
+
+func TestAdminUserComesFromTheEnvironment(t *testing.T) {
+	t.Setenv("NEON_CTL_ADMIN_USER", "e6f1a0c2-uuid")
+	cfg, err := Load(minimal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminUser != "e6f1a0c2-uuid" {
+		t.Errorf("admin user = %q", cfg.AdminUser)
+	}
+}
+
+// Nobody is the administrator unless one is named, so a deployment that forgets to say has no
+// account that can see everything rather than an accidental one.
+func TestAdminUserDefaultsToNobody(t *testing.T) {
+	cfg, err := Load(minimal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminUser != "" {
+		t.Errorf("admin user defaulted to %q, want nobody", cfg.AdminUser)
 	}
 }

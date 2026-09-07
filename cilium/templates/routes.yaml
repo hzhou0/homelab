@@ -36,13 +36,15 @@ spec:
           port: {{ $path.port }}
       {{- if and $.Values.externalAuth.enabled (ne $path.externalAuth false) }}
       filters:
-        {{- include "cilium.externalAuth" $ | nindent 8 }}
+        {{- include "cilium.externalAuth" (dict "root" $ "forwardAuthorization" $path.forwardAuthorization) | nindent 8 }}
+        {{- if ne $path.forwardAuthorization true }}
         # A credential here is the authorizer's. Header mutations run after the filter chain, so it
         # is read there and gone before the backend sees the request.
         - type: RequestHeaderModifier
           requestHeaderModifier:
             remove:
               - Authorization
+        {{- end }}
       {{- end }}
 {{- end }}
 {{- end }}

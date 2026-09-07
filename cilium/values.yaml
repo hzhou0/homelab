@@ -167,6 +167,8 @@ gateways:
           namespace: app-memos
           name: memos
           port: 80
+          # Its own API authenticates by bearer token, so the credential strip cannot apply here.
+          forwardAuthorization: true
       navidrome.internal.haustorium.net:
         /:
           namespace: app-navidrome

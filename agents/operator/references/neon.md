@@ -45,28 +45,49 @@ starts. Rotating is replacing that one Secret value and restarting the deploymen
 
 ## Bootstrap
 
-Nothing is created at install. A branch is a timeline plus a compute pointed at it, and both are
-runtime objects `neon-ctl` owns:
+Nothing is created at install. A project is a tenant, a branch is a timeline plus a compute pointed
+at it, and all of them are runtime objects `neon-ctl` owns. The published host serves both a page
+and the API behind it; the page is the whole of the interface, and every action on it is a request
+somebody could have made by hand.
 
-```sh
-curl -X POST https://neon.internal.haustorium.net/api/branches \
-  -H "Authorization: Bearer $(neon-ctl token --scope=admin --auth-key="$(cat auth.pem)")" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"main","roles":[{"name":"app","password":"..."}],
-       "databases":[{"name":"appdb","owner":"app"}],"start":true}'
-```
+A branch keeps a SCRAM verifier and never the password behind it, so the page can print a
+connection string for any branch but can only print one that carries a password at the moment the
+password is set — creating a branch, or asking for a new one.
 
-That host is the only part of `neon-ctl` published on the gateway, and the branch routes are the
-only ones that check a token — the rest answer callers inside the namespace, and one of them serves
-role verifiers to the proxy.
+The registry is authoritative for what can authenticate and Postgres for what exists, and the two
+are allowed to differ: the proxy admits only a role it holds a verifier for, so one made with SQL
+cannot connect through it. What exists is only knowable while the compute is up, so that is the only
+time a branch's roles and databases are shown at all — read from the compute's own catalogs, marked
+live, only recorded, or made somewhere else, and never dropped by this service if it was made
+elsewhere. A branch that is down claims nothing about them.
 
-Fork it with `{"name":"dev","parent":"main"}`. A fork inherits its ancestor's Postgres version and
-cannot differ.
+The one thing it still owes a person is the string that starts it again, so the names alone are kept
+at the moment of suspension and the connect strings are built from those.
 
-Clients connect to `<branch>.pg.internal.haustorium.net`, which the gateway's own DNS wildcard
+A role's password is normally not kept at all — only the verifier derived from it, which cannot be
+read back, so the password exists for exactly as long as the answer that set it. Supplying a key
+changes that: the password is then sealed under it, bound to the role's name, and can be shown
+again. The key is deliberately not the storage one, whose rotation is a routine operation; there is
+no rotation for this one, and replacing it makes every stored password unreadable without affecting
+anything else.
+
+Adding a role or a database is a statement of what should exist, so a suspended branch takes it at
+its next start. Dropping is not — a catalog cannot say that something should stop existing — so it
+happens against a running compute or not at all: the branch is woken, the drop is applied in the
+same request that records it, and the record is put back if the compute refuses.
+
+`neon-ctl` authenticates nobody. It is told who the caller is by the authenticating proxy in front
+of it, in headers, so publishing it on the gateway without that proxy would let anyone claim any
+identity. The rest of its routes are not published at all: the hooks and the proxy's auth endpoint
+answer callers inside the namespace, and one of them serves role verifiers.
+
+A fork inherits its ancestor's Postgres version and cannot differ, and it can always read what its
+ancestor could — which is why a grant is per project and never per branch.
+
+Clients connect to `<endpoint>.pg.internal.haustorium.net`, which the gateway's own DNS wildcard
 already answers — a DNS wildcard synthesises at any depth, unlike a TLS one, which matches a single
 label and is why the proxy's certificate has to be the wildcard one level below that suffix. The
-proxy takes the branch from the SNI name; a client that cannot send SNI names it in the startup
+proxy takes the endpoint from the SNI name; a client that cannot send SNI names it in the startup
 options instead.
 
 Postgres is carried on the shared gateway's TCP listener rather than an address of its own. The

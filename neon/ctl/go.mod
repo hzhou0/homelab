@@ -3,6 +3,7 @@ module github.com/hzhou0/homelab/neon/ctl
 go 1.22.0
 
 require (
+	github.com/dustinkirkland/golang-petname v0.0.0-20260215035315-f0c533e9ce9b
 	golang.org/x/crypto v0.25.0
 	golang.org/x/sync v0.7.0
 	golang.org/x/text v0.16.0

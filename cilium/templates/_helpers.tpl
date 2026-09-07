@@ -3,7 +3,7 @@ The authorization subrequest a published route makes. The response allow-list is
 the empty default copies every header the authorizer returned, including one a client had set.
 */}}
 {{ define "cilium.externalAuth" -}}
-{{- $e := .Values.externalAuth -}}
+{{- $e := .root.Values.externalAuth -}}
 - type: ExternalAuth
   externalAuth:
     protocol: HTTP
@@ -17,9 +17,11 @@ the empty default copies every header the authorizer returned, including one a c
         - accept
         - cookie
         - proxy-authorization
+        {{- if ne .forwardAuthorization true }}
         # A client that cannot hold a session sends a password on every request instead, and the
         # authorizer rather than the application is where it is checked.
         - authorization
+        {{- end }}
         # Absent this, the portal infers the scheme from its own plain-HTTP subrequest and sends the
         # browser back to an http:// address after login.
         - x-forwarded-proto

@@ -115,6 +115,9 @@ it is used rather than minted once and distributed. Deterministic, so no two pod
     secretKeyRef:
       name: {{ .root.Values.secretName }}
       key: {{ .key }}
+      {{- if .optional }}
+      optional: true
+      {{- end }}
 {{- end }}
 
 {{/*

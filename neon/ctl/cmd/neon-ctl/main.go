@@ -22,6 +22,7 @@ import (
 	"github.com/hzhou0/homelab/neon/ctl/internal/kube"
 	"github.com/hzhou0/homelab/neon/ctl/internal/neon"
 	"github.com/hzhou0/homelab/neon/ctl/internal/registry"
+	"github.com/hzhou0/homelab/neon/ctl/internal/secret"
 )
 
 func main() {
@@ -102,9 +103,22 @@ func run() error {
 		return err
 	}
 
+	passwords, err := storedPasswords(cfg)
+	if err != nil {
+		return err
+	}
+
 	server := controlplane.New(storcon, store, computes, key, storageKey, log, controlplane.Options{
 		WakeTimeout:    cfg.WakeTimeout,
 		SuspendTimeout: cfg.SuspendTimeout,
+		EndpointSuffix: cfg.EndpointSuffix,
+		Passwords:      passwords,
+		Identity: controlplane.IdentityOptions{
+			UserHeader:    cfg.IdentityUserHeader,
+			DisplayHeader: cfg.IdentityDisplayHeader,
+			GroupsHeader:  cfg.IdentityGroupsHeader,
+			Admin:         cfg.AdminUser,
+		},
 	})
 
 	go server.RunSuspender(ctx)
@@ -129,6 +143,15 @@ func run() error {
 		return err
 	}
 	return nil
+}
+
+// Supplied rather than generated, and its absence is a choice: without it a password lives only as
+// a verifier, which nothing can read back.
+func storedPasswords(cfg *config.Config) (*secret.Box, error) {
+	if len(cfg.PasswordKey) == 0 {
+		return nil, nil
+	}
+	return secret.New(cfg.PasswordKey)
 }
 
 // Supplied rather than generated: every storage component validates against its public half, so it
@@ -180,7 +203,7 @@ func derive(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(*dir, "public.pem"), public, 0o444); err != nil {
+	if err := writeDerived(*dir, "public.pem", public); err != nil {
 		return err
 	}
 	for _, scope := range strings.Split(*scopes, ",") {
@@ -191,11 +214,34 @@ func derive(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(*dir, scope+".jwt"), []byte(token), 0o444); err != nil {
+		if err := writeDerived(*dir, scope+".jwt", []byte(token)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// The destination outlives the container that writes it, so a restart re-runs this against files
+// that already exist and are not writable even by their owner. Renaming over them is what makes a
+// second run mean the same as the first, and keeps a reader from seeing a half-written file.
+func writeDerived(dir, name string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, "."+name+".*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o444); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), filepath.Join(dir, name))
 }
 
 func printToken(args []string) error {
