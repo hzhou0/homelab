@@ -17,7 +17,7 @@ import (
 func (s *Server) renderSpec(ctx context.Context, instance *kube.Instance) (*neon.ComputeSpec, error) {
 	placement, err := s.storcon.ResolvePlacement(ctx, instance.TenantID, instance.TimelineID)
 	if err != nil {
-		return nil, fmt.Errorf("resolving placement for %s: %w", instance.ID, err)
+		return nil, withStatus(http.StatusServiceUnavailable, fmt.Errorf("resolving placement for %s: %w", instance.ID, err))
 	}
 
 	// The branch name is the compute id, the endpoint id and the cluster name: Neon keys metrics
@@ -37,7 +37,6 @@ func (s *Server) renderSpec(ctx context.Context, instance *kube.Instance) (*neon
 		BranchID:               &name,
 		EndpointID:             &name,
 		ReconfigureConcurrency: 1,
-		SuspendTimeoutSeconds:  int64(s.opts.SuspendTimeout.Seconds()),
 		Cluster: neon.Cluster{
 			ClusterID: &name,
 			Name:      &name,
@@ -57,26 +56,25 @@ func (s *Server) renderSpec(ctx context.Context, instance *kube.Instance) (*neon
 		spec.SafekeepersGeneration = &generation
 	}
 
+	// A spec is read once, at startup, and nothing revisits it. Serving one without the catalog
+	// would leave a branch running that no role can log in to, so it is refused instead.
 	branch, err := s.registry.Endpoint(ctx, instance.ID)
 	if err != nil {
-		// The catalog lives in the timeline, so a spec with none mutates nothing and the compute
-		// still boots. This is what keeps a registry outage off the recovery path.
 		if errors.Is(err, registry.ErrNotFound) {
-			s.log.Warn("serving a spec for a compute with no registry entry", "compute", instance.ID)
-		} else {
-			s.log.Error("registry unavailable, serving a spec without catalog contents",
-				"compute", instance.ID, "error", err)
+			return nil, withStatus(http.StatusNotFound, fmt.Errorf("no branch owns compute %s", instance.ID))
 		}
-		spec.SkipPgCatalogUpdates = true
-		return spec, nil
+		return nil, withStatus(http.StatusServiceUnavailable, fmt.Errorf("reading the catalog of %s: %w", instance.ID, err))
 	}
 
 	for _, role := range branch.Roles {
-		verifier := role.Verifier
-		spec.Cluster.Roles = append(spec.Cluster.Roles, neon.Role{
-			Name:              role.Name,
-			EncryptedPassword: &verifier,
-		})
+		// A role with no verifier must travel as null. Upstream reads any non-SCRAM string as an
+		// md5 hash, so an empty one becomes PASSWORD 'md5' — and the ALTER carrying it grants LOGIN.
+		entry := neon.Role{Name: role.Name}
+		if role.Verifier != "" {
+			verifier := role.Verifier
+			entry.EncryptedPassword = &verifier
+		}
+		spec.Cluster.Roles = append(spec.Cluster.Roles, entry)
 	}
 	for _, database := range branch.Databases {
 		spec.Cluster.Databases = append(spec.Cluster.Databases, neon.Database{
@@ -159,9 +157,10 @@ func (s *Server) handleComputeSpec(w http.ResponseWriter, r *http.Request) {
 
 	spec, err := s.renderSpec(r.Context(), instance)
 	if err != nil {
-		// Retryable: compute_ctl backs off on 503 and gives up on 500.
+		// compute_ctl retries a 503 three times a tenth of a second apart and then exits, so the
+		// pod restart is the real backoff. Any other status it gives up on at once.
 		s.log.Error("rendering spec", "compute", id, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "cannot resolve storage placement")
+		writeError(w, statusOf(err), err.Error())
 		return
 	}
 

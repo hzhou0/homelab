@@ -180,45 +180,114 @@ func (c *httpClient) do(ctx context.Context, method, path string, query url.Valu
 	return nil
 }
 
-// ComputeSpec carries only the fields we set. Everything else upstream declares is optional or
-// defaulted, so a field needed later has to be added here first.
+// ComputeSpec mirrors upstream field for field, including everything this service never sets, so
+// the whole surface compute_ctl accepts is visible here rather than discoverable only in Rust.
+//
+// A field this service leaves zero stays off the wire: serde reads a missing Option as None and a
+// missing defaulted field as its default, which is exactly what omitting it means.
 type ComputeSpec struct {
 	FormatVersion float32 `json:"format_version"`
 
+	OperationUUID *string `json:"operation_uuid,omitempty"`
+
+	Features []ComputeFeature `json:"features,omitempty"`
+
+	// The three below are acted on only inside a Neon VM, and each additionally requires the
+	// matching compute_ctl flag before it does anything.
+	SwapSizeBytes      *uint64 `json:"swap_size_bytes,omitempty"`
+	DiskQuotaBytes     *uint64 `json:"disk_quota_bytes,omitempty"`
+	DisableLFCResizing *bool   `json:"disable_lfc_resizing,omitempty"`
+
 	Cluster Cluster `json:"cluster"`
 
-	// Set when the spec carries no catalog, which is how a compute still boots while the registry
-	// is unreachable: the catalog lives in the timeline, so an empty one must mutate nothing.
+	// Carried only by the one request that performs the change, never by a rendered catalog: a
+	// list can say what should exist and cannot say that something should stop existing.
+	DeltaOperations []DeltaOp `json:"delta_operations,omitempty"`
+
+	// A startup hint for a control plane that knows the catalog is unchanged. Nothing here tracks
+	// that, so it is never set: an unset one only costs the diff compute_ctl would run anyway.
 	SkipPgCatalogUpdates bool `json:"skip_pg_catalog_updates"`
 
-	TenantID   *TenantID   `json:"tenant_id,omitempty"`
-	TimelineID *TimelineID `json:"timeline_id,omitempty"`
+	TenantID             *TenantID   `json:"tenant_id,omitempty"`
+	TimelineID           *TimelineID `json:"timeline_id,omitempty"`
+	PageserverConnstring *string     `json:"pageserver_connstring,omitempty"`
 
-	// The modern equivalent is pageserver_connection_info. compute_ctl falls back to these two
-	// while both are accepted, and they carry no shard-index encoding to keep in step.
-	PageserverConnstring *string `json:"pageserver_connstring,omitempty"`
-	ShardStripeSize      *uint32 `json:"shard_stripe_size,omitempty"`
+	ProjectID  *string `json:"project_id,omitempty"`
+	BranchID   *string `json:"branch_id,omitempty"`
+	EndpointID *string `json:"endpoint_id,omitempty"`
 
 	// Must never regress: walproposer compares generations to decide whether an incoming
 	// membership configuration is newer than the one it is using.
 	SafekeepersGeneration *uint32  `json:"safekeepers_generation,omitempty"`
 	SafekeeperConnstrings []string `json:"safekeeper_connstrings"`
 
+	Mode ComputeMode `json:"mode"`
+
 	// What the compute presents to its pageserver and safekeepers. They refuse the connection
 	// without it unless they are running with auth off.
 	StorageAuthToken *string `json:"storage_auth_token,omitempty"`
 
-	Mode ComputeMode `json:"mode"`
+	RemoteExtensions *RemoteExtSpec `json:"remote_extensions,omitempty"`
 
-	BranchID   *string `json:"branch_id,omitempty"`
-	EndpointID *string `json:"endpoint_id,omitempty"`
+	// Ordered upstream, so a plain map would reorder pgbouncer's own config file.
+	PgbouncerSettings map[string]string `json:"pgbouncer_settings,omitempty"`
 
-	ReconfigureConcurrency int   `json:"reconfigure_concurrency"`
-	SuspendTimeoutSeconds  int64 `json:"suspend_timeout_seconds"`
+	ShardStripeSize *uint32 `json:"shard_stripe_size,omitempty"`
 
-	// Carried only by the one request that performs the change, never by a rendered catalog: a
-	// list can say what should exist and cannot say that something should stop existing.
-	DeltaOperations []DeltaOp `json:"delta_operations,omitempty"`
+	LocalProxyConfig *LocalProxySpec `json:"local_proxy_config,omitempty"`
+
+	ReconfigureConcurrency int `json:"reconfigure_concurrency"`
+
+	// A fork inherits its parent's subscriptions, and both would then pull the same replication
+	// stream from the publisher.
+	DropSubscriptionsBeforeStart bool `json:"drop_subscriptions_before_start,omitempty"`
+
+	AuditLogLevel ComputeAudit `json:"audit_log_level,omitempty"`
+
+	LogsExportHost *string `json:"logs_export_host,omitempty"`
+}
+
+// An unrecognised value is not an error upstream: anything unknown deserializes to a catch-all
+// variant, so a feature added later reaches an older compute harmlessly.
+type ComputeFeature string
+
+const FeatureActivityMonitorExperimental ComputeFeature = "activity_monitor_experimental"
+
+type ComputeAudit string
+
+const (
+	AuditDisabled ComputeAudit = "Disabled"
+	AuditBase     ComputeAudit = "Base"
+	AuditExtended ComputeAudit = "Extended"
+	AuditFull     ComputeAudit = "Full"
+)
+
+// Extensions are fetched from object storage at startup, and a compute may install only what this
+// names. Nothing here builds one: the images ship their extensions on disk.
+type RemoteExtSpec struct {
+	PublicExtensions []string                 `json:"public_extensions"`
+	CustomExtensions []string                 `json:"custom_extensions"`
+	LibraryIndex     map[string]string        `json:"library_index"`
+	ExtensionData    map[string]ExtensionData `json:"extension_data"`
+}
+
+type ExtensionData struct {
+	ControlData map[string]string `json:"control_data"`
+	ArchivePath string            `json:"archive_path"`
+}
+
+// Configures the local_proxy sidecar that authorises connections by JWT instead of by password.
+type LocalProxySpec struct {
+	JWKS []JwksSettings `json:"jwks,omitempty"`
+	TLS  *TLSConfig     `json:"tls,omitempty"`
+}
+
+type JwksSettings struct {
+	ID           string   `json:"id"`
+	RoleNames    []string `json:"role_names"`
+	JwksURL      string   `json:"jwks_url"`
+	ProviderName string   `json:"provider_name"`
+	JwtAudience  *string  `json:"jwt_audience"`
 }
 
 // DeltaOp drops or renames an object the catalog no longer mentions. compute_ctl guards each with
@@ -232,14 +301,21 @@ type DeltaOp struct {
 const (
 	DeleteRole     = "delete_role"
 	DeleteDatabase = "delete_db"
+	RenameRole     = "rename_role"
+	RenameDatabase = "rename_db"
 )
 
 type Cluster struct {
 	ClusterID *string `json:"cluster_id"`
 	Name      *string `json:"name"`
+	State     *string `json:"state"`
 
 	Roles     []Role     `json:"roles"`
 	Databases []Database `json:"databases"`
+
+	// Replaces the generated postgresql.conf outright rather than appending to it, which is why
+	// settings and not this is what carries an override.
+	PostgresqlConf *string `json:"postgresql_conf,omitempty"`
 
 	Settings []GenericOption `json:"settings"`
 }
@@ -256,6 +332,11 @@ type Database struct {
 	Name    string          `json:"name"`
 	Owner   string          `json:"owner"`
 	Options []GenericOption `json:"options"`
+
+	// Derived by compute_ctl from its own catalog and never deserialized, so whatever a spec says
+	// here is discarded.
+	RestrictConn bool `json:"restrict_conn,omitempty"`
+	Invalid      bool `json:"invalid,omitempty"`
 }
 
 type GenericOption struct {
@@ -474,6 +555,22 @@ type TimelineCreateRequest struct {
 	AncestorTimelineID *TimelineID `json:"ancestor_timeline_id,omitempty"`
 	AncestorStartLSN   *LSN        `json:"ancestor_start_lsn,omitempty"`
 	PgVersion          *int        `json:"pg_version,omitempty"`
+}
+
+// TimelineInfo is the pageserver's own account of a timeline, reached through the controller: any
+// tenant GET the controller does not implement itself is forwarded to whichever node holds shard
+// zero, so this needs no pageserver address and no second token.
+type TimelineInfo struct {
+	// Maintained incrementally by the pageserver, so reading it costs nothing there. It can be a
+	// running approximation, which is what the flag beside it says.
+	CurrentLogicalSize           uint64 `json:"current_logical_size"`
+	CurrentLogicalSizeIsAccurate bool   `json:"current_logical_size_is_accurate"`
+}
+
+func (c *StorageController) TimelineInfo(ctx context.Context, tenant TenantID, timeline TimelineID) (*TimelineInfo, error) {
+	var info TimelineInfo
+	path := fmt.Sprintf("/v1/tenant/%s/timeline/%s", tenant, timeline)
+	return &info, c.do(ctx, http.MethodGet, path, nil, nil, &info)
 }
 
 // Ping is a readiness probe: the node list is the cheapest endpoint that proves the controller

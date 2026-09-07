@@ -7,6 +7,12 @@
   --accent: #7fd77f;
   --warn: #d7c77f;
   --bad: #d78f8f;
+
+  /* A control you type into sits below the page and a control you press sits above it, so the two
+     are told apart by shape before anything is read. --edge clears 3:1 against the page. */
+  --field: #050705;
+  --raised: #2a3429;
+  --edge: #5e6d58;
 }
 
 * { box-sizing: border-box; }
@@ -35,13 +41,19 @@ header {
 }
 header .who { color: var(--dim); }
 
-h1, h2 { font-size: 13px; font-weight: 600; margin: 0; }
-h1::before, h2::before { content: "── "; color: var(--dim); }
-h2 { margin: 2rem 0 .75rem; }
+/* One step of size is the whole hierarchy: the family and colour stay put, so a section is found
+   by its weight rather than by hunting for the rule that prefixes it. */
+h1, h2 { font-size: 15px; font-weight: 600; margin: 0; }
+h1::before, h2::before { content: "── "; color: var(--rule); }
+h2 { margin: 2.25rem 0 .75rem; }
 
 .crumbs { margin: 0 0 1rem; }
 .dim { color: var(--dim); }
 .empty { color: var(--dim); padding: .75rem 0; }
+
+/* Prose is the only thing here with a comfortable measure; identifiers and tables need the width. */
+p { max-width: 68ch; }
+p.crumbs, p.pair, p.connect { max-width: none; }
 
 /* Content-sized rather than full width: every column here is monospace text of a known length, and
    stretching to the page leaves the actions an arm's length from the row they act on. */
@@ -50,8 +62,26 @@ th, td { text-align: left; padding: .35rem 1.5rem .35rem 0; vertical-align: base
 th { color: var(--dim); font-weight: 400; border-bottom: 1px solid var(--rule); }
 td.actions, th.actions { padding-right: 0; white-space: nowrap; }
 
+/* The row that is not a row yet: ruled off so it reads as the next one rather than the last one. */
+tr.add td { border-top: 1px solid var(--rule); padding-top: .6rem; }
+
+/* The masked value gets the same box as the field below it, so revealing one cannot widen the
+   column, and the action sits past its far edge. */
+.spread { display: flex; align-items: center; gap: .5rem; }
+.spread code { width: 30ch; overflow-wrap: anywhere; }
+
 .branches tbody + tbody td { border-top: 1px solid var(--rule); }
 #projects tbody tr + tr td { border-top: 1px solid var(--rule); }
+
+/* Announced rather than drawn: a column of buttons still needs a name in the header row. */
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 
 .facts {
   display: grid;
@@ -59,13 +89,36 @@ td.actions, th.actions { padding-right: 0; white-space: nowrap; }
   gap: .1rem 1.5rem;
   margin: 0;
 }
+/* Every row is as tall as the one carrying a button, so the list keeps one rhythm. */
+.facts dt, .facts dd { min-height: 1.9rem; display: flex; align-items: center; }
 .facts dt { color: var(--dim); }
-.facts dd { margin: 0; display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; }
-.pair { display: inline-flex; gap: .4rem; align-items: baseline; flex-wrap: wrap; }
-form.inline { margin: 0; gap: .35rem; }
-form.inline input { width: 9rem; }
+.facts dd { margin: 0; flex-wrap: wrap; gap: .25rem .75rem; }
+.pair { display: inline-flex; gap: .4rem; align-items: center; flex-wrap: wrap; }
+/* One pairing per group, and enough room between groups that the two do not read as one. */
+form.inline { margin: .9rem 0 0; gap: 1.5rem; }
 
 code { color: var(--fg); overflow-wrap: anywhere; }
+
+/* The one thing a person came for, set apart because handing it over is the page's whole job. */
+.connect {
+  display: flex;
+  gap: .75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: .75rem 0 0;
+  padding: .6rem .75rem;
+  width: fit-content;
+  max-width: 100%;
+  background: var(--field);
+  border-left: 2px solid var(--accent);
+}
+.connect code { font-size: 15px; }
+/* Anything masked is asking to be clicked, wherever it sits. */
+code[data-reveal] { cursor: pointer; }
+code[data-reveal]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code.mask { color: var(--dim); }
+code.mask[data-shown] { color: var(--fg); }
+
 .secret { color: var(--accent); display: block; margin-top: .25rem; }
 
 /* A compute is the one thing on the page that changes without anybody asking, so it is the one
@@ -75,28 +128,66 @@ code { color: var(--fg); overflow-wrap: anywhere; }
 .status-configuration_pending, .status-refreshing_configuration { color: var(--warn); }
 .status-failed, .status-error { color: var(--bad); }
 .status-absent, .status-suspended, .status-terminated { color: var(--dim); }
-.status-foreign { color: var(--warn); }
 
-form { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: .75rem 0 0; }
-form .fields { flex: 1; display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+form { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: 1rem 0 0; }
 label { color: var(--dim); display: flex; gap: .4rem; align-items: center; }
-.lead { color: var(--dim); width: 4rem; align-self: flex-start; padding-top: .3rem; }
+.lead { color: var(--dim); }
 
-input, select, button {
-  font: inherit;
-  color: var(--fg);
-  background: transparent;
-  border: 1px solid var(--rule);
-  padding: .25rem .5rem;
+/* Two forms, one set of tracks. Explicit widths rather than max-content, because separate grids
+   cannot share a column and the whole point is that the two rows line up. */
+form.branch {
+  display: grid;
+  grid-template-columns: 3.5rem 9rem 7.5rem 1fr;
+  gap: .5rem;
+  align-items: center;
+  margin: .75rem 0 0;
 }
-input { min-width: 0; width: 11rem; }
-input[type=checkbox] { width: auto; accent-color: var(--accent); }
+form.branch > input, form.branch > select { width: 100%; }
+form.branch .rest { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+/* Narrower here than a field gets on its own: five of them at full width wrap the submit away. */
+form.branch .rest input { width: 7rem; }
+
+/* A select carries a menu button and sizes itself from it, so a shared height is the only way the
+   three controls line up on one row. */
+input, select, button { font: inherit; height: 1.95rem; padding: 0 .5rem; }
+
+input, select {
+  color: var(--fg);
+  background: var(--field);
+  border: 1px solid var(--edge);
+  min-width: 0;
+}
+/* One width for free text everywhere, wide enough for a generated password: a column that resizes
+   around its contents moves the page every time one is revealed. */
+input, select { width: 30ch; }
+input[type=checkbox] { width: auto; height: auto; accent-color: var(--accent); }
 input::placeholder { color: var(--dim); }
-input:focus, select:focus, button:focus-visible { outline: 1px solid var(--accent); }
-button { cursor: pointer; }
-button:hover { border-color: var(--accent); color: var(--accent); }
-button.bad:hover { border-color: var(--bad); color: var(--bad); }
-button.quiet { color: var(--dim); padding: 0 .35rem; }
+
+button {
+  color: var(--fg);
+  background: var(--raised);
+  border: 1px solid var(--edge);
+  cursor: pointer;
+}
+button:hover { border-color: var(--fg); }
+
+/* The affirmative action in a form, and the one that cannot be taken back. Both say so at rest,
+   because a colour that only arrives on hover never reaches somebody working from the keyboard. */
+button.go { color: var(--accent); border-color: #3f6b3f; }
+button.go:hover { border-color: var(--accent); }
+button.bad { color: var(--bad); border-color: #6b3f3f; }
+button.bad:hover { border-color: var(--bad); }
+
+/* Neither a field nor a commitment: it acts on what sits beside it and stays out of the way. */
+button.quiet {
+  color: var(--dim);
+  background: none;
+  border: 1px solid transparent;
+  padding: 0 .35rem;
+}
+button.quiet:hover { color: var(--accent); text-decoration: underline; }
+
+input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .note {
   border-left: 2px solid var(--rule);

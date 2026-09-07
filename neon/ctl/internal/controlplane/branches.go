@@ -125,6 +125,7 @@ func roleSpecs(requested []roleRequest, seal sealer) ([]registry.RoleSpec, error
 type computeView struct {
 	Status     string     `json:"status"`
 	Replicas   int32      `json:"replicas"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
 	LastActive *time.Time `json:"last_active,omitempty"`
 	Error      string     `json:"error,omitempty"`
 }
@@ -144,6 +145,12 @@ type branchView struct {
 	Roles     []string            `json:"roles"`
 	Databases []registry.Database `json:"databases"`
 	Settings  []registry.Setting  `json:"settings"`
+
+	// What the branch holds, answered by storage rather than by the compute, so it is there
+	// whether or not one is running. Absent when the pageserver could not be asked, which is not
+	// the same as a branch holding nothing.
+	SizeBytes    *uint64 `json:"size_bytes,omitempty"`
+	SizeAccurate bool    `json:"size_accurate,omitempty"`
 
 	Compute computeView `json:"compute"`
 
@@ -271,41 +278,38 @@ func (s *Server) handlePatchBranch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := branch.Apply(patch); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err := s.applyCatalog(r.Context(), branch, patch); err != nil {
+		s.log.Error("applying a branch change", "branch", branch.Name, "error", err)
+		writeError(w, statusOf(err), err.Error())
 		return
-	}
-	if err := s.registry.Put(r.Context(), branch); err != nil {
-		s.log.Error("recording branch", "branch", branch.Name, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "registry unavailable")
-		return
-	}
-
-	if err := s.reconfigureBranch(r.Context(), branch); err != nil {
-		s.log.Error("applying branch change to a running compute", "branch", branch.Name, "error", err)
 	}
 
 	writeJSON(w, http.StatusOK, s.view(r.Context(), branch))
 }
 
-// A running compute keeps its old catalog until it is told; the spec endpoint alone would not
-// reach it until its next restart.
-func (s *Server) reconfigureBranch(ctx context.Context, branch *registry.Branch) error {
-	instance, err := s.computes.Get(ctx, branch.EndpointID)
-	if err != nil || !instance.Running() {
-		return nil
+// applyCatalog is the only way a catalog changes. Every change is carried out by a compute, so a
+// sleeping branch is woken for one: a change no compute has taken is a change that has not
+// happened, and recording it anyway is what puts the record and Postgres out of step.
+//
+// Nothing is undone when it fails. The record is desired state and the compute is asked what it
+// actually has on every render, so a change that did not land is corrected by the next read rather
+// than guessed at here.
+func (s *Server) applyCatalog(ctx context.Context, branch *registry.Branch, patch registry.Patch, deltas ...neon.DeltaOp) error {
+	if err := branch.Apply(patch); err != nil {
+		return withStatus(http.StatusBadRequest, err)
 	}
-	return s.configure(ctx, instance)
-}
+	if err := s.registry.Put(ctx, branch); err != nil {
+		return withStatus(http.StatusServiceUnavailable, fmt.Errorf("recording the change: %w", err))
+	}
 
-// A drop is performed by the compute and by nothing else, so the branch is woken for it. Recording
-// the removal without it would leave the object in Postgres holding data that nothing can reach.
-func (s *Server) dropFromCatalog(ctx context.Context, branch *registry.Branch, delta neon.DeltaOp) error {
 	instance, err := s.ensureRunning(ctx, branch)
 	if err != nil {
-		return withStatus(http.StatusServiceUnavailable, fmt.Errorf("waking the branch to drop %s: %w", delta.Name, err))
+		return withStatus(http.StatusServiceUnavailable, fmt.Errorf("starting the branch to apply the change: %w", err))
 	}
-	return s.configure(ctx, instance, delta)
+	if err := s.configure(ctx, instance, deltas...); err != nil {
+		return withStatus(http.StatusBadGateway, fmt.Errorf("the compute did not take the change: %w", err))
+	}
+	return nil
 }
 
 func (s *Server) configure(ctx context.Context, instance *kube.Instance, deltas ...neon.DeltaOp) error {
@@ -469,6 +473,14 @@ func (s *Server) view(ctx context.Context, branch *registry.Branch) branchView {
 		view.Roles = append(view.Roles, role.Name)
 	}
 
+	if info, err := s.storcon.TimelineInfo(ctx, branch.TenantID, branch.TimelineID); err != nil {
+		s.log.Warn("reading timeline size", "branch", branch.Name, "error", err)
+	} else {
+		size := info.CurrentLogicalSize
+		view.SizeBytes = &size
+		view.SizeAccurate = info.CurrentLogicalSizeIsAccurate
+	}
+
 	instance, err := s.computes.Get(ctx, branch.EndpointID)
 	if err != nil {
 		return view
@@ -492,6 +504,10 @@ func (s *Server) view(ctx context.Context, branch *registry.Branch) branchView {
 		if err == nil {
 			view.Compute.Status = string(status.Status)
 			view.Compute.LastActive = status.LastActive
+			if !status.StartTime.IsZero() {
+				started := status.StartTime
+				view.Compute.StartedAt = &started
+			}
 			if status.Error != nil {
 				view.Compute.Error = *status.Error
 			}

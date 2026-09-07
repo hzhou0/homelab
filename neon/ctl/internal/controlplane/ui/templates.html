@@ -29,11 +29,68 @@
 
   // The host and the two names are all a connection string is, so picking one is answered here
   // rather than by asking the server to render a line it already rendered.
-  function composeConnection() {
+  function connectionString(password) {
     const string = document.getElementById("connect-string");
     const role = encodeURIComponent(document.getElementById("pick-role").value);
     const database = encodeURIComponent(document.getElementById("pick-database").value);
-    string.textContent = `postgresql://${role}@${string.dataset.host}/${database}?sslmode=require`;
+    const secret = password ? `:${encodeURIComponent(password)}` : "";
+    return `postgresql://${role}${secret}@${string.dataset.host}/${database}?sslmode=require`;
+  }
+
+  // No password is ever rendered into the page. It is fetched when somebody asks to see one or to
+  // copy one, so a page left open on a screen is showing a mask and nothing else.
+  async function fetchPassword(reveal, role) {
+    const response = await fetch(`${reveal}/${encodeURIComponent(role)}/password`);
+    if (!response.ok) { return ""; }
+    return (await response.json()).password;
+  }
+
+  async function connectionPassword() {
+    const string = document.getElementById("connect-string");
+    if (!string.dataset.reveal) { return ""; }
+    return fetchPassword(string.dataset.reveal, document.getElementById("pick-role").value);
+  }
+
+  // Every mask on the page works the same way: click to ask, click again to put it back.
+  async function toggleSecret(mask) {
+    if (mask.dataset.shown) {
+      delete mask.dataset.shown;
+      mask.title = "show the password";
+      mask.textContent = "***";
+      return;
+    }
+    const password = await fetchPassword(mask.dataset.reveal, mask.dataset.role);
+    if (!password) { mask.title = "no password is kept for this role"; return; }
+    mask.dataset.shown = "1";
+    mask.title = "hide the password";
+    mask.textContent = password;
+  }
+
+  function maskConnection(string) {
+    delete string.dataset.shown;
+    string.title = "show the password";
+    string.textContent = connectionString(string.dataset.reveal ? "***" : "");
+  }
+
+  // Picking a different role is picking a different password, so the line goes back to a mask.
+  function composeConnection() {
+    maskConnection(document.getElementById("connect-string"));
+  }
+
+  async function revealConnection() {
+    const string = document.getElementById("connect-string");
+    if (string.dataset.shown) { maskConnection(string); return; }
+    const password = await connectionPassword();
+    if (!password) { string.title = "no password is kept for this role"; return; }
+    string.dataset.shown = "1";
+    string.title = "hide the password";
+    string.textContent = connectionString(password);
+  }
+
+  async function copyConnection(button) {
+    await navigator.clipboard.writeText(connectionString(await connectionPassword()));
+    button.textContent = "copied";
+    setTimeout(() => { button.textContent = "copy"; }, 1500);
   }
 </script>
 </body>
@@ -53,14 +110,14 @@
 <div class="note" role="status">
   {{with .Notice.Error}}<p class="error">{{.}}</p>{{end}}
   {{with .Notice.Secret}}
-  <p>{{.Role}} on {{.Branch}}{{if not .Kept}} — the password is shown here and nowhere again{{end}}</p>
+  <p>{{.Role}} on {{.Branch}}{{if not .Kept}} — shown here and nowhere again{{end}}</p>
   <span class="pair"><code class="secret">{{.URI}}</code>{{template "copy"}}</span>
   {{end}}
   <button class="quiet" hx-on:click="this.parentElement.remove()">dismiss</button>
 </div>
 {{end}}{{end}}
 
-{{define "copy"}}<button class="quiet" hx-on:click="navigator.clipboard.writeText(this.previousElementSibling.textContent).then(() => { this.textContent = 'copied' })">copy</button>{{end}}
+{{define "copy"}}<button class="quiet" hx-on:click="navigator.clipboard.writeText(this.previousElementSibling.textContent).then(() => { this.textContent = 'copied'; setTimeout(() => { this.textContent = 'copy' }, 1500) })">copy</button>{{end}}
 
 {{define "projects-page"}}{{template "head" .}}
 {{template "projects" .}}
@@ -69,7 +126,7 @@
       hx-on::after-request="if (event.detail.successful) this.reset()">
   <input name="name" placeholder="name" required autocomplete="off" aria-label="project name">
   <label>groups <input name="groups" placeholder="comma separated" autocomplete="off"></label>
-  <button type="submit">create</button>
+  <button class="go" type="submit">create</button>
 </form>
 {{template "foot" .}}{{end}}
 
@@ -91,7 +148,7 @@
         <td class="dim">{{.Branches}}</td>
         <td class="actions">
           <button class="bad" hx-delete="/ui/projects/{{.ID}}" hx-target="#projects" hx-swap="outerHTML"
-                  hx-confirm="Delete {{.Name}}?">rm</button>
+                  hx-confirm="Delete the project {{.Name}}? Every branch in it goes too. This cannot be undone.">del</button>
         </td>
       </tr>
       {{end}}
@@ -115,43 +172,42 @@
      hx-target="#branches" hx-swap="outerHTML" hx-indicator="#pulse"></div>
 
 <h2>new branch</h2>
-<form hx-post="/ui/projects/{{.Project.ID}}/branches" hx-target="#branches" hx-swap="outerHTML"
+<form class="branch" hx-post="/ui/projects/{{.Project.ID}}/branches" hx-target="#branches" hx-swap="outerHTML"
       hx-on::after-request="if (event.detail.successful) this.reset()" aria-label="create a root branch">
   <span class="lead">root</span>
-  <div class="fields">
-    <input name="name" placeholder="name" required autocomplete="off" aria-label="branch name">
-    <select name="pg_version" aria-label="postgres version">
-      {{range .PgVersions}}<option value="{{.}}">pg {{.}}</option>{{end}}
-    </select>
+  <input name="name" placeholder="name" required autocomplete="off" aria-label="branch name">
+  <select name="pg_version" aria-label="postgres version">
+    {{range .PgVersions}}<option value="{{.}}">pg {{.}}</option>{{end}}
+  </select>
+  <div class="rest">
     <label>role <input name="role" value="app" required autocomplete="off"></label>
     <label>database <input name="database" value="appdb" required autocomplete="off"></label>
     <label>password <input name="password" type="password" placeholder="generated"
            autocomplete="new-password"></label>
-    <label><input type="checkbox" name="start" value="1"> start</label>
-    <button type="submit">create</button>
+    <button class="go" type="submit">create</button>
   </div>
 </form>
 
-<form hx-post="/ui/projects/{{.Project.ID}}/branches" hx-target="#branches" hx-swap="outerHTML"
+<form class="branch" hx-post="/ui/projects/{{.Project.ID}}/branches" hx-target="#branches" hx-swap="outerHTML"
       hx-on::after-request="if (event.detail.successful) this.reset()" aria-label="fork a branch">
   <span class="lead">fork</span>
-  <div class="fields">
-    <input name="name" placeholder="name" required autocomplete="off" aria-label="branch name">
-    <input name="parent" list="branch-names" placeholder="parent" required autocomplete="off"
-           aria-label="parent branch">
-    <label><input type="checkbox" name="start" value="1"> start</label>
-    <button type="submit">fork</button>
+  <input name="name" placeholder="name" required autocomplete="off" aria-label="branch name">
+  {{template "parents" .}}
+  <div class="rest">
+    <button class="go" type="submit">fork</button>
   </div>
 </form>
 {{template "foot" .}}{{end}}
 
 {{define "grant"}}
 <section id="grant">
+  <h2>access</h2>
   {{with .GrantError}}<p class="error">{{.}}</p>{{end}}
   {{if .MayGrant}}
+  <p class="dim">Anyone in these groups can use every branch here.</p>
   <form hx-patch="/ui/projects/{{.Project.ID}}" hx-target="#grant" hx-swap="outerHTML">
     <label>groups <input name="groups" value="{{join .Project.Groups}}" placeholder="none" autocomplete="off"></label>
-    <button type="submit">grant</button>
+    <button class="go" type="submit">grant</button>
   </form>
   {{else}}
   <p class="dim">groups: {{if .Project.Groups}}{{join .Project.Groups}}{{else}}—{{end}}</p>
@@ -159,14 +215,18 @@
 </section>
 {{end}}
 
-{{define "branches-update"}}{{template "branches" .}}{{template "notice-oob" .}}{{end}}
+{{define "branches-update"}}{{template "branches" .}}{{template "parents-oob" .}}{{template "notice-oob" .}}{{end}}
+
+{{define "parents"}}<select id="pick-parent" name="parent" required aria-label="parent branch">{{range .Branches}}<option>{{.Name}}</option>{{end}}</select>{{end}}
+
+{{define "parents-oob"}}<select id="pick-parent" name="parent" required aria-label="parent branch" hx-swap-oob="true">{{range .Branches}}<option>{{.Name}}</option>{{end}}</select>{{end}}
 
 {{define "branches"}}
 <section id="branches">
   {{with .Error}}<p class="error">{{.}}</p>{{end}}
   {{if .Branches}}
   <table>
-    <thead><tr><th>branch</th><th>parent</th><th>pg</th><th>compute</th><th class="actions"></th></tr></thead>
+    <thead><tr><th>branch</th><th>parent</th><th>pg</th><th>size</th><th>compute</th><th class="actions"><span class="sr">actions</span></th></tr></thead>
     <tbody>
       {{$project := .Project.ID}}
       {{range .Branches}}
@@ -174,12 +234,13 @@
         <td><a href="/ui/projects/{{$project}}/branches/{{.Name}}">{{.Name}}</a></td>
         <td class="dim">{{if .Parent}}{{.Parent}}{{else}}—{{end}}</td>
         <td class="dim">{{.PgVersion}}</td>
+        <td class="dim">{{with size .SizeBytes}}{{.}}{{else}}—{{end}}</td>
         <td class="status-{{.Compute.Status}}">{{.Compute.Status}}{{with .Compute.Error}} · {{.}}{{end}}</td>
         <td class="actions">
           <button hx-post="/ui/projects/{{$project}}/branches/{{.Name}}/{{if running .Compute.Status}}stop{{else}}start{{end}}"
                   hx-target="#branches" hx-swap="outerHTML">{{if running .Compute.Status}}stop{{else}}start{{end}}</button>
           <button class="bad" hx-delete="/ui/projects/{{$project}}/branches/{{.Name}}"
-                  hx-target="#branches" hx-swap="outerHTML" hx-confirm="Delete {{.Name}}?">rm</button>
+                  hx-target="#branches" hx-swap="outerHTML" hx-confirm="Delete the branch {{.Name}}? Everything on it goes too. This cannot be undone.">del</button>
         </td>
       </tr>
       {{end}}
@@ -188,7 +249,6 @@
   {{else}}
   <p class="empty">no branches</p>
   {{end}}
-  <datalist id="branch-names">{{range .Branches}}<option value="{{.Name}}">{{end}}</datalist>
 </section>
 {{end}}
 
@@ -201,8 +261,6 @@
      hx-trigger="every 5s [!htmx.find('#branch:focus-within')]"
      hx-target="#branch" hx-swap="outerHTML" hx-indicator="#pulse"></div>
 {{template "foot" .}}{{end}}
-
-{{define "state"}}{{if .Foreign}}<span class="status-foreign">not made here</span>{{else if .Pending}}<span class="status-starting">pending</span>{{else if .Live}}<span class="status-running">live</span>{{else}}<span class="dim">recorded</span>{{end}}{{end}}
 
 {{define "branch-update"}}{{template "branch" .}}{{template "notice-oob" .}}{{end}}
 
@@ -218,12 +276,22 @@
       <button hx-post="/ui/projects/{{$project}}/branches/{{$branch}}/{{if running .Compute.Status}}stop{{else}}start{{end}}"
               hx-vals='{"view":"branch"}' hx-target="#branch" hx-swap="outerHTML"
               >{{if running .Compute.Status}}stop{{else}}start{{end}}</button></dd>
+    <dt>uptime</dt><dd class="dim">{{if .Uptime}}{{.Uptime}}{{else}}—{{end}}</dd>
     <dt>host</dt><dd>{{.Host}}</dd>
+    <dt>size</dt><dd class="dim">{{with size .SizeBytes}}{{if not $.Branch.SizeAccurate}}about {{end}}{{.}}{{else}}—{{end}}</dd>
     <dt>postgres</dt><dd class="dim">{{.PgVersion}}</dd>
     <dt>parent</dt>
     <dd class="dim">{{if .Parent}}<a href="/ui/projects/{{$project}}/branches/{{.Parent}}">{{.Parent}}</a>{{else}}—{{end}}</dd>
   </dl>
 
+  {{if .Starting}}
+  <h2>starting</h2>
+  <p class="dim">The database is starting. This page updates on its own.</p>
+  {{else if .Unknown}}
+  <h2>state</h2>
+  <p class="error">The database is not running, and it was not shut down cleanly. Start it to see
+    what it holds.</p>
+  {{else}}
   <h2>connect</h2>
   {{with .Connect}}
   {{if .URI}}
@@ -233,86 +301,89 @@
     <label>database <select id="pick-database" hx-on:change="composeConnection()">
       {{range .Databases}}<option>{{.}}</option>{{end}}</select></label>
   </form>
-  <p class="pair"><code id="connect-string" data-host="{{$.Branch.Host}}">{{.URI}}</code>{{template "copy"}}</p>
-  <p class="dim">The password is not part of this: only a verifier is kept, so it is shown once when
-    it is set.{{with .Since}} These names are the ones the branch had when it was stopped, on
-    {{.Format "2 Jan 15:04"}} — connecting starts it again.{{end}}</p>
+  <p class="connect"><code id="connect-string" data-host="{{$.Branch.Host}}"
+      {{if $.Branch.Passwords}}data-reveal="/api/projects/{{$project}}/branches/{{$branch}}/roles"
+      role="button" tabindex="0" title="show the password"
+      hx-on:click="revealConnection()"
+      hx-on:keydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); revealConnection(); }"{{end}}
+      >{{.URI}}</code><button class="quiet" hx-on:click="copyConnection(this)">copy</button></p>
+  {{if or (not $.Branch.Passwords) .Since}}
+  <p class="dim">{{if not $.Branch.Passwords}}Passwords are shown once, when they are set.{{end}}{{with .Since}} These names are from
+    {{.Format "2 Jan 15:04"}}, when the database was last running. Connecting starts it again.{{end}}</p>
+  {{end}}
   {{else}}
-  <p class="empty">no database to connect to</p>
+  <p class="empty">nothing to connect to yet</p>
   {{end}}
   {{end}}
 
   {{if not .Catalog.Known}}
   <h2>roles and databases</h2>
-  <p class="dim">The compute is not running, so there is nothing to ask what it has. Start the
-    branch to see and manage its roles and databases.</p>
+  <p class="dim">The database is not running. Start it to see its roles and databases.</p>
   {{else}}
   <h2>roles</h2>
   <table>
-    <thead><tr><th>role</th><th>state</th><th class="actions"></th></tr></thead>
+    <thead><tr><th>role</th><th>password</th><th class="actions"><span class="sr">actions</span></th></tr></thead>
     <tbody>
       {{range .Catalog.Roles}}
       <tr>
-        <td{{if .Foreign}} class="dim"{{end}}>{{.Name}}</td>
-        <td>{{template "state" .}}</td>
-        <td class="actions">
-          {{if .Managed}}
-          {{if $.Branch.Passwords}}
-          <button class="quiet" hx-get="/ui/projects/{{$project}}/branches/{{$branch}}/roles/{{.Name}}/password"
-                  hx-target="#branch" hx-swap="outerHTML">show password</button>
-          {{end}}
+        <td>{{.Name}}</td>
+        <td><span class="spread">
+          {{if $.Branch.Passwords}}<code class="mask" data-reveal="/api/projects/{{$project}}/branches/{{$branch}}/roles"
+                data-role="{{.Name}}" role="button" tabindex="0" title="show the password"
+                hx-on:click="toggleSecret(this)"
+                hx-on:keydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleSecret(this); }"
+                >***</code>{{end}}
           <button class="quiet" hx-post="/ui/projects/{{$project}}/branches/{{$branch}}/roles/{{.Name}}/password"
                   hx-target="#branch" hx-swap="outerHTML"
-                  hx-confirm="Give {{.Name}} a new password? The one it has now stops working, and every client connecting as {{.Name}} has to be told the new one — which is shown once and cannot be looked up again.">reset password</button>
+                  hx-confirm="Give {{.Name}} a new password? The current one stops working straight away.">reset</button>
+        </span></td>
+        <td class="actions">
           <button class="bad" hx-delete="/ui/projects/{{$project}}/branches/{{$branch}}/roles/{{.Name}}"
                   hx-target="#branch" hx-swap="outerHTML"
-                  hx-confirm="Drop the role {{.Name}}? This runs DROP ROLE on the branch and cannot be undone.">rm</button>
-          {{end}}
+                  hx-confirm="Delete the role {{.Name}}? This cannot be undone.">del</button>
         </td>
       </tr>
       {{end}}
+      <tr class="add">
+        <td><input form="add-role" name="role" placeholder="name" required autocomplete="off"
+                   aria-label="new role"></td>
+        <td><input form="add-role" name="password" type="password" placeholder="generated"
+                   autocomplete="new-password" aria-label="password"></td>
+        <td class="actions"><button form="add-role" class="go" type="submit">add</button></td>
+      </tr>
     </tbody>
   </table>
-  <form class="inline" hx-post="/ui/projects/{{$project}}/branches/{{$branch}}/roles"
+  <form id="add-role" hx-post="/ui/projects/{{$project}}/branches/{{$branch}}/roles"
         hx-target="#branch" hx-swap="outerHTML"
-        hx-on::after-request="if (event.detail.successful) this.reset()" aria-label="add a role">
-    <label>role <input name="role" placeholder="name" required autocomplete="off"></label>
-    <label>password <input name="password" type="password" placeholder="generated"
-           autocomplete="new-password"></label>
-    <button type="submit">add</button>
-  </form>
+        hx-on::after-request="if (event.detail.successful) this.reset()" aria-label="add a role"></form>
 
   <h2>databases</h2>
-  {{if .Catalog.Databases}}
   <table>
-    <thead><tr><th>database</th><th>owner</th><th>state</th><th class="actions"></th></tr></thead>
+    <thead><tr><th>database</th><th>owner</th><th class="actions"><span class="sr">actions</span></th></tr></thead>
     <tbody>
       {{range .Catalog.Databases}}
       <tr>
-        <td{{if .Foreign}} class="dim"{{end}}>{{.Name}}</td>
+        <td>{{.Name}}</td>
         <td class="dim">{{.Owner}}</td>
-        <td>{{template "state" .}}</td>
         <td class="actions">
-          {{if .Managed}}
           <button class="bad" hx-delete="/ui/projects/{{$project}}/branches/{{$branch}}/databases/{{.Name}}"
                   hx-target="#branch" hx-swap="outerHTML"
-                  hx-confirm="Drop the database {{.Name}}? Everything in it — schemas, tables, data — goes with it, and it cannot be undone.">rm</button>
-          {{end}}
+                  hx-confirm="Delete the database {{.Name}}? Everything in it goes too. This cannot be undone.">del</button>
         </td>
       </tr>
       {{end}}
+      <tr class="add">
+        <td><input form="add-database" name="database" placeholder="name" required autocomplete="off"
+                   aria-label="new database"></td>
+        <td><select form="add-database" name="owner" aria-label="owner">{{range .Catalog.Roles}}<option>{{.Name}}</option>{{end}}</select></td>
+        <td class="actions"><button form="add-database" class="go" type="submit">add</button></td>
+      </tr>
     </tbody>
   </table>
-  {{else}}
-  <p class="empty">no databases</p>
-  {{end}}
-  <form class="inline" hx-post="/ui/projects/{{$project}}/branches/{{$branch}}/databases"
+  <form id="add-database" hx-post="/ui/projects/{{$project}}/branches/{{$branch}}/databases"
         hx-target="#branch" hx-swap="outerHTML"
-        hx-on::after-request="if (event.detail.successful) this.reset()" aria-label="add a database">
-    <label>database <input name="database" placeholder="name" required autocomplete="off"></label>
-    <label>owner <select name="owner">{{range .Roles}}<option>{{.}}</option>{{end}}</select></label>
-    <button type="submit">add</button>
-  </form>
+        hx-on::after-request="if (event.detail.successful) this.reset()" aria-label="add a database"></form>
+  {{end}}
   {{end}}
   {{end}}
 </section>

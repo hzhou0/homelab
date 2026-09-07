@@ -126,7 +126,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/start", s.handleUIStartBranch)
 	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/stop", s.handleUIStopBranch)
 	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/roles", s.handleUIAddRole)
-	mux.HandleFunc("GET /ui/projects/{project}/branches/{name}/roles/{role}/password", s.handleUIRevealPassword)
 	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/roles/{role}/password", s.handleUIResetPassword)
 	mux.HandleFunc("DELETE /ui/projects/{project}/branches/{name}/roles/{role}", s.handleUIDeleteRole)
 	mux.HandleFunc("POST /ui/projects/{project}/branches/{name}/databases", s.handleUIAddDatabase)
@@ -239,7 +238,20 @@ func (s *Server) ensureRunning(ctx context.Context, branch *registry.Branch) (*k
 	return instance.(*kube.Instance), nil
 }
 
+// forgetCatalog is what makes a snapshot mean something: one exists only for a branch that went
+// down cleanly and has not run since, so a compute that dies leaves none behind to be believed.
+func (s *Server) forgetCatalog(ctx context.Context, branch *registry.Branch) {
+	if branch.LastSeen == nil {
+		return
+	}
+	branch.LastSeen = nil
+	if err := s.registry.Put(ctx, branch); err != nil {
+		s.log.Error("discarding a stale catalog snapshot", "branch", branch.Name, "error", err)
+	}
+}
+
 func (s *Server) wake(ctx context.Context, branch *registry.Branch) (*kube.Instance, error) {
+	s.forgetCatalog(ctx, branch)
 	instance, err := s.computes.Ensure(ctx, kube.Binding{
 		ID:         branch.EndpointID,
 		TenantID:   branch.TenantID,
@@ -303,9 +315,12 @@ func (s *Server) rememberCatalog(ctx context.Context, instance *kube.Instance) {
 	if err != nil {
 		return
 	}
+	// A snapshot that cannot be taken must take the old one with it: what is left would claim to
+	// describe a compute that has been running since, and the branch is then simply unknown.
 	catalog, err := client.Catalog(ctx)
 	if err != nil {
 		s.log.Warn("cannot read a catalog before suspending", "compute", instance.ID, "error", err)
+		s.forgetCatalog(ctx, branch)
 		return
 	}
 

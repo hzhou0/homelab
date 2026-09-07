@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -191,6 +192,9 @@ type fakeStorcon struct {
 	created    []neon.TimelineCreateRequest
 	status     int
 
+	logicalSize  uint64
+	sizeAccurate bool
+
 	timelineRefused  bool
 	deletedTenants   []string
 	deletedTimelines []string
@@ -199,8 +203,10 @@ type fakeStorcon struct {
 func newFakeStorcon(t *testing.T) *fakeStorcon {
 	t.Helper()
 	fake := &fakeStorcon{
-		shardNode:  1,
-		generation: 3,
+		shardNode:    1,
+		generation:   3,
+		logicalSize:  42 * 1024 * 1024,
+		sizeAccurate: true,
 		safekeeper: []neon.SafekeeperDescribe{
 			{ID: 11, Host: "sk-0.neon", Port: 5454},
 			{ID: 12, Host: "sk-1.neon", Port: 5454},
@@ -236,6 +242,14 @@ func newFakeStorcon(t *testing.T) *fakeStorcon {
 		generation := fake.generation
 		fake.mu.Unlock()
 		fake.respond(w, neon.TimelineLocateResponse{Generation: generation, SkSet: []neon.NodeID{11, 12, 13}})
+	})
+
+	// The controller forwards any tenant GET it does not implement to shard zero's pageserver.
+	mux.HandleFunc("GET /v1/tenant/{tenant}/timeline/{timeline}", func(w http.ResponseWriter, r *http.Request) {
+		fake.mu.Lock()
+		size, accurate := fake.logicalSize, fake.sizeAccurate
+		fake.mu.Unlock()
+		fake.respond(w, neon.TimelineInfo{CurrentLogicalSize: size, CurrentLogicalSizeIsAccurate: accurate})
 	})
 
 	mux.HandleFunc("POST /v1/tenant", func(w http.ResponseWriter, r *http.Request) {
@@ -304,6 +318,7 @@ type fakeCompute struct {
 	mu            sync.Mutex
 	configured    []neon.ComputeSpec
 	configureFail bool
+	catalogFail   bool
 	status        neon.ComputeStatus
 	lastActive    *time.Time
 	terminated    bool
@@ -333,11 +348,16 @@ func newFakeCompute(t *testing.T) *fakeCompute {
 		}
 		fake.configured = append(fake.configured, *config.Spec)
 		fake.bodies = append(fake.bodies, body)
+		fake.apply(config.Spec)
 		writeJSON(w, http.StatusOK, map[string]string{})
 	})
 	mux.HandleFunc("GET /dbs_and_roles", func(w http.ResponseWriter, r *http.Request) {
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
+		if fake.catalogFail {
+			http.Error(w, "no", http.StatusInternalServerError)
+			return
+		}
 		writeJSON(w, http.StatusOK, fake.catalog)
 	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
@@ -359,6 +379,53 @@ func newFakeCompute(t *testing.T) *fakeCompute {
 	fake.server = httptest.NewServer(mux)
 	t.Cleanup(fake.server.Close)
 	return fake
+}
+
+// The catalog answers with what it was sent, the way compute_ctl does: the cluster states what
+// should exist and a delta is the only thing that takes anything away.
+func (f *fakeCompute) apply(spec *neon.ComputeSpec) {
+	for _, role := range spec.Cluster.Roles {
+		f.catalog.Roles = upsert(f.catalog.Roles, role, func(r neon.Role) string { return r.Name })
+	}
+	for _, database := range spec.Cluster.Databases {
+		f.catalog.Databases = upsert(f.catalog.Databases, database, func(d neon.Database) string { return d.Name })
+	}
+	for _, delta := range spec.DeltaOperations {
+		switch delta.Action {
+		case neon.DeleteRole:
+			f.catalog.Roles = slices.DeleteFunc(f.catalog.Roles, func(r neon.Role) bool { return r.Name == delta.Name })
+		case neon.DeleteDatabase:
+			f.catalog.Databases = slices.DeleteFunc(f.catalog.Databases, func(d neon.Database) bool { return d.Name == delta.Name })
+		}
+	}
+}
+
+func upsert[T any](existing []T, item T, name func(T) string) []T {
+	for i := range existing {
+		if name(existing[i]) == name(item) {
+			existing[i] = item
+			return existing
+		}
+	}
+	return append(existing, item)
+}
+
+// A compute that has been running holds what the branch was created with, which is what a test
+// that seeds a branch and a live compute is describing.
+func primeCatalog(computes *fakeCompute, branches []registry.Branch) {
+	for _, branch := range branches {
+		for _, role := range branch.Roles {
+			verifier := role.Verifier
+			computes.catalog.Roles = upsert(computes.catalog.Roles,
+				neon.Role{Name: role.Name, EncryptedPassword: &verifier},
+				func(r neon.Role) string { return r.Name })
+		}
+		for _, database := range branch.Databases {
+			computes.catalog.Databases = upsert(computes.catalog.Databases,
+				neon.Database{Name: database.Name, Owner: database.Owner},
+				func(d neon.Database) string { return d.Name })
+		}
+	}
 }
 
 func (f *fakeCompute) lastBody() string {
@@ -523,15 +590,17 @@ func TestUnshardedSpecCarriesNoStripeSize(t *testing.T) {
 	}
 }
 
-// A registry that is empty or failing must not reach a compute that is booting or recovering: the
-// catalog lives in the timeline, so a spec with none mutates nothing and the compute still starts.
-func TestRenderSpecDegradesWithoutRegistry(t *testing.T) {
+// A compute reads its spec once, at startup, and nothing revisits it. Serving one without the
+// catalog would strand a branch running that no role can log in to, so the spec is refused and the
+// pod restart becomes the retry.
+func TestASpecIsRefusedWithoutACatalog(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
+		status  int
 		prepare func(t *testing.T, store *registry.Store)
 	}{
-		{"no entry", func(*testing.T, *registry.Store) {}},
-		{"registry failing", func(t *testing.T, store *registry.Store) {
+		{"no entry", http.StatusNotFound, func(*testing.T, *registry.Store) {}},
+		{"registry failing", http.StatusServiceUnavailable, func(t *testing.T, store *registry.Store) {
 			seedBranch(t, store)
 			if err := store.Close(); err != nil {
 				t.Fatal(err)
@@ -546,18 +615,15 @@ func TestRenderSpecDegradesWithoutRegistry(t *testing.T) {
 			server := newTestServer(t, storcon, store, runtime, nil)
 			tc.prepare(t, store)
 
-			spec, err := server.renderSpec(context.Background(), &instance)
-			if err != nil {
-				t.Fatalf("the spec path must not fail: %v", err)
+			if _, err := server.renderSpec(context.Background(), &instance); err == nil {
+				t.Fatal("a spec with no catalog must not be served")
+			} else if got := statusOf(err); got != tc.status {
+				t.Errorf("status = %d, want %d", got, tc.status)
 			}
-			if !spec.SkipPgCatalogUpdates {
-				t.Error("a spec without catalog contents must skip catalog updates")
-			}
-			if len(spec.Cluster.Roles) != 0 || len(spec.Cluster.Databases) != 0 {
-				t.Error("a degraded spec must not invent catalog contents")
-			}
-			if spec.TenantID == nil || spec.PageserverConnstring == nil || len(spec.SafekeeperConnstrings) == 0 {
-				t.Error("a degraded spec must still carry placement")
+
+			response := do(t, server, http.MethodGet, "/compute/api/v2/computes/"+testEndpointID+"/spec", "")
+			if response.Code != tc.status {
+				t.Errorf("the spec endpoint answered %d, want %d", response.Code, tc.status)
 			}
 		})
 	}
@@ -1382,15 +1448,25 @@ func TestCreateBranchNeverDeletesTheProjectsTenant(t *testing.T) {
 
 // identityServer runs the way a deployment behind an authenticating proxy does: headers are
 // believed, and there is no single owner to fall back on.
+// Nothing about a branch is shown that a compute has not just confirmed, so a server a page will
+// be rendered from needs a running compute holding whatever the store was seeded with.
+func liveServer(t *testing.T, store *registry.Store) (*Server, *fakeCompute) {
+	t.Helper()
+	computes := newFakeCompute(t)
+	runtime := newFakeRuntime()
+	seedCompute(t, runtime, true)
+	if branches, err := store.Branches(context.Background(), testProjectID); err == nil {
+		primeCatalog(computes, branches)
+	}
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
+	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+	return server, computes
+}
+
 func identityServer(t *testing.T, store *registry.Store) *Server {
 	t.Helper()
-	server := newTestServer(t, newFakeStorcon(t), store, newFakeRuntime(), nil)
-	server.identity = IdentityOptions{
-		UserHeader:    "Remote-User",
-		DisplayHeader: "Remote-Name",
-		GroupsHeader:  "Remote-Groups",
-		Admin:         "root",
-	}
+	server, _ := liveServer(t, store)
+	server.identity.DisplayHeader = "Remote-Name"
 	return server
 }
 
@@ -1632,5 +1708,83 @@ func TestTwoOwnersMayShareAProjectName(t *testing.T) {
 	}
 	if got := doAs(t, server, http.MethodPost, "/api/projects", "henry", "", `{"name":"app"}`).Code; got != http.StatusConflict {
 		t.Errorf("one owner reusing their own name = %d, want 409", got)
+	}
+}
+
+// A snapshot describes a compute that has stopped and not run since. Starting one invalidates it,
+// so a compute that later dies without being read leaves nothing behind to be believed.
+func TestStartingABranchDiscardsItsSnapshot(t *testing.T) {
+	store := newStore(t)
+	branch := seedBranch(t, store)
+	branch.LastSeen = &registry.LastSeen{At: time.Now().UTC(), Roles: []string{"app"}}
+	if err := store.Put(context.Background(), branch); err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime()
+	seedCompute(t, runtime, false)
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, newFakeCompute(t))
+
+	if _, err := server.ensureRunning(context.Background(), branch); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.Branch(context.Background(), testProjectID, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LastSeen != nil {
+		t.Error("a started branch kept a snapshot of what it held before it started")
+	}
+}
+
+// Suspending without being able to read the catalog leaves nothing known, so the snapshot that was
+// there has to go with it rather than describe a compute that has been running since.
+func TestSuspendingWithoutAReadDiscardsTheSnapshot(t *testing.T) {
+	store := newStore(t)
+	branch := seedBranch(t, store)
+	branch.LastSeen = &registry.LastSeen{At: time.Now().UTC(), Roles: []string{"app"}}
+	if err := store.Put(context.Background(), branch); err != nil {
+		t.Fatal(err)
+	}
+	computes := newFakeCompute(t)
+	computes.catalogFail = true
+	runtime := newFakeRuntime()
+	instance := seedCompute(t, runtime, true)
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
+
+	if err := server.suspend(context.Background(), &instance); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.Branch(context.Background(), testProjectID, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LastSeen != nil {
+		t.Error("a snapshot survived a suspension that could not read the catalog")
+	}
+}
+
+// Upstream reads any non-SCRAM string as an md5 hash, so an empty one is not an absent password:
+// it renders as PASSWORD 'md5', and the ALTER carrying it grants LOGIN to a role that had neither.
+func TestARoleWithNoVerifierTravelsAsNull(t *testing.T) {
+	store := newStore(t)
+	branch := seedBranch(t, store)
+	branch.Roles = append(branch.Roles, registry.Role{Name: "analytics"})
+	if err := store.Put(context.Background(), branch); err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime()
+	instance := seedCompute(t, runtime, true)
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, nil)
+
+	spec, err := server.renderSpec(context.Background(), &instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rendered), `{"name":"analytics","encrypted_password":null`) {
+		t.Errorf("a role with no verifier is not rendered as null: %s", rendered)
 	}
 }

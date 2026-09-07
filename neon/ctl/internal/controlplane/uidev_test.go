@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"testing"
@@ -17,9 +18,18 @@ func TestUIDev(t *testing.T) {
 	}
 
 	store := newStore(t)
-	seedBranch(t, store)
-	server := identityServer(t, store)
+	branch := seedBranch(t, store)
+	// Keyed, and with a password actually kept, so the connect string has one to unmask.
+	server := passwordServer(t, store)
 	server.opts.EndpointSuffix = "pg.example.net"
+	sealed, err := server.seal(branch.Roles[0].Name, "correct-horse-battery-staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch.Roles[0].Secret = sealed
+	if err := store.Put(context.Background(), branch); err != nil {
+		t.Fatal(err)
+	}
 
 	user := os.Getenv("NEON_CTL_UI_DEV_USER")
 	if user == "" {

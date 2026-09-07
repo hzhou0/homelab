@@ -4,6 +4,7 @@ package ui
 
 import (
 	"embed"
+	"fmt"
 	"html/template"
 	"io"
 	"net/http"
@@ -21,7 +22,26 @@ var pages = template.Must(template.New("ui").Funcs(template.FuncMap{
 	// Anything that is neither absent nor suspended has a compute to take down, whatever state
 	// compute_ctl reports it in.
 	"running": func(status string) bool { return status != "absent" && status != "suspended" },
+	// Absent is not zero: a size that could not be read is not a branch holding nothing.
+	"size": func(size *uint64) string {
+		if size == nil {
+			return ""
+		}
+		return humanBytes(*size)
+	},
 }).ParseFS(templates, "templates.html"))
+
+func humanBytes(size uint64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	value, exponent := float64(size)/unit, 0
+	for value >= unit && exponent < 3 {
+		value, exponent = value/unit, exponent+1
+	}
+	return fmt.Sprintf("%.1f %s", value, [...]string{"KiB", "MiB", "GiB", "TiB"}[exponent])
+}
 
 func Render(w io.Writer, name string, data any) error {
 	return pages.ExecuteTemplate(w, name, data)

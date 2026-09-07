@@ -5,11 +5,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"crypto/rand"
 
+	"github.com/hzhou0/homelab/neon/ctl/internal/kube"
 	"github.com/hzhou0/homelab/neon/ctl/internal/neon"
 	"github.com/hzhou0/homelab/neon/ctl/internal/registry"
 	"github.com/hzhou0/homelab/neon/ctl/internal/scram"
@@ -415,10 +418,7 @@ func TestANameCannotBeAddedTwice(t *testing.T) {
 func TestDeletingADatabaseTellsTheComputeToDropIt(t *testing.T) {
 	store := newStore(t)
 	seedBranch(t, store)
-	computes := newFakeCompute(t)
-	runtime := newFakeRuntime()
-	server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
-	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+	server, computes := liveServer(t, store)
 
 	response := form(t, server, http.MethodDelete,
 		"/ui/projects/"+testProjectID+"/branches/main/databases/appdb", "tester", "", nil)
@@ -457,9 +457,7 @@ func TestDeletingADatabaseTellsTheComputeToDropIt(t *testing.T) {
 func TestDeletingARole(t *testing.T) {
 	store := newStore(t)
 	seedBranch(t, store)
-	computes := newFakeCompute(t)
-	server := newTestServer(t, newFakeStorcon(t), store, newFakeRuntime(), computes)
-	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+	server, computes := liveServer(t, store)
 
 	// A role some database is owned by cannot go: the branch it would leave behind is one the
 	// registry refuses, and refusing here means nothing was dropped either.
@@ -538,69 +536,103 @@ func TestABranchThatIsNotThereSendsThePageBackToTheProject(t *testing.T) {
 	}
 }
 
-// The page reads from two places that can disagree, and a page that only ever showed one of them
-// would be confidently wrong about what a person can connect to.
-func TestTheBranchPageShowsWhatPostgresHasAndWhatIsOnlyRecorded(t *testing.T) {
+// The page is the catalog. Everything Postgres holds is shown and manageable, including what was
+// made with SQL — except what belongs to Postgres and to compute_ctl, which is not a branch's.
+func TestTheBranchPageShowsWhatPostgresHas(t *testing.T) {
 	store := newStore(t)
 	seedBranch(t, store)
-	computes := newFakeCompute(t)
-	runtime := newFakeRuntime()
-	seedCompute(t, runtime, true)
-	server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
-	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
-
-	// app and appdb are recorded and live; analytics was made in SQL; reporting is recorded but
-	// has not reached the compute.
+	server, computes := liveServer(t, store)
 	computes.catalog = neon.CatalogObjects{
-		Roles:     []neon.Role{{Name: "app"}},
-		Databases: []neon.Database{{Name: "appdb", Owner: "app"}, {Name: "analytics", Owner: "app"}},
-	}
-	if added := form(t, server, http.MethodPost, "/ui/projects/"+testProjectID+"/branches/main/roles",
-		"tester", "", url.Values{"role": {"reporting"}}); added.Code != http.StatusOK {
-		t.Fatalf("adding a role = %d, body = %s", added.Code, added.Body)
+		Roles: []neon.Role{{Name: "app"}, {Name: "analytics"}, {Name: "cloud_admin"}, {Name: "pg_monitor"}},
+		Databases: []neon.Database{
+			{Name: "appdb", Owner: "app"}, {Name: "reports", Owner: "analytics"},
+			{Name: "postgres", Owner: "cloud_admin"}, {Name: "template1", Owner: "cloud_admin"},
+		},
 	}
 
 	body := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
-	for _, want := range []string{"analytics", "not made here", "reporting", "pending", "live"} {
+	for _, want := range []string{"analytics", "reports", `/databases/reports"`, `/roles/analytics"`} {
 		if !strings.Contains(body, want) {
-			t.Errorf("the branch page does not say %q", want)
+			t.Errorf("the branch page does not offer %q", want)
+		}
+	}
+	for _, unwanted := range []string{"cloud_admin", "pg_monitor", "template1", "/databases/postgres\""} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("the branch page shows %q, which is not the branch's to manage", unwanted)
 		}
 	}
 
-	// Nothing made outside this service is offered an action, because dropping what it did not
-	// create is not this page's to do.
-	if strings.Contains(body, `/databases/analytics"`) {
-		t.Error("a database this service did not create was given a delete button")
+	// What the compute holds is what gets recorded, so the proxy can authenticate a role this
+	// service did not create.
+	branch, err := store.Branch(context.Background(), testProjectID, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, role := range branch.Roles {
+		names = append(names, role.Name)
+	}
+	if !slices.Equal(names, []string{"analytics", "app"}) {
+		t.Errorf("recorded roles = %v", names)
 	}
 }
 
-// Not knowing is its own answer: a suspended compute cannot be asked, and saying "pending" would
-// claim something the page has no way to know.
-func TestASuspendedBranchIsNotReportedAsPending(t *testing.T) {
-	store := newStore(t)
-	seedBranch(t, store)
-	server := identityServer(t, store)
+// A compute that stopped cleanly was read on the way out, so its names are known and a connection
+// string can still be offered. One that was never read is not known at all, and saying nothing is
+// the only honest answer.
+func TestADownBranchShowsOnlyWhatWasSnapshotted(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		snapshot *registry.LastSeen
+		want     []string
+		unwanted []string
+	}{
+		{
+			name:     "stopped cleanly",
+			snapshot: &registry.LastSeen{At: time.Now().UTC(), Roles: []string{"app"}, Databases: []string{"appdb"}},
+			want:     []string{"postgresql://app@", "not running"},
+			unwanted: []string{"was not shut down cleanly"},
+		},
+		{
+			name:     "never read",
+			want:     []string{"was not shut down cleanly"},
+			unwanted: []string{"postgresql://app@", "<h2>connect</h2>"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore(t)
+			branch := seedBranch(t, store)
+			branch.LastSeen = tc.snapshot
+			if err := store.Put(context.Background(), branch); err != nil {
+				t.Fatal(err)
+			}
+			runtime := newFakeRuntime()
+			seedCompute(t, runtime, false)
+			server := newTestServer(t, newFakeStorcon(t), store, runtime, newFakeCompute(t))
+			server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
 
-	body := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
-	if strings.Contains(body, "pending") {
-		t.Error("a branch whose compute was never asked reports its roles as pending")
-	}
-	if !strings.Contains(body, "not running") {
-		t.Error("the page does not say why it is showing only what is recorded")
+			body := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
+			for _, want := range tc.want {
+				if !strings.Contains(body, want) {
+					t.Errorf("the page does not say %q", want)
+				}
+			}
+			for _, unwanted := range tc.unwanted {
+				if strings.Contains(body, unwanted) {
+					t.Errorf("the page says %q", unwanted)
+				}
+			}
+		})
 	}
 }
 
-// A drop the compute refuses must leave the record alone: a name removed here and still there is
-// the divergence the page exists to not have.
-func TestARefusedDropChangesNothing(t *testing.T) {
+// A drop the compute refuses is not undone here, because undoing it would be a guess. The compute
+// still holds the database, so the read that renders the answer records it back.
+func TestARefusedDropIsCorrectedByTheRead(t *testing.T) {
 	store := newStore(t)
 	seedBranch(t, store)
-	computes := newFakeCompute(t)
+	server, computes := liveServer(t, store)
 	computes.configureFail = true
-	runtime := newFakeRuntime()
-	seedCompute(t, runtime, true)
-	server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
-	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
 
 	response := form(t, server, http.MethodDelete,
 		"/ui/projects/"+testProjectID+"/branches/main/databases/appdb", "tester", "", nil)
@@ -613,7 +645,26 @@ func TestARefusedDropChangesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(branch.Databases) != 1 || branch.Databases[0].Name != "appdb" {
-		t.Errorf("databases = %v, want the refused drop rolled back", branch.Databases)
+		t.Errorf("databases = %v, want what the compute still has", branch.Databases)
+	}
+}
+
+// A branch nothing is known about cannot be changed against a guess about what it holds.
+func TestAnUnknownBranchRefusesAChange(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	runtime := newFakeRuntime()
+	seedCompute(t, runtime, false)
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, newFakeCompute(t))
+	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+
+	response := form(t, server, http.MethodPost, "/ui/projects/"+testProjectID+"/branches/main/roles",
+		"tester", "", url.Values{"role": {"reporting"}})
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409, body = %s", response.Code, response.Body)
+	}
+	if runtime.ensures != 0 {
+		t.Error("a branch nothing is known about was started to take a change")
 	}
 }
 
@@ -654,7 +705,7 @@ func TestStoppingABranchKeepsTheNamesItsConnectStringsNeed(t *testing.T) {
 	if !strings.Contains(body, "analytics") {
 		t.Error("the connect strings do not offer a database the branch actually has")
 	}
-	if !strings.Contains(body, "when it was stopped") {
+	if !strings.Contains(body, "when the database was last running") {
 		t.Error("the page does not say the names are from the last time the branch ran")
 	}
 
@@ -703,16 +754,6 @@ func TestAKeptPasswordCanBeShownAgain(t *testing.T) {
 		t.Error("the password is stored as itself")
 	}
 
-	shown := doAs(t, server, http.MethodGet,
-		"/ui/projects/"+testProjectID+"/branches/trunk/roles/app/password", "tester", "", "")
-	if shown.Code != http.StatusOK {
-		t.Fatalf("reveal = %d, body = %s", shown.Code, shown.Body)
-	}
-	if !strings.Contains(shown.Body.String(), password) {
-		t.Error("the password that was kept was not the one shown back")
-	}
-
-	// And the same answer by hand, which is the only claim the page makes about the API.
 	api := doAs(t, server, http.MethodGet,
 		"/api/projects/"+testProjectID+"/branches/trunk/roles/app/password", "tester", "", "")
 	if api.Code != http.StatusOK || !strings.Contains(api.Body.String(), password) {
@@ -772,7 +813,7 @@ func TestChangingOneRoleKeepsTheOthersPasswords(t *testing.T) {
 			t.Fatalf("%s = %d, body = %s", action.name, response.Code, response.Body)
 		}
 		shown := doAs(t, server, http.MethodGet,
-			"/ui/projects/"+testProjectID+"/branches/trunk/roles/app/password", "tester", "", "")
+			"/api/projects/"+testProjectID+"/branches/trunk/roles/app/password", "tester", "", "")
 		if !strings.Contains(shown.Body.String(), password) {
 			t.Fatalf("%s discarded the password kept for a role beside it", action.name)
 		}
@@ -857,5 +898,423 @@ func TestAnOrdinarySpecCarriesNoDeltas(t *testing.T) {
 	}
 	if body := computes.lastBody(); strings.Contains(body, "delta_operations") {
 		t.Errorf("a spec that drops nothing carries the field: %s", body)
+	}
+}
+
+// Nothing here reaches Postgres except through a compute, so a branch that is asleep is woken to
+// take a change rather than the change being recorded against a compute that will never see it.
+func TestAChangeStartsASleepingBranch(t *testing.T) {
+	store := newStore(t)
+	branch := seedBranch(t, store)
+	branch.LastSeen = &registry.LastSeen{At: time.Now().UTC(), Roles: []string{"app"}, Databases: []string{"appdb"}}
+	if err := store.Put(context.Background(), branch); err != nil {
+		t.Fatal(err)
+	}
+	computes := newFakeCompute(t)
+	primeCatalog(computes, []registry.Branch{*branch})
+	runtime := newFakeRuntime()
+	seedCompute(t, runtime, false)
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
+	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+
+	response := form(t, server, http.MethodPost, "/ui/projects/"+testProjectID+"/branches/main/databases",
+		"tester", "", url.Values{"database": {"reports"}, "owner": {"app"}})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	if runtime.ensures == 0 {
+		t.Error("the branch was not started to apply the change")
+	}
+	if len(computes.specs()) == 0 {
+		t.Error("no compute was asked to apply the change")
+	}
+}
+
+// A spec that fails may still have applied part of itself, so undoing the change blindly would
+// record something Postgres does not have. What the compute reports is what gets recorded.
+func TestARefusedChangeIsRecordedAsTheComputeHasIt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		catalog neon.CatalogObjects
+		method  string
+		target  string
+		values  url.Values
+		roles   []string
+		dbs     []string
+	}{
+		{
+			name:    "nothing applied",
+			catalog: neon.CatalogObjects{Roles: []neon.Role{{Name: "app"}}, Databases: []neon.Database{{Name: "appdb", Owner: "app"}}},
+			method:  http.MethodPost,
+			target:  "/roles",
+			values:  url.Values{"role": {"reporting"}},
+			roles:   []string{"app"},
+			dbs:     []string{"appdb"},
+		},
+		{
+			name: "the role was created before the failure",
+			catalog: neon.CatalogObjects{
+				Roles:     []neon.Role{{Name: "app"}, {Name: "reporting"}},
+				Databases: []neon.Database{{Name: "appdb", Owner: "app"}},
+			},
+			method: http.MethodPost,
+			target: "/roles",
+			values: url.Values{"role": {"reporting"}},
+			roles:  []string{"app", "reporting"},
+			dbs:    []string{"appdb"},
+		},
+		{
+			name:    "the drop happened before the failure",
+			catalog: neon.CatalogObjects{Roles: []neon.Role{{Name: "app"}}},
+			method:  http.MethodDelete,
+			target:  "/databases/appdb",
+			roles:   []string{"app"},
+			dbs:     nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore(t)
+			seedBranch(t, store)
+			computes := newFakeCompute(t)
+			computes.catalog = tc.catalog
+			computes.configureFail = true
+			runtime := newFakeRuntime()
+			seedCompute(t, runtime, true)
+			server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
+			server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+
+			response := form(t, server, tc.method,
+				"/ui/projects/"+testProjectID+"/branches/main"+tc.target, "tester", "", tc.values)
+			if response.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", response.Code)
+			}
+
+			after, err := store.Branch(context.Background(), testProjectID, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var roles, dbs []string
+			for _, role := range after.Roles {
+				roles = append(roles, role.Name)
+			}
+			for _, database := range after.Databases {
+				dbs = append(dbs, database.Name)
+			}
+			if !slices.Equal(roles, tc.roles) {
+				t.Errorf("roles = %v, want %v", roles, tc.roles)
+			}
+			if !slices.Equal(dbs, tc.dbs) {
+				t.Errorf("databases = %v, want %v", dbs, tc.dbs)
+			}
+		})
+	}
+}
+
+// A password change that did not land would leave the record holding a verifier Postgres does not
+// have, and the proxy would then refuse a password that still works. The catalog carries the
+// verifier, so the record takes it from there rather than from whichever version looks likelier.
+func TestARefusedPasswordChangeTakesTheVerifierFromTheCompute(t *testing.T) {
+	for _, live := range []string{"SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy", "SCRAM-SHA-256$4096:bmV3$bmV3:bmV3"} {
+		t.Run(live, func(t *testing.T) {
+			store := newStore(t)
+			seedBranch(t, store)
+			computes := newFakeCompute(t)
+			computes.catalog = neon.CatalogObjects{
+				Roles:     []neon.Role{{Name: "app", EncryptedPassword: &live}},
+				Databases: []neon.Database{{Name: "appdb", Owner: "app"}},
+			}
+			computes.configureFail = true
+			runtime := newFakeRuntime()
+			seedCompute(t, runtime, true)
+			server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
+			server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+
+			response := form(t, server, http.MethodPost,
+				"/ui/projects/"+testProjectID+"/branches/main/roles/app/password", "tester", "", nil)
+			if response.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", response.Code)
+			}
+
+			after, err := store.Branch(context.Background(), testProjectID, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Roles[0].Verifier != live {
+				t.Errorf("verifier = %q, want the one the compute reports", after.Roles[0].Verifier)
+			}
+		})
+	}
+}
+
+// A branch nothing has confirmed shows nothing and takes no changes, so creating one from the page
+// starts it rather than leaving something to go and start.
+func TestCreatingABranchStartsIt(t *testing.T) {
+	store := newStore(t)
+	computes := newFakeCompute(t)
+	runtime := newFakeRuntime()
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
+	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+
+	response := form(t, server, http.MethodPost, "/ui/projects/"+testProjectID+"/branches", "tester", "",
+		url.Values{"name": {"trunk"}, "role": {"app"}, "database": {"appdb"}, "pg_version": {"17"}})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+
+	instances, err := runtime.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(instances) != 1 || !instances[0].Running() {
+		t.Errorf("the new branch was not started: %v", instances)
+	}
+}
+
+// A fragment URL is linkable, bookmarkable and refreshable. Answering one with a bare fragment
+// hands somebody a page with no stylesheet and no navigation.
+func TestAFragmentURLAnswersWithAPageWhenItIsNotHtmx(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	server := identityServer(t, store)
+
+	for _, target := range []string{
+		"/ui/projects",
+		"/ui/projects/" + testProjectID + "/branches",
+		"/ui/projects/" + testProjectID + "/branches/main/detail",
+	} {
+		response := doAs(t, server, http.MethodGet, target, "tester", "", "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d", target, response.Code)
+		}
+		if !strings.Contains(response.Body.String(), `href="/ui/assets/style.css"`) {
+			t.Errorf("GET %s answered with a fragment rather than a page", target)
+		}
+
+		request := httptest.NewRequest(http.MethodGet, target, nil)
+		request.Header.Set("Remote-User", "tester")
+		request.Header.Set("HX-Request", "true")
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, request)
+		if strings.Contains(recorder.Body.String(), `href="/ui/assets/style.css"`) {
+			t.Errorf("GET %s answered htmx with a whole page", target)
+		}
+	}
+}
+
+// Starting a branch is what discards its snapshot, so between the button and a compute that can be
+// read there is a window with neither. Reporting that as unknown tells somebody to start a branch
+// that is already starting.
+func TestAStartingBranchIsNotReportedAsUnknown(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	runtime := newFakeRuntime()
+	runtime.add(kube.Instance{
+		Binding:    kube.Binding{ID: testEndpointID, TenantID: mustTenant(t), TimelineID: mustTimeline(t)},
+		ControlURL: "http://compute-" + testEndpointID + ".neon:3080",
+		PgAddress:  "compute-" + testEndpointID + ".neon:55433",
+		Replicas:   1,
+	})
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, newFakeCompute(t))
+	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+
+	body := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
+	if strings.Contains(body, "was not shut down cleanly") {
+		t.Error("a branch that is coming up is reported as one nothing is known about")
+	}
+	if !strings.Contains(body, "The database is starting") {
+		t.Error("the page does not say the branch is starting")
+	}
+}
+
+// Stopping a branch takes its snapshot, so the answer to the stop is the first thing that can show
+// a connection string built from one. Rendering it from the copy the request started with reports
+// a branch nothing is known about, one poll before the snapshot turns up.
+func TestStoppingABranchAnswersWithItsSnapshot(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	server, _ := liveServer(t, store)
+
+	response := form(t, server, http.MethodPost,
+		"/ui/projects/"+testProjectID+"/branches/main/stop", "tester", "", url.Values{"view": {"branch"}})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+
+	body := response.Body.String()
+	if strings.Contains(body, "was not shut down cleanly") {
+		t.Error("stopping a branch answered as though nothing were known about it")
+	}
+	if !strings.Contains(body, "postgresql://app@") {
+		t.Error("the answer does not carry the connection string the snapshot was taken for")
+	}
+}
+
+// The password rides in the connection string as a mask. Nothing renders it into the page: the
+// string carries a placeholder and the browser fetches the real one only when somebody asks.
+func TestTheConnectionStringMasksAPasswordThatCanBeShown(t *testing.T) {
+	for _, keyed := range []bool{true, false} {
+		name := "no password kept"
+		if keyed {
+			name = "password kept"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newStore(t)
+			branch := seedBranch(t, store)
+			branch.Roles[0].Secret = "sealed"
+			if err := store.Put(context.Background(), branch); err != nil {
+				t.Fatal(err)
+			}
+			server, _ := liveServer(t, store)
+			if keyed {
+				key := make([]byte, secret.KeySize)
+				if _, err := rand.Read(key); err != nil {
+					t.Fatal(err)
+				}
+				box, err := secret.New(key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				server.secrets = box
+			}
+			server.opts.EndpointSuffix = "pg.example.net"
+
+			body := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
+			masked := "postgresql://app:***@ep-test-branch-aaaaaaaa.pg.example.net/appdb?sslmode=require"
+			if got := strings.Contains(body, masked); got != keyed {
+				t.Errorf("connection string masked = %v, want %v", got, keyed)
+			}
+			if got := strings.Contains(body, "data-reveal="); got != keyed {
+				t.Errorf("string offers to reveal = %v, want %v", got, keyed)
+			}
+			if got := strings.Contains(body, "Passwords are shown once"); got == keyed {
+				t.Errorf("page says passwords are shown once = %v, want %v", got, !keyed)
+			}
+			// The mask is a placeholder, not a credential, and must not arrive percent-encoded.
+			if strings.Contains(body, "%2A") {
+				t.Error("the mask was escaped as though it were a password")
+			}
+			if strings.Contains(body, "sealed") {
+				t.Error("a stored password reached the page")
+			}
+		})
+	}
+}
+
+// A parent is picked from the branches that exist. The list lives outside the section an action
+// replaces, so it is swapped alongside it or it names branches that have since gone.
+func TestTheParentPickerFollowsTheBranchList(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	server := identityServer(t, store)
+
+	page := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID, "tester", "", "").Body.String()
+	if !strings.Contains(page, `<select id="pick-parent"`) {
+		t.Error("the fork form does not offer the branches to pick from")
+	}
+	if !strings.Contains(page, "<option>main</option>") {
+		t.Error("the parent picker does not list the branch that exists")
+	}
+
+	created := form(t, server, http.MethodPost, "/ui/projects/"+testProjectID+"/branches", "tester", "",
+		url.Values{"name": {"trunk"}, "role": {"app"}, "database": {"appdb"}, "pg_version": {"17"}})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create = %d, body = %s", created.Code, created.Body)
+	}
+	body := created.Body.String()
+	if !strings.Contains(body, `id="pick-parent"`) || !strings.Contains(body, `hx-swap-oob="true"`) {
+		t.Fatal("creating a branch did not refresh the parent picker")
+	}
+	if !strings.Contains(body, "<option>trunk</option>") {
+		t.Error("the refreshed picker does not offer the branch that was just made")
+	}
+}
+
+// Size comes from storage rather than from the compute, so it is a fact about the branch and is
+// there whether or not one is running. Uptime is the compute's and goes with it.
+func TestABranchReportsItsSizeWithoutACompute(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	storcon := newFakeStorcon(t)
+	storcon.logicalSize = 42 * 1024 * 1024
+	runtime := newFakeRuntime()
+	server := newTestServer(t, storcon, store, runtime, newFakeCompute(t))
+	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+
+	// No compute at all: the branch page cannot say what it holds, but it can say how much.
+	page := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
+	if !strings.Contains(page, "42.0 MiB") {
+		t.Error("a branch with no compute does not report its size")
+	}
+	if !strings.Contains(page, "<dt>uptime</dt>") {
+		t.Error("the compute facts do not offer uptime")
+	}
+
+	// And the listing carries it, for the same reason.
+	list := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID, "tester", "", "").Body.String()
+	if !strings.Contains(list, "42.0 MiB") {
+		t.Error("the branch list does not report size")
+	}
+
+	api := doAs(t, server, http.MethodGet, "/api/projects/"+testProjectID+"/branches/main", "tester", "", "")
+	if !strings.Contains(api.Body.String(), `"size_bytes":44040192`) {
+		t.Errorf("the api does not carry the size: %s", api.Body)
+	}
+}
+
+// A size the pageserver is still working out is reported as approximate rather than as fact.
+func TestAnApproximateSizeIsMarked(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	storcon := newFakeStorcon(t)
+	storcon.logicalSize = 1536
+	storcon.sizeAccurate = false
+	server := newTestServer(t, storcon, store, newFakeRuntime(), newFakeCompute(t))
+	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+
+	page := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
+	if !strings.Contains(page, "about 1.5 KiB") {
+		t.Error("an approximate size is reported as though it were exact")
+	}
+}
+
+// The roles table masks a password the same way the connection string does. Neither renders one
+// into the page: the mask is all the browser holds until somebody asks for the real thing.
+func TestTheRolesTableMasksThePassword(t *testing.T) {
+	store := newStore(t)
+	branch := seedBranch(t, store)
+	branch.Roles[0].Secret = "sealed"
+	if err := store.Put(context.Background(), branch); err != nil {
+		t.Fatal(err)
+	}
+	server, _ := liveServer(t, store)
+	key := make([]byte, secret.KeySize)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	box, err := secret.New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.secrets = box
+
+	body := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
+	if !strings.Contains(body, `<code class="mask"`) {
+		t.Error("the roles table does not mask the password")
+	}
+	if !strings.Contains(body, `data-role="app"`) {
+		t.Error("the mask does not say which role it would reveal")
+	}
+	if strings.Contains(body, "sealed") {
+		t.Error("a stored password reached the page")
+	}
+
+	// With no key there is nothing to unmask, so the column offers only the reset.
+	server.secrets = nil
+	bare := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
+	if strings.Contains(bare, `<code class="mask"`) {
+		t.Error("a deployment that keeps no passwords still offered to show one")
+	}
+	if !strings.Contains(bare, ">reset</button>") {
+		t.Error("the reset went missing with the mask")
 	}
 }

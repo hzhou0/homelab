@@ -70,13 +70,24 @@ type branchRow struct {
 	Connect connectOptions
 	Catalog catalogState
 
+	// How long this compute has been up. What the branch holds is a branch fact and rides on the
+	// view, so it is there for a listing too.
+	Uptime string
+
+	// Set while the compute is coming up, when there is nothing to say yet but there will be.
+	Starting bool
+
+	// Set when the branch has neither a compute to ask nor a snapshot to fall back on, so nothing
+	// about it can be stated — not even a connection string, whose names may since have gone.
+	Unknown bool
+
 	// Whether a password can be asked for a second time here at all.
 	Passwords bool
 }
 
 // connectOptions is what the connect strings can be built from. The names come from the compute
-// while it is up and from what it had when it was last stopped while it is down, because a string
-// that names a database is what wakes it.
+// while it is up and from the snapshot taken as it stopped while it is down, because a string that
+// names a database is what wakes it.
 type connectOptions struct {
 	Roles     []string
 	Databases []string
@@ -87,8 +98,8 @@ type connectOptions struct {
 	Since *time.Time
 }
 
-// catalogState is the registry and Postgres laid over each other. What this service records is
-// what may authenticate; what Postgres holds is what exists, and the two are allowed to differ.
+// catalogState is what the compute has. Postgres is the only thing that knows what exists, so it
+// is read on every render and nothing is shown that was not just confirmed there.
 type catalogState struct {
 	// False when the compute could not be asked, which is the difference between knowing a name is
 	// absent and having no way to find out.
@@ -102,72 +113,93 @@ type catalogEntry struct {
 	Name  string
 	Owner string
 
-	known    bool
-	Recorded bool
-	Live     bool
+	verifier string
 }
 
-func (e catalogEntry) Managed() bool { return e.Recorded }
-func (e catalogEntry) Pending() bool { return e.known && e.Recorded && !e.Live }
-func (e catalogEntry) Foreign() bool { return e.Live && !e.Recorded }
+// Postgres reserves the pg_ prefix for its own roles and refuses to create anything using it; the
+// other two are made by compute_ctl for itself and are not a branch's to manage.
+func reservedRole(name string) bool {
+	return strings.HasPrefix(name, "pg_") || name == "cloud_admin" || name == "neon_superuser"
+}
 
-// A branch is read from two places that can disagree, and saying so is the whole point: a name the
-// compute does not have is one nothing can use yet, and one only the compute has was not made here.
-func (s *Server) catalogState(ctx context.Context, branch *registry.Branch, instance *kube.Instance) catalogState {
-	state := catalogState{}
-	for _, role := range branch.Roles {
-		state.Roles = append(state.Roles, catalogEntry{Name: role.Name, Recorded: true})
-	}
-	for _, database := range branch.Databases {
-		state.Databases = append(state.Databases, catalogEntry{Name: database.Name, Owner: database.Owner, Recorded: true})
-	}
+// compute_ctl's own connection string names postgres, so offering a way to drop it would be a way
+// to break the compute.
+func reservedDatabase(name string) bool {
+	return name == "postgres" || name == "template0" || name == "template1"
+}
+
+func (s *Server) readCatalog(ctx context.Context, branch *registry.Branch, instance *kube.Instance) catalogState {
 	if instance == nil || !instance.Running() {
-		return state
+		return catalogState{}
 	}
-
 	live, err := s.liveCatalog(ctx, instance)
 	if err != nil {
 		s.log.Error("reading a compute catalog", "branch", branch.Name, "error", err)
-		return state
-	}
-	state.Known = true
-
-	roles := map[string]bool{}
-	for _, role := range live.Roles {
-		roles[role.Name] = true
-	}
-	for i := range state.Roles {
-		state.Roles[i].known = true
-		state.Roles[i].Live = roles[state.Roles[i].Name]
-		delete(roles, state.Roles[i].Name)
-	}
-	for _, role := range live.Roles {
-		if roles[role.Name] {
-			state.Roles = append(state.Roles, catalogEntry{Name: role.Name, known: true, Live: true})
-		}
+		return catalogState{}
 	}
 
-	databases := map[string]string{}
-	for _, database := range live.Databases {
-		databases[database.Name] = database.Owner
-	}
-	for i := range state.Databases {
-		owner, live := databases[state.Databases[i].Name]
-		state.Databases[i].known = true
-		state.Databases[i].Live = live
-		// The owner Postgres reports is the one deciding what a role may do there, so it is the one
-		// worth showing when the two disagree.
-		if live && owner != "" {
-			state.Databases[i].Owner = owner
+	state := catalogState{Known: true}
+	for _, role := range live.Roles {
+		if reservedRole(role.Name) {
+			continue
 		}
-		delete(databases, state.Databases[i].Name)
+		entry := catalogEntry{Name: role.Name}
+		if role.EncryptedPassword != nil {
+			entry.verifier = *role.EncryptedPassword
+		}
+		state.Roles = append(state.Roles, entry)
 	}
 	for _, database := range live.Databases {
-		if owner, ok := databases[database.Name]; ok {
-			state.Databases = append(state.Databases, catalogEntry{Name: database.Name, Owner: owner, known: true, Live: true})
+		if !reservedDatabase(database.Name) {
+			state.Databases = append(state.Databases, catalogEntry{Name: database.Name, Owner: database.Owner})
 		}
 	}
+	// pg_authid and pg_database answer in whatever order they please, and a table that reorders
+	// itself under the poll is unreadable.
+	byName := func(a, b catalogEntry) int { return strings.Compare(a.Name, b.Name) }
+	slices.SortFunc(state.Roles, byName)
+	slices.SortFunc(state.Databases, byName)
+
+	s.adopt(ctx, branch, state)
 	return state
+}
+
+// adopt records what the compute has. A role made with SQL authenticates through the proxy like any
+// other once it is here, and it has to be here rather than read live: the proxy resolves a verifier
+// before it wakes a compute, so there is a moment when the registry is the only place one exists.
+// A sealed password survives only for a name whose verifier has not moved.
+func (s *Server) adopt(ctx context.Context, branch *registry.Branch, state catalogState) {
+	sealed := map[registry.Role]string{}
+	for _, role := range branch.Roles {
+		if role.Secret != "" {
+			sealed[registry.Role{Name: role.Name, Verifier: role.Verifier}] = role.Secret
+		}
+	}
+
+	updated := *branch
+	updated.Roles = nil
+	updated.Databases = nil
+	for _, entry := range state.Roles {
+		role := registry.Role{Name: entry.Name, Verifier: entry.verifier}
+		role.Secret = sealed[role]
+		updated.Roles = append(updated.Roles, role)
+	}
+	for _, entry := range state.Databases {
+		updated.Databases = append(updated.Databases, registry.Database{Name: entry.Name, Owner: entry.Owner})
+	}
+
+	if slices.Equal(updated.Roles, branch.Roles) && slices.Equal(updated.Databases, branch.Databases) {
+		return
+	}
+	if err := updated.Validate(); err != nil {
+		s.log.Warn("cannot record what the compute has", "branch", branch.Name, "error", err)
+		return
+	}
+	if err := s.registry.Put(ctx, &updated); err != nil {
+		s.log.Error("recording what the compute has", "branch", branch.Name, "error", err)
+		return
+	}
+	*branch = updated
 }
 
 func (s *Server) liveCatalog(ctx context.Context, instance *kube.Instance) (*neon.CatalogObjects, error) {
@@ -184,31 +216,20 @@ func (s *Server) branchRow(ctx context.Context, branch *registry.Branch) branchR
 
 // What exists is the compute's to say; what it had when it stopped is the next best thing; what is
 // recorded here is all there is for a branch that has never run.
-func (s *Server) connectOptions(branch *registry.Branch, host string, catalog catalogState) connectOptions {
+func (s *Server) connectOptions(branch *registry.Branch, host string, catalog catalogState, masked bool) connectOptions {
 	options := connectOptions{}
 	switch {
 	case catalog.Known:
 		for _, entry := range catalog.Roles {
-			if entry.Live {
-				options.Roles = append(options.Roles, entry.Name)
-			}
+			options.Roles = append(options.Roles, entry.Name)
 		}
 		for _, entry := range catalog.Databases {
-			if entry.Live {
-				options.Databases = append(options.Databases, entry.Name)
-			}
+			options.Databases = append(options.Databases, entry.Name)
 		}
 	case branch.LastSeen != nil:
 		options.Roles = branch.LastSeen.Roles
 		options.Databases = branch.LastSeen.Databases
 		options.Since = &branch.LastSeen.At
-	default:
-		for _, role := range branch.Roles {
-			options.Roles = append(options.Roles, role.Name)
-		}
-		for _, database := range branch.Databases {
-			options.Databases = append(options.Databases, database.Name)
-		}
 	}
 
 	if len(options.Databases) == 0 || len(options.Roles) == 0 {
@@ -223,8 +244,26 @@ func (s *Server) connectOptions(branch *registry.Branch, host string, catalog ca
 			break
 		}
 	}
-	options.URI = connectionURI(host, role, options.Databases[0], "")
+	if masked {
+		options.URI = maskedConnectionURI(host, role, options.Databases[0])
+	} else {
+		options.URI = connectionURI(host, role, options.Databases[0], "")
+	}
 	return options
+}
+
+// Coarse on purpose: the difference between 3h11m and 3h12m of uptime is not worth reading.
+func since(start time.Time) string {
+	elapsed := time.Since(start)
+	switch {
+	case elapsed < time.Minute:
+		return fmt.Sprintf("%ds", int(elapsed.Seconds()))
+	case elapsed < time.Hour:
+		return fmt.Sprintf("%dm", int(elapsed.Minutes()))
+	case elapsed < 24*time.Hour:
+		return fmt.Sprintf("%dh %dm", int(elapsed.Hours()), int(elapsed.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd %dh", int(elapsed.Hours())/24, int(elapsed.Hours())%24)
 }
 
 func (s *Server) endpointHost(branch *registry.Branch) string {
@@ -232,6 +271,17 @@ func (s *Server) endpointHost(branch *registry.Branch) string {
 		return branch.EndpointID
 	}
 	return branch.EndpointID + "." + s.opts.EndpointSuffix
+}
+
+// passwordMask stands in the connection string for a password the browser has not asked for yet.
+const passwordMask = "***"
+
+// A mask is a placeholder rather than a credential, so it is spliced in rather than encoded:
+// url.UserPassword renders *** as %2A%2A%2A, which is what somebody copying the line would get.
+func maskedConnectionURI(host, role, database string) string {
+	plain := connectionURI(host, role, database, "")
+	user := url.User(role).String()
+	return strings.Replace(plain, user+"@", user+":"+passwordMask+"@", 1)
 }
 
 // The proxy takes the endpoint out of the SNI name and demands TLS, so both the host and the mode
@@ -337,6 +387,15 @@ func (s *Server) uiScope(w http.ResponseWriter, r *http.Request) (*Identity, *re
 	return identity, project
 }
 
+// A fragment is only a fragment to htmx. Reached any other way — a bookmark, a refresh, a link
+// somebody was sent — it has to arrive as a page, or it renders with no stylesheet and no way out.
+func shell(r *http.Request, fragment, page string) string {
+	if r.Header.Get("HX-Request") == "" {
+		return page
+	}
+	return fragment
+}
+
 func (s *Server) handleUIProjects(w http.ResponseWriter, r *http.Request) {
 	identity := s.uiCaller(w, r)
 	if identity == nil {
@@ -350,7 +409,7 @@ func (s *Server) handleUIProjectsFragment(w http.ResponseWriter, r *http.Request
 	if identity == nil {
 		return
 	}
-	s.renderProjects(w, r, identity, "projects", http.StatusOK, notice{})
+	s.renderProjects(w, r, identity, shell(r, "projects", "projects-page"), http.StatusOK, notice{})
 }
 
 func (s *Server) renderProjects(w http.ResponseWriter, r *http.Request, identity *Identity, template string, status int, note notice) {
@@ -460,7 +519,7 @@ func (s *Server) handleUIBranches(w http.ResponseWriter, r *http.Request) {
 	if project == nil {
 		return
 	}
-	s.renderBranches(w, r, identity, project, "branches", http.StatusOK, notice{})
+	s.renderBranches(w, r, identity, project, shell(r, "branches", "project-page"), http.StatusOK, notice{})
 }
 
 func (s *Server) renderBranches(w http.ResponseWriter, r *http.Request, identity *Identity, project *registry.Project, template string, status int, note notice) {
@@ -500,7 +559,7 @@ func (s *Server) handleUIBranchFragment(w http.ResponseWriter, r *http.Request) 
 	if branch == nil {
 		return
 	}
-	s.renderBranch(w, r, identity, project, branch, "branch", http.StatusOK, notice{})
+	s.renderBranch(w, r, identity, project, branch, shell(r, "branch", "branch-page"), http.StatusOK, notice{})
 }
 
 func (s *Server) renderBranch(w http.ResponseWriter, r *http.Request, identity *Identity, project *registry.Project, branch *registry.Branch, template string, status int, note notice) {
@@ -510,9 +569,16 @@ func (s *Server) renderBranch(w http.ResponseWriter, r *http.Request, identity *
 	if err != nil {
 		instance = nil
 	}
-	row.Catalog = s.catalogState(r.Context(), branch, instance)
-	row.Connect = s.connectOptions(branch, row.Host, row.Catalog)
+	row.Catalog = s.readCatalog(r.Context(), branch, instance)
 	row.Passwords = s.secrets != nil
+	row.Connect = s.connectOptions(branch, row.Host, row.Catalog, row.Passwords)
+	if started := row.Compute.StartedAt; started != nil {
+		row.Uptime = since(*started)
+	}
+	// A compute on its way up has no catalog to read and no snapshot either, because starting one
+	// is what discards it. That is a named state rather than an absence of one.
+	row.Starting = instance != nil && instance.Replicas > 0 && !instance.Ready
+	row.Unknown = !row.Catalog.Known && !row.Starting && branch.LastSeen == nil
 	s.render(w, status, template, &page{
 		Title:    branch.Name,
 		Identity: identity,
@@ -572,10 +638,12 @@ func (s *Server) handleUICreateBranch(w http.ResponseWriter, r *http.Request) {
 		s.renderBranches(w, r, identity, project, "branches-update", status, notice{Error: message})
 	}
 
+	// Always started: a branch nothing has confirmed shows nothing and takes no changes, so
+	// creating one and leaving it down would only produce something to go and start.
 	request := createBranchRequest{
 		Name:   strings.TrimSpace(r.PostFormValue("name")),
 		Parent: strings.TrimSpace(r.PostFormValue("parent")),
-		Start:  r.PostFormValue("start") != "",
+		Start:  true,
 	}
 	if version, err := strconv.Atoi(r.PostFormValue("pg_version")); err == nil {
 		request.PgVersion = version
@@ -616,11 +684,9 @@ func (s *Server) handleUICreateBranch(w http.ResponseWriter, r *http.Request) {
 			Kept:   s.secrets != nil,
 		}
 	}
-	if request.Start {
-		if _, err := s.ensureRunning(r.Context(), branch); err != nil {
-			s.log.Error("starting new branch", "branch", branch.Name, "error", err)
-			note.Error = "the branch exists but its compute did not start: " + err.Error()
-		}
+	if _, err := s.ensureRunning(r.Context(), branch); err != nil {
+		s.log.Error("starting new branch", "branch", branch.Name, "error", err)
+		note.Error = "the branch exists but its compute did not start: " + err.Error()
 	}
 	s.renderBranches(w, r, identity, project, "branches-update", http.StatusOK, note)
 }
@@ -649,21 +715,29 @@ func (s *Server) uiBranch(w http.ResponseWriter, r *http.Request) (*Identity, *r
 	return identity, project, branch
 }
 
-// Every change to a catalog is the same three steps, and the third can fail on its own: the branch
-// is already changed, and only the compute is behind.
-func (s *Server) patchBranch(w http.ResponseWriter, r *http.Request, identity *Identity, project *registry.Project, branch *registry.Branch, patch registry.Patch, note notice) {
-	if err := branch.Apply(patch); err != nil {
-		s.renderBranch(w, r, identity, project, branch, "branch-update", http.StatusBadRequest, notice{Error: err.Error()})
+// A branch with neither a compute to ask nor a snapshot to fall back on is one nothing is known
+// about, and a change made against a guess is how the two ends stop agreeing. Starting it is what
+// makes it knowable, and that is a thing a person does deliberately.
+func (s *Server) unknownState(ctx context.Context, branch *registry.Branch) bool {
+	if branch.LastSeen != nil {
+		return false
+	}
+	instance, err := s.computes.Get(ctx, branch.EndpointID)
+	return err != nil || !instance.Running()
+}
+
+// The page reports what the branch is, never what it was asked to be: a change that did not reach
+// a compute is not shown as having been made.
+func (s *Server) patchBranch(w http.ResponseWriter, r *http.Request, identity *Identity, project *registry.Project, branch *registry.Branch, patch registry.Patch, note notice, deltas ...neon.DeltaOp) {
+	if s.unknownState(r.Context(), branch) {
+		s.renderBranch(w, r, identity, project, branch, "branch-update", http.StatusConflict,
+			notice{Error: "nothing is known about this branch; start it before changing anything"})
 		return
 	}
-	if err := s.registry.Put(r.Context(), branch); err != nil {
-		s.log.Error("recording branch", "branch", branch.Name, "error", err)
-		s.renderBranch(w, r, identity, project, branch, "branch-update", http.StatusServiceUnavailable, notice{Error: "registry unavailable"})
+	if err := s.applyCatalog(r.Context(), branch, patch, deltas...); err != nil {
+		s.log.Error("applying a catalog change", "branch", branch.Name, "error", err)
+		s.renderBranch(w, r, identity, project, branch, "branch-update", statusOf(err), notice{Error: err.Error()})
 		return
-	}
-	if err := s.reconfigureBranch(r.Context(), branch); err != nil {
-		s.log.Error("applying branch change to a running compute", "branch", branch.Name, "error", err)
-		note.Error = "the compute has not taken the change yet; restart the branch to apply it"
 	}
 	s.renderBranch(w, r, identity, project, branch, "branch-update", http.StatusOK, note)
 }
@@ -738,10 +812,9 @@ func (s *Server) handleUIAddDatabase(w http.ResponseWriter, r *http.Request) {
 	s.patchBranch(w, r, identity, project, branch, registry.Patch{Databases: &databases}, notice{})
 }
 
-// Dropping is the compute's to do, and it is asked to do it before the catalog forgets the name:
-// a removal recorded here alone would leave the object in Postgres, holding its data, reachable by
-// nothing and listed nowhere. The registry refuses the removals that would break the branch — the
-// last role, or a role some database is owned by — so neither is checked again here.
+// A removal has to be named, because a list of what should exist cannot say that something should
+// stop existing. The registry refuses the removals that would break the branch — the last role, or
+// a role some database is owned by — so neither is checked again here.
 func (s *Server) handleUIDeleteRole(w http.ResponseWriter, r *http.Request) {
 	identity, project, branch := s.uiBranch(w, r)
 	if branch == nil {
@@ -749,7 +822,7 @@ func (s *Server) handleUIDeleteRole(w http.ResponseWriter, r *http.Request) {
 	}
 	role := r.PathValue("role")
 	specs := slices.DeleteFunc(roleSpecsOf(branch), func(spec registry.RoleSpec) bool { return spec.Name == role })
-	s.dropFrom(w, r, identity, project, branch, registry.Patch{Roles: &specs},
+	s.patchBranch(w, r, identity, project, branch, registry.Patch{Roles: &specs}, notice{},
 		neon.DeltaOp{Action: neon.DeleteRole, Name: role})
 }
 
@@ -762,85 +835,10 @@ func (s *Server) handleUIDeleteDatabase(w http.ResponseWriter, r *http.Request) 
 	databases := slices.DeleteFunc(slices.Clone(branch.Databases), func(database registry.Database) bool {
 		return database.Name == name
 	})
-	s.dropFrom(w, r, identity, project, branch, registry.Patch{Databases: &databases},
+	s.patchBranch(w, r, identity, project, branch, registry.Patch{Databases: &databases}, notice{},
 		neon.DeltaOp{Action: neon.DeleteDatabase, Name: name})
 }
 
-// A drop is the one change that is not a statement of what should exist, so it cannot be left for
-// the compute to pick up later: it happens now, against a running compute, or it does not happen.
-// The record is put back if the compute refuses, because a removal recorded here and not performed
-// there is exactly the divergence this page exists to not have.
-func (s *Server) dropFrom(w http.ResponseWriter, r *http.Request, identity *Identity, project *registry.Project, branch *registry.Branch, patch registry.Patch, delta neon.DeltaOp) {
-	refuse := func(status int, message string) {
-		s.renderBranch(w, r, identity, project, branch, "branch-update", status, notice{Error: message})
-	}
-
-	recorded := *branch
-	if err := branch.Apply(patch); err != nil {
-		refuse(http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := s.registry.Put(r.Context(), branch); err != nil {
-		s.log.Error("recording branch", "branch", branch.Name, "error", err)
-		refuse(http.StatusServiceUnavailable, "registry unavailable")
-		return
-	}
-
-	if err := s.dropFromCatalog(r.Context(), branch, delta); err != nil {
-		s.log.Error("dropping from a compute", "branch", branch.Name, "name", delta.Name, "error", err)
-		*branch = recorded
-		if restore := s.registry.Put(r.Context(), branch); restore != nil {
-			s.log.Error("restoring a branch whose drop failed", "branch", branch.Name, "error", restore)
-		}
-		refuse(http.StatusBadGateway, "the compute did not drop "+delta.Name+", so nothing was removed: "+err.Error())
-		return
-	}
-	s.renderBranch(w, r, identity, project, branch, "branch-update", http.StatusOK, notice{})
-}
-
-// A password that was kept can be shown again; one that was not is gone, and the difference is
-// worth saying out loud rather than answering both with an empty string.
-func (s *Server) handleUIRevealPassword(w http.ResponseWriter, r *http.Request) {
-	identity, project, branch := s.uiBranch(w, r)
-	if branch == nil {
-		return
-	}
-	role, found := branch.Role(r.PathValue("role"))
-	if !found {
-		s.renderBranch(w, r, identity, project, branch, "branch-update", http.StatusNotFound,
-			notice{Error: "no role " + r.PathValue("role") + " on " + branch.Name})
-		return
-	}
-	// Answers carrying a password are not something a cache anywhere between here and the browser
-	// should be keeping.
-	w.Header().Set("Cache-Control", "no-store")
-	password, ok := s.reveal(&role)
-	if !ok {
-		message := "this deployment keeps no passwords, so " + role.Name + "'s cannot be shown again"
-		if s.secrets != nil {
-			message = role.Name + "'s password was not kept; reset it to be given a new one"
-		}
-		s.renderBranch(w, r, identity, project, branch, "branch-update", http.StatusNotFound,
-			notice{Error: message})
-		return
-	}
-
-	database := r.FormValue("database")
-	if database == "" {
-		database = ownedDatabase(branch, role.Name)
-	}
-	s.renderBranch(w, r, identity, project, branch, "branch-update", http.StatusOK, notice{
-		Secret: &credential{
-			Branch: branch.Name,
-			Role:   role.Name,
-			URI:    connectionURI(s.endpointHost(branch), role.Name, database, password),
-			Kept:   true,
-		},
-	})
-}
-
-// The password is replaced rather than read back: only a verifier is kept, so the one moment it can
-// be shown is the moment it is set.
 func (s *Server) handleUIResetPassword(w http.ResponseWriter, r *http.Request) {
 	identity, project, branch := s.uiBranch(w, r)
 	if branch == nil {
@@ -912,7 +910,14 @@ func (s *Server) branchAction(w http.ResponseWriter, r *http.Request, act func(*
 	if branch == nil {
 		return
 	}
-	if err := act(branch); err != nil {
+	err := act(branch)
+	// Suspending writes the snapshot against the copy of the branch it resolved for itself, so the
+	// one held here is behind the moment the action returns. The answer is rendered from a re-read
+	// or it reports a branch nothing is known about, one poll before the snapshot appears.
+	if fresh, reread := s.registry.Branch(r.Context(), project.ID, branch.Name); reread == nil {
+		branch = fresh
+	}
+	if err != nil {
 		s.log.Error("branch action", "branch", branch.Name, "error", err)
 		s.answerBranchAction(w, r, identity, project, branch, statusOf(err), notice{Error: err.Error()})
 		return

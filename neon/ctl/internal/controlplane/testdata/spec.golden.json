@@ -3,6 +3,7 @@
   "cluster": {
     "cluster_id": "ep-test-branch-aaaaaaaa",
     "name": "ep-test-branch-aaaaaaaa",
+    "state": null,
     "roles": [
       {
         "name": "app",
@@ -89,6 +90,8 @@
   "tenant_id": "1a2b3344556677881122334455667788",
   "timeline_id": "aa223344556677881122334455667788",
   "pageserver_connstring": "postgresql://no_user@ps-0.neon:6400",
+  "branch_id": "ep-test-branch-aaaaaaaa",
+  "endpoint_id": "ep-test-branch-aaaaaaaa",
   "safekeepers_generation": 3,
   "safekeeper_connstrings": [
     "sk-0.neon:5454",
@@ -96,8 +99,5 @@
     "sk-2.neon:5454"
   ],
   "mode": "Primary",
-  "branch_id": "ep-test-branch-aaaaaaaa",
-  "endpoint_id": "ep-test-branch-aaaaaaaa",
-  "reconfigure_concurrency": 1,
-  "suspend_timeout_seconds": 60
+  "reconfigure_concurrency": 1
 }

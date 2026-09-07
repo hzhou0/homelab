@@ -52,15 +52,19 @@ A branch keeps a SCRAM verifier and never the password behind it, so the page ca
 connection string for any branch but can only print one that carries a password at the moment the
 password is set — creating a branch, or asking for a new one.
 
-The registry is authoritative for what can authenticate and Postgres for what exists, and the two
-are allowed to differ: the proxy admits only a role it holds a verifier for, so one made with SQL
-cannot connect through it. What exists is only knowable while the compute is up, so that is the only
-time a branch's roles and databases are shown at all — read from the compute's own catalogs, marked
-live, only recorded, or made somewhere else, and never dropped by this service if it was made
-elsewhere. A branch that is down claims nothing about them.
+Postgres is the source of truth for what roles and databases exist, and its catalog is read before
+anything about them is shown. Whatever it holds is recorded, so a role made with SQL authenticates
+through the proxy like any other and can be dropped from the page like any other. Recording it is
+not a convenience: the proxy resolves a verifier before it wakes a compute, so there is a moment
+when the registry is the only place one exists. What belongs to Postgres and to compute_ctl is left
+out — the reserved `pg_` roles, `cloud_admin`, `neon_superuser`, and the databases the compute needs
+for itself — because those are not a branch's to manage.
 
-The one thing it still owes a person is the string that starts it again, so the names alone are kept
-at the moment of suspension and the connect strings are built from those.
+Nothing is shown that was not just confirmed there. A branch whose compute stopped cleanly was read
+on the way out, and the names from that read are enough to build the string that starts it again. A
+branch that was never read is not partly known, it is unknown: the page says so and offers nothing
+but the button that starts it. That is why a snapshot is discarded when a compute starts rather than
+when it stops — one exists only for a branch that went down cleanly and has not run since.
 
 A role's password is normally not kept at all — only the verifier derived from it, which cannot be
 read back, so the password exists for exactly as long as the answer that set it. Supplying a key
@@ -69,10 +73,22 @@ again. The key is deliberately not the storage one, whose rotation is a routine 
 no rotation for this one, and replacing it makes every stored password unreadable without affecting
 anything else.
 
-Adding a role or a database is a statement of what should exist, so a suspended branch takes it at
-its next start. Dropping is not — a catalog cannot say that something should stop existing — so it
-happens against a running compute or not at all: the branch is woken, the drop is applied in the
-same request that records it, and the record is put back if the compute refuses.
+Every catalog change is carried out by a compute and by nothing else, so a change is accepted only
+once a compute has taken it, and a sleeping branch is woken for one. A branch nothing is known about
+is not woken: it has to be started deliberately first, because a change made against a guess about
+what is there is how the two ends stop agreeing. The page never leaves one in that state — creating
+a branch starts it, and the suspender takes it down again once nobody is using it. Additions could in principle wait for the next
+start, since a spec states what should exist; drops could not, because a catalog cannot say that
+something should stop existing.
+
+Nothing is undone when a change fails. A spec that fails partway may still have applied some of
+itself, so putting the record back would be a guess; the next read is what corrects it, and the next
+read happens before anything is displayed.
+
+The same rule decides what happens when the registry cannot be read while a compute is starting. A
+spec is read once, at startup, and nothing revisits it, so serving one without the catalog would
+leave a branch running that no role can log in to. It is refused instead, and the pod restart is
+the retry.
 
 `neon-ctl` authenticates nobody. It is told who the caller is by the authenticating proxy in front
 of it, in headers, so publishing it on the gateway without that proxy would let anyone claim any
