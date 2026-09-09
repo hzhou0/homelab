@@ -170,8 +170,13 @@ gateways:
           # Its own API authenticates by bearer token, so the credential strip cannot apply here.
           forwardAuthorization: true
       neon.internal.haustorium.net:
-        # Only the two human surfaces. A prefix route here would also publish the compute spec
-        # endpoint, the storage hooks and the proxy's auth endpoints, none of which authenticate.
+        # Only the human surfaces. A prefix route here would also publish the compute spec endpoint,
+        # the storage hooks and the proxy's auth endpoints, none of which authenticate.
+        /:
+          match: Exact
+          namespace: neon
+          name: neon-ctl
+          port: 8080
         /ui:
           namespace: neon
           name: neon-ctl

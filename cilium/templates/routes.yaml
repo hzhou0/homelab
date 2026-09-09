@@ -27,8 +27,10 @@ spec:
         request: {{ . | quote }}
       {{- end }}
       matches:
+        # Exact is how a bare host is published without the prefix dragging in every other path the
+        # backend serves on the same port.
         - path:
-            type: PathPrefix
+            type: {{ $path.match | default "PathPrefix" }}
             value: {{ $prefix | quote }}
       backendRefs:
         - name: {{ $path.name }}

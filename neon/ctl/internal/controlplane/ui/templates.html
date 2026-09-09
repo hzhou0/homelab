@@ -99,7 +99,7 @@
 
 {{define "error-page"}}{{template "head" .}}
 <p class="error">{{.Message}}</p>
-<p><a href="/">projects</a></p>
+<p><a href="/ui/projects">projects</a></p>
 {{template "foot" .}}{{end}}
 
 {{define "notice"}}<div id="notice">{{template "notice-body" .}}</div>{{end}}
@@ -161,7 +161,7 @@
 {{end}}
 
 {{define "project-page"}}{{template "head" .}}
-<p class="crumbs"><a href="/">projects</a> / {{.Project.Name}}
+<p class="crumbs"><a href="/ui/projects">projects</a> / {{.Project.Name}}
   <span class="dim">· {{.Project.ID}} · tenant {{.Project.TenantID}}</span></p>
 {{template "grant" .}}
 
@@ -253,7 +253,7 @@
 {{end}}
 
 {{define "branch-page"}}{{template "head" .}}
-<p class="crumbs"><a href="/">projects</a> /
+<p class="crumbs"><a href="/ui/projects">projects</a> /
   <a href="/ui/projects/{{.Project.ID}}">{{.Project.Name}}</a> / {{.Branch.Name}}
   <span class="dim">· {{.Branch.EndpointID}}</span></p>
 {{template "branch" .}}

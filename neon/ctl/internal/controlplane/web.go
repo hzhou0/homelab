@@ -138,6 +138,14 @@ func (s *Server) readCatalog(ctx context.Context, branch *registry.Branch, insta
 		return catalogState{}
 	}
 
+	state := manageable(live)
+	s.adopt(ctx, branch, state)
+	return state
+}
+
+// The only way a catalog reaches anything else: every caller needs the same names dropped, and the
+// one that filtered separately drifted from the one that did not.
+func manageable(live *neon.CatalogObjects) catalogState {
 	state := catalogState{Known: true}
 	for _, role := range live.Roles {
 		if reservedRole(role.Name) {
@@ -159,9 +167,23 @@ func (s *Server) readCatalog(ctx context.Context, branch *registry.Branch, insta
 	byName := func(a, b catalogEntry) int { return strings.Compare(a.Name, b.Name) }
 	slices.SortFunc(state.Roles, byName)
 	slices.SortFunc(state.Databases, byName)
-
-	s.adopt(ctx, branch, state)
 	return state
+}
+
+func (c catalogState) roleNames() []string {
+	names := make([]string, 0, len(c.Roles))
+	for _, entry := range c.Roles {
+		names = append(names, entry.Name)
+	}
+	return names
+}
+
+func (c catalogState) databaseNames() []string {
+	names := make([]string, 0, len(c.Databases))
+	for _, entry := range c.Databases {
+		names = append(names, entry.Name)
+	}
+	return names
 }
 
 // adopt records what the compute has. A role made with SQL authenticates through the proxy like any
@@ -394,14 +416,6 @@ func shell(r *http.Request, fragment, page string) string {
 		return page
 	}
 	return fragment
-}
-
-func (s *Server) handleUIProjects(w http.ResponseWriter, r *http.Request) {
-	identity := s.uiCaller(w, r)
-	if identity == nil {
-		return
-	}
-	s.renderProjects(w, r, identity, "projects-page", http.StatusOK, notice{})
 }
 
 func (s *Server) handleUIProjectsFragment(w http.ResponseWriter, r *http.Request) {

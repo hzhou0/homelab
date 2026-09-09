@@ -35,6 +35,7 @@ kubectl -n neon create secret generic neon-credentials \
   --from-file=authPrivateKey=auth.pem
 
 helm install neon neon/chart -n neon
+helm upgrade neon neon/chart -n neon
 ```
 
 That key is the whole of the storage layer's authentication. Every public key and every token is a

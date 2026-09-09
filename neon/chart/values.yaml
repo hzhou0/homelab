@@ -131,7 +131,7 @@ proxy:
 ctl:
   image:
     repository: ghcr.io/hzhou0/neon-ctl
-    tag: "sha-036103d"
+    tag: "sha-5793d78"
     pullPolicy: IfNotPresent
   port: 8080
   # Set by the authenticating proxy in front, and believed without question — nothing here may be

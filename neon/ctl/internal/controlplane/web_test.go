@@ -42,7 +42,6 @@ func TestEveryPageRenders(t *testing.T) {
 	server := identityServer(t, store)
 
 	for _, target := range []string{
-		"/",
 		"/ui/projects",
 		"/ui/projects/" + testProjectID,
 		"/ui/projects/" + testProjectID + "/branches",
@@ -54,6 +53,22 @@ func TestEveryPageRenders(t *testing.T) {
 		if got := response.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
 			t.Errorf("GET %s content type = %q", target, got)
 		}
+	}
+}
+
+// A bare hostname has to reach something, and naming the page rather than serving a second copy of
+// it keeps one address in history and bookmarks.
+func TestTheRootNamesTheProjectsPage(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	server := identityServer(t, store)
+
+	response := doAs(t, server, http.MethodGet, "/", "tester", "", "")
+	if response.Code != http.StatusFound {
+		t.Errorf("GET / = %d, want %d", response.Code, http.StatusFound)
+	}
+	if got := response.Header().Get("Location"); got != "/ui/projects" {
+		t.Errorf("Location = %q, want /ui/projects", got)
 	}
 }
 
@@ -1316,5 +1331,55 @@ func TestTheRolesTableMasksThePassword(t *testing.T) {
 	}
 	if !strings.Contains(bare, ">reset</button>") {
 		t.Error("the reset went missing with the mask")
+	}
+}
+
+// The snapshot is what the connect strings are built from once the compute is gone, so a name that
+// may never be offered must not survive into it.
+func TestStoppingABranchKeepsNoReservedNames(t *testing.T) {
+	store := newStore(t)
+	seedBranch(t, store)
+	computes := newFakeCompute(t)
+	runtime := newFakeRuntime()
+	seedCompute(t, runtime, true)
+	server := newTestServer(t, newFakeStorcon(t), store, runtime, computes)
+	server.identity = IdentityOptions{UserHeader: "Remote-User", GroupsHeader: "Remote-Groups", Admin: "root"}
+	server.opts.EndpointSuffix = "pg.example.net"
+	computes.catalog = neon.CatalogObjects{
+		Roles: []neon.Role{
+			{Name: "pg_monitor"}, {Name: "cloud_admin"}, {Name: "neon_superuser"}, {Name: "app"},
+		},
+		Databases: []neon.Database{
+			{Name: "template0", Owner: "cloud_admin"}, {Name: "template1", Owner: "cloud_admin"},
+			{Name: "postgres", Owner: "cloud_admin"}, {Name: "appdb", Owner: "app"},
+		},
+	}
+
+	if stopped := form(t, server, http.MethodPost, "/ui/projects/"+testProjectID+"/branches/main/stop",
+		"tester", "", nil); stopped.Code != http.StatusOK {
+		t.Fatalf("stop = %d, body = %s", stopped.Code, stopped.Body)
+	}
+
+	branch, err := store.Branch(context.Background(), testProjectID, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.LastSeen == nil {
+		t.Fatal("stopping the branch kept nothing")
+	}
+	if got := branch.LastSeen.Roles; !slices.Equal(got, []string{"app"}) {
+		t.Errorf("roles = %v, want only app", got)
+	}
+	if got := branch.LastSeen.Databases; !slices.Equal(got, []string{"appdb"}) {
+		t.Errorf("databases = %v, want only appdb", got)
+	}
+
+	// The first name in each list is what the offered connection string is built from, so a
+	// reserved one reaching the page hands somebody a role that cannot log in.
+	body := doAs(t, server, http.MethodGet, "/ui/projects/"+testProjectID+"/branches/main", "tester", "", "").Body.String()
+	for _, reserved := range []string{"pg_monitor", "cloud_admin", "neon_superuser", "template0", "template1"} {
+		if strings.Contains(body, reserved) {
+			t.Errorf("the stopped branch page offers %q", reserved)
+		}
 	}
 }

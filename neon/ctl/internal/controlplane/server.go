@@ -112,7 +112,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/projects/{project}/branches/{name}/roles/{role}/password", s.handleRevealPassword)
 
 	mux.Handle("GET /ui/assets/", http.StripPrefix("/ui/", ui.Assets()))
-	mux.HandleFunc("GET /{$}", s.handleUIProjects)
+	// The root is published so a bare hostname reaches something; it names the page rather than
+	// serving a second copy of it, so history and bookmarks settle on one address.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui/projects", http.StatusFound)
+	})
 	mux.HandleFunc("GET /ui/projects", s.handleUIProjectsFragment)
 	mux.HandleFunc("POST /ui/projects", s.handleUICreateProject)
 	mux.HandleFunc("GET /ui/projects/{project}", s.handleUIProject)
@@ -324,14 +328,12 @@ func (s *Server) rememberCatalog(ctx context.Context, instance *kube.Instance) {
 		return
 	}
 
-	seen := registry.LastSeen{At: time.Now().UTC()}
-	for _, role := range catalog.Roles {
-		seen.Roles = append(seen.Roles, role.Name)
+	state := manageable(catalog)
+	branch.LastSeen = &registry.LastSeen{
+		At:        time.Now().UTC(),
+		Roles:     state.roleNames(),
+		Databases: state.databaseNames(),
 	}
-	for _, database := range catalog.Databases {
-		seen.Databases = append(seen.Databases, database.Name)
-	}
-	branch.LastSeen = &seen
 	if err := s.registry.Put(ctx, branch); err != nil {
 		s.log.Error("recording a catalog before suspending", "branch", branch.Name, "error", err)
 	}
