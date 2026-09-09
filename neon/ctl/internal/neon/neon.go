@@ -245,6 +245,10 @@ type ComputeSpec struct {
 	AuditLogLevel ComputeAudit `json:"audit_log_level,omitempty"`
 
 	LogsExportHost *string `json:"logs_export_host,omitempty"`
+
+	// Required: the compute refuses a spec without it. Its only effect there is the interval
+	// between installed-extension collections, and -1 states that nothing suspends itself.
+	SuspendTimeoutSeconds int64 `json:"suspend_timeout_seconds"`
 }
 
 // An unrecognised value is not an error upstream: anything unknown deserializes to a catch-all

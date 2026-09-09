@@ -79,6 +79,10 @@ rc-update add lvm boot
 
 kubectl label nodes k3s-server vg=nvme
 
+# openrc skips any service missing from its dependency cache, and rebuilds that cache only
+# when /etc/init.d is strictly newer — a same-second package install ties and is skipped.
+rm -f /var/cache/rc/deptree /run/openrc/deptree
+
 touch /etc/local.d/20-bootstrap.done
 echo "==> k3s server bootstrap complete. NotReady until the cilium/ chart is installed. Token:"
 cat /var/lib/rancher/k3s/server/node-token

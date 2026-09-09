@@ -64,6 +64,9 @@ data:
             {{- with .claimsPolicy }}
             claims_policy: '{{ . }}'
             {{- end }}
+            {{- with .tokenEndpointAuthMethod }}
+            token_endpoint_auth_method: '{{ . }}'
+            {{- end }}
             {{- with .consentMode }}
             consent_mode: '{{ . }}'
             {{- end }}

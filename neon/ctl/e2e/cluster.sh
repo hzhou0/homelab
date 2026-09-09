@@ -11,25 +11,30 @@ CONTEXT="k3d-$CLUSTER"
 NAMESPACE="${NEON_NAMESPACE:-neon}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$HERE/../../chart"
-PGPORT="${NEON_PGPORT:-55432}"
 CILIUM_VERSION="${CILIUM_VERSION:-v1.20.0}"
+GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.6.1}"
+# The homelab's server version: CRD schemas carry CEL the API server has to be new enough to
+# compile, so an older default silently tests against a validator the real cluster does not use.
+K3S_VERSION="${K3S_VERSION:-v1.36.3-k3s1}"
 
 k() { kubectl --context "$CONTEXT" "$@"; }
 
 case "${1:-up}" in
 up)
   if ! k3d cluster list "$CLUSTER" >/dev/null 2>&1; then
-    # servicelb stays: it is what gives the proxy's LoadBalancer an address, and binding the
-    # service port on the node is what makes the host port mapping reach it.
     k3d cluster create "$CLUSTER" \
+      --image "rancher/k3s:$K3S_VERSION" \
       --agents 1 \
-      --k3s-arg "--disable=traefik@server:*" \
-      -p "$PGPORT:5432@server:0"
+      --k3s-arg "--disable=traefik@server:*"
   fi
 
   # Flannel does not enforce these, but the objects still have to apply. Pinned to the version the
   # homelab runs, because that is the schema they have to satisfy.
   k apply -f "https://raw.githubusercontent.com/cilium/cilium/$CILIUM_VERSION/pkg/k8s/apis/cilium.io/client/crds/v2/ciliumnetworkpolicies.yaml"
+
+  # The experimental channel, because TCPRoute is only published there and the proxy's listener is
+  # a TCPRoute. Nothing here routes through a gateway; the objects still have to apply.
+  k apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/experimental-install.yaml"
 
   k apply -f "$HERE/minio.yaml"
   k -n minio rollout status deploy/minio --timeout=180s
@@ -55,6 +60,9 @@ up)
 
   helm --kube-context "$CONTEXT" upgrade --install neon "$CHART" \
     -f "$CHART/values-e2e.yaml" -n "$NAMESPACE" --wait --timeout 10m
+
+  # The proxy is a ClusterIP behind a TCPRoute, and no gateway runs here to serve that route.
+  echo "proxy: kubectl --context $CONTEXT -n $NAMESPACE port-forward svc/neon-proxy 15432:5432"
   ;;
 down)
   k3d cluster delete "$CLUSTER"

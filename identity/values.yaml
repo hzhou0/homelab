@@ -79,6 +79,7 @@ authelia:
           - navidrome.internal.haustorium.net
           - music-files.internal.haustorium.net
           - files.internal.haustorium.net
+          - neon.internal.haustorium.net
           - users.internal.haustorium.net
           - grafana.internal.haustorium.net
           - prometheus.internal.haustorium.net
@@ -118,6 +119,9 @@ authelia:
         redirectURIs:
           - https://headlamp.internal.haustorium.net/oidc-callback
         claimsPolicy: kubernetes
+        # Its refresh sends the secret in the request body, which the spec default refuses; without
+        # this the refresh fails hourly and it retries every request until the rate limit bites.
+        tokenEndpointAuthMethod: client_secret_post
         # Its session outlives the ID token only with a refresh token, which offline_access grants.
         scopes: ['openid', 'profile', 'email', 'groups', 'offline_access']
         # offline_access is refused unless the code flow it depends on is spelled out.

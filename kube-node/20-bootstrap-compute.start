@@ -59,6 +59,10 @@ if [ -n "$LVM_PART" ] && [ -b "$LVM_PART" ]; then
   rc-update add lvm boot
 fi
 
+# openrc skips any service missing from its dependency cache, and rebuilds that cache only
+# when /etc/init.d is strictly newer — a same-second package install ties and is skipped.
+rm -f /var/cache/rc/deptree /run/openrc/deptree
+
 touch /etc/local.d/20-bootstrap.done
 echo "==> k3s compute bootstrap complete. Run from control plane:"
 echo "  kubectl label nodes $(hostname) gvisor=true"

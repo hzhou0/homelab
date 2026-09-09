@@ -131,7 +131,7 @@ proxy:
 ctl:
   image:
     repository: ghcr.io/hzhou0/neon-ctl
-    tag: "sha-709c9e2"
+    tag: "sha-036103d"
     pullPolicy: IfNotPresent
   port: 8080
   # Set by the authenticating proxy in front, and believed without question — nothing here may be
@@ -142,7 +142,7 @@ ctl:
     groupsHeader: Remote-Groups
   # The one identifier that may see every project, as the user header would carry it. Empty means
   # nobody.
-  adminUser: ""
+  adminUser: "henry"
   # A cold start is a basebackup, so this scales with working-set size.
   wakeTimeout: 90s
   # Zero never suspends.

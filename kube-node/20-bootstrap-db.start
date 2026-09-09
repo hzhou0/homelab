@@ -68,6 +68,10 @@ curl -sfL https://get.k3s.io | \
 
 rc-service k3s-agent restart
 
+# openrc skips any service missing from its dependency cache, and rebuilds that cache only
+# when /etc/init.d is strictly newer — a same-second package install ties and is skipped.
+rm -f /var/cache/rc/deptree /run/openrc/deptree
+
 touch /etc/local.d/20-bootstrap.done
 echo "==> k3s db bootstrap complete. Run from control plane:"
 echo "  kubectl label nodes $(hostname) node-role=database"

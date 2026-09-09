@@ -99,5 +99,6 @@
     "sk-2.neon:5454"
   ],
   "mode": "Primary",
-  "reconfigure_concurrency": 1
+  "reconfigure_concurrency": 1,
+  "suspend_timeout_seconds": -1
 }

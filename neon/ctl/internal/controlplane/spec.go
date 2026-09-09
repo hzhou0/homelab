@@ -37,6 +37,7 @@ func (s *Server) renderSpec(ctx context.Context, instance *kube.Instance) (*neon
 		BranchID:               &name,
 		EndpointID:             &name,
 		ReconfigureConcurrency: 1,
+		SuspendTimeoutSeconds:  -1,
 		Cluster: neon.Cluster{
 			ClusterID: &name,
 			Name:      &name,

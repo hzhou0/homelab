@@ -126,15 +126,19 @@ Work down this list; each rung depends on the ones above it.
    stall cluster-wide. Pair it with a standing alert on safekeeper volume use.
 6. A query succeeds from a granted namespace and is refused from an ungranted one.
 7. **Exercise the hooks.** Migrate a tenant to another pageserver and confirm `neon-ctl` resolves the
-   node id, rebuilds the spec, and reconfigures the compute *without* restarting it. A plain migrate
-   returns 200 without moving anything — the optimiser reverts a sub-optimal placement, so set the
-   tenant's scheduling policy to `Essential` and pass `override_scheduler` first. Then delete a
-   compute pod and confirm it returns correctly bound, which exercises the pull path.
+   node id, rebuilds the spec, and reconfigures the compute *without* restarting it. A migrate
+   returns 200 without moving anything in two separate cases, and both are silent: the optimiser
+   reverts a sub-optimal placement unless the tenant's scheduling policy is `Essential` and
+   `override_scheduler` is set, and a migration defaults to `prewarm`, which waits for a secondary
+   that has no heatmap yet on a freshly written tenant. Pass `prewarm: false` to cut over cold.
+   Then delete a compute pod and confirm it returns correctly bound, which exercises the pull path.
 8. **Exercise the cold path.** Let a branch idle to zero, connect, and confirm the proxy wakes it.
    Measure how long it takes.
 
-`ctl/e2e/cluster.sh` runs 1–8 against a throwaway k3d cluster with MinIO standing in for hypha. It
-never touches the current kubeconfig context.
+`ctl/e2e/cluster.sh` builds a throwaway k3d cluster to run 1–8 against, with MinIO standing in for
+hypha; the checks themselves are manual. It pins the k3s version to the homelab's, because a CRD
+schema that the real API server accepts is half of what is being tested. `k3d cluster create`
+switches the current kubeconfig context even though every command here names its own.
 
 ## Operating
 
