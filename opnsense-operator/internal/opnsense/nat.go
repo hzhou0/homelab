@@ -12,73 +12,72 @@ import (
 // keeps one rule per owner, so a constant is sufficient.
 const natSequence = "1"
 
-// syncPortForward converges the single WAN DNAT rule owned by `owner` to
-// `desired`. A nil desired removes the owner's rule(s). Returns whether a
-// mutation occurred (so the caller knows whether to apply the firewall).
+// syncPortForwards converges the WAN DNAT rules owned by `owner` to `desired`,
+// returning whether any mutation occurred (so the caller knows whether to apply
+// the firewall). A nil/empty desired set removes all of the owner's rules.
 //
 // As with DNS, the operator-authored description is both the ownership marker
 // and the change detector: a matching description means the rule is already
 // correct.
-func (c *Client) syncPortForward(ctx context.Context, owner Owner, desired *PortForward) (bool, error) {
+func (c *Client) syncPortForwards(ctx context.Context, owner Owner, desired []PortForward) (bool, error) {
 	rows, err := c.decodeSearch(c.gen.FirewallDNatControllerSearchRuleAction(ctx))
 	if err != nil {
 		return false, fmt.Errorf("opnsense: search dnat rules: %w", err)
 	}
 
-	var owned []row
+	existing := map[string]row{}
 	for _, r := range rows {
 		if describesOwner(r.desc(), owner) {
-			owned = append(owned, r)
+			existing[portForwardKeyFromDescription(r.desc())] = r
 		}
 	}
 
 	changed := false
+	desiredKeys := map[string]struct{}{}
 
-	if desired == nil {
-		for _, r := range owned {
-			if err := c.decodeVoid(c.gen.FirewallDNatControllerDelRuleAction(ctx, r.UUID)); err != nil {
-				return changed, fmt.Errorf("opnsense: del dnat rule: %w", err)
+	for _, p := range desired {
+		key := portForwardKey(p)
+		desiredKeys[key] = struct{}{}
+		wantDesc := natDescription(owner, p)
+
+		if cur, ok := existing[key]; ok {
+			if cur.desc() == wantDesc {
+				continue
 			}
-			changed = true
-		}
-		return changed, nil
-	}
-
-	wantDesc := natDescription(owner, *desired)
-
-	// Keep the first owned rule, update it if drifted; delete any extras.
-	if len(owned) > 0 {
-		keep := owned[0]
-		if keep.desc() != wantDesc {
 			if _, err := c.decodeWrite(c.gen.FirewallDNatControllerSetRuleAction(
-				ctx, keep.UUID, setNATBody(*desired, wantDesc))); err != nil {
-				return changed, fmt.Errorf("opnsense: set dnat rule: %w", err)
+				ctx, cur.UUID, setNATBody(p, wantDesc))); err != nil {
+				return changed, fmt.Errorf("opnsense: set dnat rule %s: %w", key, err)
 			}
 			changed = true
+			continue
 		}
-		for _, extra := range owned[1:] {
-			if err := c.decodeVoid(c.gen.FirewallDNatControllerDelRuleAction(ctx, extra.UUID)); err != nil {
-				return changed, fmt.Errorf("opnsense: del extra dnat rule: %w", err)
-			}
-			changed = true
+
+		if _, err := c.decodeWrite(c.gen.FirewallDNatControllerAddRuleAction(
+			ctx, addNATBody(p, wantDesc))); err != nil {
+			return changed, fmt.Errorf("opnsense: add dnat rule %s: %w", key, err)
 		}
-		return changed, nil
+		changed = true
 	}
 
-	if _, err := c.decodeWrite(c.gen.FirewallDNatControllerAddRuleAction(
-		ctx, addNATBody(*desired, wantDesc))); err != nil {
-		return changed, fmt.Errorf("opnsense: add dnat rule: %w", err)
+	for key, r := range existing {
+		if _, ok := desiredKeys[key]; ok {
+			continue
+		}
+		if err := c.decodeVoid(c.gen.FirewallDNatControllerDelRuleAction(ctx, r.UUID)); err != nil {
+			return changed, fmt.Errorf("opnsense: del dnat rule %q: %w", key, err)
+		}
+		changed = true
 	}
-	return true, nil
+
+	return changed, nil
 }
 
-func validatePortForward(pf *PortForward) error {
-	if pf == nil {
-		return nil
-	}
-	target, err := netip.ParseAddr(pf.TargetIP)
-	if err != nil || !target.Unmap().Is4() {
-		return fmt.Errorf("opnsense: DNAT target %q is not IPv4", pf.TargetIP)
+func validatePortForwards(rules []PortForward) error {
+	for _, pf := range rules {
+		target, err := netip.ParseAddr(pf.TargetIP)
+		if err != nil || !target.Unmap().Is4() {
+			return fmt.Errorf("opnsense: DNAT target %q is not IPv4", pf.TargetIP)
+		}
 	}
 	return nil
 }

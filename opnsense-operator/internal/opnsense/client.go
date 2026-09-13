@@ -55,11 +55,11 @@ func New(cfg *config.Config) (*Client, error) {
 	return &Client{gen: gen, wan: cfg.WANInterface}, nil
 }
 
-// Sync converges OPNsense to the desired DNS overrides, port-forward and WAN
+// Sync converges OPNsense to the desired DNS overrides, port-forwards and WAN
 // pass rules for a single owner, then applies the relevant subsystems. It is
 // safe for concurrent callers.
-func (c *Client) Sync(ctx context.Context, owner Owner, dns []HostOverride, pf *PortForward, pass []PassRule) error {
-	if err := validatePortForward(pf); err != nil {
+func (c *Client) Sync(ctx context.Context, owner Owner, dns []HostOverride, pf []PortForward, pass []PassRule) error {
+	if err := validatePortForwards(pf); err != nil {
 		return err
 	}
 	if err := validatePassRules(pass); err != nil {
@@ -73,7 +73,7 @@ func (c *Client) Sync(ctx context.Context, owner Owner, dns []HostOverride, pf *
 	if err != nil {
 		return err
 	}
-	natChanged, err := c.syncPortForward(ctx, owner, pf)
+	natChanged, err := c.syncPortForwards(ctx, owner, pf)
 	if err != nil {
 		return err
 	}
@@ -94,7 +94,7 @@ func (c *Client) Delete(ctx context.Context, owner Owner) error {
 	if err != nil {
 		return err
 	}
-	natChanged, err := c.syncPortForward(ctx, owner, nil)
+	natChanged, err := c.syncPortForwards(ctx, owner, nil)
 	if err != nil {
 		return err
 	}

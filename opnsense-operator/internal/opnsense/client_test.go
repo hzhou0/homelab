@@ -154,7 +154,7 @@ func TestSyncCreatesDNSAndNAT(t *testing.T) {
 
 	err := c.Sync(context.Background(), owner,
 		[]HostOverride{{Host: "grafana", Domain: "lab", Address: "10.0.0.100", RecordType: "A"}},
-		&PortForward{Interface: "wan", Protocol: "tcp", ExternalPort: "443", TargetIP: "10.0.0.100", LocalPort: "443"},
+		[]PortForward{{Interface: "wan", Protocol: "tcp", ExternalPort: "443", TargetIP: "10.0.0.100", LocalPort: "443"}},
 		nil,
 	)
 	if err != nil {
@@ -345,13 +345,13 @@ func TestSyncRejectsIPv6DNAT(t *testing.T) {
 	f := newFake()
 	c := newTestClient(t, f)
 	owner := Owner{Kind: "Service", Namespace: "app-media", Name: "media"}
-	pf := &PortForward{
+	pf := []PortForward{{
 		Interface:    "wan",
 		Protocol:     "udp",
 		ExternalPort: "3478",
 		TargetIP:     "2001:db8::101",
 		LocalPort:    "3478",
-	}
+	}}
 
 	err := c.Sync(context.Background(), owner, nil, pf, nil)
 	if err == nil || !strings.Contains(err.Error(), "is not IPv4") {

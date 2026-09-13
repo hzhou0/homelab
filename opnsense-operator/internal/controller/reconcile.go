@@ -25,7 +25,7 @@ const requeueNotReady = 15 * time.Second
 // Syncer is the slice of the OPNsense client the reconcilers depend on. It is
 // an interface so tests can substitute a fake.
 type Syncer interface {
-	Sync(ctx context.Context, owner opnsense.Owner, dns []opnsense.HostOverride, pf *opnsense.PortForward, pass []opnsense.PassRule) error
+	Sync(ctx context.Context, owner opnsense.Owner, dns []opnsense.HostOverride, pf []opnsense.PortForward, pass []opnsense.PassRule) error
 	Delete(ctx context.Context, owner opnsense.Owner) error
 }
 
@@ -103,7 +103,7 @@ func handle(
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if err := opn.Sync(ctx, owner, desired.Hosts, desired.PortForward, desired.PassRules); err != nil {
+	if err := opn.Sync(ctx, owner, desired.Hosts, desired.PortForwards, desired.PassRules); err != nil {
 		rec.Eventf(obj, corev1.EventTypeWarning, "SyncFailed", "OPNsense sync failed: %v", err)
 		return ctrl.Result{}, err
 	}

@@ -67,8 +67,8 @@ func TestParseExposure(t *testing.T) {
 			d.Hosts[0].Address != "10.0.0.100" || d.Hosts[0].RecordType != "A" {
 			t.Fatalf("unexpected hosts: %+v", d.Hosts)
 		}
-		if d.PortForward != nil {
-			t.Fatalf("expected no port-forward, got %+v", d.PortForward)
+		if len(d.PortForwards) != 0 {
+			t.Fatalf("expected no port-forward, got %+v", d.PortForwards)
 		}
 	})
 
@@ -108,10 +108,10 @@ func TestParseExposure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		pf := d.PortForward
-		if pf == nil {
-			t.Fatal("expected port-forward")
+		if len(d.PortForwards) != 1 {
+			t.Fatalf("want one port-forward, got %+v", d.PortForwards)
 		}
+		pf := d.PortForwards[0]
 		if pf.Protocol != "tcp" || pf.ExternalPort != "443" || pf.LocalPort != "443" ||
 			pf.TargetIP != "10.0.0.100" || pf.Interface != "wan" {
 			t.Fatalf("unexpected port-forward: %+v", pf)
@@ -133,7 +133,10 @@ func TestParseExposure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		pf := d.PortForward
+		if len(d.PortForwards) != 1 {
+			t.Fatalf("want one port-forward, got %+v", d.PortForwards)
+		}
+		pf := d.PortForwards[0]
 		if pf.Protocol != "udp" || pf.ExternalPort != "27015" || pf.LocalPort != "27016" {
 			t.Fatalf("unexpected port-forward: %+v", pf)
 		}
@@ -167,7 +170,7 @@ func TestParseExposure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if d.HasIntent || len(d.Hosts) != 0 || d.PortForward != nil || len(d.PassRules) != 0 {
+		if d.HasIntent || len(d.Hosts) != 0 || len(d.PortForwards) != 0 || len(d.PassRules) != 0 {
 			t.Fatalf("expected empty exposure, got %+v", d)
 		}
 	})
@@ -189,8 +192,8 @@ func TestParseExposure(t *testing.T) {
 		if len(d.Hosts) != 2 || d.Hosts[0].RecordType != "A" || d.Hosts[1].RecordType != "AAAA" {
 			t.Fatalf("unexpected dual-stack hosts: %+v", d.Hosts)
 		}
-		if d.PortForward == nil || d.PortForward.TargetIP != "10.0.0.101" {
-			t.Fatalf("DNAT must target only IPv4: %+v", d.PortForward)
+		if len(d.PortForwards) != 1 || d.PortForwards[0].TargetIP != "10.0.0.101" {
+			t.Fatalf("DNAT must target only IPv4: %+v", d.PortForwards)
 		}
 		if len(d.PassRules) != 1 || d.PassRules[0].Destination != "2001:db8::101" ||
 			d.PassRules[0].Port != "3478" || d.PassRules[0].Protocol != "udp" {
@@ -212,8 +215,8 @@ func TestParseExposure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if d.PortForward != nil {
-			t.Fatalf("IPv6 needs no translation: %+v", d.PortForward)
+		if len(d.PortForwards) != 0 {
+			t.Fatalf("IPv6 needs no translation: %+v", d.PortForwards)
 		}
 		if len(d.PassRules) != 1 || d.PassRules[0].Interface != "wan" ||
 			d.PassRules[0].Destination != "2001:db8::101" {
@@ -271,8 +274,53 @@ func TestParseExposure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if d.PortForward == nil || d.PortForward.LocalPort != "27016" {
-			t.Fatalf("IPv4-only remap must still work: %+v", d.PortForward)
+		if len(d.PortForwards) != 1 || d.PortForwards[0].LocalPort != "27016" {
+			t.Fatalf("IPv4-only remap must still work: %+v", d.PortForwards)
+		}
+	})
+
+	// A gateway fronts more than one listener, so a single object has to be able to
+	// ask for a forward per port. The two lists pair up by position.
+	t.Run("several ports produce a forward each", func(t *testing.T) {
+		d, err := ParseExposure(ExposureInput{
+			Annotations: map[string]string{
+				AnnExpose:       "true",
+				AnnExternalPort: "443,5432",
+				AnnInternalPort: "443,5432",
+			},
+			Addresses:       []string{"10.0.0.99", "2001:db8::99"},
+			DefaultProtocol: "tcp",
+		}, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(d.PortForwards) != 2 ||
+			d.PortForwards[0].ExternalPort != "443" || d.PortForwards[1].ExternalPort != "5432" {
+			t.Fatalf("want a forward per port: %+v", d.PortForwards)
+		}
+		for _, pf := range d.PortForwards {
+			if pf.TargetIP != "10.0.0.99" {
+				t.Fatalf("every forward aims at the one IPv4 address: %+v", pf)
+			}
+		}
+		// IPv6 is not translated, so each port needs a pass rule of its own.
+		if len(d.PassRules) != 2 || d.PassRules[0].Port != "443" || d.PassRules[1].Port != "5432" {
+			t.Fatalf("want a pass rule per port: %+v", d.PassRules)
+		}
+	})
+
+	t.Run("port lists that do not pair up are rejected", func(t *testing.T) {
+		_, err := ParseExposure(ExposureInput{
+			Annotations: map[string]string{
+				AnnExpose:       "true",
+				AnnExternalPort: "443,5432",
+				AnnInternalPort: "443",
+			},
+			Addresses:       []string{"10.0.0.99"},
+			DefaultProtocol: "tcp",
+		}, cfg)
+		if err == nil {
+			t.Fatal("expected a rejection when the port lists do not pair up")
 		}
 	})
 

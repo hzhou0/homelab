@@ -89,14 +89,33 @@ func hostOverrideKeyFromDescription(desc string) string {
 	return tokenValue(desc, "host=") + "\x00" + tokenValue(desc, "ip=")
 }
 
-// Destination alone is the pass-rule identity: an owner has at most one
-// protocol/port pair, so its rules differ only by which address they admit.
+// One object names a single protocol, so an owner's rules differ only by the
+// address they admit and the port they admit it on. Protocol is therefore an
+// attribute to correct in place, not part of what identifies a rule.
 func passRuleKey(p PassRule) string {
-	return p.Destination
+	return p.Destination + "\x00" + p.Port
 }
 
 func passRuleKeyFromDescription(desc string) string {
-	return tokenValue(desc, "dest=")
+	return tokenValue(desc, "dest=") + "\x00" + portOfPair(tokenValue(desc, "pass="))
+}
+
+// A forward is identified by what it answers on the WAN: an owner may forward
+// several ports, but never the same one twice.
+func portForwardKey(p PortForward) string {
+	return p.ExternalPort
+}
+
+func portForwardKeyFromDescription(desc string) string {
+	return portOfPair(tokenValue(desc, "pf="))
+}
+
+// Both descriptions render the pair as "protocol/port"; only the port is identity.
+func portOfPair(pair string) string {
+	if i := strings.LastIndexByte(pair, '/'); i >= 0 {
+		return pair[i+1:]
+	}
+	return pair
 }
 
 // tokenValue returns the value of a "key=value" token in a space-delimited

@@ -22,17 +22,22 @@ Put these on a `LoadBalancer` Service or a `Gateway`:
 |---|---|---|
 | `homelab.lab/hostname` | Comma-separated DNS names (wildcard ok, e.g. `*.lab`) | — |
 | `homelab.lab/expose` | `"true"` to open WAN access (IPv4 port-forward, IPv6 pass rule) | off |
-| `homelab.lab/external-port` | External WAN port | service/listener port |
-| `homelab.lab/protocol` | `tcp` or `udp` | service port protocol (Gateways: tcp) |
-| `homelab.lab/internal-port` | Forwarded-to port (IPv4 only; see below) | service/listener port |
+| `homelab.lab/external-port` | Comma-separated external WAN ports | service/listener port |
+| `homelab.lab/protocol` | `tcp` or `udp`, for every port on the object | service port protocol (Gateways: tcp) |
+| `homelab.lab/internal-port` | Comma-separated forwarded-to ports (IPv4 only; see below) | service/listener port |
 
 Hostnames outside the configured `MANAGED_DOMAINS` are rejected. The controller owns only the
 OPNsense objects it creates (tagged `k8s:opnsense-operator owner=<Kind>/<ns>/<name>`) and removes
 them via a finalizer on deletion.
 
-A dual-stack object gets records and firewall state for both families: DNAT for its first IPv4
-address, one pass rule per IPv6 address. Each pass rule admits exactly one address, port and
-protocol; everything else stays default-denied.
+One object may ask for several ports — a Gateway fronting an HTTPS listener and a raw TCP one is the
+case this exists for. The two port lists pair up by position, so lists of unequal length are
+rejected. The protocol belongs to the object rather than to a port, so an object that mixes TCP and
+UDP has to be two objects.
+
+A dual-stack object gets records and firewall state for both families: a DNAT per port to its first
+IPv4 address, and a pass rule per port for each IPv6 address. Each pass rule admits exactly one
+address, port and protocol; everything else stays default-denied.
 
 The operator deliberately does not redirect ports over IPv6 — only translation can remap a port,
 and translating a globally routable address gives up the end-to-end reachability that is the point

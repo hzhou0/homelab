@@ -27,9 +27,9 @@ const (
 
 // DesiredExposure is the parsed, validated intent for one source object.
 type DesiredExposure struct {
-	Hosts       []opnsense.HostOverride
-	PortForward *opnsense.PortForward
-	PassRules   []opnsense.PassRule
+	Hosts        []opnsense.HostOverride
+	PortForwards []opnsense.PortForward
+	PassRules    []opnsense.PassRule
 	// HasIntent distinguishes "nothing was asked for" from "something was asked
 	// for but no address has been assigned yet"; the latter must wait rather
 	// than tear down.
@@ -48,9 +48,13 @@ func (d DesiredExposure) Summary() string {
 		sort.Strings(names)
 		parts = append(parts, "dns="+strings.Join(names, ","))
 	}
-	if d.PortForward != nil {
-		p := d.PortForward
-		parts = append(parts, fmt.Sprintf("wan=%s/%s->%s:%s", p.Protocol, p.ExternalPort, p.TargetIP, p.LocalPort))
+	if len(d.PortForwards) > 0 {
+		fwds := make([]string, 0, len(d.PortForwards))
+		for _, p := range d.PortForwards {
+			fwds = append(fwds, fmt.Sprintf("%s/%s->%s:%s", p.Protocol, p.ExternalPort, p.TargetIP, p.LocalPort))
+		}
+		sort.Strings(fwds)
+		parts = append(parts, "wan="+strings.Join(fwds, ","))
 	}
 	if len(d.PassRules) > 0 {
 		dests := make([]string, 0, len(d.PassRules))
@@ -116,40 +120,60 @@ func ParseExposure(in ExposureInput, cfg *config.Config) (DesiredExposure, error
 			return d, fmt.Errorf("invalid %s %q (want tcp or udp)", AnnProtocol, proto)
 		}
 
-		extPort := firstNonEmpty(in.Annotations[AnnExternalPort], in.DefaultPort)
-		localPort := firstNonEmpty(in.Annotations[AnnInternalPort], in.DefaultPort)
-		if extPort == "" || localPort == "" {
+		// The ports are lists so that one object can ask for several forwards at
+		// once. The two pair up by position, which is what lets a port be remapped.
+		extPorts := splitList(firstNonEmpty(in.Annotations[AnnExternalPort], in.DefaultPort))
+		localPorts := splitList(firstNonEmpty(in.Annotations[AnnInternalPort], in.DefaultPort))
+		if len(extPorts) == 0 || len(localPorts) == 0 {
 			return d, fmt.Errorf("%s set but no port available (annotate %s/%s)", AnnExpose, AnnExternalPort, AnnInternalPort)
 		}
-
-		// Only translation can remap a port, and IPv6 is passed through
-		// untranslated. Refusing the whole object beats wiring up IPv4 and
-		// leaving IPv6 admitted on a port nothing listens on.
-		if extPort != localPort && hasIPv6(addresses) {
-			return d, fmt.Errorf("%s %s differs from %s %s, which cannot be honoured for an IPv6 address: IPv6 is not translated",
-				AnnExternalPort, extPort, AnnInternalPort, localPort)
+		if len(extPorts) != len(localPorts) {
+			return d, fmt.Errorf("%s names %d ports and %s names %d: they pair up by position",
+				AnnExternalPort, len(extPorts), AnnInternalPort, len(localPorts))
 		}
 
-		// IPv4 is reached by translating the WAN address; IPv6 is globally
-		// routable, so it only needs the WAN's default-deny lifted.
+		// Every forward of one object aims at the same place, so the first IPv4
+		// address it has is the target for all of them.
+		var target string
 		for _, address := range addresses {
-			if !address.addr.Is4() {
+			if address.addr.Is4() {
+				target = address.addr.String()
+				break
+			}
+		}
+
+		for i, extPort := range extPorts {
+			localPort := localPorts[i]
+
+			// Only translation can remap a port, and IPv6 is passed through
+			// untranslated. Refusing the whole object beats wiring up IPv4 and
+			// leaving IPv6 admitted on a port nothing listens on.
+			if extPort != localPort && hasIPv6(addresses) {
+				return d, fmt.Errorf("%s %s differs from %s %s, which cannot be honoured for an IPv6 address: IPv6 is not translated",
+					AnnExternalPort, extPort, AnnInternalPort, localPort)
+			}
+
+			// IPv4 is reached by translating the WAN address; IPv6 is globally
+			// routable, so it only needs the WAN's default-deny lifted.
+			for _, address := range addresses {
+				if address.addr.Is4() {
+					continue
+				}
 				d.PassRules = append(d.PassRules, opnsense.PassRule{
 					Interface:   cfg.WANInterface,
 					Protocol:    proto,
 					Destination: address.addr.String(),
 					Port:        extPort,
 				})
-				continue
 			}
-			if d.PortForward == nil {
-				d.PortForward = &opnsense.PortForward{
+			if target != "" {
+				d.PortForwards = append(d.PortForwards, opnsense.PortForward{
 					Interface:    cfg.WANInterface,
 					Protocol:     proto,
 					ExternalPort: extPort,
-					TargetIP:     address.addr.String(),
+					TargetIP:     target,
 					LocalPort:    localPort,
-				}
+				})
 			}
 		}
 	}
