@@ -6,7 +6,7 @@ domain: haustorium.net
 
 # The zone the portal and the directory are published under. The routes themselves are in the
 # cilium chart; Authelia still has to know the URL a browser reaches it at.
-publishedDomain: internal.haustorium.net
+publishedDomain: haustorium.net
 
 # Created by hand before install, so nothing sensitive reaches the release history.
 secretName: identity-credentials
@@ -74,23 +74,34 @@ authelia:
     defaultPolicy: deny
     rules:
       - domain:
-          - home.internal.haustorium.net
-          - memos.internal.haustorium.net
-          - navidrome.internal.haustorium.net
-          - music-files.internal.haustorium.net
-          - files.internal.haustorium.net
-          - neon.internal.haustorium.net
-          - users.internal.haustorium.net
-          - grafana.internal.haustorium.net
-          - prometheus.internal.haustorium.net
-          - hubble.internal.haustorium.net
-          - kyverno.internal.haustorium.net
+          - home.haustorium.net
+          - memos.haustorium.net
+          - navidrome.haustorium.net
+          - music-files.haustorium.net
+          - files.haustorium.net
+          - grafana.haustorium.net
         policy: one_factor
+
+      # Everyone has an entry of their own to manage here, so no group gates it. What a person may
+      # change once inside is the directory's own to enforce.
+      - domain:
+          - users.haustorium.net
+        policy: two_factor
+
+      # A database control plane that believes the identity it is handed, trusted to a narrower set
+      # than cluster administration and to a wider one than everybody.
+      - domain:
+          - neon.haustorium.net
+        subject: ['group:neon']
+        policy: two_factor
 
       # Reachable from here is a change to the cluster or to what stores its data, so these are the
       # ones an account is separately trusted with. The group is directory data, created by hand.
       - domain:
-          - headlamp.internal.haustorium.net
+          - headlamp.haustorium.net
+          - prometheus.haustorium.net
+          - hubble.haustorium.net
+          - kyverno.internal.haustorium.net
           - seaweedfs.internal.haustorium.net
           - seaweedfs-filer.internal.haustorium.net
         subject: ['group:admins']
@@ -117,12 +128,12 @@ authelia:
         name: Memos
         secretDigest: "$pbkdf2-sha512$310000$SNoRqt2qeOBhxC07JEl5lw$o0cDoZDQlBVQgcjo4IWldjXvxUB30xjlc7yXv1HULfhDDMSB9Xo/euha9zydoUqWmShcChtcW2.bg.yANCjNsg"
         redirectURIs:
-          - https://memos.internal.haustorium.net/auth/callback
+          - https://memos.haustorium.net/auth/callback
       - id: headlamp
         name: Headlamp
         secretDigest: "$pbkdf2-sha512$310000$xSiVF9mL83f/aWsuB20gpA$L2WhvQ4d2l710OOdzUmy99DLF/DpBWXRq9TH845dJxuC/HlqkBZplgqtEwSYDgcuU.EoGSoT7d7iwML/6mGGTw"
         redirectURIs:
-          - https://headlamp.internal.haustorium.net/oidc-callback
+          - https://headlamp.haustorium.net/oidc-callback
         claimsPolicy: kubernetes
         # No refresh token: it refreshes from several requests at once, the provider revokes the grant
         # on the second use, and it then retries every request until the rate limit refuses its login.

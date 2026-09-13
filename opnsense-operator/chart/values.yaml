@@ -9,8 +9,9 @@ opnsense:
   url: "https://10.0.0.1"
   wanInterface: "wan"
   insecureTLS: true
-  # Comma-separated DNS zones the operator may manage. Empty allows any zone.
-  managedDomains: "internal.haustorium.net"
+  # Comma-separated DNS zones the operator may manage; a zone covers every zone beneath it, so the
+  # apex is the whole of what the homelab owns. Empty allows any zone.
+  managedDomains: "haustorium.net"
 
   existingSecret: "opnsense-operator-creds"
 

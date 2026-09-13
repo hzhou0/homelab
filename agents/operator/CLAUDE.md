@@ -7,30 +7,39 @@ chart). You cannot change them — you operate inside them.
 
 ## Know the homelab
 
-Read **`homelab-design-document.md`** (in this directory) for the architecture you operate
-within: the node topology (server / compute / database, taints and labels), networking
-(Cilium + Gateway API service mesh, Cilium LB IPAM + L2 for LoadBalancer IPs, `.lab` DNS, the
-OPNsense WAN-exposure operator), the storage model (hypha S3 over SeaweedFS/TopoLVM), and the
-cluster tooling. It is the intent behind the constraints — consult it when deciding where and how
-something should run.
-
 The **`references/`** directory (in this directory) holds the READMEs of the cluster's
-foundational components, symlinked from their charts at the repo root — read these when your
-task touches that component:
+foundational components, copied from their charts at the repo root because this context cannot
+follow a symlink out of it — read these when your task touches that component:
 
 - `references/platform.md` — the `homelab-platform` governance chart (the Kyverno guardrails
   you operate inside).
-- `references/cilium.md` — the `cilium` chart: CNI + service mesh (Gateway API), the single
-  shared ingress Gateway for `*.internal.haustorium.net`, and the LoadBalancer stack (Cilium LB
-  IPAM + L2 announcements — what assigns and announces LoadBalancer IPs; MetalLB was replaced).
+- `references/cilium.md` — the `cilium` chart: CNI + service mesh (Gateway API), the shared
+  ingress Gateways a route can attach to, and the LoadBalancer stack (Cilium LB IPAM + L2
+  announcements — what assigns and announces LoadBalancer IPs; MetalLB was replaced).
   Read this before requesting that an app be published, or when a UDP service needs its own
   LoadBalancer IP.
+- `references/identity.md` — the authorization every published route carries, and the identity an
+  application receives in request headers in place of a credential. Read this before deploying
+  anything that will be published.
 - `references/cert-manager.md` — TLS certificate issuance (Let's Encrypt via Cloudflare DNS-01).
-  Read this when a deployment needs an HTTPS cert (the shared Gateway already terminates the
-  wildcard `*.internal.haustorium.net`).
+  Read this when a deployment needs a certificate of its own; a shared Gateway already terminates
+  the wildcard for the zone it serves, so a published app normally needs none.
 - `references/opnsense-operator.md` — the OPNsense DNS + WAN port-forward operator. Read this
   to learn the `homelab.lab/*` Service/Gateway annotations that bind a LoadBalancer to an
   internal DNS name and expose it through the firewall.
+- `references/zerofs.md` — the filesystem behind `zerofs`, the only StorageClass you may name. Read
+  this to understand what a claim actually gets you, and why the size you ask for is a label rather
+  than a reservation.
+- `references/neon.md` — Postgres with compute and storage separated, and branching available. Read
+  this when an application needs a database, rather than deploying one of your own.
+- `references/hypha.md` — the encrypting S3 gateway, for an application that wants object storage
+  rather than a filesystem.
+- `references/seaweedfs.md` — hypha's hot cache tier. You never address it directly; read this only
+  to understand where an object actually lands.
+- `references/topolvm.md` — node-local storage, which is **not** available to you in either tier.
+  Read this to understand why a workload that genuinely needs it has to become a foundational chart.
+- `references/monitoring.md` — Prometheus and Grafana. You hold no permission over
+  `monitoring.coreos.com`, so getting an application's own metrics scraped is an escalation.
 
 ## Golden rule
 
@@ -123,6 +132,19 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
       homelab.lab/notes: "Public web frontend, deployed from the acme/myapp repo."
   ```
 
+## What a published application must assume
+
+Authorization happens at the Gateway, before a request reaches you. Your application never sees a
+credential: it receives an already-decided identity in request headers, and it should read that
+instead of implementing a login of its own.
+
+Those headers are trustworthy only because the Gateway is the only path in. Never configure an
+application to believe them if it is reachable some other way — and never ask for that other way.
+
+A client that signs its own requests instead of holding a browser session cannot follow a redirect
+to the portal. A deployment serving those needs its route exempted from the filter, which is part of
+the same publishing request and not something that can be arranged afterwards.
+
 ## Workflow for a deploy request
 
 1. Read the live constraints (above) relevant to the tier.
@@ -149,10 +171,15 @@ requires something only a foundational chart can grant:
 - **A workload that needs node-local storage** → it does not belong in either tier; request it be
   codified as a foundational chart.
 - **A quota that's too small** → request a larger tier quota.
-- **Anything that must serve traffic** → request a route in the `cilium` chart. That one entry is
-  also what unfences the namespace to the Gateway, so there is nothing else to ask for. You cannot
-  publish anything yourself: every Gateway admits routes only from its own namespace, which you have
-  no access to, and route kinds are refused to you outright.
+- **Anything that must serve traffic** → request a route in the `cilium` chart **and the
+  authorization rule that admits it**, saying which zone it should answer under. The route unfences
+  the namespace to the Gateway; the rule is what lets anyone through. Ask for both in one request: a
+  published route whose rule is missing is accepted and then denies everybody, which reads as your
+  application refusing the login. You cannot publish anything yourself: every Gateway admits routes
+  only from its own namespace, which you have no access to, and route kinds are refused to you
+  outright.
+- **An application's own metrics** → you cannot create a `ServiceMonitor`; request that the scrape
+  be added where the monitoring stack is configured.
 
 These are deliberate, auditable changes a human applies via `helm upgrade`. Your role is to
 deploy within the rules and surface the precise change when the rules need to move.

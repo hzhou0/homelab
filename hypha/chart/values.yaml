@@ -15,11 +15,11 @@ deployments:
   cached:
     mode: cached
     bucketPrefix: hypha
-    hostname: s3.internal.haustorium.net
+    hostname: s3.haustorium.net
   durable:
     mode: durable
     bucketPrefix: hypha-direct
-    hostname: s3-direct.internal.haustorium.net
+    hostname: s3-direct.haustorium.net
 
 image:
   repository: ghcr.io/hzhou0/hypha

@@ -5,6 +5,15 @@ that asks Authelia whether the request may proceed, and the application behind i
 decided identity in request headers. The routes, the filter and the namespace belong to the `cilium`
 chart; install it first.
 
+An application speaks OpenID Connect where it supports it, and reads the forwarded identity where it
+does not. The header is trustworthy because the gateway is the only path in, not because the
+application checks anything — so an application moved outside the fence stops being safe to
+configure this way. A caller that signs its own requests is exempt instead: a browser redirect would
+break it, and it authenticates nobody here.
+
+`Remote-User` carries the directory login name. lldap has no rename, so it is stable for the life of
+an account.
+
 ## Install
 
 Generate the issuer signing key and wrap it as a configuration file:
@@ -98,6 +107,10 @@ Two things here decide whether that file works. The portal's route is unauthenti
 lets the API server fetch discovery and keys directly. And a client whose groups decide access needs
 a claims policy placing them in the ID token — Authelia serves the rest from userinfo, which the API
 server never calls.
+
+The API server calls nothing back, so a token it has already accepted stays good for the whole of its
+lifespan. That lifespan is therefore also how long a disabled account keeps what its groups grant
+here — the one path where disabling an account is not immediate, and the reason to keep it short.
 
 `authn.yaml` is node-local and a rebuilt server comes back without it. Signing in still succeeds
 then, and every call the application makes is refused.

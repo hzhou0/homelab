@@ -164,91 +164,11 @@ gateways:
         port: 5432
         namespace: neon
     routes:
-      home.internal.haustorium.net:
-        /:
-          namespace: app-homepage
-          name: homepage
-          port: 80
-      memos.internal.haustorium.net:
-        /:
-          namespace: app-memos
-          name: memos
-          port: 80
-          # Its own API authenticates by bearer token, so the credential strip cannot apply here.
-          forwardAuthorization: true
-      neon.internal.haustorium.net:
-        # Only the human surfaces. A prefix route here would also publish the compute spec endpoint,
-        # the storage hooks and the proxy's auth endpoints, none of which authenticate.
-        /:
-          match: Exact
-          namespace: neon
-          name: neon-ctl
-          port: 8080
-        /ui:
-          namespace: neon
-          name: neon-ctl
-          port: 8080
-        /api:
-          namespace: neon
-          name: neon-ctl
-          port: 8080
-      navidrome.internal.haustorium.net:
-        /:
-          namespace: app-navidrome
-          name: navidrome
-          port: 80
-      music-files.internal.haustorium.net:
-        /:
-          namespace: app-navidrome
-          name: filebrowser
-          port: 80
-      s3.internal.haustorium.net:
-        /:
-          namespace: hypha
-          name: hypha-cached
-          port: 8014
-          externalAuth: false
-          # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
-          requestTimeout: 0s
-      s3-direct.internal.haustorium.net:
-        /:
-          namespace: hypha
-          name: hypha-durable
-          port: 8014
-          externalAuth: false
-          # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
-          requestTimeout: 0s
-      auth.internal.haustorium.net:
-        /:
-          namespace: identity
-          name: identity-authelia
-          port: 9091
-          externalAuth: false
-      users.internal.haustorium.net:
-        /:
-          namespace: identity
-          name: identity-lldap
-          port: 17170
-      hubble.internal.haustorium.net:
-        /:
-          namespace: kube-system
-          name: hubble-ui
-          port: 80
       kyverno.internal.haustorium.net:
         /:
           namespace: kyverno
           name: policy-reporter-ui
           port: 8080
-      grafana.internal.haustorium.net:
-        /:
-          namespace: monitoring
-          name: homelab-monitoring-grafana
-          port: 80
-      prometheus.internal.haustorium.net:
-        /:
-          namespace: monitoring
-          name: homelab-monitoring-kube-pr-prometheus
-          port: 9090
       seaweedfs.internal.haustorium.net:
         /:
           namespace: seaweedfs
@@ -259,22 +179,6 @@ gateways:
           namespace: seaweedfs
           name: homelab-seaweedfs-filer
           port: 8888
-      files.internal.haustorium.net:
-        # Its session endpoint is served by a helper that supplies the identity the application has
-        # no way to read for itself.
-        /api/session/auth/:
-          namespace: tool-filestash
-          name: filestash
-          port: 8080
-        /:
-          namespace: tool-filestash
-          name: filestash
-          port: 80
-      headlamp.internal.haustorium.net:
-        /:
-          namespace: tool-headlamp
-          name: headlamp
-          port: 80
 
   # The authorization service a published route sends its subrequest to. Every namespace that may
   # hold a route is granted a reference to it.
@@ -292,12 +196,109 @@ gateways:
       poolName: public-gateway-pool
       ip: "10.0.0.99"
       v6: "2001:569:5bc1:7f00:ffff::1"
-    # Never a wildcard: it would shadow every name in the public zone, including those that resolve
-    # outside the cluster.
-    dnsNames: []
+    # A wildcard so an internal client reaches this address directly rather than hairpinning off the
+    # WAN one, which is not reflected. It shadows every other record type in the zone, apex included.
+    dnsNames: ["*.haustorium.net"]
     expose: true
     tcpListeners: []
-    routes: {}
+    routes:
+      # Nothing can authenticate the authorizer, so its own route carries no filter.
+      auth.haustorium.net:
+        /:
+          namespace: identity
+          name: identity-authelia
+          port: 9091
+          externalAuth: false
+      users.haustorium.net:
+        /:
+          namespace: identity
+          name: identity-lldap
+          port: 17170
+      home.haustorium.net:
+        /:
+          namespace: app-homepage
+          name: homepage
+          port: 80
+      memos.haustorium.net:
+        /:
+          namespace: app-memos
+          name: memos
+          port: 80
+          # Its own API authenticates by bearer token, so the credential strip cannot apply here.
+          forwardAuthorization: true
+      navidrome.haustorium.net:
+        /:
+          namespace: app-navidrome
+          name: navidrome
+          port: 80
+      music-files.haustorium.net:
+        /:
+          namespace: app-navidrome
+          name: filebrowser
+          port: 80
+      files.haustorium.net:
+        # Its session endpoint is served by a helper that supplies the identity the application has
+        # no way to read for itself.
+        /api/session/auth/:
+          namespace: tool-filestash
+          name: filestash
+          port: 8080
+        /:
+          namespace: tool-filestash
+          name: filestash
+          port: 80
+      headlamp.haustorium.net:
+        /:
+          namespace: tool-headlamp
+          name: headlamp
+          port: 80
+      grafana.haustorium.net:
+        /:
+          namespace: monitoring
+          name: homelab-monitoring-grafana
+          port: 80
+      prometheus.haustorium.net:
+        /:
+          namespace: monitoring
+          name: homelab-monitoring-kube-pr-prometheus
+          port: 9090
+      hubble.haustorium.net:
+        /:
+          namespace: kube-system
+          name: hubble-ui
+          port: 80
+      neon.haustorium.net:
+        # Only the human surfaces. A prefix route here would also publish the compute spec endpoint,
+        # the storage hooks and the proxy's auth endpoints, none of which authenticate.
+        /:
+          match: Exact
+          namespace: neon
+          name: neon-ctl
+          port: 8080
+        /ui:
+          namespace: neon
+          name: neon-ctl
+          port: 8080
+        /api:
+          namespace: neon
+          name: neon-ctl
+          port: 8080
+      s3.haustorium.net:
+        /:
+          namespace: hypha
+          name: hypha-cached
+          port: 8014
+          externalAuth: false
+          # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
+          requestTimeout: 0s
+      s3-direct.haustorium.net:
+        /:
+          namespace: hypha
+          name: hypha-durable
+          port: 8014
+          externalAuth: false
+          # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
+          requestTimeout: 0s
 
 # ---------------------------------------------------------------------------
 # WireGuard remote-access tunnel

@@ -10,7 +10,7 @@ there is no root build system or shared Go module beyond `opnsense-operator/`.
 | `opnsense-operator/` | Go controller-runtime operator + its own Helm chart (`opnsense-operator/chart/`) |
 | `hypha/` | design only (`ARCHITECTURE.md`); the Rust S3 gateway, not yet built here |
 | `kube-node/` | Alpine/k3s node image build scripts + `nodes.md` provisioning runbook |
-| `agents/operator/` | sandboxed autonomous-operator agent — own `CLAUDE.md`, `homelab-design-document.md`, `references/` |
+| `agents/operator/` | sandboxed autonomous-operator agent — own `CLAUDE.md`, `references/` |
 | `utils/` | misc node scripts (gVisor install) |
 
 ## Conventions

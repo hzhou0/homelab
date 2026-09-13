@@ -5,6 +5,11 @@ cert-manager:
   crds:
     enabled: true
   replicaCount: 1
+  # A DNS-01 self-check must not use the cluster resolver: the LAN resolver answers the whole zone
+  # from a local override, so the challenge record and the zone's own nameservers read as NODATA.
+  extraArgs:
+    - --dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53
+    - --dns01-recursive-nameservers-only
   # Keep cert issuance off the reclaimable spot node (node.kubernetes.io/capacity-type=spot).
   affinity: &avoidSpot
     nodeAffinity:

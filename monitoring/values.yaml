@@ -84,12 +84,12 @@ kube-prometheus-stack:
     # adminPassword defaults to upstream "prom-operator"; override out-of-git.
     grafana.ini:
       server:
-        root_url: "https://grafana.internal.haustorium.net"
+        root_url: "https://grafana.haustorium.net"
       auth:
         # The gateway has already decided who this is: no local form, and nothing to sign out of
         # here — the session belongs to the portal.
         disable_login_form: true
-        signout_redirect_url: "https://auth.internal.haustorium.net/logout"
+        signout_redirect_url: "https://auth.haustorium.net/logout"
       auth.proxy:
         enabled: true
         header_name: Remote-User
