@@ -26,10 +26,9 @@ the empty default copies every header the authorizer returned, including one a c
         # browser back to an http:// address after login.
         - x-forwarded-proto
       allowedResponseHeaders:
-        - Remote-User
-        - Remote-Groups
-        - Remote-Name
-        - Remote-Email
+        {{- range $e.identityHeaders }}
+        - {{ . }}
+        {{- end }}
         - Set-Cookie
         - Location
 {{- end }}

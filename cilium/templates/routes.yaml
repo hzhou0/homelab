@@ -47,6 +47,16 @@ spec:
             remove:
               - Authorization
         {{- end }}
+      {{- else if and $.Values.externalAuth.enabled $.Values.externalAuth.identityHeaders }}
+      # No subrequest overwrites the asserted identity on an exempt route, so a client's own copy is
+      # stripped rather than replaced — a backend behind one can never read an identity it forged.
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove:
+              {{- range $.Values.externalAuth.identityHeaders }}
+              - {{ . }}
+              {{- end }}
       {{- end }}
 {{- end }}
 {{- end }}

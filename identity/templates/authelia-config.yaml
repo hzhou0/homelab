@@ -51,6 +51,11 @@ data:
       oidc:
         # The signing key is the one thing that cannot arrive as an environment secret: nothing can
         # address a list entry, so it is a second configuration file mounted from the Secret.
+        {{- with .lifespans }}
+        lifespans:
+          custom:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
         {{- with .claimsPolicies }}
         claims_policies:
           {{- toYaml . | nindent 10 }}
@@ -64,8 +69,8 @@ data:
             {{- with .claimsPolicy }}
             claims_policy: '{{ . }}'
             {{- end }}
-            {{- with .tokenEndpointAuthMethod }}
-            token_endpoint_auth_method: '{{ . }}'
+            {{- with .lifespan }}
+            lifespan: '{{ . }}'
             {{- end }}
             {{- with .consentMode }}
             consent_mode: '{{ . }}'

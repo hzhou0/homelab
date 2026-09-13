@@ -127,6 +127,13 @@ externalAuth:
   namespace: identity
   service: identity-authelia
   port: 9091
+  # The identity the authorizer asserts, and the response headers it may return. A client never sets
+  # these: a filtered route overwrites them, an exempt route strips them, so none can be forged.
+  identityHeaders:
+    - Remote-User
+    - Remote-Groups
+    - Remote-Name
+    - Remote-Email
 
 gateways:
   internal:

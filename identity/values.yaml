@@ -100,6 +100,11 @@ authelia:
   # header, so it is preferred wherever an application supports it.
   oidc:
     enabled: true
+    # Nothing can revoke a token the API server has already accepted, so this is also how long a
+    # disabled account keeps what its groups grant there.
+    lifespans:
+      kubernetes:
+        id_token: 12h
     # A claim not named here is served from userinfo, which the Kubernetes API server never calls.
     claimsPolicies:
       kubernetes:
@@ -119,14 +124,10 @@ authelia:
         redirectURIs:
           - https://headlamp.internal.haustorium.net/oidc-callback
         claimsPolicy: kubernetes
-        # Its refresh sends the secret in the request body, which the spec default refuses; without
-        # this the refresh fails hourly and it retries every request until the rate limit bites.
-        tokenEndpointAuthMethod: client_secret_post
-        # Its session outlives the ID token only with a refresh token, which offline_access grants.
-        scopes: ['openid', 'profile', 'email', 'groups', 'offline_access']
-        # offline_access is refused unless the code flow it depends on is spelled out.
-        responseTypes: ['code']
-        grantTypes: ['authorization_code', 'refresh_token']
+        # No refresh token: it refreshes from several requests at once, the provider revokes the grant
+        # on the second use, and it then retries every request until the rate limit refuses its login.
+        lifespan: kubernetes
+        scopes: ['openid', 'profile', 'email', 'groups']
         consentMode: implicit
   resources:
     requests:
