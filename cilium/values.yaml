@@ -50,6 +50,15 @@ cilium:
       enabled: true
     ui:
       enabled: true
+    # A flow shows what crossed the wire, and a presigned URL, an authorization code and a session
+    # cookie are each a credential to whoever reads it.
+    redact:
+      enabled: true
+      http:
+        urlQuery: true
+        userInfo: true
+        headers:
+          allow: [Content-Type, Content-Length, User-Agent]
 
   # Scope Cilium's datapath (and host firewall) to ethernet only: a node that rolls onto wifi would
   # otherwise have Cilium manage that interface and the host firewall would lock down wifi ingress.
@@ -249,7 +258,7 @@ gateways:
           port: 80
       headlamp.haustorium.net:
         /:
-          namespace: tool-headlamp
+          namespace: headlamp
           name: headlamp
           port: 80
       grafana.haustorium.net:

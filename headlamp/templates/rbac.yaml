@@ -1,0 +1,130 @@
+{{- $fullname := include "headlamp.fullname" . }}
+{{- with .Values.adminGroups }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-admin
+  labels:
+    {{- include "headlamp.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  {{- include "headlamp.subjects" (dict "groups" . "prefix" $.Values.groupPrefix) | trim | nindent 2 }}
+---
+{{- end }}
+# Read-only without a path to a credential. Kinds are named rather than wildcarded: a wildcard carries
+# Secrets and every exec, attach and proxy subresource, including the kubelet's exec over GET.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-read
+  labels:
+    {{- include "headlamp.labels" . | nindent 4 }}
+rules:
+  # No logs: nothing stops a process printing a credential.
+  - apiGroups: [""]
+    resources:
+      - componentstatuses
+      - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - nodes
+      - persistentvolumeclaims
+      - persistentvolumes
+      - pods
+      - podtemplates
+      - replicationcontrollers
+      - resourcequotas
+      - serviceaccounts
+      - services
+    verbs: [get, list, watch]
+  # A group is listed only if none of its kinds can hold a credential inline, so one installed later
+  # stays invisible until someone checks it.
+  - apiGroups:
+      - acme.cert-manager.io
+      - admissionregistration.k8s.io
+      - apiextensions.k8s.io
+      - apiregistration.k8s.io
+      - apps
+      - autoscaling
+      - batch
+      - certificates.k8s.io
+      - cert-manager.io
+      - coordination.k8s.io
+      - discovery.k8s.io
+      - events.k8s.io
+      - flowcontrol.apiserver.k8s.io
+      - gateway.networking.k8s.io
+      - gateway.networking.x-k8s.io
+      - k3s.cattle.io
+      - metrics.k8s.io
+      - networking.k8s.io
+      - node.k8s.io
+      - policies.kyverno.io
+      - policy
+      - rbac.authorization.k8s.io
+      - reports.kyverno.io
+      - resource.k8s.io
+      - scheduling.k8s.io
+      - storage.k8s.io
+      - topolvm.io
+      - wgpolicyk8s.io
+    resources: ["*"]
+    verbs: [get, list, watch]
+  # Raw Envoy configuration can inline a TLS key.
+  - apiGroups: [cilium.io]
+    resources:
+      - ciliumcidrgroups
+      - ciliumclusterwidenetworkpolicies
+      - ciliumendpoints
+      - ciliumgatewayclassconfigs
+      - ciliumidentities
+      - ciliuml2announcementpolicies
+      - ciliumloadbalancerippools
+      - ciliumnetworkpolicies
+      - ciliumnodeconfigs
+      - ciliumnodes
+      - ciliumpodippools
+    verbs: [get, list, watch]
+  # An update request embeds the admission request that raised it, object and all.
+  - apiGroups: [kyverno.io]
+    resources:
+      - cleanuppolicies
+      - clustercleanuppolicies
+      - clusterpolicies
+      - globalcontextentries
+      - policies
+      - policyexceptions
+    verbs: [get, list, watch]
+  # A receiver's webhook URL is a plain string, and those often carry their token.
+  - apiGroups: [monitoring.coreos.com]
+    resources:
+      - alertmanagers
+      - podmonitors
+      - probes
+      - prometheusagents
+      - prometheuses
+      - prometheusrules
+      - scrapeconfigs
+      - servicemonitors
+      - thanosrulers
+    verbs: [get, list, watch]
+{{- with .Values.readGroups }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-read
+  labels:
+    {{- include "headlamp.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-read
+subjects:
+  {{- include "headlamp.subjects" (dict "groups" . "prefix" $.Values.groupPrefix) | trim | nindent 2 }}
+{{- end }}

@@ -78,7 +78,7 @@ jwt:
       url: https://<the portal>
       audiences: ['<the client>']
     claimValidationRules:
-      - expression: 'has(claims.groups) && ("admins" in dyn(claims.groups))'
+      - expression: 'has(claims.groups) && ("admins" in dyn(claims.groups) || "infra-read" in dyn(claims.groups))'
     claimMappings:
       username:
         claim: preferred_username
@@ -100,8 +100,8 @@ exits on a file it cannot parse, taking the control plane with it; every claim r
 reloads it on write, and a bad write leaves the running configuration in place.
 
 The prefixes keep directory names clear of the ones Kubernetes already knows, and RBAC binds to the
-prefixed group. The validation rule decides authentication, so an account outside the group holds no
-token the API server accepts.
+prefixed group. The validation rule decides authentication, so an account outside those groups holds
+no token the API server accepts.
 
 Two things here decide whether that file works. The portal's route is unauthenticated, which is what
 lets the API server fetch discovery and keys directly. And a client whose groups decide access needs

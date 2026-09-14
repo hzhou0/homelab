@@ -76,10 +76,14 @@ authelia:
       - domain:
           - home.haustorium.net
           - memos.haustorium.net
-          - navidrome.haustorium.net
-          - music-files.haustorium.net
           - files.haustorium.net
           - grafana.haustorium.net
+        policy: one_factor
+
+      - domain:
+          - navidrome.haustorium.net
+          - music-files.haustorium.net
+        subject: ['group:music']
         policy: one_factor
 
       # Everyone has an entry of their own to manage here, so no group gates it. What a person may
@@ -105,6 +109,15 @@ authelia:
           - seaweedfs.internal.haustorium.net
           - seaweedfs-filer.internal.haustorium.net
         subject: ['group:admins']
+        policy: two_factor
+
+      # The surfaces that cannot change anything themselves; Headlamp's limit is the API server's to
+      # enforce.
+      - domain:
+          - headlamp.haustorium.net
+          - hubble.haustorium.net
+          - kyverno.internal.haustorium.net
+        subject: ['group:infra-read']
         policy: two_factor
 
   # An application that speaks OpenID Connect gets a real session of its own rather than trusting a

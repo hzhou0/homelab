@@ -57,7 +57,6 @@ imageAllowlist:
   - docker.io/rclone/rclone:1.68.2
   - docker.io/rancher/system-upgrade-controller:v0.14.2
   - docker.io/rancher/kubectl:v1.30.2
-  - ghcr.io/headlamp-k8s/headlamp:v0.43.0
   - ghcr.io/gethomepage/homepage:v2.2.0
   - ghcr.io/kyverno/policy-reporter:3.7.4
   - ghcr.io/kyverno/policy-reporter-ui:2.5.1

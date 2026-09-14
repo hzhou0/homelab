@@ -1,0 +1,15 @@
+apiVersion: v2
+name: homelab-headlamp
+description: >-
+  Headlamp as a window onto the API server, and the cluster-scoped grants that decide what each
+  directory group sees through it. Foundational like identity — cluster-admin installs it into its
+  own headlamp namespace, not an app-*/tool-* one.
+type: application
+version: 0.1.0
+appVersion: "v0.43.0"
+keywords:
+  - headlamp
+  - kubernetes
+  - dashboard
+  - rbac
+  - homelab
