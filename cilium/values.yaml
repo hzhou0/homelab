@@ -157,12 +157,7 @@ gateways:
     dnsNames: ["*.internal.haustorium.net"]
     # No WAN forward: this address answers on the LAN only.
     expose: false
-    # Ports forwarded byte-for-byte to one namespace each, for protocols the HTTP listeners cannot
-    # carry. The hostname wildcard already answers for them at any depth, so they need no record.
-    tcpListeners:
-      - name: postgres
-        port: 5432
-        namespace: neon
+    tcpListeners: []
     routes:
       kyverno.internal.haustorium.net:
         /:
@@ -200,7 +195,12 @@ gateways:
     # WAN one, which is not reflected. It shadows every other record type in the zone, apex included.
     dnsNames: ["*.haustorium.net"]
     expose: true
-    tcpListeners: []
+    # Ports forwarded byte-for-byte to one namespace each, for protocols the HTTP listeners cannot
+    # carry. Exposure follows this list, so a port added here is admitted through the firewall too.
+    tcpListeners:
+      - name: postgres
+        port: 5432
+        namespace: neon
     routes:
       # Nothing can authenticate the authorizer, so its own route carries no filter.
       auth.haustorium.net:

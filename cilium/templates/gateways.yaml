@@ -42,10 +42,13 @@ metadata:
     homelab.lab/hostname: {{ join "," . | quote }}
     {{- end }}
     {{- if $g.expose }}
+    {{- $ports := list ($g.listenPort | toString) }}
+    {{- range $g.tcpListeners }}{{ $ports = append $ports (.port | toString) }}{{ end }}
+    # Derived from the listeners, so what the firewall admits cannot drift from what is served.
     homelab.lab/expose: "true"
     homelab.lab/protocol: "tcp"
-    homelab.lab/external-port: {{ $g.listenPort | quote }}
-    homelab.lab/internal-port: {{ $g.listenPort | quote }}
+    homelab.lab/external-port: {{ join "," $ports | quote }}
+    homelab.lab/internal-port: {{ join "," $ports | quote }}
     {{- end }}
 spec:
   gatewayClassName: {{ $g.className | default "cilium" }}

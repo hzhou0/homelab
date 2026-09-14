@@ -119,7 +119,7 @@ proxy:
     enabled: true
     issuer: letsencrypt-cloudflare
     issuerKind: ClusterIssuer
-    hostname: pg.internal.haustorium.net
+    hostname: pg.haustorium.net
   resources:
     requests:
       cpu: 100m
@@ -221,8 +221,8 @@ computePodTemplate:
 # The shared gateway that forwards Postgres to the proxy. Its listener must name this namespace,
 # and the namespace must be one the gateway is allowed to reach on the return hop.
 gateway:
-  name: internal
-  namespace: cilium-gateway
+  name: public
+  namespace: cilium-gateway-public
   sectionName: postgres
 
 # Namespaces granted reach to the proxy. Everything else is refused by the cluster-wide east-west

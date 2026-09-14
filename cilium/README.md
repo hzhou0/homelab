@@ -31,7 +31,8 @@ provides a CNI.
 and Cilium requires them for Gateway API support. Pin the Gateway API release that Cilium's current
 minor conformance-tests against; a mismatch surfaces as Gateways never reconciling rather than as an
 install error. TCPRoute/UDPRoute are opt-in — Cilium disables L4 routing entirely when those CRDs
-are absent, and will not accept a Gateway that mixes them with HTTP/GRPC/TLS routes.
+are absent. A Gateway may carry them alongside HTTP listeners; that traffic bypasses Envoy and
+reaches the generated Service directly.
 
 The **experimental** channel is required, because the `ExternalAuth` HTTPRoute filter the ingress
 uses for centralized auth exists only there.
@@ -201,7 +202,11 @@ knobs.
   address of each family out of the bottom of the v6 prefix, and its exposure annotation is what
   asks the firewall to admit the v6 half. Scoping the front-door allow by listener port instead
   would hold only while a v4 port-forward is doing the remapping.
-- **DNS stays manual for the public zone.** Its name is a registrar record aimed at the WAN
-  address; nothing here publishes it. A gateway's `dnsNames` become Unbound overrides — a wildcard
-  is right for the internal zone and wrong for the public one, where it would shadow every name
-  including those that resolve outside the cluster.
+- **Both zones answer by wildcard.** A registrar wildcard aims the public zone at the WAN address,
+  and a gateway's `dnsNames` become Unbound overrides answering those same names with an address a
+  client on the LAN can actually reach — the firewall does not reflect its own WAN address, so
+  without that an internal client could not reach anything published. The closest enclosing zone
+  wins, which is what leaves the internal zone its own answer beneath the public one. Publishing a
+  name therefore needs no record of its own, and the price is that an override shadows every other
+  record type in its zone: anything the zone gains elsewhere has to be mirrored in to stay visible
+  from inside.

@@ -54,14 +54,9 @@ runtimeProfiles:
 # Vetted container images. Anything not listed is rejected in app-* and tool-*.
 # Cilium and cert-manager run in ungoverned namespaces and are not listed.
 imageAllowlist:
-  - quay.io/ceph/ceph:v18
-  - docker.io/rook/ceph:v1.15.6
-  - ghcr.io/cloudnative-pg/postgresql:17.5-minimal-bullseye
-  - ghcr.io/cloudnative-pg/cloudnative-pg:1.24.1
   - docker.io/rclone/rclone:1.68.2
   - docker.io/rancher/system-upgrade-controller:v0.14.2
   - docker.io/rancher/kubectl:v1.30.2
-  - ghcr.io/hzhou0/opnsense-operator:0.1.0
   - ghcr.io/headlamp-k8s/headlamp:v0.43.0
   - ghcr.io/gethomepage/homepage:v2.2.0
   - ghcr.io/kyverno/policy-reporter:3.7.4

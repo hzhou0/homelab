@@ -65,7 +65,7 @@ spec:
             # it happens before the wake, so a bad password never costs a cold start.
             - --auth-backend=control-plane
             - --auth-endpoint={{ include "neon.ctlURL" $ }}/proxy/v1
-            - --proxy=0.0.0.0:{{ $.Values.proxy.pgPort }}
+            - --proxy=[::]:{{ $.Values.proxy.pgPort }}
             - --mgmt=0.0.0.0:{{ $.Values.proxy.mgmtPort }}
             - --http=0.0.0.0:{{ $.Values.proxy.httpPort }}
             - --region={{ $.Values.availabilityZone }}
@@ -106,6 +106,7 @@ metadata:
     {{- include "neon.labels" $ctx | nindent 4 }}
 spec:
   type: ClusterIP
+  ipFamilyPolicy: PreferDualStack
   selector:
     {{- include "neon.selectorLabels" $ctx | nindent 4 }}
   ports:
