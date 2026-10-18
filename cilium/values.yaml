@@ -203,6 +203,10 @@ gateways:
     # A wildcard so an internal client reaches this address directly rather than hairpinning off the
     # WAN one, which is not reflected. It shadows every other record type in the zone, apex included.
     dnsNames: ["*.haustorium.net"]
+    # Served by its own listener and certificate SAN, since neither a wildcard listener nor a
+    # wildcard certificate covers the zone apex.
+    redirects:
+      haustorium.net: home.haustorium.net
     expose: true
     # Ports forwarded byte-for-byte to one namespace each, for protocols the HTTP listeners cannot
     # carry. Exposure follows this list, so a port added here is admitted through the firewall too.

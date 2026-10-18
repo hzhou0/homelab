@@ -24,6 +24,9 @@ spec:
   secretName: {{ $g.tls.secretName }}
   dnsNames:
     - {{ $g.hostname | quote }}
+    {{- range $from, $to := $g.redirects }}
+    - {{ $from | quote }}
+    {{- end }}
   issuerRef:
     name: {{ $g.tls.issuerName }}
     kind: ClusterIssuer
@@ -67,6 +70,21 @@ spec:
       allowedRoutes:
         namespaces:
           from: Same
+    {{- range $from, $to := $g.redirects }}
+    # A wildcard listener does not match the zone apex, so a name sent elsewhere needs its own.
+    - name: redirect-{{ $from | replace "." "-" }}
+      protocol: HTTPS
+      port: {{ $g.listenPort }}
+      hostname: {{ $from | quote }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: {{ $g.tls.secretName }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+    {{- end }}
     {{- with $g.plaintextPort }}
     - name: http
       protocol: HTTP

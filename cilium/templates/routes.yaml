@@ -60,6 +60,33 @@ spec:
       {{- end }}
 {{- end }}
 {{- end }}
+{{- range $from, $to := $g.redirects }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: redirect-{{ $from | replace "." "-" }}
+  namespace: {{ $g.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  parentRefs:
+    - name: {{ $name }}
+      namespace: {{ $g.namespace }}
+  hostnames:
+    - {{ $from | quote }}
+  rules:
+      # No backendRef: the filter answers the request, so nothing here is published and the
+      # authorizer is never consulted — the target route does that after the browser follows.
+    - filters:
+        # Naming a scheme guards the route with an inverted X-Forwarded-Proto match, which a request
+        # arriving over TLS can never satisfy. Omitting it carries the incoming scheme through.
+        - type: RequestRedirect
+          requestRedirect:
+            hostname: {{ $to | quote }}
+            statusCode: 302
+{{- end }}
 {{- $grants := dict }}
 {{- range $host, $paths := $g.routes }}
 {{- range $prefix, $path := $paths }}
