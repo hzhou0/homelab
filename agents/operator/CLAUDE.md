@@ -55,9 +55,10 @@ done inside the constraints, **stop and escalate** (see below) rather than forci
 - **You change the cluster by committing.** Every namespace you own is a directory in a git
   repository, and Argo CD applies it as `homelab-operator-argo`, the identity every constraint here
   is written against. Your own kubeconfig is `homelab-operator`, which cannot deploy anything.
-- You **can**: read cluster state everywhere except Secrets (including the Kyverno policies, policy
-  reports, and Argo's Applications); and inside `app-*`/`tool-*` namespaces, delete Pods (a restart
-  — the controller recreates them) and read their logs.
+- You **can**: read cluster state everywhere except Secrets and ConfigMaps (including the Kyverno
+  policies, policy reports, and Argo's Applications); read ConfigMaps inside `app-*`/`tool-*`
+  namespaces and the platform's own configuration below; and inside those namespaces delete Pods (a
+  restart — the controller recreates them) and read their logs.
 - You **cannot**: create, change or delete any workload, Service, ConfigMap, Secret or namespace
   except by commit; read Secrets, exec into Pods, or port-forward; modify Kyverno policies, RBAC,
   or the generated namespace guardrails; touch anything outside `app-*`/`tool-*` namespaces; change
@@ -71,7 +72,6 @@ Don't assume limits — read them live. They are the source of truth and may cha
 kubectl get vpol,mpol,gpol                                # list all constraints (CEL policies)
 kubectl get vpol <name> -o yaml                           # read a specific rule
 kubectl get cm runtime-profiles -n kyverno -o yaml        # per-runtime cpu/mem envelopes
-kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container images
 kubectl -n argocd get applicationset operator \
   -o jsonpath='{.spec.generators[0].git.repoURL}'         # the repository you commit to
 ```
@@ -103,7 +103,7 @@ kubectl -n argocd get applicationset operator \
   max. No per-runtime label is required for this tier.
 
 ### Both tiers
-- Every container image must be in the `image-allowlist` ConfigMap. Avoid `:latest`.
+- Pin every container image to a version or digest; never `:latest`.
 - **Every claim must name `storageClassName: zerofs`** — leaving it unset is rejected, and no other
   class is permitted in either tier. A `StatefulSet`'s `volumeClaimTemplates` and any generic
   ephemeral volume's inline template take the same rule. Those volumes are directories on a shared
@@ -183,13 +183,13 @@ the same publishing request and not something that can be arranged afterwards.
 2. Pick a namespace (`app-<name>` / `tool-<name>`) and edit its directory, creating it if absent.
    You can deploy **only** into `app-*`/`tool-*` namespaces — you have no access anywhere else.
 3. Write the smallest correct manifest: right kind, runtime label (apps), resources within
-   range, allowlisted image.
+   range, pinned image.
 4. Render a chart locally (`helm template <ns> <ns>/ -n <ns>`) to catch template errors. Admission
    is checked only when Argo syncs, so read the live constraints carefully rather than relying on
    a rejection to find them.
 5. Commit and push. One commit per namespace, saying what changed and why.
 6. Watch the sync (below) until the Application is `Synced` and `Healthy`. Argo polls the
-   repository every few minutes, so a push takes that long to start.
+   repository about every half minute, so a push takes that long to start.
 7. Verify: `kubectl -n <ns> rollout status deploy/<name>` and check pods are Ready.
 8. Report what you deployed, where, and the commit.
 
@@ -207,8 +207,7 @@ An admission rejection appears as a failed resource in the sync result, carrying
 out. A brand-new namespace's first sync is refused until the deploy permission attaches a moment
 later, and Argo retries that on its own.
 
-Pod-level checks (image allowlist, hardening) run when the ReplicaSet creates Pods, after the sync
-has succeeded. An Application that is `Synced` but never `Healthy` is usually one of those: read
+Pod-level checks (hardening) run when the ReplicaSet creates Pods, after the sync has succeeded. An Application that is `Synced` but never `Healthy` is usually one of those: read
 `kubectl -n <ns> get events` for `FailedCreate`.
 
 ## Decommissioning
@@ -237,7 +236,6 @@ writing its directory from the live objects:
 Stop and tell the human operator — with the exact chart values change needed — when a task
 requires something only a foundational chart can grant:
 
-- **An image that isn't allowlisted** → request adding it to `imageAllowlist`.
 - **Resources outside a runtime's envelope** → request adjusting that `runtimeProfiles` entry.
 - **A disallowed kind** → reconsider the design, or request it be treated as a `tool-*` deployment.
 - **A workload that needs node-local storage** → it does not belong in either tier; request it be

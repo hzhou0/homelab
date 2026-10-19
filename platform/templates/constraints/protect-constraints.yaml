@@ -59,7 +59,7 @@ metadata:
   annotations:
     policies.kyverno.io/title: Protect platform ConfigMaps from the operator
     policies.kyverno.io/description: >-
-      The operator may not modify the runtime-profiles / image-allowlist ConfigMaps;
+      The operator may not modify the runtime-profiles ConfigMap;
       change them via a chart upgrade.
 spec:
   validationActions: [Deny]
@@ -78,8 +78,8 @@ spec:
     - name: is-platform-configmap
       expression: >-
         request.namespace == '{{ .Release.Namespace }}' &&
-        (request.name == 'runtime-profiles' || request.name == 'image-allowlist')
+        request.name == 'runtime-profiles'
   validations:
     - expression: "false"
-      message: "The operator may not modify the runtime-profiles / image-allowlist ConfigMaps."
+      message: "The operator may not modify the runtime-profiles ConfigMap."
 {{- end }}

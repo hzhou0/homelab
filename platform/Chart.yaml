@@ -4,8 +4,8 @@ description: >-
   Constraint-based deployment platform for the homelab k3s cluster. Ships Kyverno
   (as a dependency) plus the admission constraints that define the feasible region an
   autonomous operator deploys into: per-tier allowed resource kinds, restricted/baseline
-  Pod Security, auto-governed namespaces (quota/limitrange/netpol/PSA), a container-image
-  allowlist, runtime-keyed resource ranges for apps, and the operator's own identity/RBAC.
+  Pod Security, auto-governed namespaces (quota/limitrange/netpol/PSA), runtime-keyed
+  resource ranges for apps, and the operator's own identity/RBAC.
 type: application
 version: 0.2.0
 appVersion: "0.2.0"

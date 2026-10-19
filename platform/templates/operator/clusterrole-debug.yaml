@@ -14,4 +14,8 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # Tier-scoped rather than cluster-wide: other namespaces' ConfigMaps are no business of the operator.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
 {{- end }}

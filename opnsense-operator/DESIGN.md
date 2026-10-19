@@ -126,8 +126,7 @@ Deployment (1 replica, distroless non-root), ServiceAccount, ClusterRole/Binding
 Services + Gateways, patch their metadata/finalizers, emit Events), Secret (OPNsense creds),
 values.yaml. Installed by a human via Helm (like the `cilium`/`cert-manager` charts) into its own namespace
 `opnsense-operator` — deliberately **not** an `app-*`/`tool-*` namespace, so the platform's
-Kyverno governance (which only targets those prefixes) does not apply. The image is also
-listed in the platform image allowlist for a complete catalogue.
+Kyverno governance (which only targets those prefixes) does not apply.
 
 ## Verification
 

@@ -37,7 +37,7 @@ results:
       - runtime-profiles
     result: skip
 
-  # protect-platform-configmaps: deny writes to runtime-profiles/image-allowlist in default ns
+  # protect-platform-configmaps: deny writes to runtime-profiles in default ns
   - kind: ConfigMap
     policy: protect-platform-configmaps
     resources:

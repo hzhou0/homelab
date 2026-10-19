@@ -15,7 +15,6 @@ themselves**.
 | Storage | claims on the shared-filesystem class only | same |
 | Pod Security | `restricted` | `baseline` |
 | Resources | per-runtime envelope (see below) | LimitRange defaults + ceiling |
-| Images | allowlist only | allowlist only |
 
 Every `app-*`/`tool-*` namespace is auto-governed the moment it is created: Kyverno generates a
 `ResourceQuota` and `LimitRange` (the operator deploy `RoleBinding` too) and stamps PSA labels.
@@ -52,11 +51,6 @@ never becomes ready instead of a refusal.
 `app-*` Deployments must carry `homelab.lab/runtime` (e.g. `go`, `node`, `python`, `jvm`, `rust`,
 `static`). Each runtime maps to a cpu/mem envelope in the `runtime-profiles` ConfigMap; containers
 outside the envelope for their runtime are rejected.
-
-## Image allowlist
-
-Only images listed under `imageAllowlist` in `values.yaml` may run. Adding an image requires a
-`helm upgrade` — a deliberate, auditable step.
 
 ## Install
 
@@ -118,7 +112,6 @@ Helm release.
 | No bare Pods | `ValidatingPolicy` `no-bare-pods` |
 | Storage confined to a class | `ValidatingPolicy` `tier-storage-class` + `tier-claim-template-storage-class` |
 | Pod Security | native PSA labels (via `MutatingPolicy` `namespace-psa-labels`) + `harden-defaults` |
-| Image allowlist | `ValidatingPolicy` `image-allowlist` + ConfigMap |
 | App resource ranges | `ValidatingPolicy` `runtime-label` + `runtime-ranges` + ConfigMap |
 | Tool resource ranges | generated `LimitRange` + `ResourceQuota` |
 | One chart per `tool-*` ns | one repository directory per namespace (see GitOps) |
@@ -137,9 +130,9 @@ Helm release.
   Kyverno policy needed. App ranges require Kyverno because they vary by the runtime label, which a
   static `LimitRange` can't express.
 - **CEL policies, not `ClusterPolicy`.** Validate/mutate constraints use the GA CEL types
-  (`ValidatingPolicy`, `MutatingPolicy`). Pod-level checks (`image-allowlist`, `no-bare-pods`,
-  `harden-defaults`) run at **Pod** admission (podController autogen is disabled), so a bad image
-  surfaces as a ReplicaSet `FailedCreate`. The **generate** policies (`namespace-governance`,
+  (`ValidatingPolicy`, `MutatingPolicy`). Pod-level checks (`no-bare-pods`, `harden-defaults`) run
+  at **Pod** admission (podController autogen is disabled), so a rejected Pod surfaces as a
+  ReplicaSet `FailedCreate`. The **generate** policies (`namespace-governance`,
   `namespace-default-ingress`) temporarily use Kyverno `ClusterPolicy` instead of CEL
   `GeneratingPolicy` because the upstream `GeneratingPolicy.syncExisting`/`synchronize` fix
   (https://github.com/kyverno/kyverno/pull/16041) is not yet in a released Kyverno 1.19; migrate

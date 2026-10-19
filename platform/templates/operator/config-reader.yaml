@@ -1,5 +1,5 @@
 {{- if .Values.operator.enabled }}
-# Lets the operator READ the platform config (runtime-profiles, image-allowlist)
+# Lets the operator READ the platform config (runtime-profiles)
 # in the release namespace for introspection -- without granting it cluster-wide
 # ConfigMap access. Scoped to the release namespace only.
 apiVersion: rbac.authorization.k8s.io/v1

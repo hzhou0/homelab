@@ -18,6 +18,10 @@ argo-cd:
     cm:
       admin.enabled: "false"
       application.sync.impersonation.enabled: "true"
+      # Polling stands in for a webhook, which would need a path to the server around the gateway's
+      # authorization filter.
+      timeout.reconciliation: 30s
+      timeout.reconciliation.jitter: 10s
       oidc.config: |
         name: Authelia
         issuer: https://auth.haustorium.net
