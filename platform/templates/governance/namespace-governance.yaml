@@ -141,6 +141,29 @@ spec:
             name: "{{ .Values.operator.serviceAccountName }}-deploy"
           subjects:
             - kind: ServiceAccount
+              name: "{{ include "platform.argoServiceAccountName" . }}"
+              namespace: "{{ .Values.operator.namespace }}"
+    - name: operator-debug-rolebinding
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              operations: [CREATE, UPDATE]
+              names: ["{{ .Values.prefixes.app }}*", "{{ .Values.prefixes.tool }}*"]
+      generate:
+        generateExisting: true
+        synchronize: true
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        name: "{{ .Values.operator.serviceAccountName }}-debug"
+        namespace: "{{`{{ request.object.metadata.name }}`}}"
+        data:
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: "{{ .Values.operator.serviceAccountName }}-debug"
+          subjects:
+            - kind: ServiceAccount
               name: "{{ .Values.operator.serviceAccountName }}"
               namespace: "{{ .Values.operator.namespace }}"
 {{- end }}

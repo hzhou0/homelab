@@ -1,0 +1,18 @@
+apiVersion: v2
+name: homelab-forgejo
+description: >-
+  Forgejo as the git server the cluster reconciles from. Foundational — cluster-admin installs it
+  into its own forgejo namespace, not an app-*/tool-* one, since the operator agent's own deployments
+  are what it serves.
+type: application
+version: 0.1.0
+appVersion: "15.0.10"
+keywords:
+  - forgejo
+  - git
+  - gitops
+  - homelab
+dependencies:
+  - name: forgejo
+    version: "17.3.1"
+    repository: oci://code.forgejo.org/forgejo-helm

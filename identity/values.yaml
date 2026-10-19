@@ -105,6 +105,8 @@ authelia:
           - headlamp.haustorium.net
           - prometheus.haustorium.net
           - hubble.haustorium.net
+          - git.haustorium.net
+          - argocd.haustorium.net
           - kyverno.internal.haustorium.net
           - seaweedfs.internal.haustorium.net
           - seaweedfs-filer.internal.haustorium.net
@@ -133,6 +135,8 @@ authelia:
     claimsPolicies:
       kubernetes:
         id_token: ['groups', 'preferred_username']
+      argocd:
+        id_token: ['groups', 'preferred_username', 'email']
     # The digest is not a credential — it is what the plaintext is checked against, and the
     # plaintext belongs wherever the client runs. A client's policy is its own: the rules above
     # gate the route, not the token exchange.
@@ -151,6 +155,21 @@ authelia:
         # No refresh token: it refreshes from several requests at once, the provider revokes the grant
         # on the second use, and it then retries every request until the rate limit refuses its login.
         lifespan: kubernetes
+        scopes: ['openid', 'profile', 'email', 'groups']
+        consentMode: implicit
+      - id: forgejo
+        name: Forgejo
+        secretDigest: "$pbkdf2-sha512$310000$TYQRtNkY765RwWXT96kvow$CTDTyTT04wu/2wFkJ1hS/gDMOZWZaejEmnUMuiERvZmI/U.DerUUHTydgbatvj3kf1LlVL0.Un6X8smCKjDXfg"
+        redirectURIs:
+          - https://git.haustorium.net/user/oauth2/authelia/callback
+        scopes: ['openid', 'profile', 'email', 'groups']
+        consentMode: implicit
+      - id: argocd
+        name: Argo CD
+        secretDigest: "$pbkdf2-sha512$310000$UCjKyVpa2nZUOeJO8XaSlg$3mDgAe.03EgLjoz8B7t.xl11JUAVWnldmf00FoaRVPVbb0ZsQ/hlVRyzmhgEvWP/Z/EwMicc0l5Q/ohKkkh0zg"
+        redirectURIs:
+          - https://argocd.haustorium.net/auth/callback
+        claimsPolicy: argocd
         scopes: ['openid', 'profile', 'email', 'groups']
         consentMode: implicit
   resources:

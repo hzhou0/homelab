@@ -1,0 +1,39 @@
+# homelab-argocd values
+
+argo-cd:
+  # Stable Service names regardless of release name, since a gateway route is pinned to them.
+  fullnameOverride: argocd
+
+  global:
+    domain: argocd.haustorium.net
+    # Reclaimable capacity would stall reconciliation mid-sync.
+    affinity:
+      nodeAffinity:
+        matchExpressions:
+          - key: node.kubernetes.io/capacity-type
+            operator: NotIn
+            values: [spot]
+
+  configs:
+    cm:
+      admin.enabled: "false"
+      application.sync.impersonation.enabled: "true"
+      oidc.config: |
+        name: Authelia
+        issuer: https://auth.haustorium.net
+        clientID: argocd
+        clientSecret: $argocd-oidc:clientSecret
+        requestedScopes: [openid, profile, email, groups]
+    params:
+      # TLS ends at the gateway.
+      server.insecure: "true"
+      # A client-side diff reports every field a controller defaults, a bound claim's volume included.
+      controller.diff.server.side: "true"
+    rbac:
+      policy.csv: |
+        g, admins, role:admin
+
+  dex:
+    enabled: false
+  notifications:
+    enabled: false

@@ -94,6 +94,24 @@ The chart creates the operator's `ServiceAccount`, `ClusterRole`, and binding. M
 via `./platform/gen-kubeconfig.sh` for an out-of-cluster operator; in-cluster the pod uses the
 ServiceAccount directly.
 
+## GitOps
+
+With a repository configured, the operator commits instead of applying, and Argo CD reconciles each
+top-level directory into the namespace of the same name. Syncs run as `homelab-operator-argo`, which
+holds the deploy role and is the identity every constraint here is written against, so a commit is
+judged exactly as a direct write once was.
+
+The operator's own identity can read but not deploy. Inside its tiers it can also restart Pods and
+read their logs — nothing that touches a field the repository manages, so every change to a workload
+is a commit. Kubernetes cannot
+tell an impersonated request from one made with the identity's own token, which is why the identity
+that deploys is one no kubeconfig holds.
+
+The operator chooses directories and their contents, never an Application: an Application names its
+own project, and the project is the boundary. A repository directory is also one Application in one
+namespace, which keeps one chart per `tool-*` namespace once Argo renders charts without recording a
+Helm release.
+
 ## What enforces what
 
 | Concern | Mechanism |
@@ -105,7 +123,8 @@ ServiceAccount directly.
 | Image allowlist | `ValidatingPolicy` `image-allowlist` + ConfigMap |
 | App resource ranges | `ValidatingPolicy` `runtime-label` + `runtime-ranges` + ConfigMap |
 | Tool resource ranges | generated `LimitRange` + `ResourceQuota` |
-| One chart per `tool-*` ns | `ValidatingPolicy` `tool-single-release` |
+| One chart per `tool-*` ns | one repository directory per namespace (see GitOps) |
+| Operator can't deploy directly | `homelab-operator` holds read plus a per-namespace debug role; only `homelab-operator-argo` holds the deploy role |
 | Namespace provenance metadata | `ValidatingPolicy` `namespace-metadata` |
 | Per-namespace caps | generated `ResourceQuota` |
 | Constraint immutability | operator `ClusterRole` omits kyverno/RBAC/quota writes + `protect-constraints` |
@@ -127,7 +146,7 @@ ServiceAccount directly.
   `GeneratingPolicy` because the upstream `GeneratingPolicy.syncExisting`/`synchronize` fix
   (https://github.com/kyverno/kyverno/pull/16041) is not yet in a released Kyverno 1.19; migrate
   them back when 1.19 ships.
-- **Operator confinement** is RBAC-first: the `homelab-operator` `ClusterRole` has no namespaced
+- **Operator confinement** is RBAC-first: the `homelab-operator-argo` `ClusterRole` has no namespaced
   write power — all write rights live in `homelab-operator-deploy`, which `namespace-governance`
   binds into each `app-*`/`tool-*` namespace only. `restrict-operator-namespaces` (a native
   `ValidatingAdmissionPolicy`, bypassing Kyverno's own-namespace exclusion) blocks creating/deleting

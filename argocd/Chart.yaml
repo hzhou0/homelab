@@ -1,0 +1,16 @@
+apiVersion: v2
+name: homelab-argocd
+description: >-
+  Argo CD reconciling the operator agent's repository into its tiers. Foundational — cluster-admin
+  installs it into its own argocd namespace, not an app-*/tool-* one.
+type: application
+version: 0.1.0
+appVersion: "v3.5.5"
+keywords:
+  - argocd
+  - gitops
+  - homelab
+dependencies:
+  - name: argo-cd
+    version: "10.10.5"
+    repository: oci://ghcr.io/argoproj/argo-helm

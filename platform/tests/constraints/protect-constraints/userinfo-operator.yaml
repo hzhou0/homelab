@@ -3,5 +3,5 @@ kind: UserInfo
 metadata:
   name: homelab-operator
 userInfo:
-  username: "system:serviceaccount:tool-operator:homelab-operator"
+  username: "system:serviceaccount:tool-operator:homelab-operator-argo"
   groups: []

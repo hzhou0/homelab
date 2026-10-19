@@ -17,5 +17,5 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterroles"]
     verbs: ["bind"]
-    resourceNames: ["{{ .Values.operator.serviceAccountName }}-deploy"]
+    resourceNames: ["{{ .Values.operator.serviceAccountName }}-deploy", "{{ .Values.operator.serviceAccountName }}-debug"]
 {{- end }}

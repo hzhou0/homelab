@@ -8,11 +8,19 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 {{- end -}}
 
 {{/*
-Fully-qualified username of the operator ServiceAccount, used by RBAC bindings
-and by the constraint self-protection policy (matched against request.userInfo).
+The identity Argo syncs the operator's repository as. No kubeconfig holds it: Kubernetes cannot
+tell an impersonated request from one made with the identity's own token.
+*/}}
+{{- define "platform.argoServiceAccountName" -}}
+{{ .Values.operator.serviceAccountName }}-argo
+{{- end -}}
+
+{{/*
+Fully-qualified username every operator deployment arrives as, matched against request.userInfo
+by the deployment guardrails.
 */}}
 {{- define "platform.operatorUsername" -}}
-system:serviceaccount:{{ .Values.operator.namespace }}:{{ .Values.operator.serviceAccountName }}
+system:serviceaccount:{{ .Values.operator.namespace }}:{{ include "platform.argoServiceAccountName" . }}
 {{- end -}}
 
 {{/*

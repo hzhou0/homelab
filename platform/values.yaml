@@ -35,7 +35,13 @@ policies:
 operator:
   enabled: true
   namespace: tool-operator
+  # The operator reads and debugs as this; its commits are synced as the same name suffixed -argo.
   serviceAccountName: homelab-operator
+  # Each top-level directory of the repository is one namespace. Empty leaves the operator applying
+  # directly.
+  gitops:
+    repoURL: https://git.haustorium.net/henry/homelab.git
+    argocdNamespace: argocd
 
 prefixes:
   app: "app-"
@@ -102,11 +108,6 @@ tiers:
       default:        { cpu: "500m", memory: "512Mi" }
       min: { cpu: "10m",  memory: "16Mi" }
       max: { cpu: "4",    memory: "4Gi" }
-
-# Require at most one Helm release per tool-* namespace. Needs Kyverno admission controller to
-# read Secrets (an aggregation ClusterRole is created). Set false to drop both.
-oneChartPerToolNamespace:
-  enabled: true
 
 namespaceMetadata:
   enabled: true

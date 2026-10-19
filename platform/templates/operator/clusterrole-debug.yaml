@@ -1,0 +1,17 @@
+{{- if .Values.operator.enabled }}
+# A restart deletes Pods rather than patching the workload, so nothing here reaches a field the
+# repository manages.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.operator.serviceAccountName }}-debug
+  labels:
+{{ include "platform.labels" . | indent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+{{- end }}

@@ -96,8 +96,8 @@ Never edit `references/` by hand — it is generated.
 - Foundational charts are installed by a human (cluster-admin), each in its **own non-tier
   namespace** (e.g. `opnsense-operator`, `kyverno`), deliberately **not** `app-*`/`tool-*` so
   Kyverno governance does not apply. The autonomous operator must not install them.
-- One Helm release per `tool-*` namespace is enforced by `platform`'s `tool-single-release`
-  policy — don't add a second chart to an existing tool namespace.
+- One chart per `tool-*` namespace follows from the agent's repository layout (one directory, one
+  Application, one namespace) — don't add a second chart to an existing tool namespace.
 - `platform` install is a two-pass dance because Kyverno CRDs exceed the 1 MB Secret limit and
   are applied out-of-band: `helm dependency build platform` → `./platform/install-crds.sh` →
   pass 1 (`--set policies.enabled=false --set operator.enabled=false`) → wait for Kyverno →

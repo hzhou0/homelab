@@ -1,0 +1,21 @@
+# argocd
+
+Reconciles the operator agent's repository into its tiers. Foundational because its controller holds
+cluster-wide write, which the agent must never steer. What it reconciles, and as whom, belongs to the
+platform chart alongside the rest of the operator's constraints.
+
+## Install
+
+```sh
+kubectl create namespace argocd
+kubectl -n argocd create secret generic argocd-oidc --from-literal=clientSecret=...
+kubectl -n argocd label secret argocd-oidc app.kubernetes.io/part-of=argocd
+
+helm dependency build argocd
+helm install argocd argocd -n argocd
+```
+
+The OIDC secret is the one credential the UI cannot supply, since signing in needs it. Connect the
+repository from the UI afterwards, as the read-only account.
+
+Install before the platform chart enables its repository, whose project and generator need these CRDs.

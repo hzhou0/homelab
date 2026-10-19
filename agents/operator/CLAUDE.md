@@ -40,23 +40,28 @@ follow a symlink out of it — read these when your task touches that component:
   Read this to understand why a workload that genuinely needs it has to become a foundational chart.
 - `references/monitoring.md` — Prometheus and Grafana. You hold no permission over
   `monitoring.coreos.com`, so getting an application's own metrics scraped is an escalation.
+- `references/argocd.md` and `references/forgejo.md` — the reconciler that applies your commits
+  and the git server holding them. Read these when a push or a sync behaves unexpectedly.
 
 ## Golden rule
 
 **The constraints are the spec.** If the cluster accepts your manifest, it is compliant. If
 it rejects it, the rejection message tells you which rule you broke — read it, fix the
-manifest, retry. Never try to work around or disable a policy. If a task genuinely cannot be
+manifest, commit again. Never try to work around or disable a policy. If a task genuinely cannot be
 done inside the constraints, **stop and escalate** (see below) rather than forcing it.
 
 ## Your access
 
-- You act as the `homelab-operator` ServiceAccount (in-cluster), or via a kubeconfig
-  provided to you for that ServiceAccount.
-- You **can**: create `app-*` and `tool-*` namespaces and deploy the standard workload kinds
-  into them; read cluster state (including the Kyverno policies and policy reports) for
-  introspection.
-- You **cannot**: modify Kyverno policies, RBAC, or the generated namespace guardrails
-  (ResourceQuota/LimitRange/NetworkPolicy); write anywhere outside `app-*`/`tool-*` namespaces.
+- **You change the cluster by committing.** Every namespace you own is a directory in a git
+  repository, and Argo CD applies it as `homelab-operator-argo`, the identity every constraint here
+  is written against. Your own kubeconfig is `homelab-operator`, which cannot deploy anything.
+- You **can**: read cluster state everywhere except Secrets (including the Kyverno policies, policy
+  reports, and Argo's Applications); and inside `app-*`/`tool-*` namespaces, delete Pods (a restart
+  — the controller recreates them) and read their logs.
+- You **cannot**: create, change or delete any workload, Service, ConfigMap, Secret or namespace
+  except by commit; read Secrets, exec into Pods, or port-forward; modify Kyverno policies, RBAC,
+  or the generated namespace guardrails; touch anything outside `app-*`/`tool-*` namespaces; change
+  how Argo reconciles your repository. Scaling or editing a running object is a commit too.
 
 ## Always introspect before deploying
 
@@ -67,6 +72,8 @@ kubectl get vpol,mpol,gpol                                # list all constraints
 kubectl get vpol <name> -o yaml                           # read a specific rule
 kubectl get cm runtime-profiles -n kyverno -o yaml        # per-runtime cpu/mem envelopes
 kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container images
+kubectl -n argocd get applicationset operator \
+  -o jsonpath='{.spec.generators[0].git.repoURL}'         # the repository you commit to
 ```
 
 ## Two tiers
@@ -89,8 +96,8 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
 ### `tool-*` namespaces — cluster tooling
 - One namespace per tool: `tool-<name>`.
 - Allowed kinds = the app set **plus** `StatefulSet`, `DaemonSet`, `Job`, `CronJob`.
-- **At most one Helm release (chart) per `tool-*` namespace.** Install each tool into its own
-  namespace; a second chart in the same namespace is rejected.
+- **At most one chart per `tool-*` namespace.** A directory is either plain manifests or one
+  chart, so a second tool needs a namespace of its own.
 - Pod Security is **baseline** (slightly wider than app). Still no privileged/host access.
 - Requests/limits: the namespace `LimitRange` supplies defaults and a ceiling; stay under the
   max. No per-runtime label is required for this tier.
@@ -106,7 +113,7 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
 - Node-local storage (`topolvm-provisioner`) is not available to you in either tier. A workload
   that genuinely needs it has to be codified as a foundational chart by the human operator.
 - New namespaces are auto-governed (quota, limits, default NetworkPolicy, PSA labels) the
-  instant you create them — you don't (and can't) create those yourself.
+  instant they are created — you don't (and can't) create those yourself.
 - **Every namespace you create must carry provenance metadata** — the create is rejected
   otherwise:
   - annotation `homelab.lab/src`: URL of the deployment's source code, or the vendor name if
@@ -132,6 +139,31 @@ kubectl get cm image-allowlist  -n kyverno -o yaml        # allowed container im
       homelab.lab/notes: "Public web frontend, deployed from the acme/myapp repo."
   ```
 
+## The repository
+
+Each top-level directory is one namespace, named exactly as the namespace, and becomes one Argo
+Application. Nothing else belongs at the top level: every directory there is turned into an
+Application, and one that names no permitted namespace is refused.
+
+A directory holds either plain manifests or a single Helm chart. Commit a chart's dependencies
+(`helm dependency build`, then commit `charts/`) rather than leaving them to be fetched. Either way
+the directory carries its own `Namespace` manifest with the provenance metadata above.
+
+Two kinds of object must carry `argocd.argoproj.io/sync-options: Prune=false`, because pruning one
+destroys more than its file:
+- the `Namespace` — pruning it deletes everything inside;
+- every `PersistentVolumeClaim` — pruning it releases the data.
+
+**Secrets holding a credential never go in the repository**, where every reader of the history
+holds them forever, and you cannot create one yourself. Reference it by name from the committed
+manifests and escalate for the human operator to create it — naming the namespace, the Secret, and
+each key with what it must hold. Say in the namespace's `homelab.lab/notes` which Secrets exist
+out-of-band.
+
+Pushes authenticate with the token in `git-token.txt`, beside this file. Read it through a git
+credential helper; never write it into a remote URL, a config file, or a commit. Commit as
+`operator-agent`.
+
 ## What a published application must assume
 
 Authorization happens at the Gateway, before a request reaches you. Your application never sees a
@@ -147,18 +179,58 @@ the same publishing request and not something that can be arranged afterwards.
 
 ## Workflow for a deploy request
 
-1. Read the live constraints (above) relevant to the tier.
-2. Pick a namespace (`app-<name>` / `tool-<name>`); create it if absent. You may **only**
-   create or delete `app-*`/`tool-*` namespaces, and you can deploy **only** into those —
-   you have no access anywhere else. Just after you create a namespace, your deploy
-   permission and its guardrails attach a moment later; if a deploy is initially forbidden,
-   wait briefly and retry. Deleting an `app-*`/`tool-*` namespace tears down everything in
-   it — do it only when decommissioning that app/tool.
+1. Read the live constraints (above) relevant to the tier, and pull the repository.
+2. Pick a namespace (`app-<name>` / `tool-<name>`) and edit its directory, creating it if absent.
+   You can deploy **only** into `app-*`/`tool-*` namespaces — you have no access anywhere else.
 3. Write the smallest correct manifest: right kind, runtime label (apps), resources within
    range, allowlisted image.
-4. Apply it. If rejected, read the admission error, correct the offending field, retry.
-5. Verify: `kubectl -n <ns> rollout status deploy/<name>` and check pods are Ready.
-6. Report what you deployed and where.
+4. Render a chart locally (`helm template <ns> <ns>/ -n <ns>`) to catch template errors. Admission
+   is checked only when Argo syncs, so read the live constraints carefully rather than relying on
+   a rejection to find them.
+5. Commit and push. One commit per namespace, saying what changed and why.
+6. Watch the sync (below) until the Application is `Synced` and `Healthy`. Argo polls the
+   repository every few minutes, so a push takes that long to start.
+7. Verify: `kubectl -n <ns> rollout status deploy/<name>` and check pods are Ready.
+8. Report what you deployed, where, and the commit.
+
+## Watching a sync
+
+```sh
+kubectl -n argocd get applications                                 # sync + health for every namespace
+kubectl -n argocd get application <ns> -o jsonpath='{.status.operationState.phase}: {.status.operationState.message}'
+kubectl -n argocd get application <ns> -o jsonpath='{range .status.operationState.syncResult.resources[*]}{.kind}/{.name}: {.status} {.message}{"\n"}{end}'
+kubectl -n argocd get application <ns> -o jsonpath='{.status.conditions}'   # refusals by the project
+```
+
+An admission rejection appears as a failed resource in the sync result, carrying the same message
+`kubectl` would have printed. Fix the manifest and push again; don't wait for the retries to run
+out. A brand-new namespace's first sync is refused until the deploy permission attaches a moment
+later, and Argo retries that on its own.
+
+Pod-level checks (image allowlist, hardening) run when the ReplicaSet creates Pods, after the sync
+has succeeded. An Application that is `Synced` but never `Healthy` is usually one of those: read
+`kubectl -n <ns> get events` for `FailedCreate`.
+
+## Decommissioning
+
+Delete the directory and push. Argo stops managing the namespace but leaves everything in it
+running — then ask the human operator to delete the namespace. Removing a deployment is a
+deliberate act, never the side effect of a commit.
+
+## Adopting a namespace that predates the repository
+
+Namespaces deployed before the repository existed are live but unrecorded. Adopting one means
+writing its directory from the live objects:
+
+1. Export every object you created in it (`kubectl -n <ns> get <kind> <name> -o yaml`), then strip
+   `status`, `metadata.uid`, `resourceVersion`, `creationTimestamp`, `generation`, `managedFields`
+   and the `kubectl.kubernetes.io/last-applied-configuration` annotation.
+2. Leave out whatever governance generated — the ResourceQuota, LimitRange, NetworkPolicy and
+   RoleBinding — and anything a controller rebuilds, such as ReplicaSets and Pods.
+3. Keep each claim's `spec.volumeName`: it is what binds the claim to the data it already holds.
+4. Commit only values you read from the live object. The sync takes ownership of exactly the fields
+   you commit and leaves the rest alone, so an omitted field stays as it is, but an altered one
+   changes a running workload.
 
 ## When to escalate (don't force it)
 
@@ -178,15 +250,17 @@ requires something only a foundational chart can grant:
   application refusing the login. You cannot publish anything yourself: every Gateway admits routes
   only from its own namespace, which you have no access to, and route kinds are refused to you
   outright.
+- **A Secret holding a credential** → request it by namespace, name and keys (see above).
+- **Deleting a namespace** → see Decommissioning.
 - **An application's own metrics** → you cannot create a `ServiceMonitor`; request that the scrape
   be added where the monitoring stack is configured.
 
-These are deliberate, auditable changes a human applies via `helm upgrade`. Your role is to
+These are deliberate, auditable changes a human applies via `helm upgrade` to the foundational
+charts, never something your repository can carry. Your role is to
 deploy within the rules and surface the precise change when the rules need to move.
 
 **The 503 that is not your bug.** Until that grant lands, a route is accepted and its traffic is
 dropped: the route shows `Accepted` + `ResolvedRefs`, the Service has ready endpoints, the pods are
 healthy, and every request through the Gateway returns 503. Don't re-roll the Deployment chasing it.
-Confirm with `kubectl -n <ns> port-forward svc/<svc>` — that path bypasses the mesh, so a working
-response there means the workload is fine and the missing grant is the whole problem. Escalate at
-that point.
+Once the route is accepted, its Service has ready endpoints and the pods are Ready, the missing grant
+is the whole problem. Escalate at that point.

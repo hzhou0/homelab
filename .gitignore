@@ -2,6 +2,7 @@
 kube-node/output
 kube-node/.aports
 agents/operator/*.kubeconfig
+agents/operator/*.txt
 **.tgz
 opnsense-operator/bin
 migration

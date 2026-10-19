@@ -13,11 +13,7 @@ helm template homelab-platform "$CHART_DIR" \
   --set policies.enabled=true \
   --set operator.enabled=true \
   --set namespaceMetadata.enabled=true \
-  --set oneChartPerToolNamespace.enabled=true \
   --output-dir "$RENDERED_DIR"
 
 echo "→ Running kyverno policy tests"
 kubectl kyverno test "$TESTS_DIR"
-
-# tool-single-release uses resource.List() which kyverno test cannot mock offline;
-# it is verified via the live cluster (helm upgrade + kubectl apply round-trip).

@@ -2,10 +2,8 @@
 #
 # Mint a kubeconfig for the homelab autonomous operator ServiceAccount.
 #
-# The operator deploys with this kubeconfig. Its power is bounded entirely by the
-# homelab-operator ClusterRole (broad deploy, no kyverno/RBAC/quota writes) and by
-# the Kyverno admission constraints -- so this file is "deploy anything inside the
-# rules" but cannot move the rules.
+# The operator reads and debugs with this kubeconfig but cannot deploy: its changes reach the
+# cluster only as commits, synced under an identity no kubeconfig holds.
 #
 # Usage:
 #   ./gen-kubeconfig.sh [-n NAMESPACE] [-s SA_NAME] [-d DURATION] [-o OUTFILE] [-a API_SERVER]

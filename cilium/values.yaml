@@ -296,6 +296,28 @@ gateways:
           namespace: neon
           name: neon-ctl
           port: 8080
+      git.haustorium.net:
+        # Git clients present a Forgejo token the authorizer cannot verify. Envoy matches the whole
+        # path, and Cilium orders regex rules ahead of every prefix.
+        '/[^/]+/[^/]+\.git/.*':
+          match: RegularExpression
+          namespace: forgejo
+          name: forgejo-http
+          port: 3000
+          externalAuth: false
+          # A pack is unbounded, so any request timeout is a size limit in disguise.
+          requestTimeout: 0s
+        /:
+          namespace: forgejo
+          name: forgejo-http
+          port: 3000
+      argocd.haustorium.net:
+        /:
+          namespace: argocd
+          name: argocd-server
+          port: 80
+          # The UI watches over streams that stay open for as long as the page does.
+          requestTimeout: 0s
       s3.haustorium.net:
         /:
           namespace: hypha

@@ -1,0 +1,57 @@
+# homelab-forgejo values
+
+forgejo:
+  # Stable Service names regardless of release name, since a gateway route is pinned to them.
+  fullnameOverride: forgejo
+
+  # SQLite allows one writer, so two pods must never hold the volume at once.
+  strategy:
+    type: Recreate
+  replicaCount: 1
+
+  persistence:
+    storageClass: zerofs
+    size: 20Gi
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+  gitea:
+    # No local administrator: the first sign-in from the admin group becomes one.
+    admin:
+      username: ""
+
+    oauth:
+      - name: authelia
+        provider: openidConnect
+        # Created by hand before install, holding `key` (client id) and `secret`.
+        existingSecret: forgejo-oidc
+        autoDiscoverUrl: https://auth.haustorium.net/.well-known/openid-configuration
+        scopes: "openid profile email groups"
+        groupClaimName: groups
+        adminGroup: admins
+        # The portal already demanded the second factor before the route admitted the browser.
+        skip-local-2fa: true
+
+    config:
+      APP_NAME: Forgejo
+      server:
+        DOMAIN: git.haustorium.net
+        ROOT_URL: https://git.haustorium.net/
+        DISABLE_SSH: true
+      service:
+        # Accounts arrive only through the issuer; nothing here holds a password.
+        DISABLE_REGISTRATION: false
+        ALLOW_ONLY_EXTERNAL_REGISTRATION: true
+        ENABLE_INTERNAL_SIGNIN: false
+        REQUIRE_SIGNIN_VIEW: true
+      oauth2_client:
+        ENABLE_AUTO_REGISTRATION: true
+      session:
+        COOKIE_SECURE: true
+      actions:
+        ENABLED: false
