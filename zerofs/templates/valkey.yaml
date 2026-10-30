@@ -1,0 +1,93 @@
+{{- if .Values.valkey.enabled }}
+{{- $fullname := include "zerofs.valkey.fullname" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.chartLabels" . | nindent 4 }}
+    {{- include "zerofs.valkey.selectorLabels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "zerofs.valkey.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: valkey
+      port: {{ .Values.valkey.port }}
+      targetPort: valkey
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.chartLabels" . | nindent 4 }}
+    {{- include "zerofs.valkey.selectorLabels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Two instances would be two independent lock tables, which is no lock at all.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "zerofs.valkey.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "zerofs.chartLabels" . | nindent 8 }}
+        {{- include "zerofs.valkey.selectorLabels" . | nindent 8 }}
+    spec:
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: valkey
+          image: "{{ .Values.valkey.image.repository }}:{{ .Values.valkey.image.tag }}"
+          imagePullPolicy: {{ .Values.valkey.image.pullPolicy }}
+          args:
+            - --port
+            - {{ .Values.valkey.port | quote }}
+            - --protected-mode
+            - "no"
+            # A lock outlives no restart by design: persisting one would hand a dead holder's fence
+            # to whoever reads it back.
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - 32mb
+            # An evicted lock is a silently dropped fence; a refused write fails the commit loudly.
+            - --maxmemory-policy
+            - noeviction
+          ports:
+            - name: valkey
+              containerPort: {{ .Values.valkey.port }}
+          readinessProbe:
+            exec:
+              command: [valkey-cli, -p, {{ .Values.valkey.port | quote }}, ping]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml .Values.valkey.resources | nindent 12 }}
+      {{- with .Values.valkey.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.valkey.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.valkey.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

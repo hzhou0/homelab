@@ -3,7 +3,7 @@
 gateway:
   image:
     repository: ghcr.io/barre/zerofs
-    tag: "2.2.3"
+    tag: "2.3.6"
     pullPolicy: IfNotPresent
 
   ports:
@@ -27,9 +27,6 @@ gateway:
     endpoint: "https://s3.us-west-4.idrivee2.com"
     region: us-west-4
     allow_http: "false"
-    # ZeroFS fences writers with put-if-not-exists. A store that answers success instead of a
-    # precondition failure needs this Redis URL to arbitrate, or two nodes can both believe they lead.
-    # conditional_put: "redis://..."
 
   # One pre-created Secret holds every credential under fixed key names, so nothing sensitive
   # reaches a values file or the release history. Both nodes read the same one.
@@ -81,10 +78,35 @@ gateway:
   podAnnotations: {}
   podLabels: {}
 
+valkey:
+  enabled: true
+  image:
+    repository: valkey/valkey
+    tag: "9.1.2-alpine"
+    pullPolicy: IfNotPresent
+  port: 6379
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 96Mi
+  # Every manifest commit waits on it, so it stays off reclaimable capacity.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node.kubernetes.io/capacity-type
+                operator: NotIn
+                values: [spot]
+  nodeSelector: {}
+  tolerations: []
+
 csi:
   image:
     repository: ghcr.io/barre/zerofs-csi
-    tag: "2.2.3"
+    tag: "2.3.6"
     pullPolicy: IfNotPresent
 
   provisionerImage: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0

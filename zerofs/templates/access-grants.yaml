@@ -50,3 +50,26 @@ spec:
             - port: {{ .Values.gateway.ports.metrics | quote }}
               protocol: TCP
 {{- end }}
+{{- if .Values.valkey.enabled }}
+---
+# Any client that can reach the lock table can hold or release a manifest fence, so only the pair may.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-valkey
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zerofs.chartLabels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "zerofs.valkey.selectorLabels" . | nindent 6 }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            {{- include "zerofs.gateway.podSelectorLabels" . | nindent 12 }}
+      toPorts:
+        - ports:
+            - port: {{ .Values.valkey.port | quote }}
+              protocol: TCP
+{{- end }}

@@ -158,6 +158,12 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 {{ $key }} = {{ $value | quote }}
 {{- end }}
 {{- end }}
+{{- if $root.Values.valkey.enabled }}
+{{- if $g.aws.conditional_put }}
+{{- fail "gateway.aws.conditional_put and valkey.enabled both arbitrate conditional PUTs; set one" }}
+{{- end }}
+conditional_put = {{ include "zerofs.valkey.url" $root | quote }}
+{{- end }}
 
 [filesystem]
 compression = "{{ $g.filesystem.compression }}"
@@ -185,6 +191,19 @@ peers = [{{ join ", " $peers }}]
 
 {{ . }}
 {{- end }}
+{{- end }}
+
+{{ define "zerofs.valkey.fullname" -}}
+{{ printf "%s-valkey" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{ define "zerofs.valkey.selectorLabels" -}}
+app.kubernetes.io/name: zerofs-valkey
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{ define "zerofs.valkey.url" -}}
+{{ printf "redis://%s.%s.svc:%v" (include "zerofs.valkey.fullname" .) .Release.Namespace .Values.valkey.port }}
 {{- end }}
 
 {{ define "zerofs.bindingBackup.fullname" -}}

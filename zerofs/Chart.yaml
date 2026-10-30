@@ -8,8 +8,8 @@ description: >-
   its own zerofs namespace, not an app-*/tool-* one, because the node plugin is a privileged
   DaemonSet and the driver is cluster-scoped.
 type: application
-version: 0.1.0
-appVersion: "2.2.3"
+version: 0.1.1
+appVersion: "2.3.6"
 keywords:
   - zerofs
   - csi

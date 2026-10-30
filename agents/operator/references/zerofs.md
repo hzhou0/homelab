@@ -62,10 +62,21 @@ what the store already expects.
 ## Storage backend
 
 The install requires a storage URL: there is no backend worth guessing. ZeroFS fences writers with
-put-if-not-exists, so the backend must reject a conditional PUT against an existing object — that
-rejection is the fence. A store that answers success instead needs a Redis to arbitrate, or both
-halves of the pair can come to believe they lead. Verify this before pointing the chart at a new S3
-implementation.
+put-if-not-exists, and every manifest commit is one: the memtable flusher and the compactor race for
+the next version, and the loser's rejection is what makes it merge and retry. A store must therefore
+reject a conditional PUT that overlaps another, not merely one that follows a finished one. ZeroFS's
+startup check probes only the sequential case, and iDrive e2 passes it while accepting every one of
+several concurrent creates, so the second commit silently replaces the first. That lost a compaction
+from the manifest and wedged the compactor until the L0 limit stopped all writes.
+
+The chart's Valkey closes that gap. ZeroFS's `conditional_put` coordinator speaks the Redis
+protocol, so it takes a per-object lock in Valkey, checks existence with a HEAD, and writes
+unconditionally while holding it. The lock is the only mutual exclusion, so every writer must share
+one instance, and conditional writes stall when it is unreachable. It keeps nothing across a restart,
+which can briefly reopen the race for a commit in flight — a far narrower window than the store's own.
+
+Before pointing the chart at a new S3 implementation, race several conditional creates at one key and
+count the successes; only a store that admits exactly one may run without the Valkey.
 
 Whatever tier is chosen must be hot and instant-access. ZeroFS reads the manifest, the SSTs and
 segment objects continuously, so an archive class makes the filesystem unreadable rather than merely
