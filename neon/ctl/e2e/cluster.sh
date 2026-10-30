@@ -11,7 +11,7 @@ CONTEXT="k3d-$CLUSTER"
 NAMESPACE="${NEON_NAMESPACE:-neon}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$HERE/../../chart"
-CILIUM_VERSION="${CILIUM_VERSION:-v1.20.0}"
+CILIUM_VERSION="${CILIUM_VERSION:-v1.20.4}"
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.6.1}"
 # The homelab's server version: CRD schemas carry CEL the API server has to be new enough to
 # compile, so an older default silently tests against a validator the real cluster does not use.
