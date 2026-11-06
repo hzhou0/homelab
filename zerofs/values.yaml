@@ -2,8 +2,9 @@
 
 gateway:
   image:
-    repository: ghcr.io/barre/zerofs
-    tag: "2.3.6"
+    # Upstream 2.3.6 rebuilt with a SlateDB that clamps entries for caller-provided caches.
+    repository: ghcr.io/hzhou0/zerofs
+    tag: "2.3.6-21c16ba430f0-slatedb-76c8ec2e0284"
     pullPolicy: IfNotPresent
 
   ports:
@@ -51,6 +52,9 @@ gateway:
 
   logLevel: info
 
+  # Huge pages keep the untouched parts of sparse allocations resident, outside the cache budget.
+  jemallocConf: "thp:never"
+
   # SIGTERM starts a real drain: servers quiesce, the open segment is sealed, and up to 256 MiB of
   # buffered writes go to the remote. Being SIGKILLed through it costs the next start a recovery scan.
   terminationGracePeriodSeconds: 120
@@ -58,7 +62,7 @@ gateway:
   resources:
     requests:
       cpu: 500m
-      memory: 1Gi
+      memory: 1536Mi
     limits:
       memory: 3Gi
 
@@ -145,7 +149,7 @@ csi:
         cpu: 100m
         memory: 128Mi
       limits:
-        memory: 1Gi
+        memory: 3Gi
 
   storageClass:
     enabled: true

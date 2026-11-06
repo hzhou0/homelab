@@ -104,6 +104,10 @@ spec:
                 secretKeyRef:
                   name: {{ $secret }}
                   key: encryptionPassword
+            {{- with $root.Values.gateway.jemallocConf }}
+            - name: _RJEM_MALLOC_CONF
+              value: {{ . | quote }}
+            {{- end }}
           # The replication port, not 9P: a standby binds it before its role is resolved but binds
           # 9P only once it takes over, so probing 9P would drop the standby out of its Service and
           # cut off the ships it exists to receive.
