@@ -204,6 +204,14 @@ knobs.
   address of each family out of the bottom of the v6 prefix, and its exposure annotation is what
   asks the firewall to admit the v6 half. Scoping the front-door allow by listener port instead
   would hold only while a v4 port-forward is doing the remapping.
+- **Passthrough is for a backend that must own its handshake.** A passthrough entry is matched by
+  SNI on the same port as the terminating listeners and forwarded unopened, so the backend holds its
+  own certificate and no authorization filter can apply — the backend authenticates its own
+  clients. Sharing the port is why terminating listeners are one per published name rather than
+  the zone wildcard: Cilium refuses a terminating hostname that overlaps a passthrough one, so an
+  unpublished name now fails the handshake instead of reaching Envoy. It still traverses Envoy, so its namespace is unfenced to the `ingress` identity like any
+  route's backend. With no port 80 on the public Gateway, such a backend must obtain its certificate
+  by TLS-ALPN-01, which passthrough carries.
 - **Both zones answer by wildcard.** A registrar wildcard aims the public zone at the WAN address,
   and a gateway's `dnsNames` become Unbound overrides answering those same names with an address a
   client on the LAN can actually reach — the firewall does not reflect its own WAN address, so

@@ -87,12 +87,44 @@ spec:
             hostname: {{ $to | quote }}
             statusCode: 302
 {{- end }}
+{{- range $host, $b := $g.passthrough }}
+{{- with index $g.routes $host }}{{ fail (printf "gateway %s: %s is both routed and passed through" $name $host) }}{{ end }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: {{ first (splitList "." $host) }}
+  namespace: {{ $g.namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  parentRefs:
+    - name: {{ $name }}
+      namespace: {{ $g.namespace }}
+      sectionName: passthrough-{{ $host | replace "." "-" }}
+  hostnames:
+    - {{ $host | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ $b.name }}
+          namespace: {{ $b.namespace }}
+          port: {{ $b.port }}
+{{- end }}
 {{- $grants := dict }}
+{{- $kinds := dict }}
 {{- range $host, $paths := $g.routes }}
 {{- range $prefix, $path := $paths }}
 {{- if ne $path.namespace $g.namespace }}
 {{- $_ := set $grants $path.namespace (append (index $grants $path.namespace | default list) $path.name) }}
+{{- $_ := set $kinds $path.namespace (append (index $kinds $path.namespace | default list) "HTTPRoute") }}
 {{- end }}
+{{- end }}
+{{- end }}
+{{- range $host, $b := $g.passthrough }}
+{{- if ne $b.namespace $g.namespace }}
+{{- $_ := set $grants $b.namespace (append (index $grants $b.namespace | default list) $b.name) }}
+{{- $_ := set $kinds $b.namespace (append (index $kinds $b.namespace | default list) "TLSRoute") }}
 {{- end }}
 {{- end }}
 {{- range $ns, $names := $grants }}
@@ -108,9 +140,11 @@ metadata:
     app.kubernetes.io/part-of: homelab-cilium
 spec:
   from:
+    {{- range $kind := (index $kinds $ns | uniq | sortAlpha) }}
     - group: gateway.networking.k8s.io
-      kind: HTTPRoute
+      kind: {{ $kind }}
       namespace: {{ $g.namespace }}
+    {{- end }}
   to:
     {{- range $n := ($names | uniq | sortAlpha) }}
     - group: ""

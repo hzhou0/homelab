@@ -1,0 +1,45 @@
+{{- with .Values.internetEgress.namespaces }}
+# A CIDR rule never matches a cluster identity, so pods, nodes and the apiserver stay out without
+# being named; only the LAN, which is `world` to Cilium, has to be carved out of the internet.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: internet-egress-only
+  labels:
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/part-of: homelab-cilium
+spec:
+  endpointSelector:
+    matchExpressions:
+      - key: k8s:io.kubernetes.pod.namespace
+        operator: In
+        values:
+          {{- range . }}
+          - {{ . | quote }}
+          {{- end }}
+  enableDefaultDeny:
+    egress: true
+    ingress: false
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    - toCIDRSet:
+        - cidr: 0.0.0.0/0
+          except:
+            {{- range $.Values.internetEgress.excludeV4 }}
+            - {{ . | quote }}
+            {{- end }}
+        - cidr: ::/0
+          except:
+            {{- range $.Values.internetEgress.excludeV6 }}
+            - {{ . | quote }}
+            {{- end }}
+{{- end }}

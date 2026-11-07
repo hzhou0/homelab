@@ -58,10 +58,13 @@ spec:
   listeners:
     # Same-namespace attachment is the whole model: no RoleBinding reaches a gateway namespace, so
     # nothing a workload deploys can publish itself on any gateway.
-    - name: https
+    # One listener per name rather than the zone wildcard: Cilium refuses a terminating hostname
+    # that overlaps a passthrough one on the same port, and a wildcard overlaps every name.
+    {{- range $host := concat (keys $g.routes) (keys ($g.redirects | default dict)) | sortAlpha }}
+    - name: https-{{ $host | replace "." "-" }}
       protocol: HTTPS
       port: {{ $g.listenPort }}
-      hostname: {{ $g.hostname | quote }}
+      hostname: {{ $host | quote }}
       tls:
         mode: Terminate
         certificateRefs:
@@ -70,17 +73,16 @@ spec:
       allowedRoutes:
         namespaces:
           from: Same
-    {{- range $from, $to := $g.redirects }}
-    # A wildcard listener does not match the zone apex, so a name sent elsewhere needs its own.
-    - name: redirect-{{ $from | replace "." "-" }}
-      protocol: HTTPS
+    {{- end }}
+    {{- range $host, $b := $g.passthrough }}
+    # The backend owns this handshake and its certificate, so no authorization filter can apply:
+    # the backend admits its own clients.
+    - name: passthrough-{{ $host | replace "." "-" }}
+      protocol: TLS
       port: {{ $g.listenPort }}
-      hostname: {{ $from | quote }}
+      hostname: {{ $host | quote }}
       tls:
-        mode: Terminate
-        certificateRefs:
-          - kind: Secret
-            name: {{ $g.tls.secretName }}
+        mode: Passthrough
       allowedRoutes:
         namespaces:
           from: Same

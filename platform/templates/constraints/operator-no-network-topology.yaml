@@ -26,7 +26,7 @@ spec:
       - apiGroups: ["gateway.networking.k8s.io"]
         apiVersions: ["v1", "v1alpha2", "v1beta1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["gateways", "gatewayclasses", "tcproutes", "httproutes", "grpcroutes"]
+        resources: ["gateways", "gatewayclasses", "tcproutes", "tlsroutes", "udproutes", "httproutes", "grpcroutes"]
       - apiGroups: ["cilium.io"]
         apiVersions: ["v2", "v2alpha1"]
         operations: ["CREATE", "UPDATE", "DELETE"]

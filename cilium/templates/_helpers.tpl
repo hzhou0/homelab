@@ -34,7 +34,7 @@ the empty default copies every header the authorizer returned, including one a c
 {{- end }}
 
 {{/*
-The namespaces the gateways serve: every route's backend and every raw-TCP listener's target. The
+The namespaces the gateways serve: every route's backend, raw-TCP target and passthrough target. The
 reverse hop and a tunnel peer's reach are both this set, so neither can drift from what is published.
 */}}
 {{ define "cilium.gatewayBackends" -}}
@@ -43,6 +43,7 @@ reverse hop and a tunnel peer's reach are both this set, so neither can drift fr
 {{- if $g.enabled -}}
 {{- range $host, $paths := $g.routes }}{{ range $prefix, $path := $paths }}{{ $ns = append $ns $path.namespace }}{{ end }}{{ end -}}
 {{- range $l := $g.tcpListeners }}{{ $ns = append $ns $l.namespace }}{{ end -}}
+{{- range $host, $b := $g.passthrough }}{{ $ns = append $ns $b.namespace }}{{ end -}}
 {{- end -}}
 {{- end -}}
 {{- $ns | uniq | sortAlpha | join "," -}}

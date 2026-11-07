@@ -167,6 +167,7 @@ gateways:
     # No WAN forward: this address answers on the LAN only.
     expose: false
     tcpListeners: []
+    passthrough: {}
     routes:
       kyverno.internal.haustorium.net:
         /:
@@ -214,6 +215,11 @@ gateways:
       - name: postgres
         port: 5432
         namespace: neon
+    passthrough:
+      rust-lang.haustorium.net:
+        namespace: app-rust-lang
+        name: rust
+        port: 443
     routes:
       # Nothing can authenticate the authorizer, so its own route carries no filter.
       auth.haustorium.net:
@@ -334,6 +340,27 @@ gateways:
           externalAuth: false
           # S3 bodies are unbounded, so any request timeout is a size limit in disguise.
           requestTimeout: 0s
+
+# ---------------------------------------------------------------------------
+# Internet-only egress
+# ---------------------------------------------------------------------------
+internetEgress:
+  namespaces:
+    - app-rust-lang
+  excludeV4:
+    - 0.0.0.0/8
+    - 10.0.0.0/8
+    - 100.64.0.0/10
+    - 127.0.0.0/8
+    - 169.254.0.0/16
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 224.0.0.0/3
+  excludeV6:
+    - 2001:569:5bc1:7f00::/48
+    - fc00::/7
+    - fe80::/10
+    - ff00::/8
 
 # ---------------------------------------------------------------------------
 # WireGuard remote-access tunnel
