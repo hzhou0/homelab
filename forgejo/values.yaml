@@ -55,3 +55,7 @@ forgejo:
         COOKIE_SECURE: true
       actions:
         ENABLED: false
+      # ZeroFS loses a hardlinked file's handle when the 9P session replays: EBADF until remount.
+      # TODO: drop once ZeroFS restores the parent on unlink or rebinds parentless inodes (upstream).
+      git.config:
+        core.createObject: rename
